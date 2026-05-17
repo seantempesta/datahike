@@ -25,8 +25,13 @@
    #?(:clj  [clojure.test :as t :refer [is]]
       :cljs [cljs.test :as t :refer-macros [is]])
    [clojure.core.async :as a :refer [<!]]
+   ;; <p! bridges Promise → channel inside a go block; needed since
+   ;; datahike.api on CLJS now returns js/Promise (see
+   ;; datahike.api.async). Channel-returning libs (konserve etc.) keep
+   ;; using plain <!.
+   #?(:cljs [cljs.core.async.interop :refer-macros [<p!]])
    [datahike.api :as d]
-   [datahike.test.async #?(:clj :refer :cljs :refer-macros) [deftest-async]]))
+   [datahike.test.async #?(:clj :refer :cljs :refer-macros) [deftest-async <!?]]))
 
 (defn- mem-cfg []
   {:store {:backend :memory
@@ -39,15 +44,15 @@
   (a/go
     #?(:clj  (do (d/create-database cfg)
                  (d/connect cfg))
-       :cljs (do (<! (d/create-database cfg))
-                 (<! (d/connect cfg {:sync? false}))))))
+       :cljs (do (<p! (d/create-database cfg))
+                 (<p! (d/connect cfg))))))
 
 (defn- teardown [conn cfg]
   (a/go
     #?(:clj  (do (d/release conn)
                  (d/delete-database cfg))
-       :cljs (do (d/release conn)
-                 (<! (d/delete-database cfg))))))
+       :cljs (do (<p! (d/release conn))
+                 (<p! (d/delete-database cfg))))))
 
 ;; ---------------------------------------------------------------------------
 ;; The failing query from the PR description:
@@ -59,9 +64,9 @@
         conn (<! (setup cfg))]
     ;; A handful of entities with two attributes; the query joins
     ;; on a value that's also an attribute name elsewhere.
-    (<! (d/transact! conn [{:db/id -1 :a 1 :b 10}
-                           {:db/id -2 :a 2 :b 20}
-                           {:db/id -3 :a 3 :b 30}]))
+    (<!? (d/transact! conn [{:db/id -1 :a 1 :b 10}
+                            {:db/id -2 :a 2 :b 20}
+                            {:db/id -3 :a 3 :b 30}]))
     (let [;; Simplest multi-clause FindColl: project entity ids whose
           ;; :a value matches some entity's :b. Triggers hash-join
           ;; over scan-produced tuples.
@@ -87,9 +92,9 @@
 (deftest-async two-clause-join-finds-matches
   (let [cfg  (mem-cfg)
         conn (<! (setup cfg))]
-    (<! (d/transact! conn [{:db/id -1 :name "Alice" :friend "Bob"}
-                           {:db/id -2 :name "Bob"   :friend "Carol"}
-                           {:db/id -3 :name "Carol" :friend "Dave"}]))
+    (<!? (d/transact! conn [{:db/id -1 :name "Alice" :friend "Bob"}
+                            {:db/id -2 :name "Bob"   :friend "Carol"}
+                            {:db/id -3 :name "Carol" :friend "Dave"}]))
     (let [;; Find names of entities someone is a friend of.
           result (set (d/q '[:find [?name ...]
                              :where
@@ -109,8 +114,8 @@
 (deftest-async single-clause-find-coll-works
   (let [cfg  (mem-cfg)
         conn (<! (setup cfg))]
-    (<! (d/transact! conn [{:db/id -1 :name "Ivan"}
-                           {:db/id -2 :name "Petr"}]))
+    (<!? (d/transact! conn [{:db/id -1 :name "Ivan"}
+                            {:db/id -2 :name "Petr"}]))
     (let [result (set (d/q '[:find [?name ...]
                              :where [_ :name ?name]]
                            @conn))]

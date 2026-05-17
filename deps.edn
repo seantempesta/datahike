@@ -34,9 +34,24 @@
 
            :1.10 {:override-deps {org.clojure/clojure {:mvn/version "1.10.0"}}}
 
-           :cljs {:extra-deps {org.clojure/clojurescript {:mvn/version "1.12.134"}
-                               thheller/shadow-cljs      {:mvn/version "3.3.6"}}
-                               
+           :cljs {:extra-deps {org.clojure/clojurescript {:mvn/version "1.12.145"}
+                               thheller/shadow-cljs      {:mvn/version "3.4.10"}
+                               org.clojure/core.async    {:mvn/version "1.10.870-alpha2"}}
+                  ;; The new tests use ^:async deftest + (await ...) from
+                  ;; CLJS 1.12.145 (CLJS-3470 / CLJS-3476). That bump
+                  ;; exposes a latent bug in is.simm/partial-cps where
+                  ;; its macro-probing during CPS transformation invokes
+                  ;; cljs.core/await directly, which asserts on (:async &env)
+                  ;; and throws. Until the upstream fix lands, override to
+                  ;; a fork that catches probe failures defensively.
+                  ;; Upstream commit + PR-in-progress:
+                  ;;   https://github.com/seantempesta/partial-cps/commit/c0d941d4b591351267bc828fdfdf029be53a132f
+                  ;; If/when simm-is/partial-cps releases a version with the
+                  ;; fix, switch back to :mvn/version and drop this block.
+                  :override-deps
+                  {is.simm/partial-cps
+                   {:git/url "https://github.com/seantempesta/partial-cps"
+                    :git/sha "c0d941d4b591351267bc828fdfdf029be53a132f"}}
                   :extra-paths ["test"]}
 
            :dev {:extra-paths ["dev" "benchmark/src"]

@@ -34,10 +34,27 @@
   #?(:clj  (:require [clojure.test]
                      [clojure.core.async])
      :cljs (:require [cljs.test]
-                     [clojure.core.async]))
+                     [clojure.core.async]
+                     [cljs.core.async.interop]))
   #?(:cljs (:require-macros [datahike.test.async])))
 
 (defn- cljs-env? [env] (some? (:ns env)))
+
+(defmacro <!?
+  "Platform-bridging take for tests.
+
+   - CLJ: `<!` (works on channels and — inside a go — on synchronous
+     values that have been wrapped to be channel-yielding by the caller).
+   - CLJS: `<p!` from `cljs.core.async.interop` (bridges a `js/Promise`
+     to a channel-take, throws on rejection).
+
+   Use anywhere a test body calls a datahike API that returns a Promise
+   on CLJS but a value on CLJ (since `datahike.api`'s CLJS expansion
+   wraps every fn through `datahike.api.async/chan->promise`)."
+  [expr]
+  (if (cljs-env? &env)
+    `(cljs.core.async.interop/<p! ~expr)
+    `(clojure.core.async/<! ~expr)))
 
 (defmacro deftest-async
   "Like `clojure.test/deftest` but wraps the body in a `go` block.
