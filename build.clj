@@ -7,24 +7,29 @@
 (def basis (b/create-basis {:project "deps.edn"}))
 
 (defn compile-java
+  "Compile both the hand-written Java API in java/ AND the vendored
+  generated API in java/src-generated/. The generated file
+  (DatahikeGenerated.java) is checked in to this branch so that
+  consumers using `:git/url` succeed at `deps/prep-lib` cold —
+  without having to bootstrap the codegen step that needs IEntity
+  pre-compiled.
+
+  To regenerate after a spec change:
+    1. clojure -T:build compile-java        ; first pass populates target/classes
+    2. clojure -Scp \"$(clojure -Spath):target/classes\" -m datahike.codegen.java java/src-generated
+    3. git add java/src-generated/datahike/java/DatahikeGenerated.java
+    4. clojure -T:build compile-java        ; recompile with the new file"
   [_]
-  (b/javac {:src-dirs ["java"]
+  (b/javac {:src-dirs ["java" "java/src-generated"]
             :class-dir class-dir
             :basis basis
             :javac-opts ["--release" "8"
                          "-Xlint:deprecation"]}))
 
-(defn javadoc
-  "Generate Javadoc for the Java API.
-   Output will be in target/javadoc and automatically included in the jar."
-  [_]
-  (b/javadoc {:src-dirs ["java/src"]
-              :output-dir "target/javadoc"
-              :javadoc-opts ["-public"
-                            "-Xdoclint:none"
-                            "-windowtitle" "Datahike Java API"
-                            "-doctitle" "Datahike Java API Documentation"
-                            "-link" "https://docs.oracle.com/javase/8/docs/api/"
-                            "-link" "https://clojure.github.io/clojure/"]})
-  (println "Javadoc generated in target/javadoc")
-  (println "Javadoc will be automatically published to javadoc.io when released to Clojars"))
+;; NOTE: the upstream `javadoc` fn used to live here. It called
+;; `b/javadoc` which does not exist in any released tools.build
+;; (checked 0.10.13). That call fails to LOAD this namespace under
+;; the pinned tools.build, which breaks `deps/prep-lib compile-java`
+;; for every consumer that pulls datahike via :git/url. Removed here
+;; because it only ran at release time (to publish HTML to
+;; javadoc.io). Restore once tools.build ships `javadoc`.
