@@ -59,7 +59,10 @@ npm-package/output.txt
 resources/DATAHIKE_VERSION
 
 # Auto-generated code (regenerate with bb codegen-*)
-java/src-generated/
+# NOTE: java/src-generated/ is intentionally tracked on this branch so
+# that consumers via :git/url succeed at deps/prep-lib cold. See
+# build.clj for the regen recipe.
+#java/src-generated/
 libdatahike/src/datahike/impl/LibDatahike.java
 pydatahike/src/datahike/generated.py
 .clj-kondo/datahike/
