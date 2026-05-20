@@ -10,7 +10,8 @@
             [datahike.writer]
             [datahike.index.secondary :as sec]
             #?(:clj  [superv.async :refer [go-try- <?- <? S go-loop-try]]
-               :cljs [superv.async :refer-macros [go-try- <?- S go-loop-try]])
+               :cljs [superv.async :refer [S]
+                                   :refer-macros [go-try- <?- <? go-loop-try]])
             [datahike.db.utils :refer [db?]]
             [datahike.tools :as dt]
             [replikativ.logging :as log]
