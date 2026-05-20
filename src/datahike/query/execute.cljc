@@ -316,7 +316,7 @@
 #?(:cljs
    (defn- merge-datom-match?
      "Predicate: does merge datom d match entity+attr+value+shared-var constraints?"
-     [d eid ra vg? vgv check-v? check-tx? scan-d]
+     [^datahike.datom/Datom d eid ra vg? vgv check-v? check-tx? ^datahike.datom/Datom scan-d]
      (and (== (.-e d) eid) (= (.-a d) ra)
           (or (not vg?) (val-eq? (.-v d) vgv))
           (or (not check-v?) (val-eq? (.-v d) (.-v scan-d)))
@@ -339,7 +339,7 @@
 #?(:cljs
    (defn- temporal-merge-datom-match?
      "Like merge-datom-match? but also checks temporal-tx-filter and added-filter."
-     [d eid ra vg? vgv check-v? check-tx? scan-d temporal-tx-filter added-filter]
+     [^datahike.datom/Datom d eid ra vg? vgv check-v? check-tx? ^datahike.datom/Datom scan-d temporal-tx-filter added-filter]
      (and (== (.-e d) eid) (= (.-a d) ra)
           (or (not vg?) (val-eq? (.-v d) vgv))
           (or (nil? temporal-tx-filter) (temporal-tx-filter d))
@@ -1025,7 +1025,8 @@
                :while (or (neg? max-n) (< (result-list-size result-list) max-n))]
          (check-cancel! cancel)
          (when (scan-filter scan-d ground-filter strict-filter probe-set probe-datom-field)
-           (let [eid (.-e ^Datom scan-d)
+           (let [^datahike.datom/Datom scan-d scan-d
+                 eid (.-e scan-d)
                  ok? (loop [mi (int 0) ok? true]
                        (if (or (not ok?) (>= mi n-merges))
                          ok?
@@ -1034,7 +1035,7 @@
                                vg? (aget merge-v-ground mi)
                                vgv (aget merge-v-vals mi)
                                probe (datom eid ra vgv tx0)
-                               ^Datom d (pss-lookup-ge eavt-pss probe)
+                               ^datahike.datom/Datom d (pss-lookup-ge eavt-pss probe)
                                found? (and d
                                            (== (.-e d) eid)
                                            (= (.-a d) ra)
@@ -1518,11 +1519,14 @@
                                  (.add result (.next iter)))))))
                        result)
                      :cljs nil)
-                  ;; Non-temporal probe-driven
-                  (let [pf (int probe-datom-field)]
-                    (probe-driven-iterable
-                     (if (= pf 2) (:avet index-db) (:eavt index-db))
-                     resolved-a probe-set pf)))
+                  ;; Non-temporal probe-driven (CLJ-only — `use-probe-driven?` is
+                  ;; forced false in CLJS so this branch is dead; the conditional
+                  ;; just keeps the CLJS analyzer from seeing the CLJ-only var.)
+                  #?(:clj  (let [pf (int probe-datom-field)]
+                             (probe-driven-iterable
+                              (if (= pf 2) (:avet index-db) (:eavt index-db))
+                              resolved-a probe-set pf))
+                     :cljs nil))
                 (if temporal
                   (build-scan-slice db db-index from-datom to-datom index
                                     temporal index-db resolved-a)
@@ -1807,46 +1811,49 @@
         (when (< write-i n)
           (result-list-trim result-list write-i))))))
 
-(defn- post-filter-not-joins
-  "Apply NOT-JOIN anti-probe filtering on result-list.
-   For each NOT-JOIN op, executes its sub-plan to get exclusion values,
-   builds a HashSet of join-var tuples, and removes matching result tuples."
-  [result-list not-join-ops var-index db]
-  (doseq [nj-op not-join-ops]
-    (let [join-vars (:join-vars nj-op)
-          sub-plan (:sub-plan nj-op)
-          ;; Execute the NOT-JOIN's sub-plan via the Relation engine
-          neg-ctx (execute-plan sub-plan {:rels [] :sources {}} db)
-          neg-rel (when (and neg-ctx (seq (:rels neg-ctx)))
-                    (reduce rel/hash-join (:rels neg-ctx)))]
-      (when (and neg-rel (pos? (count (:tuples neg-rel))))
-        ;; Build exclusion set from the negation result
-        (let [neg-attrs (:attrs neg-rel)
-              jv-vec (vec join-vars)
-              n-jv (count jv-vec)
-              excl-set (java.util.HashSet.)]
-          ;; Collect all join-var value tuples from negation result
-          (doseq [tuple (:tuples neg-rel)]
-            (if (= 1 n-jv)
-              (.add excl-set (get tuple (get neg-attrs (first jv-vec))))
-              (.add excl-set (mapv #(get tuple (get neg-attrs %)) jv-vec))))
-          ;; Filter result-list: remove tuples whose join-var values are in the exclusion set
-          (let [jv-indices (mapv #(int (get var-index %)) jv-vec)
-                n (result-list-size result-list)]
-            (loop [read-i (int 0) write-i (int 0)]
-              (if (< read-i n)
-                (let [^objects tuple (result-list-get result-list read-i)
-                      probe (if (= 1 n-jv)
-                              (aget tuple (int (first jv-indices)))
-                              (mapv #(aget tuple (int %)) jv-indices))
-                      excluded? (.contains excl-set probe)]
-                  (if excluded?
-                    (recur (unchecked-inc-int read-i) write-i)
-                    (do (when (not= read-i write-i)
-                          (result-list-set result-list write-i tuple))
-                        (recur (unchecked-inc-int read-i) (unchecked-inc-int write-i)))))
-                (when (< write-i n)
-                  (result-list-trim result-list write-i))))))))))
+#?(:clj
+   (defn- post-filter-not-joins
+     "Apply NOT-JOIN anti-probe filtering on result-list.
+      For each NOT-JOIN op, executes its sub-plan to get exclusion values,
+      builds a HashSet of join-var tuples, and removes matching result tuples.
+      CLJ-only — uses `java.util.HashSet` for O(1) anti-probes; the CLJS
+      query path does not exercise NOT-JOIN post-filtering yet."
+     [result-list not-join-ops var-index db]
+     (doseq [nj-op not-join-ops]
+       (let [join-vars (:join-vars nj-op)
+             sub-plan (:sub-plan nj-op)
+             ;; Execute the NOT-JOIN's sub-plan via the Relation engine
+             neg-ctx (execute-plan sub-plan {:rels [] :sources {}} db)
+             neg-rel (when (and neg-ctx (seq (:rels neg-ctx)))
+                       (reduce rel/hash-join (:rels neg-ctx)))]
+         (when (and neg-rel (pos? (count (:tuples neg-rel))))
+           ;; Build exclusion set from the negation result
+           (let [neg-attrs (:attrs neg-rel)
+                 jv-vec (vec join-vars)
+                 n-jv (count jv-vec)
+                 excl-set (java.util.HashSet.)]
+             ;; Collect all join-var value tuples from negation result
+             (doseq [tuple (:tuples neg-rel)]
+               (if (= 1 n-jv)
+                 (.add excl-set (get tuple (get neg-attrs (first jv-vec))))
+                 (.add excl-set (mapv #(get tuple (get neg-attrs %)) jv-vec))))
+             ;; Filter result-list: remove tuples whose join-var values are in the exclusion set
+             (let [jv-indices (mapv #(int (get var-index %)) jv-vec)
+                   n (result-list-size result-list)]
+               (loop [read-i (int 0) write-i (int 0)]
+                 (if (< read-i n)
+                   (let [^objects tuple (result-list-get result-list read-i)
+                         probe (if (= 1 n-jv)
+                                 (aget tuple (int (first jv-indices)))
+                                 (mapv #(aget tuple (int %)) jv-indices))
+                         excluded? (.contains excl-set probe)]
+                     (if excluded?
+                       (recur (unchecked-inc-int read-i) write-i)
+                       (do (when (not= read-i write-i)
+                             (result-list-set result-list write-i tuple))
+                           (recur (unchecked-inc-int read-i) (unchecked-inc-int write-i)))))
+                   (when (< write-i n)
+                     (result-list-trim result-list write-i)))))))))))
 
 (defn- binding-vars
   "Extract the binding variable(s) from a binding form as a flat vector.
@@ -2202,7 +2209,8 @@
             (when (seq pred-ops)
               (post-filter-preds result-list pred-ops var-index))
             (when (seq not-join-ops)
-              (post-filter-not-joins result-list not-join-ops var-index db))
+              #?(:clj  (post-filter-not-joins result-list not-join-ops var-index db)
+                 :cljs nil))
             (let [var-index (if (seq fn-ops)
                               (post-apply-fns result-list fn-ops var-index)
                               var-index)]
@@ -2443,9 +2451,14 @@
                    (or e-probe v-probe)))
                :cljs nil)
             filtered-datoms (cond->> (if sip-probe
-                                       (probe-driven-iterable
-                                        (if (== (:field sip-probe) 2) (:avet db) (:eavt db))
-                                        resolved-a (:values sip-probe) (:field sip-probe))
+                                       ;; CLJ-only — `sip-probe` is forced nil in
+                                       ;; CLJS so this branch is dead; the
+                                       ;; conditional keeps the CLJS analyzer from
+                                       ;; seeing the CLJ-only var.
+                                       #?(:clj  (probe-driven-iterable
+                                                 (if (== (:field sip-probe) 2) (:avet db) (:eavt db))
+                                                 resolved-a (:values sip-probe) (:field sip-probe))
+                                          :cljs nil)
                                        (di/-slice db-index from-datom to-datom index))
                               ground-filter (filter ground-filter)
                               strict-filter (filter strict-filter))
