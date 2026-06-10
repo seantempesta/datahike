@@ -22,8 +22,8 @@
    new planner is opt-in via DATAHIKE_QUERY_PLANNER); on CLJS the new
    planner is the default."
   (:require
-   #?(:clj  [clojure.test :as t :refer [is]]
-      :cljs [cljs.test :as t :refer-macros [is]])
+   #?(:clj  [clojure.test :as t :refer [is deftest]]
+      :cljs [cljs.test :as t :refer-macros [is deftest]])
    [clojure.core.async :as a :refer [<!]]
    ;; <p! bridges Promise → channel inside a go block; needed since
    ;; datahike.api on CLJS now returns js/Promise (see
@@ -31,6 +31,8 @@
    ;; using plain <!.
    #?(:cljs [cljs.core.async.interop :refer-macros [<p!]])
    [datahike.api :as d]
+   [datahike.db]
+   [datahike.query]
    [datahike.test.async #?(:clj :refer :cljs :refer-macros) [deftest-async <!?]]))
 
 (defn- mem-cfg []
@@ -121,6 +123,77 @@
                            @conn))]
       (is (= #{"Ivan" "Petr"} result)))
     (<! (teardown conn cfg))))
+
+;; ---------------------------------------------------------------------------
+;; Regression (2026-06-10, found by seon's gym lane): a query joining TWO
+;; identity-attr clauses through one message row —
+;;   [?ag :seon.agent/id ?bid] [?m :from ?ag] [?m :to ?u] [?u :seon.user/id "user"]
+;; with `:in $ ?bid` — IGNORED the ?bid binding and returned the
+;; inverse-direction (user→agent) rows. Root cause: execute-plan-direct's
+;; multi-group hash-probe loop only supports a single producer→consumer
+;; edge; this plan has ONE producer (the ?m entity-group) feeding TWO
+;; consumer pattern-scans (?ag and ?u). The producer built one probe-map
+;; keyed by ?ag, the ?u consumer probed it with ?u values (joining through
+;; the wrong key), and its combine step clobbered the ?ag join's results.
+;; Fixed conservatively: can-direct-fuse? now rejects multi-edge /
+;; multi-consumer / chained group-join topologies, falling back to the
+;; Relation path. On CLJ this was masked by `*force-legacy*` defaulting to
+;; true; with DATAHIKE_QUERY_PLANNER=true the CLJ engine had the same bug.
+
+(deftest two-identity-joins-through-one-row-honor-in-binding
+  (let [schema {:seon.agent/id     {:db/unique :db.unique/identity}
+                :seon.user/id      {:db/unique :db.unique/identity}
+                :seon.message/from {:db/valueType :db.type/ref}
+                :seon.message/to   {:db/valueType :db.type/ref}}
+        db (-> (datahike.db/empty-db schema)
+               (d/db-with
+                [{:db/id -1 :seon.user/id "user"}
+                 {:db/id -2 :seon.agent/id "a"}
+                 {:db/id -3 :seon.agent/id "b"}
+                 {:seon.message/from -1 :seon.message/to -2
+                  :seon.message/content "alpha question"}
+                 {:seon.message/from -2 :seon.message/to -1
+                  :seon.message/content "ALPHA-ANSWER"}
+                 {:seon.message/from -1 :seon.message/to -3
+                  :seon.message/content "beta question"}
+                 {:seon.message/from -3 :seon.message/to -1
+                  :seon.message/content "BETA-ANSWER"}]))
+        query '[:find ?c
+                :in $ ?bid
+                :where
+                [?ag :seon.agent/id ?bid]
+                [?m :seon.message/from ?ag]
+                [?m :seon.message/to ?u]
+                [?u :seon.user/id "user"]
+                [?m :seon.message/content ?c]]
+        run (fn [bid]
+              #?(:clj  (binding [datahike.query/*force-legacy* false]
+                         (d/q query db bid))
+                 :cljs (d/q query db bid)))]
+    (is (= #{["BETA-ANSWER"]} (run "b"))
+        "?bid binding must scope the from-agent join (pre-fix: returned the inverse user→agent rows)")
+    (is (= #{["ALPHA-ANSWER"]} (run "a")))
+    ;; clause order must not matter
+    (is (= #{["BETA-ANSWER"]}
+           #?(:clj (binding [datahike.query/*force-legacy* false]
+                     (d/q '[:find ?c
+                            :in $ ?bid
+                            :where
+                            [?u :seon.user/id "user"]
+                            [?m :seon.message/to ?u]
+                            [?m :seon.message/from ?ag]
+                            [?ag :seon.agent/id ?bid]
+                            [?m :seon.message/content ?c]]
+                          db "b"))
+              :cljs (d/q '[:find ?c
+                           :in $ ?bid
+                           :where
+                           [?u :seon.user/id "user"]
+                           [?m :seon.message/to ?u]
+                           [?m :seon.message/from ?ag]
+                           [?ag :seon.agent/id ?bid]
+                           [?m :seon.message/content ?c]]
+                         db "b"))))))
 
 (comment
   ;; CLJ REPL:

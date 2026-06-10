@@ -1697,12 +1697,27 @@
    Delegates structural checks (op types, post-op eligibility, source exclusion)
    to plan/structurally-fusable?, then adds runtime-specific checks:
    - ALL find-vars resolvable from groups, function outputs, or consts
+   - Multi-group: single producer→consumer probe-join edge only
    - Multi-group: probe vars in consumer scan, find-vars from consumer group"
   [plan find-vars consts]
   (let [ops (:ops plan)
         groups (filterv #(#{:entity-group :pattern-scan} (:op %)) ops)]
     (and ;; Structural eligibility (shared with plan-time pre-check)
      (plan/structurally-fusable? ops)
+     ;; Multi-group topology: the direct executor's hash-probe loop only
+     ;; supports a SINGLE producer→consumer edge (producer executed first).
+     ;; One producer feeding TWO consumers builds ONE probe-map keyed by
+     ;; the first consumer's probe-var, probes the second consumer with the
+     ;; wrong value set, and lets the second combine clobber the first's
+     ;; results — silently wrong answers (e.g. a query joining two
+     ;; identity-attr clauses through one row ignores its :in binding).
+     ;; Chains (a consumer that is itself a producer) never publish their
+     ;; probe-set, silently dropping the downstream group's constraint.
+     ;; Bail here → callers fall back to the (correct) Relation path.
+     (let [gj (:group-joins plan)]
+       (and (<= (count gj) 1)
+            (= (count gj) (dec (max 1 (count groups))))
+            (every? (fn [[gi {:keys [producer-idx]}]] (< producer-idx gi)) gj)))
          ;; Find-var coverage: groups + function outputs + consts
      (let [group-vars (into #{} (mapcat :vars) groups)
            fn-ops (filterv #(= :function (:op %)) ops)
