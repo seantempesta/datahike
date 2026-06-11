@@ -2007,6 +2007,12 @@
                (if (contains? plan :structurally-fusable?)
                  (:structurally-fusable? plan)
                  true)
+               ;; Standalone optional scans (LOptionalScan from get-else) need
+               ;; default-on-miss semantics; the fused scan is a raw index
+               ;; slice and would emit nothing for entities lacking the attr.
+               ;; Bail to the relation path (execute-plan), which routes
+               ;; optional ops through bind-by-fn(get-else).
+               (not-any? #(and (= :pattern-scan (:op %)) (:optional? %)) ops)
                (can-direct-fuse? plan find-vars consts))
       (let [group-joins (:group-joins plan)
             groups (filterv #(#{:entity-group :pattern-scan} (:op %)) ops)
@@ -2302,6 +2308,13 @@
                ;; (unlike execute-plan-direct which has post-filter machinery)
                (seq ops)
                (every? #(#{:entity-group :pattern-scan} (:op %)) ops)
+               ;; Standalone optional scans (LOptionalScan from get-else) need
+               ;; left-outer-with-default semantics against already-bound rels;
+               ;; the fused scan is a raw index slice (inner join) and the
+               ;; caller hash-joins the returned Relation — entities lacking
+               ;; the attribute would be silently dropped. Bail to execute-plan,
+               ;; which routes optional ops through bind-by-fn(get-else).
+               (not-any? #(and (= :pattern-scan (:op %)) (:optional? %)) ops)
                (not-any? :source ops))
       ;; Collect ALL vars produced by all groups
       (let [groups (filterv #(#{:entity-group :pattern-scan} (:op %)) ops)
@@ -3393,15 +3406,18 @@
                                      rel/*lookup-attrs* (lookup-attrs-for-clauses op-db (:clause op) nil)]
                              (update ctx :rels rel/collapse-rels new-rel))]
                   (recur ctx' plan (inc idx)))
-                (if (not (pss-instance? (:eavt op-db)))
-                  ;; Temporal/non-standard DB — use legacy lookup with search context.
+                (if (or (:optional? op) (not (pss-instance? (:eavt op-db))))
+                  ;; Temporal/non-standard DB, or a standalone optional scan —
+                  ;; use legacy lookup with search context.
                   ;; lookup-batch-search takes [source context orig-pattern resolved-pattern];
                   ;; passing clause twice — no resolution needed in fallback.
                   ;; If this op is a standalone LOptionalScan-derived pattern-scan
                   ;; (get-else where the entity isn't shared with another scan in
-                  ;; the same scope, e.g. `?e` only appears inside OR branches),
-                  ;; the legacy lookup-batch-search would inner-join and drop
-                  ;; entities lacking the attribute. Route through bind-by-fn for
+                  ;; the same scope, e.g. `?e` bound by an :in binding or only
+                  ;; appearing inside OR branches), a plain index scan would
+                  ;; inner-join and drop entities lacking the attribute — on ANY
+                  ;; db type, PSS included (execute-pattern-scan is a raw index
+                  ;; slice with no default-on-miss). Route through bind-by-fn for
                   ;; left-outer-with-default semantics, matching the legacy
                   ;; engine's behavior for [(get-else …) ?v].
                   (let [ctx' (binding [rel/*implicit-source* op-db]

@@ -20,7 +20,8 @@
             [cljs.nodejs :as nodejs]
             ;; Sibling test namespaces — included so `bb node-cljs-test`
             ;; covers them too.
-            [datahike.test.cljs-pattern-scan-test]))
+            [datahike.test.cljs-pattern-scan-test]
+            [datahike.test.query-getelse-test]))
 
 ;; Hook cljs.test's end-of-run callback so the Node process exits with
 ;; status 0 only when all tests pass.
@@ -293,4 +294,5 @@
 
 (defn -main []
   (t/run-tests 'datahike.test.nodejs-test
-               'datahike.test.cljs-pattern-scan-test))
+               'datahike.test.cljs-pattern-scan-test
+               'datahike.test.query-getelse-test))
