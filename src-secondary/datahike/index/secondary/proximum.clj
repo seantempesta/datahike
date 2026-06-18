@@ -22,6 +22,21 @@
    [replikativ.logging :as log]
    [clojure.core.async :as async]))
 
+(def ^:private float-array-class (Class/forName "[F"))
+
+(defn- ->float-array
+  "Coerce an embedding value to a Java float[] for Proximum. Datahike validates
+   a :db.type/tuple value as a Clojure vector, so the value reaching -transact
+   is a (vector? ...) of numbers — but Proximum's insert/search want a float[].
+   Accept either form; nil if it is neither (e.g. a non-vector value on the
+   indexed attr, which we then skip)."
+  [v]
+  (cond
+    (nil? v)                       nil
+    (instance? float-array-class v) v
+    (sequential? v)                (float-array v)
+    :else                          nil))
+
 (defn- make-proximum-index
   "Create an ISecondaryIndex backed by Proximum.
    Entity IDs are used as external keys in the Proximum index."
@@ -32,11 +47,12 @@
         ;; query-spec: {:vector float-array, :k int}
         ;; Returns EntityBitSet of matching entity IDs
         (let [{:keys [vector k]} query-spec
+              qv (->float-array vector)
               results (if entity-filter
-                        (prox/search-filtered prox-idx vector k
+                        (prox/search-filtered prox-idx qv k
                                               (fn [ext-id _meta]
                                                 (es/entity-bitset-contains? entity-filter (long ext-id))))
-                        (prox/search prox-idx vector k))]
+                        (prox/search prox-idx qv k))]
           (es/entity-bitset-from-longs (map :id results))))
 
       (-estimate [_ query-spec]
@@ -50,12 +66,13 @@
       (-slice-ordered [_ query-spec entity-filter _attr _direction limit]
         ;; KNN results are already distance-ordered; limit is just k
         (let [{:keys [vector k]} query-spec
+              qv (->float-array vector)
               effective-k (if limit (min k limit) k)
               results (if entity-filter
-                        (prox/search-filtered prox-idx vector effective-k
+                        (prox/search-filtered prox-idx qv effective-k
                                               (fn [ext-id _meta]
                                                 (es/entity-bitset-contains? entity-filter (long ext-id))))
-                        (prox/search prox-idx vector effective-k))]
+                        (prox/search prox-idx qv effective-k))]
           ;; Return as seq of {:entity-id :distance} for the caller to project
           (mapv (fn [{:keys [id distance]}]
                   {:entity-id id :distance distance})
@@ -138,12 +155,13 @@
               eid (.-e datom)
               val (.-v datom)]
           (if added?
-            ;; Insert: val should be a float-array vector, eid is external key
-            (if (instance? (Class/forName "[F") val)
+            ;; Insert: coerce the datahike value (a Clojure vector after tuple
+            ;; validation, or a raw float[]) to float[] for Proximum.
+            (if-let [fa (->float-array val)]
               (make-proximum-index
-               (prox/insert prox-idx val eid)
+               (prox/insert prox-idx fa eid)
                config)
-              (do (log/warn :datahike/non-float-array-vector {:eid eid :type (type val)})
+              (do (log/warn :datahike/non-vector-embedding {:eid eid :type (type val)})
                   (make-proximum-index prox-idx config)))
             ;; Retract: delete by external entity ID
             (make-proximum-index
@@ -154,8 +172,11 @@
  :proximum
  (fn [config _db]
    (let [prox-config (merge {:type :hnsw}
+                            ;; Keys must match proximum.hnsw/create-index's destructure
+                            ;; (hnsw.clj:1159): it reads :M (uppercase), not :m — the old
+                            ;; :m here was silently dropped, pinning M at the default 16.
                             (select-keys config [:dim :distance :store-config :mmap-dir
-                                                 :capacity :m :ef-construction :ef-search]))
+                                                 :capacity :M :ef-construction :ef-search]))
          prox-idx (prox/create-index prox-config)]
      (make-proximum-index prox-idx config))))
 
