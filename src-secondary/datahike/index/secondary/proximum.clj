@@ -13,6 +13,7 @@
    [datahike.index.audit :as audit]
    [datahike.index.secondary :as sec]
    [datahike.index.entity-set :as es]
+   [konserve.core :as k]
    [proximum.core :as prox]
    [proximum.crypto :as pcrypto]
    [proximum.protocols :as pproto]
@@ -94,12 +95,28 @@
         ;; state on the live record.
         ;;
         ;; NOTE on the <!!: writing.cljc invokes -sec-flush from inside
-        ;; commit!'s go-try-, so blocking from here parks a core.async
-        ;; pool thread. Under load this can deadlock the writer. The
-        ;; correct fix is making -sec-flush async in the protocol;
-        ;; tracked separately. This call is the minimal fix to stop
-        ;; throwing NPE (which was caused by previously calling the
-        ;; wrong, VectorStore-shaped sync! against an HnswIndex).
+        ;; commit!'s go-try- (the writer's commit loop), so this <!! blocks
+        ;; the go-block's dispatch thread until proximum's async sync!
+        ;; completes. Whether that is a deadlock hazard depends ENTIRELY on
+        ;; the core.async dispatch model:
+        ;;   - classic FIXED go-pool (8 threads): blocking here consumes a
+        ;;     bounded pool thread; enough concurrent blocked commits could
+        ;;     deadlock. (The original concern, written for that model.)
+        ;;   - virtual-thread dispatch (core.async >= 1.7 on JDK >= 21): each
+        ;;     go-block IS a virtual thread; blocking <!! unmounts it from its
+        ;;     carrier — there is NO bounded pool to exhaust, so NO deadlock.
+        ;; The wire-server runs core.async 1.9.829-alpha2 on Java 22, where
+        ;; go-blocks ARE virtual threads (verified: -sec-flush executes in the
+        ;; "VirtualThreads" group, Thread.isVirtual = true). VERIFIED LIVE
+        ;; (P2-A.5, tmp/embed-restore/src/deadlock_smoke.clj): 100 concurrent
+        ;; embedding writes at concurrency 32 all commit in ~1.3s with NO
+        ;; deadlock, and a reopen+restore still passes. So this blocking <!!
+        ;; is SAFE on the wire-server runtime. If core.async is ever
+        ;; downgraded below the virtual-thread dispatch line (or pinned to the
+        ;; fixed go-pool), this becomes a real hazard again and -sec-flush must
+        ;; be made async up the chain (db->stored/commit! awaiting a channel) —
+        ;; a datahike framework change, deliberately NOT done here to avoid
+        ;; destabilizing the universal commit path against a non-problem.
         (let [synced (async/<!! (pproto/sync! prox-idx))
               cid    (phi/commit-id synced)]
           {:type :proximum
@@ -168,17 +185,74 @@
              (prox/delete prox-idx eid)
              config)))))))
 
+(defn- committed-index-exists?*
+  "True iff `store-config` points at a konserve store that ALREADY holds a
+   committed proximum index (i.e. has at least one branch). Used by the factory
+   to choose connect-if-exists (restore skeleton) over create. We require a
+   committed BRANCH, not merely a store dir, so a genuinely-empty/stale store
+   (dir exists but no commit) takes the CREATE path rather than producing a
+   passive skeleton that no `-sec-restore` will populate. Defensive: any backend
+   error → treat as not-existing and fall through to create (which surfaces the
+   real error)."
+  [store-config]
+  (boolean
+   (when store-config
+     (try
+       (and (k/store-exists? store-config {:sync? true})
+            (let [store (pwr/connect-store-sync store-config)]
+              (seq (k/get store :branches nil {:sync? true}))))
+       (catch Throwable _ false)))))
+
+(defn- make-restore-skeleton
+  "A passive placeholder index for datahike's `restore-secondary-indices`
+   reopen path (writing.cljc:179). datahike creates a skeleton ONLY to dispatch
+   `-sec-restore` on it (the real index materializes from the durable konserve
+   store via `pwr/load-commit`), so the skeleton must NOT `create-store` or write
+   `:index/config`/`:branches` (that overwrites the very store being restored —
+   the P2-A.5 root cause). This reify implements `IVersionedSecondaryIndex` so
+   the `(satisfies? ...)` check at writing.cljc:180 passes; only `-sec-restore`
+   is ever invoked on it — every other method throws loudly if the reopen flow
+   ever changes to call them on the skeleton (we want to know, not silently
+   serve an empty index)."
+  [config]
+  (let [bug! (fn [m] (throw (ex-info (str "proximum restore-skeleton: " m
+                                          " — only -sec-restore should be called on a skeleton")
+                                     {:config config})))]
+    (reify
+      sec/IVersionedSecondaryIndex
+      (-sec-flush [_ _store _branch] (bug! "-sec-flush"))
+      (-sec-restore [_ _store key-map]
+        ;; The real restore: load the committed HNSW from proximum's own
+        ;; durable store. Identical to the live index's `-sec-restore`.
+        (let [restored (pwr/load-commit (:store-config key-map) (:commit-id key-map)
+                                        {:branch (keyword (:branch key-map))})]
+          (make-proximum-index restored config)))
+      (-sec-branch [_ _store _from _new] (bug! "-sec-branch"))
+      (-sec-mark [_] #{}))))
+
 (sec/register-index-type!
  :proximum
  (fn [config _db]
+   ;; CONNECT-IF-EXISTS. `create-index` (this factory) is called from two
+   ;; datahike paths, BOTH with db = nil (so we cannot branch on db):
+   ;;   1. fresh create / re-instantiate (transaction.cljc:218) — the store does
+   ;;      NOT yet exist; we must `prox/create-index` to allocate + write config.
+   ;;   2. reopen restore skeleton (writing.cljc:179) — the store DOES exist
+   ;;      (durable file/jdbc, or the JVM-global :memory registry); we must NOT
+   ;;      `create-index`, or `create-store-sync` throws "store already exists"
+   ;;      and the real `-sec-restore`→`load-commit` never runs (the bug).
+   ;; Branching on a committed store is correct for both: no committed index →
+   ;; create; a committed index → passive skeleton, let `-sec-restore` populate.
    (let [prox-config (merge {:type :hnsw}
                             ;; Keys must match proximum.hnsw/create-index's destructure
                             ;; (hnsw.clj:1159): it reads :M (uppercase), not :m — the old
                             ;; :m here was silently dropped, pinning M at the default 16.
                             (select-keys config [:dim :distance :store-config :mmap-dir
-                                                 :capacity :M :ef-construction :ef-search]))
-         prox-idx (prox/create-index prox-config)]
-     (make-proximum-index prox-idx config))))
+                                                 :capacity :M :ef-construction :ef-search]))]
+     (if (committed-index-exists?* (:store-config config))
+       (make-restore-skeleton config)
+       (let [prox-idx (prox/create-index prox-config)]
+         (make-proximum-index prox-idx config))))))
 
 ;; GC: proximum uses its own store, not datahike's konserve
 (defmethod sec/mark-from-key-map :proximum [_ _] #{})
