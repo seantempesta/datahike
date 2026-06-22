@@ -40,25 +40,61 @@
 
 (defn- make-proximum-index
   "Create an ISecondaryIndex backed by Proximum.
-   Entity IDs are used as external keys in the Proximum index."
+   Entity IDs are used as external keys in the Proximum index.
+
+   The live proximum index value is held in a MUTABLE atom `!idx` (not a
+   plain closed-over `prox-idx`). This is load-bearing for durable edge
+   persistence across incremental commits, and fixes a SAVE bug that dropped
+   the HNSW edge graph on reopen:
+
+     `proximum.protocols/sync!` returns a NEW immutable index value whose
+     edge `:address-map` (position -> konserve chunk UUID) was just populated
+     by the flush. datahike's commit path calls `-sec-flush` (which runs
+     sync!) but then keeps the SAME reify in `:secondary-indices` — it has
+     nowhere to install sync!'s return value (flush returns a key-map, not an
+     index). If the bridge discards the synced value, the NEXT `-transact`
+     forks from the PRE-sync index whose edge `:address-map` is still empty
+     and whose dirty chunks were already cleared by the prior sync. The
+     follow-on commit therefore persists an EMPTY `edges-addr-pss`, so every
+     committed snapshot links zero edge chunks. Vectors survived only because
+     proximum's vector chunk-address-map is an atom shared by reference across
+     index values; the edge address-map is immutable state lost with the
+     discarded value. Result on reopen: `load-commit` restores all vectors but
+     an empty edge graph, leaving only the entrypoint reachable (KNN returns 1
+     hit) until a full re-embed.
+
+   Fix: `-sec-flush` resets `!idx` to the synced value, so the subsequent
+   `-transact` on this same reify forks from the post-sync index (carrying the
+   populated edge `:address-map`), and the address-map accumulates across
+   commits exactly as a single bulk-insert+sync would. (Verified live: 20
+   incremental insert+sync rounds that DISCARD the synced value persist 0 edge
+   chunks and reload to 1 reachable node; RETAINING it persists the edge map
+   and reloads to all nodes reachable.)"
   [prox-idx config]
-  (let [attrs (set (:attrs config))]
+  (let [attrs (set (:attrs config))
+        ;; Mutable holder for the live index value. -sec-flush installs the
+        ;; post-sync value here so the next -transact forks from it (see the
+        ;; docstring). -transact/-restore/-branch still build fresh reifies for
+        ;; datahike's immutable assoc-in; the atom only bridges the flush gap
+        ;; WITHIN one reify's lifetime.
+        !idx (atom prox-idx)]
     (reify sec/ISecondaryIndex
       (-search [_ query-spec entity-filter]
         ;; query-spec: {:vector float-array, :k int}
         ;; Returns EntityBitSet of matching entity IDs
         (let [{:keys [vector k]} query-spec
               qv (->float-array vector)
+              cur @!idx
               results (if entity-filter
-                        (prox/search-filtered prox-idx qv k
+                        (prox/search-filtered cur qv k
                                               (fn [ext-id _meta]
                                                 (es/entity-bitset-contains? entity-filter (long ext-id))))
-                        (prox/search prox-idx qv k))]
+                        (prox/search cur qv k))]
           (es/entity-bitset-from-longs (map :id results))))
 
       (-estimate [_ query-spec]
         ;; For KNN, the result count is exactly k (or less if fewer vectors exist)
-        (min (:k query-spec 10) (prox/count-vectors prox-idx)))
+        (min (:k query-spec 10) (prox/count-vectors @!idx)))
 
       (-can-order? [_ _attr direction]
         ;; Proximum results are naturally ordered by distance (ascending)
@@ -69,11 +105,12 @@
         (let [{:keys [vector k]} query-spec
               qv (->float-array vector)
               effective-k (if limit (min k limit) k)
+              cur @!idx
               results (if entity-filter
-                        (prox/search-filtered prox-idx qv effective-k
+                        (prox/search-filtered cur qv effective-k
                                               (fn [ext-id _meta]
                                                 (es/entity-bitset-contains? entity-filter (long ext-id))))
-                        (prox/search prox-idx qv effective-k))]
+                        (prox/search cur qv effective-k))]
           ;; Return as seq of {:entity-id :distance} for the caller to project
           (mapv (fn [{:keys [id distance]}]
                   {:entity-id id :distance distance})
@@ -117,8 +154,17 @@
         ;; be made async up the chain (db->stored/commit! awaiting a channel) —
         ;; a datahike framework change, deliberately NOT done here to avoid
         ;; destabilizing the universal commit path against a non-problem.
-        (let [synced (async/<!! (pproto/sync! prox-idx))
+        ;; INSTALL the synced value back into !idx (load-bearing — see the
+        ;; make-proximum-index docstring): sync! returns a new index whose edge
+        ;; :address-map was just populated. Without resetting !idx, the next
+        ;; -transact on this same reify would fork from the pre-sync value with
+        ;; an empty edge address-map (dirty chunks already cleared), and the
+        ;; follow-on commit would persist an empty edges-addr-pss — losing the
+        ;; whole HNSW edge graph on reopen. Resetting !idx makes the address-map
+        ;; accumulate across commits.
+        (let [synced (async/<!! (pproto/sync! @!idx))
               cid    (phi/commit-id synced)]
+          (reset! !idx synced)
           {:type :proximum
            :branch (name branch)
            :commit-id cid
@@ -133,7 +179,7 @@
 
       (-sec-branch [_ _store _from-branch new-branch]
         ;; Fork via proximum's native branching (reflink mmap + konserve COW)
-        (let [branched (pver/branch! prox-idx (keyword new-branch))]
+        (let [branched (pver/branch! @!idx (keyword new-branch))]
           (make-proximum-index branched config)))
 
       (-sec-mark [_]
@@ -144,7 +190,7 @@
       (-merkle-root [_]
         ;; Proximum's commit-id is a content hash of the HNSW graph
         ;; + vectors state. Returns nil pre-commit; never throws.
-        (phi/commit-id prox-idx))
+        (phi/commit-id @!idx))
       (-recompute-merkle-root [this]
         ;; When proximum.audit (>= the audit-chain release) is on the
         ;; classpath, delegate the live-index walk to it — that gives
@@ -153,7 +199,7 @@
         ;; versions fall back to the local translation.
         (or (when-let [recompute (try (requiring-resolve 'proximum.audit/-recompute-merkle-root)
                                       (catch Throwable _ nil))]
-              (recompute prox-idx))
+              (recompute @!idx))
             (let [store-config (:store-config config)
                   branch (or (:branch config) :main)
                   result (pcrypto/verify-from-cold store-config branch)
@@ -168,21 +214,25 @@
 
       (-transact [_ tx-report]
         ;; tx-report: {:datom datom :added? bool}
+        ;; Forks from @!idx — the post-sync value installed by the previous
+        ;; -sec-flush (or the value this reify was created with), so the edge
+        ;; :address-map carries forward across commits (see docstring).
         (let [{:keys [datom added?]} tx-report
               eid (.-e datom)
-              val (.-v datom)]
+              val (.-v datom)
+              cur @!idx]
           (if added?
             ;; Insert: coerce the datahike value (a Clojure vector after tuple
             ;; validation, or a raw float[]) to float[] for Proximum.
             (if-let [fa (->float-array val)]
               (make-proximum-index
-               (prox/insert prox-idx fa eid)
+               (prox/insert cur fa eid)
                config)
               (do (log/warn :datahike/non-vector-embedding {:eid eid :type (type val)})
-                  (make-proximum-index prox-idx config)))
+                  (make-proximum-index cur config)))
             ;; Retract: delete by external entity ID
             (make-proximum-index
-             (prox/delete prox-idx eid)
+             (prox/delete cur eid)
              config)))))))
 
 (defn- committed-index-exists?*
