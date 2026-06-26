@@ -388,8 +388,18 @@
 
        IEmptyableCollection (-empty [_] (throw (js/Error. "-empty is not supported on FilteredDB")))
 
-       ILookup (-lookup ([_ _] (throw (js/Error. "-lookup is not supported on FilteredDB")))
-                        ([_ _ _] (throw (js/Error. "-lookup is not supported on FilteredDB"))))
+       ;; Field-or-nil lookup, matching JVM defrecord valAt: a wrapper db has no
+       ;; index fields, so `(:eavt wrapper)` is nil. The query planner's
+       ;; `(pss-instance? (:eavt op-db))` fast-path check (query/execute.cljc)
+       ;; needs that nil to route wrapper dbs through the temporal/search-context
+       ;; path; a throwing -lookup broke every query reaching the check. NOT a
+       ;; delegation to the underlying db's -lookup (that returns its PSS index and
+       ;; would silently bypass the wrapper's filtering).
+       ILookup (-lookup ([this k] (-lookup this k nil))
+                        ([this k nf] (case k
+                                       :unfiltered-db (.-unfiltered-db this)
+                                       :pred          (.-pred this)
+                                       nf)))
 
        IAssociative
        (-contains-key? [_ _] (throw (js/Error. "-contains-key? is not supported on FilteredDB")))
@@ -464,8 +474,12 @@
 
        IEmptyableCollection (-empty [_] (throw (js/Error. "-empty is not supported on HistoricalDB")))
 
-       ILookup (-lookup ([_ _] (throw (js/Error. "-lookup is not supported on HistoricalDB")))
-                        ([_ _ _] (throw (js/Error. "-lookup is not supported on HistoricalDB"))))
+       ;; Field-or-nil lookup (see FilteredDB above) — `(:eavt HistoricalDB)` is nil,
+       ;; routing it through the planner's temporal/search-context path.
+       ILookup (-lookup ([this k] (-lookup this k nil))
+                        ([this k nf] (case k
+                                       :origin-db  (.-origin-db this)
+                                       nf)))
 
        IAssociative
        (-contains-key? [_ _] (throw (js/Error. "-contains-key? is not supported on HistoricalDB")))
@@ -530,8 +544,13 @@
 
        IEmptyableCollection (-empty [_] (throw (js/Error. "-empty is not supported on AsOfDB")))
 
-       ILookup (-lookup ([_ _] (throw (js/Error. "-lookup is not supported on AsOfDB")))
-                        ([_ _ _] (throw (js/Error. "-lookup is not supported on AsOfDB"))))
+       ;; Field-or-nil lookup (see FilteredDB above) — `(:eavt AsOfDB)` is nil,
+       ;; routing it through the planner's temporal/search-context path.
+       ILookup (-lookup ([this k] (-lookup this k nil))
+                        ([this k nf] (case k
+                                       :origin-db  (.-origin-db this)
+                                       :time-point (.-time-point this)
+                                       nf)))
 
        IAssociative
        (-contains-key? [_ _] (throw (js/Error. "-contains-key? is not supported on AsOfDB")))
@@ -597,8 +616,13 @@
 
        IEmptyableCollection (-empty [_] (throw (js/Error. "-empty is not supported on SinceDB")))
 
-       ILookup (-lookup ([_ _] (throw (js/Error. "-lookup is not supported on SinceDB")))
-                        ([_ _ _] (throw (js/Error. "-lookup is not supported on SinceDB"))))
+       ;; Field-or-nil lookup (see FilteredDB above) — `(:eavt SinceDB)` is nil,
+       ;; routing it through the planner's temporal/search-context path.
+       ILookup (-lookup ([this k] (-lookup this k nil))
+                        ([this k nf] (case k
+                                       :origin-db  (.-origin-db this)
+                                       :time-point (.-time-point this)
+                                       nf)))
 
        IAssociative
        (-contains-key? [_ _] (throw (js/Error. "-contains-key? is not supported on SinceDB")))
