@@ -770,3 +770,52 @@
           (str "both-bound should be ≤ min(3,1,base)≤3, got " with-both)))
     (testing "empty bindings = base"
       (is (= base (estimate-with-bindings db pi-free si {}))))))
+
+(deftest test-probe-join-on-merge-clause-tx-var
+  ;; Regression: a probe var bound from a NON-VALUE slot of an entity-group
+  ;; MERGE clause (here ?tx from the tx slot of [?e :src/title _ ?tx]) was
+  ;; collected as the merge datom's .-v (ignoring collect-datom-field), so the
+  ;; downstream probe join matched nothing and the query silently returned #{}.
+  ;; The failing order is exactly the "most selective clause first" guidance:
+  ;; id-lookup first, tx-binding wildcard-value clause second, tx join third.
+  ;; Needs a real connection: db/empty-db carries no :db/txInstant datoms,
+  ;; so the tx-join clause would be vacuously empty on both engines.
+  (let [cfg {:store {:backend :memory
+                     :id #uuid "9f0c9c1e-0000-4000-8000-0000000000aa"}
+             :schema-flexibility :write
+             :keep-history? true
+             :attribute-refs? false}
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)
+        _ (d/transact conn {:tx-data [{:db/ident :src/id
+                                       :db/valueType :db.type/string
+                                       :db/cardinality :db.cardinality/one
+                                       :db/unique :db.unique/identity}
+                                      {:db/ident :src/title
+                                       :db/valueType :db.type/string
+                                       :db/cardinality :db.cardinality/one}]})
+        _ (d/transact conn {:tx-data [{:src/id "src-1" :src/title "Hello"}
+                                      {:src/id "src-2" :src/title "World"}]})
+        db @conn
+        ;; :find must NOT include ?e: with ?e in the find-vars the producer
+        ;; group supplies a find-var the consumer lacks and the executor takes
+        ;; the (correct) probe-map path. [?at ?tx] forces the collect-only
+        ;; probe-set path, which is the one that was broken.
+        failing-order '[:find ?at ?tx
+                        :where [?e :src/id "src-1"]
+                               [?e :src/title _ ?tx]
+                               [?tx :db/txInstant ?at]]
+        working-order '[:find ?at ?tx
+                        :where [?e :src/title _ ?tx]
+                               [?e :src/id "src-1"]
+                               [?tx :db/txInstant ?at]]]
+    (testing "planner returns rows for the selective-clause-first order"
+      (let [compiled (binding [q/*force-legacy* false] (d/q failing-order db))]
+        (is (seq compiled)
+            "3-clause id-first order must not silently return #{}")))
+    (testing "both engines and both clause orders agree"
+      (assert-engines-agree db failing-order)
+      (assert-engines-agree db working-order)
+      (is (= (binding [q/*force-legacy* false] (d/q failing-order db))
+             (binding [q/*force-legacy* false] (d/q working-order db)))))))

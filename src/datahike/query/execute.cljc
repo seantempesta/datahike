@@ -503,8 +503,15 @@
                       (case (int ~collect-datom-field)
                         0 (.-e ~d) 1 (.-a ~d)
                         2 (.-v ~d) 3 (datom/datom-tx ~d) (.-v ~d))
+                      ;; The probe-var may sit in ANY slot of the merge clause,
+                      ;; not just the value: e.g. [?e :attr _ ?tx] binds ?tx from
+                      ;; the merge datom's tx field. Honor collect-datom-field —
+                      ;; always reading .-v here silently collected the wrong
+                      ;; values and made downstream probe joins return empty.
                       (let [~md (aget ~merge-datoms ~collect-merge-idx)]
-                        (.-v ~md)))]
+                        (case (int ~collect-datom-field)
+                          0 (.-e ~md) 1 (.-a ~md)
+                          2 (.-v ~md) 3 (datom/datom-tx ~md) (.-v ~md))))]
            (probe-set-add ~collect-set val#)))
        (when (pos? ~n-find)
          (let [out# #?(:clj (object-array ~n-find) :cljs (make-array ~n-find))]
