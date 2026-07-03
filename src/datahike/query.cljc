@@ -3684,20 +3684,28 @@
                            ;; post-filter vars (e.g. [?e _ _] next to a rule
                            ;; on other vars) is IGNORED by the legacy engine —
                            ;; whether it matches anything or not. Keeping such
-                           ;; a component here gave its sub-query an empty
-                           ;; :find, which returned zero tuples and silently
-                           ;; collapsed the whole Cartesian merge to #{}.
-                           ;; Drop it before the merge, matching legacy.
-                           components
-                           (filterv (fn [{:keys [vars find-vars]}]
-                                      (or (seq find-vars)
-                                          (some post-filter-vars vars)))
-                                    components)
+                           ;; a component in the merge gave its sub-query an
+                           ;; empty :find, which returned zero tuples and
+                           ;; silently collapsed the whole Cartesian merge to
+                           ;; #{}. But it must still RUN: legacy raises on
+                           ;; e.g. a `not` over truly unbound vars, and
+                           ;; dropping the component would swallow that. So:
+                           ;; run every component (ignored ones get a witness
+                           ;; var so their :find parses), then merge only the
+                           ;; contributing ones.
+                           contributes?
+                           (mapv (fn [{:keys [vars find-vars]}]
+                                   (boolean (or (seq find-vars)
+                                                (some post-filter-vars vars))))
+                                 components)
                            extended-find
                            (mapv (fn [{:keys [vars find-vars]}]
                                    (let [pf-here (filter vars post-filter-vars)
-                                         seen (into #{} find-vars)]
-                                     (vec (concat find-vars (remove seen pf-here)))))
+                                         seen (into #{} find-vars)
+                                         ext (vec (concat find-vars (remove seen pf-here)))]
+                                     (if (empty? ext)
+                                       [(first (sort-by str vars))]
+                                       ext)))
                                  components)
                            sub-results
                            (mapv
@@ -3716,8 +3724,11 @@
                                 {:tuples (raw-q* sub-input)
                                  :vars   sub-find}))
                             components extended-find)
-                           wide-vars (vec (mapcat :vars sub-results))
-                           merged    (cartesian-merge sub-results wide-vars)
+                           merge-results (into []
+                                               (comp (filter first) (map second))
+                                               (map vector contributes? sub-results))
+                           wide-vars (vec (mapcat :vars merge-results))
+                           merged    (cartesian-merge merge-results wide-vars)
                            filtered  (apply-post-filters merged wide-vars post-filters)
                            ;; Project wide tuples back to the user's find-var order.
                            wide->find-idxs (let [idx (into {} (map-indexed (fn [i v] [v i])) wide-vars)]
