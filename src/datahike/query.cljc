@@ -3427,8 +3427,20 @@
   (let [call    (first pred-clause)
         fn-sym  (first call)
         args    (rest call)
-        pred-fn (resolve-pred-symbol fn-sym)]
-    (when-not pred-fn
+        ;; The fn position may itself be a free var bound by a data
+        ;; clause (e.g. [_ :pred ?pred] … [(?pred ?a)]). The legacy
+        ;; engine resolves such a var from the context; here the wide
+        ;; tuples carry it (post-filter vars extend each sub-query's
+        ;; :find), so read the predicate per-tuple instead of trying —
+        ;; and failing — to resolve it as a global symbol.
+        fn-idx  (when (analyze/free-var? fn-sym)
+                  (let [idx (get var->idx fn-sym)]
+                    (when (nil? idx)
+                      (throw (ex-info (str "Post-filter references unknown var: " fn-sym)
+                                      {:clause pred-clause})))
+                    idx))
+        pred-fn (when-not fn-idx (resolve-pred-symbol fn-sym))]
+    (when-not (or fn-idx pred-fn)
       (throw (ex-info (str "Cannot resolve predicate in cross-component post-filter: " fn-sym
                            #?(:cljs
                               " (CLJS-only limitation: user-defined predicate functions are not resolvable at runtime — use a built-in comparison or restructure the query to avoid the cross-component span)"
@@ -3445,7 +3457,8 @@
                                 (constantly a)))
                             args)]
       (into #{} (filter (fn [t]
-                          (apply pred-fn (map #(% t) arg-readers))))
+                          (let [f (if fn-idx (nth t fn-idx) pred-fn)]
+                            (apply f (map #(% t) arg-readers)))))
             tuples))))
 
 (defn- apply-post-filters
@@ -3665,6 +3678,21 @@
                      (let [post-filter-vars (into #{}
                                                   (mapcat (comp :vars analyze/classify-clause))
                                                   post-filters)
+                           ;; Legacy parity: -collect skips any rel whose
+                           ;; attrs don't intersect the collected symbols, so
+                           ;; a disconnected component contributing NO find or
+                           ;; post-filter vars (e.g. [?e _ _] next to a rule
+                           ;; on other vars) is IGNORED by the legacy engine —
+                           ;; whether it matches anything or not. Keeping such
+                           ;; a component here gave its sub-query an empty
+                           ;; :find, which returned zero tuples and silently
+                           ;; collapsed the whole Cartesian merge to #{}.
+                           ;; Drop it before the merge, matching legacy.
+                           components
+                           (filterv (fn [{:keys [vars find-vars]}]
+                                      (or (seq find-vars)
+                                          (some post-filter-vars vars)))
+                                    components)
                            extended-find
                            (mapv (fn [{:keys [vars find-vars]}]
                                    (let [pf-here (filter vars post-filter-vars)

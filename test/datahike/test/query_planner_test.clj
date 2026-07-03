@@ -819,3 +819,66 @@
       (assert-engines-agree db working-order)
       (is (= (binding [q/*force-legacy* false] (d/q failing-order db))
              (binding [q/*force-legacy* false] (d/q working-order db)))))))
+
+(deftest test-disjoint-component-dropped
+  ;; Regression: in the cross-component (Cartesian) split, a component
+  ;; contributing NO find or post-filter vars (e.g. [?e _ _] next to clauses
+  ;; on other vars) got an EMPTY :find for its sub-query, which returned zero
+  ;; tuples — and the Cartesian merge then silently collapsed the whole
+  ;; result to #{}. Legacy -collect IGNORES rels whose attrs don't intersect
+  ;; the collected symbols (matching or not), so such a component must be
+  ;; dropped from the merge entirely, matching legacy semantics.
+  ;; Surfaced as datahike.test.attribute_refs.query-rules-test/test-rules
+  ;; "Rule context is isolated from outer context" failing planner-ON (the
+  ;; plain query-rules-test variant queries a raw datom VECTOR, which is
+  ;; planner-ineligible, so only the attr-refs variant caught it).
+  (testing "disjoint component next to a rule on other vars"
+    (let [query '[:find ?x
+                  :in $ %
+                  :where [?e _ _]
+                  (rule ?x)]
+          rules '[[(rule ?a)
+                   [_ :follows ?a]]]]
+      (is (= #{[2] [3] [4] [6]}
+             (binding [q/*force-legacy* false] (d/q query @test-db rules)))
+          "gate matches → rule results must survive the merge")
+      (assert-engines-agree-with-rules @test-db query rules)))
+  (testing "disjoint plain clause next to a find-var clause"
+    (let [query '[:find ?v :where [?e _ _] [_ :follows ?v]]]
+      (is (seq (binding [q/*force-legacy* false] (d/q query @test-db)))
+          "must not silently return #{}")
+      (assert-engines-agree @test-db query)))
+  (testing "non-matching disjoint component is ignored (legacy -collect parity)"
+    (let [query '[:find ?v :where [?e :nonexistent _] [_ :follows ?v]]]
+      (is (= #{[2] [3] [4] [6]}
+             (binding [q/*force-legacy* false] (d/q query @test-db)))
+          "legacy drops rels sharing no vars with :find — planner must too")
+      (assert-engines-agree @test-db query))))
+
+(deftest test-var-valued-predicate-post-filter
+  ;; Regression (issue-180 shape, planner-ON): a cross-component post-filter
+  ;; whose fn position is a FREE VAR bound by a data clause —
+  ;; [(?pred ?a)] with [_ :pred ?pred] — threw "Cannot resolve predicate in
+  ;; cross-component post-filter: ?pred". eval-post-filter now reads the
+  ;; predicate per-tuple from the wide tuples (which already carry all
+  ;; post-filter vars), mirroring the legacy engine's context resolution.
+  (testing "unbound predicate var over empty component returns #{}"
+    (is (= #{}
+           (binding [q/*force-legacy* false]
+             (d/q '[:find ?e ?a
+                    :where [_ :pred ?pred]
+                    [?e :age ?a]
+                    [(?pred ?a)]]
+                  (d/db-with (db/empty-db) [[:db/add 1 :age 20]]))))))
+  (testing "bound fn-valued predicate var filters per tuple"
+    (let [db (d/db-with (db/empty-db)
+                        [[:db/add 1 :age 20]
+                         [:db/add 2 :age 21]
+                         [:db/add 3 :pred even?]])
+          query '[:find ?e ?a
+                  :where [_ :pred ?pred]
+                  [?e :age ?a]
+                  [(?pred ?a)]]]
+      (is (= #{[1 20]}
+             (binding [q/*force-legacy* false] (d/q query db))))
+      (assert-engines-agree db query))))
