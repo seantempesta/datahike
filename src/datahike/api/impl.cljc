@@ -69,6 +69,13 @@
   #?(:clj @(apply dw/delete-database args)
      :cljs (apply dw/delete-database args)))
 
+(defn fork-database
+  ([source-config target-config]
+   (fork-database source-config target-config {}))
+  ([source-config target-config opts]
+   #?(:clj  (dv/fork-database source-config target-config (assoc opts :sync? true))
+      :cljs (dv/fork-database source-config target-config (assoc opts :sync? false)))))
+
 (defn database-exists? [config]
   #?(:clj  @(writing/database-exists? config)
      :cljs (writing/database-exists? config)))

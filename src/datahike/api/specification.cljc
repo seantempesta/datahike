@@ -144,6 +144,24 @@
                  :code "(delete-database {:store {:backend :memory :id \"example\"}})"}]
      :impl datahike.api.impl/delete-database}
 
+    fork-database
+    {:args [:function
+            [:=> [:cat :datahike/SConfig :datahike/SConfig] :datahike/SConfig]
+            [:=> [:cat :datahike/SConfig :datahike/SConfig :map] :datahike/SConfig]]
+     :ret :datahike/SConfig
+     :categories [:database :lifecycle :versioning :write]
+     :stability :experimental
+     :supports-remote? true
+     :referentially-transparent? false
+     :doc "Forks the source database into an independent, writable target database. Copies the source store, then points the target's :db branch at the commit selected by :at in the options map — a tx-id long (exact :max-tx match), an inst (newest commit at or before it), or absent for the head. The fork preserves entity ids, transaction ids, tx-meta, schema and history byte-faithfully as of the fork point; new transactions continue from there. The target gets a fresh store identity (minted when the target config carries no [:store :id]). Returns the target's effective config — connect with exactly that value."
+     :examples [{:desc "Fork at head"
+                 :code "(fork-database {:store {:backend :file :path \"/data/src\" :id source-id}} {:store {:backend :file :path \"/data/fork\"}})"}
+                {:desc "Fork at a transaction id"
+                 :code "(fork-database src-cfg tgt-cfg {:at 536870950})"}
+                {:desc "Fork at a point in time"
+                 :code "(fork-database src-cfg tgt-cfg {:at #inst \"2026-07-01\"})"}]
+     :impl datahike.api.impl/fork-database}
+
     ;; =========================================================================
     ;; Connection Lifecycle
     ;; =========================================================================
