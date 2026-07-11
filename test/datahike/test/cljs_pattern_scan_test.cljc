@@ -18,9 +18,9 @@
      2) tuple access sites use `get` (works uniformly on JS arrays,
         Object[], and PersistentVectors) instead of `da/aget`.
 
-   On CLJ this code path was masked by `*force-legacy* = true` (the
-   new planner is opt-in via DATAHIKE_QUERY_PLANNER); on CLJS the new
-   planner is the default."
+   On CLJ this code path was historically masked when the base engine ran;
+   the planner is now the default (opt out with DATAHIKE_QUERY_PLANNER=false),
+   and on CLJS the planner is always the default."
   (:require
    #?(:clj  [clojure.test :as t :refer [is deftest]]
       :cljs [cljs.test :as t :refer-macros [is deftest]])
@@ -137,8 +137,8 @@
 ;; the wrong key), and its combine step clobbered the ?ag join's results.
 ;; Fixed conservatively: can-direct-fuse? now rejects multi-edge /
 ;; multi-consumer / chained group-join topologies, falling back to the
-;; Relation path. On CLJ this was masked by `*force-legacy*` defaulting to
-;; true; with DATAHIKE_QUERY_PLANNER=true the CLJ engine had the same bug.
+;; Relation path. On CLJ this was historically masked by the planner being
+;; opt-in; with the planner default-ON the CLJ engine had the same bug.
 
 (deftest two-identity-joins-through-one-row-honor-in-binding
   (let [schema {:seon.agent/id     {:db/unique :db.unique/identity}
@@ -167,7 +167,7 @@
                 [?u :seon.user/id "user"]
                 [?m :seon.message/content ?c]]
         run (fn [bid]
-              #?(:clj  (binding [datahike.query/*force-legacy* false]
+              #?(:clj  (binding [datahike.query/*disable-planner* false]
                          (d/q query db bid))
                  :cljs (d/q query db bid)))]
     (is (= #{["BETA-ANSWER"]} (run "b"))
@@ -175,7 +175,7 @@
     (is (= #{["ALPHA-ANSWER"]} (run "a")))
     ;; clause order must not matter
     (is (= #{["BETA-ANSWER"]}
-           #?(:clj (binding [datahike.query/*force-legacy* false]
+           #?(:clj (binding [datahike.query/*disable-planner* false]
                      (d/q '[:find ?c
                             :in $ ?bid
                             :where

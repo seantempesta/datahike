@@ -53,6 +53,11 @@
             binding   ;; binding form
             vars])    ;; #{free variables}
 
+(defn bind?
+  "True for LBind nodes (function-binding clauses like [(f ?x) ?out])."
+  [x]
+  (instance? LBind x))
+
 (defrecord LEntityJoin
            [entity-var  ;; the shared entity variable (?e)
             scans       ;; vector of LScan (positive patterns on this entity)
@@ -73,18 +78,6 @@
             vars        ;; #{referenced variables}
             join-vars   ;; for OR-JOIN: explicit join variable set; nil for OR
             type])      ;; :or or :or-join
-
-(defrecord LFixpoint
-           [clause              ;; original rule call clause
-            rule-name           ;; rule name symbol
-            call-args           ;; arguments to the rule call (may include constants)
-            head-vars           ;; head variable symbols (free vars for recursion)
-            scc-rule-names      ;; set of mutually recursive rule names
-            scc-rule-plans      ;; {rule-name → {:head-vars, :base-plans, :rec-clause-versions}}
-            base-plans          ;; vector of LogicalPlans (base cases)
-            rec-clause-versions ;; vector of LogicalPlans (recursive delta-clause versions)
-            base-scan-attr      ;; attribute from base case scan (for magic set optimization)
-            vars])              ;; #{referenced variables}
 
 (defrecord LRuleCall
            [clause      ;; original clause [rule-name ?arg1 ?arg2 ...]

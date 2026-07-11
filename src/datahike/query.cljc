@@ -26,6 +26,8 @@
    [datahike.query.relation :as rel]
    [datahike.query.plan :as plan]
    [datahike.query.analyze :as analyze]
+   #?(:clj [datahike.query.logical :as logical])
+   #?(:clj [datahike.query.lower :as lower])
    #?(:cljs [datahike.db :refer [DB AsOfDB SinceDB HistoricalDB]])
    #?(:cljs [datahike.query.execute :as execute])
    #?(:cljs [datahike.query.logical :as logical])
@@ -54,11 +56,13 @@
 
 (def ^:const lru-cache-size 100)
 
-(def ^:dynamic *force-legacy*
-  "When true, bypass the query planner and use legacy engine.
-   Set DATAHIKE_QUERY_PLANNER=true to enable the query planner.
-   Default: legacy engine (query planner is opt-in during testing)."
-  #?(:clj (not= "true" (System/getenv "DATAHIKE_QUERY_PLANNER"))
+(def ^:dynamic *disable-planner*
+  "When true, bypass the query planner and run every query through the relational
+   (base) engine. The planner is the DEFAULT: it handles eligible queries and falls
+   back to the relational engine for the rest (multi-source disjoint joins, nested
+   temporal wrappers, stats), so the base engine is a permanent fallback, not legacy.
+   Set DATAHIKE_QUERY_PLANNER=false to disable the planner globally."
+  #?(:clj  (= "false" (System/getenv "DATAHIKE_QUERY_PLANNER"))
      :cljs false))
 
 (def ^:dynamic *query-result-cache?*
@@ -99,7 +103,7 @@
                      (log/warn :datahike/query-input-ignored {:query query}))
                    (:args query-input))
                arg-inputs)
-        extra-ks [:offset :limit :order-by :stats? :settings :cancel]]
+        extra-ks [:offset :limit :order-by :stats? :count-fns? :settings :cancel]]
     (-> (cond-> {:query (apply dissoc query extra-ks)
                  :args args}
           (map? query-input)
@@ -958,9 +962,12 @@
                           (let [e (.-e ^datahike.datom.Datom datom)
                                 a (.-a ^datahike.datom.Datom datom)
                                 a-kw (keyword (.-fqn ^clj a))  ; Extract from Keyword object
-                                v (.-v ^datahike.datom.Datom datom)
-                                tx (.-tx ^datahike.datom.Datom datom)]
-                            #js [e a-kw v tx (pos? tx)])  ; JS array for goog.array/get
+                                v (.-v ^datahike.datom.Datom datom)]
+                            ;; tx is sign-encoded with the added flag (retraction => negative
+                            ;; raw .-tx). Project the ABS tx (datom-tx) and read added from the
+                            ;; sign (datom-added) — using raw .-tx would give retractions a
+                            ;; negative ?t that no [?t :db/txInstant] join could ever match.
+                            #js [e a-kw v (datom/datom-tx datom) (datom/datom-added datom)])  ; JS array for goog.array/get
                           datom))
                 :clj (fn [[e a v tx added?]]
                        [e a v tx added?])))
@@ -974,11 +981,13 @@
                                                     (.-e d)))
                                          (let [a (.-a ^datahike.datom.Datom d)
                                                a-kw (keyword (.-fqn ^clj a))]
+                                           ;; abs tx + sign-derived added — see
+                                           ;; relation-from-datoms-xform.
                                            #js [(.-e ^datahike.datom.Datom d)
                                                 a-kw
                                                 (.-v ^datahike.datom.Datom d)
-                                                (.-tx ^datahike.datom.Datom d)
-                                                (pos? (.-tx ^datahike.datom.Datom d))])
+                                                (datom/datom-tx d)
+                                                (datom/datom-added d)])
                                          d))
                                      datoms)]
                  (rel/->Relation (var-mapping orig-pattern (range))
@@ -1132,7 +1141,15 @@
       ;; in the function call are bound. If not, we return nil which
       ;; is handled by `datahike.tools/resolve-clauses`.
     (when (every? symbols-with-values attrs)
-      (let [new-rel (if fun
+      ;; Engine-level function-invocation count (atom-free): the fn is applied
+      ;; once per production tuple, so invocations = (count (:tuples production)).
+      ;; Accumulated into the threaded context by fn-symbol; surfaced as result
+      ;; metadata. Gated on :count-fns? so normal queries pay nothing.
+      (let [context (cond-> context
+                      (:count-fns? context)
+                      (update :fn-counts (fn [m] (update (or m {}) f (fnil + 0)
+                                                         (count (:tuples production))))))
+            new-rel (if fun
                       (let [tuple-fn (-call-fn context production fun args)
                             rels (for [tuple (:tuples production)
                                        :let [val (tuple-fn tuple)]
@@ -1557,7 +1574,16 @@
       3 (if (lookup-ref? pattern-value)
           (dbu/entid-strict source pattern-value error-code)
           pattern-value)
-      4 pattern-value)))
+      4 pattern-value
+      ;; Indices 0-4 are the datom positions (e, a, v, tx, added). A larger
+      ;; index reaches here only when the caller passes a `:tuple-element-index`
+      ;; — a var's position in a WIDE relation tuple (e.g. a multi-source query
+      ;; whose driving relation joined several entity-groups) — rather than a
+      ;; pattern position. Such a position is not a datom slot, so it can never
+      ;; be a resolvable pattern lookup-ref: return the value unchanged.
+      ;; (Previously this threw "No matching clause: N", crashing the legacy
+      ;; engine on variable-attribute cross-source patterns.)
+      pattern-value)))
 
 (defn lookup-ref-replacer
   ([context] (lookup-ref-replacer context ::error))
@@ -1715,11 +1741,23 @@
         pattern-substitution-inds (map :tuple-element-index substituted-vars)
         pattern-filter-inds (map :tuple-element-index filtered-vars)
 
+        ;; The filter feature-extractor reads a var's value from the RELATION
+        ;; TUPLE (via `:tuple-element-index`) but `lrr`
+        ;; (resolve-pattern-lookup-ref-at-index) resolves lookup-refs by the
+        ;; var's PATTERN position (e/a/v/tx/added). On a wide multi-source
+        ;; relation the two indices differ, so the raw tuple index would pick
+        ;; the wrong resolution case (and, past index 4, formerly crashed).
+        ;; Translate tuple-index → pattern-index before resolving.
+        tuple-idx->pattern-idx (into {} (map (juxt :tuple-element-index :pattern-element-index))
+                                     filtered-vars)
+        lrr-by-tuple-idx (fn [tuple-idx v]
+                           (lrr (get tuple-idx->pattern-idx tuple-idx tuple-idx) v))
+
         ;; This function returns a unique feature for the values at
         ;; `pattern-filter-inds` given a pattern.
         feature-extractor (index-feature-extractor pattern-filter-inds
                                                    true
-                                                   lrr)
+                                                   lrr-by-tuple-idx)
 
         ;; These are the indices of the locations in the pattern that will be substituted
         ;; with values from the tuples in this relation.
@@ -2200,21 +2238,29 @@
      (-collect [start-array] rels symbols)))
   ([acc rels symbols]
    (if-some [rel (first rels)]
-     (let [keep-attrs (select-keys (:attrs rel) symbols)]
-       (if (empty? keep-attrs)
-         (recur acc (next rels) symbols)
-         (let [copy-map (to-array (map #(get keep-attrs %) symbols))
-               len (count symbols)]
-           (recur (for [#?(:cljs t1
-                           :clj ^{:tag "[[Ljava.lang.Object;"} t1) acc
-                        t2 (:tuples rel)]
-                    (let [res (aclone t1)]
-                      (dotimes [i len]
-                        (when-some [idx (aget copy-map i)]
-                          (aset res i (get t2 idx))))
-                      res))
-                  (next rels)
-                  symbols))))
+     (if (empty? (:tuples rel))
+       ;; A zero-tuple relation means this conjunct has no satisfying bindings,
+       ;; so the whole conjunctive result is empty — annihilate. This must run
+       ;; before the keep-attrs test below: a const-only / no-find-var clause
+       ;; (e.g. a predicate over `:in` constants like `[(= ?e 999)]`) produces
+       ;; an empty-attrs eliminating relation that would otherwise be skipped,
+       ;; letting the const-seeded accumulator survive unfiltered (issue #848).
+       []
+       (let [keep-attrs (select-keys (:attrs rel) symbols)]
+         (if (empty? keep-attrs)
+           (recur acc (next rels) symbols)
+           (let [copy-map (to-array (map #(get keep-attrs %) symbols))
+                 len (count symbols)]
+             (recur (for [#?(:cljs t1
+                             :clj ^{:tag "[[Ljava.lang.Object;"} t1) acc
+                          t2 (:tuples rel)]
+                      (let [res (aclone t1)]
+                        (dotimes [i len]
+                          (when-some [idx (aget copy-map i)]
+                            (aset res i (get t2 idx))))
+                        res))
+                    (next rels)
+                    symbols)))))
      acc)))
 
 (defprotocol IContextResolve
@@ -2331,11 +2377,44 @@
         (if (pos? n) n 64))
       64)))
 
-(defonce ^{:doc "Global LRU query result cache. Keys are [hash max-tx max-eid] identifying
-   a DB snapshot. Values are maps of {cache-key -> {:result r :attrs #{...}}}.
+(def ^:dynamic *query-cache-weight-limit*
+  "Maximum total number of cached result tuples retained across all DB snapshots
+   in the query result cache. 0 disables the budget, leaving only the
+   snapshot-count cap *query-cache-size*. Set DATAHIKE_QUERY_CACHE_WEIGHT_LIMIT
+   env var or call set-query-cache-weight-limit! to change. Default: 1000000."
+  (let [env-val #?(:clj (System/getenv "DATAHIKE_QUERY_CACHE_WEIGHT_LIMIT") :cljs nil)]
+    (if env-val
+      (let [n #?(:clj (Long/parseLong env-val) :cljs (js/parseInt env-val))]
+        (if (nat-int? n) n 1000000))
+      1000000)))
+
+(defn- result-weight
+  "Cached-tuple weight of one query result. Relation / collection finds
+   return countable collections (weight = tuple count); scalar-find (`.`)
+   and single-tuple / single-pull finds return a non-collection value
+   that weighs 1. Computed once at cache-put time and stored on the entry
+   as :weight, so the weigh path never calls `count` on a raw result
+   (a scalar `:result` would otherwise throw)."
+  [result]
+  (cond
+    (nil? result)     0
+    (counted? result) (count result)
+    #?@(:clj [(instance? java.util.Collection result) (count result)])
+    (coll? result)    (count result)
+    :else             1))
+
+(defn- bucket-weight
+  "Total cached-tuple weight of one DB-snapshot bucket — sums the
+   per-entry :weight precomputed at cache-put time (see `result-weight`)."
+  [bucket]
+  (reduce-kv (fn [acc _ entry] (+ acc (:weight entry 0))) 0 bucket))
+
+(defonce ^{:doc "Global weighted LRU query result cache. Keys are [hash max-tx max-eid]
+   identifying a DB snapshot. Values are maps of {cache-key -> {:result r :attrs #{...}}}.
+   Bounded by *query-cache-size* snapshots and *query-cache-weight-limit* total tuples.
    Inspect with @datahike.query/query-result-cache."}
   query-result-cache
-  (atom (datahike.lru/lru *query-cache-size*)))
+  (atom (datahike.lru/weighted-lru *query-cache-size* *query-cache-weight-limit* bucket-weight)))
 
 (defn set-query-cache-size!
   "Set the maximum number of DB snapshots retained in the query result cache.
@@ -2344,13 +2423,26 @@
   {:pre [(pos-int? n)]}
   #?(:clj (alter-var-root #'*query-cache-size* (constantly n))
      :cljs (set! *query-cache-size* n))
-  (reset! query-result-cache (datahike.lru/lru n))
+  (reset! query-result-cache
+          (datahike.lru/weighted-lru n *query-cache-weight-limit* bucket-weight))
   n)
 
 (defn clear-query-cache!
   "Clear all entries from the query result cache."
   []
-  (reset! query-result-cache (datahike.lru/lru *query-cache-size*)))
+  (reset! query-result-cache
+          (datahike.lru/weighted-lru *query-cache-size* *query-cache-weight-limit* bucket-weight)))
+
+(defn set-query-cache-weight-limit!
+  "Set the maximum total number of cached result tuples across all DB snapshots.
+   0 disables the weight budget. Takes effect immediately by replacing the cache."
+  [n]
+  {:pre [(nat-int? n)]}
+  #?(:clj (alter-var-root #'*query-cache-weight-limit* (constantly n))
+     :cljs (set! *query-cache-weight-limit* n))
+  (reset! query-result-cache
+          (datahike.lru/weighted-lru *query-cache-size* n bucket-weight))
+  n)
 
 (defn- db-cache-key
   "Compute the cache identity key for a DB snapshot."
@@ -2455,7 +2547,9 @@
     (swap! query-result-cache
            (fn [lru]
              (let [existing (or (get lru dk) {})]
-               (assoc lru dk (assoc existing cache-key {:result result :attrs attr-deps})))))))
+               (assoc lru dk (assoc existing cache-key
+                                    {:result result :attrs attr-deps
+                                     :weight (result-weight result)})))))))
 
 (defn propagate-query-cache
   "Propagate query result cache from parent DB to child DB after a transaction.
@@ -2513,6 +2607,22 @@
   "Extract the set of variables already bound in context relations (from :in bindings)."
   [context]
   (into #{} (mapcat (comp keys :attrs)) (:rels context)))
+
+(defn- in-card-seed
+  "Value-independent {var → card} cardinality seed for :in bindings, derived
+   from binding SHAPE alone (so it is safe to fold into the plan cache key).
+   Collection/relation bindings ([?x ...], [[?a ?b]]) bind many rows; tuple and
+   scalar bindings bind one. Routes through plan/source-cards so the planner has
+   a single produce-side definition of how each cardinality source seeds the
+   join-graph estimate. `qin` is the parsed :in vector of binding records."
+  [qin]
+  (reduce (fn [m b]
+            (let [shape (cond (instance? BindColl b)  :collection
+                              (instance? BindTuple b) :tuple
+                              :else                   :scalar)
+                  vars (map :symbol (dpi/collect-vars-distinct b))]
+              (merge m (plan/source-cards {:kind :input :shape shape :vars vars}))))
+          {} qin))
 
 (defn- substitute-consts
   "Replace const-bound variables in where clauses with their values.
@@ -2732,14 +2842,11 @@
       [context-in' @reverse-map])))
 
 (defn- create-plan-via-ir
-  "Build a plan using the IR pipeline: logical IR → lowering."
-  [db clauses bound-vars rules]
-  (let [build-logical #?(:clj @(requiring-resolve 'datahike.query.logical/build-logical-plan)
-                         :cljs logical/build-logical-plan)
-        lower-plan #?(:clj @(requiring-resolve 'datahike.query.lower/lower)
-                      :cljs lower/lower)
-        logical (build-logical db clauses bound-vars rules)
-        plan (lower-plan logical db rules)]
+  "Build a plan using the IR pipeline: logical IR → lowering.
+   `in-cards` is the value-independent :in cardinality seed (see in-card-seed)."
+  [db clauses bound-vars rules in-cards]
+  (let [logical (logical/build-logical-plan db clauses bound-vars rules)
+        plan (lower/lower logical db rules in-cards)]
     plan))
 
 #?(:clj
@@ -2807,19 +2914,26 @@
 
 (defn- get-or-create-plan
   "Get a cached query plan or create a new one. Plans are cached by
-   [clauses bound-vars rules-keys schema-hash] since the plan structure
+   [clauses bound-vars rules-keys in-cards schema-hash] since the plan structure
    (index selection, merge ordering) depends on query shape and schema,
-   not on the actual data.
+   not on the actual data. `in-cards` (shape-derived, value-independent) is in
+   the key only to separate tuple from relation :in bindings (see
+   get-or-create-plan body) — it does not make the plan data-dependent.
 
    `clauses` may embed substituted constants (substitute-consts-with-lookup-refs),
    so the key is run through `scale-sensitive-key` to keep BigDecimals of
    different scale distinct (Clojure `=`/`hash` would otherwise collapse them)."
-  [db clauses bound-vars rules]
+  [db clauses bound-vars rules in-cards]
   (let [schema-hash (hash (dbi/-schema db))
-        cache-key (scale-sensitive-key [clauses bound-vars (when rules rules) schema-hash])]
+        ;; `in-cards` is part of the key: it is value-independent (shape-only),
+        ;; but it distinguishes bindings the bound-var SET cannot — e.g. a tuple
+        ;; [?a ?b] (#{?a ?b}, card 1) from a relation [[?a ?b]] (#{?a ?b}, many)
+        ;; — which would otherwise collide on identical clauses + bound-vars.
+        cache-key (scale-sensitive-key [clauses bound-vars (when rules rules)
+                                        (not-empty in-cards) schema-hash])]
     (if-some [cached (get @plan-cache cache-key nil)]
       cached
-      (let [plan (create-plan-via-ir db clauses bound-vars rules)]
+      (let [plan (create-plan-via-ir db clauses bound-vars rules in-cards)]
         (vswap! plan-cache assoc cache-key plan)
         plan))))
 
@@ -2930,12 +3044,21 @@
            context-in (-> (Context. [] {} built-in-rules {} default-settings nil)
                           (resolve-ins qin args))
            db (get (:sources context-in) '$)
+           ;; Temporal wrappers (HistoricalDB/AsOfDB/SinceDB) carry no own
+           ;; :eavt/:avet indexes, so the planner's cardinality estimation
+           ;; (-count on the index) would NPE. Plan against the origin DB's
+           ;; indexes, mirroring how execute-plan uses (planner-origin-db ...).
+           plan-db (cond
+                     (nil? db) db
+                     (instance? DB db) db
+                     :else (let [o (dbi/-origin db)]
+                             (if (instance? DB o) o db)))
            bound-vars (context-bound-vars context-in)
            clauses (if db
                      (substitute-consts-with-lookup-refs db (:where query) (:consts context-in))
                      (:where query))
            rules (not-empty (:rules context-in))
-           plan (create-plan-via-ir db clauses bound-vars rules)
+           plan (create-plan-via-ir plan-db clauses bound-vars rules (in-card-seed qin))
            find-vars (mapv #(.-symbol ^Variable %) (filter #(instance? Variable %) (dpip/find-elements qfind)))
            header (str "=== Query Plan ===\n"
                        "find: " (pr-str find-vars) "\n"
@@ -3422,52 +3545,57 @@
 (defn- eval-post-filter
   "Apply a single predicate post-filter to a set of wide tuples.
    `pred-clause` is [(fn-sym arg ...)]; each arg is either a free var
-   (looked up in `var->idx`) or a constant value."
-  [tuples var->idx pred-clause]
-  (let [call    (first pred-clause)
-        fn-sym  (first call)
-        args    (rest call)
-        ;; The fn position may itself be a free var bound by a data
-        ;; clause (e.g. [_ :pred ?pred] … [(?pred ?a)]). The legacy
-        ;; engine resolves such a var from the context; here the wide
-        ;; tuples carry it (post-filter vars extend each sub-query's
-        ;; :find), so read the predicate per-tuple instead of trying —
-        ;; and failing — to resolve it as a global symbol.
-        fn-idx  (when (analyze/free-var? fn-sym)
-                  (let [idx (get var->idx fn-sym)]
-                    (when (nil? idx)
-                      (throw (ex-info (str "Post-filter references unknown var: " fn-sym)
-                                      {:clause pred-clause})))
-                    idx))
-        pred-fn (when-not fn-idx (resolve-pred-symbol fn-sym))]
-    (when-not (or fn-idx pred-fn)
-      (throw (ex-info (str "Cannot resolve predicate in cross-component post-filter: " fn-sym
-                           #?(:cljs
-                              " (CLJS-only limitation: user-defined predicate functions are not resolvable at runtime — use a built-in comparison or restructure the query to avoid the cross-component span)"
-                              :clj nil))
-                      {:clause pred-clause})))
-    (let [arg-readers (mapv (fn [a]
-                              (if (and (symbol? a)
-                                       (analyze/free-var? a))
-                                (let [idx (get var->idx a)]
-                                  (when (nil? idx)
-                                    (throw (ex-info (str "Post-filter references unknown var: " a)
-                                                    {:clause pred-clause})))
-                                  (fn [t] (nth t idx)))
-                                (constantly a)))
-                            args)]
-      (into #{} (filter (fn [t]
-                          (let [f (if fn-idx (nth t fn-idx) pred-fn)]
-                            (apply f (map #(% t) arg-readers)))))
-            tuples))))
+   (looked up in `var->idx`) or a constant value.
+   The fn position may itself be a variable: either bound by a data
+   clause (e.g. `[_ :pred ?pred] … [(?pred ?a)]`) — the wide tuples
+   carry it (post-filter vars extend each sub-query's :find), so it is
+   read per-tuple via `var->idx` — or supplied as an :in parameter,
+   resolved from `consts` (the {:in var → value} binding map)."
+  [tuples var->idx pred-clause consts]
+  ;; No tuples to test → nothing to resolve or apply. Short-circuits the
+  ;; case where an upstream component matched nothing (so the predicate,
+  ;; whose function may be unresolvable, is never actually invoked).
+  (if (empty? tuples)
+    tuples
+    (let [call    (first pred-clause)
+          fn-sym  (first call)
+          args    (rest call)
+          fn-var? (and (symbol? fn-sym) (analyze/free-var? fn-sym))
+          fn-idx  (when fn-var? (get var->idx fn-sym))
+          pred-fn (when-not fn-idx
+                    (or (when (and fn-var? (contains? consts fn-sym))
+                          (get consts fn-sym))
+                        (resolve-pred-symbol fn-sym)))]
+      (when-not (or fn-idx pred-fn)
+        (throw (ex-info (str "Cannot resolve predicate in cross-component post-filter: " fn-sym
+                             #?(:cljs
+                                " (CLJS-only limitation: user-defined predicate functions are not resolvable at runtime — use a built-in comparison or restructure the query to avoid the cross-component span)"
+                                :clj nil))
+                        {:clause pred-clause})))
+      (let [arg-readers (mapv (fn [a]
+                                (if (and (symbol? a)
+                                         (analyze/free-var? a))
+                                  (let [idx (get var->idx a)]
+                                    (when (nil? idx)
+                                      (throw (ex-info (str "Post-filter references unknown var: " a)
+                                                      {:clause pred-clause})))
+                                    (fn [t] (nth t idx)))
+                                  (constantly a)))
+                              args)]
+        (into #{} (filter (fn [t]
+                            (let [f (if fn-idx (nth t fn-idx) pred-fn)]
+                              (apply f (map #(% t) arg-readers)))))
+              tuples)))))
 
 (defn- apply-post-filters
-  "Apply each post-filter clause in sequence to the merged tuple set."
-  [tuples target-vars post-filters]
+  "Apply each post-filter clause in sequence to the merged tuple set.
+   `consts` is the {:in var → value} binding map, threaded to
+   `eval-post-filter` so a predicate passed as an :in parameter resolves."
+  [tuples target-vars post-filters consts]
   (if (empty? post-filters)
     tuples
     (let [var->idx (into {} (map-indexed (fn [i v] [v i])) target-vars)]
-      (reduce (fn [ts pf] (eval-post-filter ts var->idx pf))
+      (reduce (fn [ts pf] (eval-post-filter ts var->idx pf consts))
               tuples
               post-filters))))
 
@@ -3501,6 +3629,10 @@
   [plan db qfind find-elements context-in query stats? qreturnmaps]
   (let [direct-eligible? (and (instance? FindRel qfind)
                               (not stats?)
+                              ;; the fused HashSet path applies fns via post-apply-fns,
+                              ;; which doesn't accumulate :fn-counts — route counting
+                              ;; queries through the relation path (bind-by-fn) instead.
+                              (not (:count-fns? context-in))
                               (not qreturnmaps)
                               (not (:with query))
                               (not-any? #(instance? Aggregate %) find-elements)
@@ -3539,6 +3671,15 @@
                                                                   (apply dissoc rs (keys built-in-rules))))
                                                         (assoc :ret % :query query)))))
 
+(defn- with-fn-counts
+  "Surface the engine-collected {fn-sym → invocations} map (accumulated in the
+   threaded context by bind-by-fn under :count-fns?) as :fn-counts metadata on
+   `result`, when present and the result supports metadata."
+  [context-out result]
+  (if-let [fc (:fn-counts context-out)]
+    (cond-> result (coll? result) (vary-meta assoc :fn-counts fc))
+    result))
+
 (defn- execute-planned-relation
   "Relation path: fused scan → collect → dedup → aggregate/pull.
    Returns final result."
@@ -3547,10 +3688,21 @@
    stats? qreturnmaps]
   (let [exec-direct-rel #?(:clj (requiring-resolve 'datahike.query.execute/execute-plan-direct-rel)
                            :cljs execute/execute-plan-direct-rel)
-        fused-rel (try (exec-direct-rel plan db (:cancel context-in))
-                       (catch #?(:clj Exception :cljs :default) e
-                         (log/debug "fused-scan-rel not applicable:" #?(:clj (.getMessage ^Exception e) :cljs (str e)))
-                         nil))
+        ;; Only take the direct-rel fast path when there are NO input relations.
+        ;; That path executes the plan from scratch and `collapse-rels`-joins the
+        ;; result with the :in rels AFTERWARD, which defeats sideways-information-
+        ;; passing: a pattern whose value/entity var is bound by an :in binding
+        ;; would scan its whole attribute instead of probing the bound values.
+        ;; execute-plan threads context-in into execute-fused-scan-rel, whose SIP
+        ;; extracts a probe-set from the input rels and uses AVET/EAVT seeks
+        ;; (jobtech batched lookups: 43ms -> 0.26ms at small batch sizes). This
+        ;; mirrors the `(empty? (:rels context-in))` gate already in
+        ;; execute-planned-direct.
+        fused-rel (when (empty? (:rels context-in))
+                    (try (exec-direct-rel plan db (:cancel context-in))
+                         (catch #?(:clj Exception :cljs :default) e
+                           (log/debug "fused-scan-rel not applicable:" #?(:clj (.getMessage ^Exception e) :cljs (str e)))
+                           nil)))
         context-out (if fused-rel
                       (update context-in :rels collapse-rels fused-rel)
                       (#?(:clj (requiring-resolve 'datahike.query.execute/execute-plan)
@@ -3582,8 +3734,9 @@
                             deduped)
                       deduped))
                   deduped)]
-    (post-process-result deduped context-in context-out query qfind find-elements
-                         result-arity order-spec offset limit stats? qreturnmaps)))
+    (with-fn-counts context-out
+      (post-process-result deduped context-in context-out query qfind find-elements
+                           result-arity order-spec offset limit stats? qreturnmaps))))
 
 (defn- execute-legacy
   "Legacy engine path: -q → collect → dedup → aggregate/pull."
@@ -3592,10 +3745,11 @@
   (let [context-out (-q context-in (:where query))
         resultset (collect context-out all-vars)
         deduped (into #{} resultset)]
-    (post-process-result deduped context-in context-out query qfind find-elements
-                         result-arity order-spec offset limit stats? qreturnmaps)))
+    (with-fn-counts context-out
+      (post-process-result deduped context-in context-out query qfind find-elements
+                           result-arity order-spec offset limit stats? qreturnmaps))))
 
-(defn- raw-q* [{:keys [query args offset limit order-by stats? settings cancel] :as _query-map}]
+(defn- raw-q* [{:keys [query args offset limit order-by stats? count-fns? settings cancel] :as _query-map}]
   (let [t0 (when *profile?* #?(:clj (System/nanoTime) :cljs (* 1000 (.getTime (js/Date.)))))
         settings (merge default-settings settings)
         {:keys [qfind qwith qreturnmaps qin]} (memoized-parse-query query)
@@ -3603,7 +3757,11 @@
         context-in (-> (if stats?
                          (StatContext. [] {} built-in-rules {} [] settings cancel)
                          (Context. [] {} built-in-rules {} settings cancel))
-                       (resolve-ins qin args))
+                       (resolve-ins qin args)
+                       ;; When set, bind-by-fn accumulates {fn-sym → invocations}
+                       ;; into the threaded context :fn-counts; surfaced as result
+                       ;; metadata. (Extra defrecord keys persist via the extmap.)
+                       (cond-> count-fns? (assoc :count-fns? true)))
         t2 (when *profile?* #?(:clj (System/nanoTime) :cljs (* 1000 (.getTime (js/Date.)))))
 
         all-vars      (concat (dpi/find-vars qfind) (map :symbol qwith))
@@ -3618,7 +3776,7 @@
                          (some (fn [[_k v]] (when (and (dbu/db? v) (planner-eligible-db? v)) v))
                                sources)))
         multi-source? (> (count (:sources context-in)) 1)
-        use-planner? (and (not *force-legacy*)
+        use-planner? (and (not *disable-planner*)
                           (not stats?)
                           (some? primary-db)
                           (dbu/db? primary-db)
@@ -3678,34 +3836,24 @@
                      (let [post-filter-vars (into #{}
                                                   (mapcat (comp :vars analyze/classify-clause))
                                                   post-filters)
-                           ;; Legacy parity: -collect skips any rel whose
-                           ;; attrs don't intersect the collected symbols, so
-                           ;; a disconnected component contributing NO find or
-                           ;; post-filter vars (e.g. [?e _ _] next to a rule
-                           ;; on other vars) is IGNORED by the legacy engine —
-                           ;; whether it matches anything or not. Keeping such
-                           ;; a component in the merge gave its sub-query an
-                           ;; empty :find, which returned zero tuples and
-                           ;; silently collapsed the whole Cartesian merge to
-                           ;; #{}. But it must still RUN: legacy raises on
-                           ;; e.g. a `not` over truly unbound vars, and
-                           ;; dropping the component would swallow that. So:
-                           ;; run every component (ignored ones get a witness
-                           ;; var so their :find parses), then merge only the
-                           ;; contributing ones.
-                           contributes?
-                           (mapv (fn [{:keys [vars find-vars]}]
-                                   (boolean (or (seq find-vars)
-                                                (some post-filter-vars vars))))
-                                 components)
                            extended-find
                            (mapv (fn [{:keys [vars find-vars]}]
                                    (let [pf-here (filter vars post-filter-vars)
                                          seen (into #{} find-vars)
-                                         ext (vec (concat find-vars (remove seen pf-here)))]
-                                     (if (empty? ext)
-                                       [(first (sort-by str vars))]
-                                       ext)))
+                                         ef (vec (concat find-vars (remove seen pf-here)))]
+                                     ;; A component that projects NO var is a pure
+                                     ;; existence/liveness constraint (e.g. `[?e _ _]`
+                                     ;; sharing no var with the rest of the query). Running
+                                     ;; it with `:find []` returns #{} even when the
+                                     ;; component is satisfiable, which would wrongly
+                                     ;; collapse the whole cartesian-merge to #{}. Give it
+                                     ;; one of its own free vars so the sub-query yields
+                                     ;; ≥1 row iff the component matches; the extra var is
+                                     ;; dropped by the final projection to the user's
+                                     ;; find-vars.
+                                     (if (and (empty? ef) (seq vars))
+                                       [(first vars)]
+                                       ef)))
                                  components)
                            sub-results
                            (mapv
@@ -3724,12 +3872,10 @@
                                 {:tuples (raw-q* sub-input)
                                  :vars   sub-find}))
                             components extended-find)
-                           merge-results (into []
-                                               (comp (filter first) (map second))
-                                               (map vector contributes? sub-results))
-                           wide-vars (vec (mapcat :vars merge-results))
-                           merged    (cartesian-merge merge-results wide-vars)
-                           filtered  (apply-post-filters merged wide-vars post-filters)
+                           wide-vars (vec (mapcat :vars sub-results))
+                           merged    (cartesian-merge sub-results wide-vars)
+                           filtered  (apply-post-filters merged wide-vars post-filters
+                                                         (:consts context-in))
                            ;; Project wide tuples back to the user's find-var order.
                            wide->find-idxs (let [idx (into {} (map-indexed (fn [i v] [v i])) wide-vars)]
                                              (mapv idx find-var-syms))
@@ -3750,7 +3896,7 @@
                 clauses (substitute-consts-with-lookup-refs db (:where query) (:consts context-in)
                                                             (when multi-source? (:sources context-in)))
                 rules (not-empty (:rules context-in))
-                plan (get-or-create-plan plan-db clauses bound-vars rules)]
+                plan (get-or-create-plan plan-db clauses bound-vars rules (in-card-seed qin))]
 
           ;; Try paths in order of preference:
           ;; 1. Direct HashSet (non-aggregate simple queries)
@@ -3826,7 +3972,7 @@
       returns nil when its condition is false, or the body's last expression when true.
       The innermost when-let binds the result and returns (-post-process qfind result)."
      [{:keys [query args offset limit order-by stats?]}]
-     (when (and (not *force-legacy*)
+     (when (and (not *disable-planner*)
                 (not stats?)
                 (not order-by)
                 (not offset)
@@ -3847,19 +3993,20 @@
                                         (resolve-ins qin args))
                          clauses (substitute-consts-with-lookup-refs db (:where query) (:consts context-in))
                          bound-vars (context-bound-vars context-in)
-                         plan (get-or-create-plan db clauses bound-vars nil)]
+                         plan (get-or-create-plan db clauses bound-vars nil (in-card-seed qin))]
                      (when (and (empty? (:rels context-in))
                                 (seq (:ops plan)))
                        (when-let [result (try-secondary-index-aggregate db plan find-elements)]
                          (-post-process qfind result)))))))))))))
 
-(defn raw-q [{:keys [query args stats? offset limit order-by] :as query-map}]
+(defn raw-q [{:keys [query args stats? count-fns? offset limit order-by] :as query-map}]
   (let [uncached (fn []
                    #?(:clj (or (try-secondary-index-aggregate-fast query-map)
                                (raw-q* query-map))
                       :cljs (raw-q* query-map)))]
     (if (or (not *query-result-cache?*)
             stats?
+            count-fns?                         ;; counting needs re-execution; a cache hit wouldn't re-run the fn
             #?(:clj *profile?* :cljs false))
       (uncached)
       ;; Try result cache
@@ -3873,7 +4020,7 @@
                 ;; Clojure, so they'd share a result-cache entry and return the
                 ;; first-cached scale. Keep them distinct.
                 cache-key (scale-sensitive-key
-                           [query non-db-args offset limit order-by *force-legacy*])
+                           [query non-db-args offset limit order-by *disable-planner*])
                 entry (result-cache-get db cache-key)]
             (if entry
               (:result entry)

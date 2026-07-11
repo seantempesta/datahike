@@ -400,15 +400,150 @@
 ;; ---------------------------------------------------------------------------
 ;; Pattern scan → Relation (for legacy-compatible path)
 
-(defn- execute-pattern-scan [db op cancel]
-  (let [{:keys [clause index pushdown-preds]} op
-        [e a v tx] clause
+#?(:clj
+   (defn- pattern-probe-set
+     "Build a probe HashSet from `rels` for a scan clause's bound entity- or
+      value-var, when restricting the scan by it would help (the bound set is
+      smaller than the scan slice `scan-n`). Returns
+      {:field 0|2 :values HashSet :seekable? bool} or nil — :field 0 = entity
+      (EAVT-seekable), 2 = value (AVET-seekable only if the attr is indexed)."
+     [db clause resolved-a rels scan-n]
+     (when (seq rels)
+       (let [scan-n (long scan-n)
+             [e _ v] clause
+             extract (fn [rel col-idx]
+                       (let [tuples (:tuples rel)
+                             n (if (instance? java.util.Collection tuples)
+                                 (.size ^java.util.Collection tuples)
+                                 (count tuples))]
+                         (when (pos? n)
+                           ;; Gate on the DISTINCT value count, not the raw tuple
+                           ;; count: a large intermediate rel from a deep join can
+                           ;; have many rows but few distinct values for this var
+                           ;; (e.g. ?b across a 219k-row hop result). Build the set
+                           ;; with an early-exit once it reaches scan-n — at that
+                           ;; point it isn't selective, so fall back to a full scan.
+                           ;; Bounds build cost to O(min(n, until scan-n distinct)).
+                           (let [hs (java.util.HashSet.)]
+                             (reduce (fn [_ t]
+                                       (let [val (cond
+                                                   (instance? clojure.lang.Indexed t) (.nth ^clojure.lang.Indexed t col-idx)
+                                                   (sequential? t) (nth t col-idx)
+                                                   :else (get t col-idx))]
+                                         (when (some? val) (.add hs val)))
+                                       (if (>= (.size hs) scan-n) (reduced nil) nil))
+                                     nil tuples)
+                             (when (and (pos? (.size hs)) (< (.size hs) scan-n)) hs)))))
+             e-probe (when (and (symbol? e) (analyze/free-var? e))
+                       (some (fn [rel]
+                               (when-let [ci (get (:attrs rel) e)]
+                                 (when-let [hs (extract rel ci)]
+                                   {:field 0 :values hs :seekable? true})))
+                             rels))
+             v-probe (when (and (not e-probe) resolved-a
+                                (symbol? v) (analyze/free-var? v))
+                       (some (fn [rel]
+                               (when-let [ci (get (:attrs rel) v)]
+                                 (when-let [hs (extract rel ci)]
+                                   {:field 2 :values hs
+                                    :seekable? (boolean (and (:avet db) (dbu/indexing? db resolved-a)))})))
+                             rels))]
+         (or e-probe v-probe)))))
+
+#?(:clj
+   (defn- var-attr-avet-pairs
+     "Distinct (attr, value) pairs bound in `rels` for a VARIABLE-attribute
+      clause `[?e ?a ?v]` (both ?a and ?v logic vars), returned only when a
+      per-pair AVET point-seek beats a full scan: one rel binds BOTH ?a and ?v,
+      every distinct attr is AVET-indexed, and the pair count is selective
+      (K * probe-driven-threshold < scan-n). nil → caller falls back to
+      scan/filter. Result-preserving: the seeks only restrict to the bound
+      (attr, value) set the downstream join enforces anyway."
+     [db clause rels scan-n]
+     (let [[_ a v] clause
+           scan-n (long scan-n)
+           cell (fn [t i] (cond (instance? clojure.lang.Indexed t) (.nth ^clojure.lang.Indexed t (int i))
+                                (sequential? t) (nth t i)
+                                :else (get t i)))]
+       (some (fn [rel]
+               (let [ai (get (:attrs rel) a)
+                     vi (get (:attrs rel) v)]
+                 (when (and ai vi)
+                   (let [seen (java.util.HashSet.)
+                         aborted (reduce (fn [_ t]
+                                           (let [pa (cell t ai) pv (cell t vi)]
+                                             (when (and (some? pa) (some? pv)) (.add seen [pa pv])))
+                                           (if (>= (.size seen) scan-n) (reduced true) nil))
+                                         nil (:tuples rel))]
+                     (when (and (not (true? aborted)) (pos? (.size seen)))
+                       (let [ps (vec seen)]
+                         (when (and (< (* (long (count ps)) (long probe-driven-threshold)) scan-n)
+                                    (every? (fn [[pa _]] (dbu/indexing? db pa)) ps))
+                           ps)))))))
+             rels))))
+
+(defn- scan-datoms
+  "Datoms for a scan clause, driven by the currently-bound `rels` (sideways
+   information passing) when beneficial — the single retrieval seam shared by
+   every scan site. Three regimes, chosen from K=#bound-values vs N=scan slice
+   size (`scan-n`, the pattern's estimated attribute cardinality):
+
+     seek   index point-seeks per bound value   (K*threshold < N, and seekable)
+     filter full slice, drop non-matching datoms (K < N)            [semi-join]
+     scan   full index slice                     (no useful probe)
+
+   Result-preserving: seek/filter only restrict the scan to the bound
+   entity/value set, which the downstream join enforces anyway — so this never
+   changes results, only how many datoms (and downstream merge lookups) are
+   touched."
+  [db clause index pushdown-preds rels scan-n]
+  (let [[e a v] clause
         resolved-a (when (and (some? a) (not (symbol? a))) (resolve-attr db a))
         resolved-e (when (and (some? e) (not (symbol? e)) (number? e)) #?(:clj (long e) :cljs e))
         pushdown-bounds (when (seq pushdown-preds) (plan/pushdown-to-bounds pushdown-preds))
-        [from-datom to-datom] (compute-slice-bounds clause index pushdown-bounds resolved-a resolved-e)
+        [from to] (compute-slice-bounds clause index pushdown-bounds resolved-a resolved-e)
         db-index (get db index)
-        datoms (di/-slice db-index from-datom to-datom index)
+        scan-n (long (or scan-n (di/-count db-index)))
+        full (fn [] (di/-slice db-index from to index))]
+    #?(:clj
+       (if-let [avet-pairs (when (and (:avet db)
+                                      (nil? resolved-a)
+                                      (symbol? a) (analyze/free-var? a)
+                                      (symbol? v) (analyze/free-var? v))
+                             (var-attr-avet-pairs db clause rels scan-n))]
+         ;; Variable-attribute pattern [?e ?a ?v] with ?a and ?v both bound
+         ;; upstream (e.g. a reference-driven join whose attribute comes from the
+         ;; data): AVET point-seek per (attr, value) pair instead of full-scanning
+         ;; EAVT and filtering. O(pairs * log n) vs O(all datoms).
+         (mapcat (fn [[pa pv]]
+                   (di/-slice (:avet db) (datom e0 pa pv tx0) (datom emax pa pv txmax) :avet))
+                 avet-pairs)
+         (if-let [probe (pattern-probe-set db clause resolved-a rels scan-n)]
+           (let [k     (.size ^java.util.HashSet (:values probe))
+                 field (int (:field probe))
+                 seek-index (if (== field 2) (:avet db) (:eavt db))]
+           ;; Seeks build (entity attr nil)/(e0 attr value) probe datoms and use
+           ;; a PersistentSortedSet ForwardCursor, so they need (a) a PSS index
+           ;; and (b) a RESOLVED, non-nil attribute — a variable-attribute
+           ;; pattern [?e ?a ?v] has resolved-a=nil, which would feed nil into
+           ;; the no-nil-check attr comparator (cmp-attr-quick → NPE). In both
+           ;; cases the index-agnostic filter regime below is correct instead.
+             (if (and (:seekable? probe)
+                      (some? resolved-a)
+                      (pss-instance? seek-index)
+                      (< (* (long k) (long probe-driven-threshold)) scan-n))
+               (probe-driven-iterable seek-index resolved-a (:values probe) field)
+               (let [^java.util.HashSet hs (:values probe)]
+                 (filter (fn [^Datom d]
+                           (.contains hs (if (== field 0) (.-e d) (.-v d))))
+                         (full)))))
+           (full)))
+       :cljs (full))))
+
+(defn- execute-pattern-scan [db op cancel rels]
+  (let [{:keys [clause index pushdown-preds]} op
+        pushdown-bounds (when (seq pushdown-preds) (plan/pushdown-to-bounds pushdown-preds))
+        datoms (scan-datoms db clause index pushdown-preds rels (:estimated-card op))
         var-map (rel/var-mapping clause (range))
         ground-filter (build-ground-filter clause index)
         scan-var-map (rel/var-mapping clause (range))
@@ -421,13 +556,17 @@
                            (if strict-filter (filter strict-filter) identity)
                            (map (fn [^Datom d]
                                   (check-cancel! cancel)
-                                  #?(:clj  [(.-e d) (.-a d) (.-v d) (.-tx d) true]
+                                  ;; 5th component is the datom's actual added flag, NOT a
+                                  ;; hardcoded true — history/temporal scans emit retraction
+                                  ;; datoms whose op-var (e.g. [?e :age ?a ?t ?op]) must bind
+                                  ;; false. Mirrors the fused path's find-src-scan-added slot.
+                                  #?(:clj  [(.-e d) (.-a d) (.-v d) (.-tx d) (datom/datom-added d)]
                                      :cljs (let [t (make-array 5)]
                                              (aset t 0 (.-e d))
                                              (aset t 1 (.-a d))
                                              (aset t 2 (.-v d))
                                              (aset t 3 (.-tx d))
-                                             (aset t 4 true)
+                                             (aset t 4 (datom/datom-added d))
                                              t)))))
                      datoms)]
     (rel/->Relation var-map tuples)))
@@ -535,10 +674,21 @@
 ;; ---------------------------------------------------------------------------
 ;; Temporal query support helpers
 
-(defn- resolve-date-to-tx-id
-  "Resolve a Date time-point to the max numeric tx-id where :db/txInstant <= date.
-   Scans temporal AEVT for :db/txInstant datoms on the origin DB (plain DB).
-   Returns tx0 if no transactions exist at or before the given date."
+(def ^:private date-tx-id-cache
+  "Memoizes Date→tx-id resolution. `temporal-info` is recomputed per plan-op, so a
+   single date-based `(d/as-of db <Date>)` query would otherwise re-scan the whole
+   `:db/txInstant` log once per op (~Nx). Keyed on the origin-db's store id +
+   branch + `:max-tx` (which together identify an immutable db state, so the cached
+   tx-id can never be stale) plus the Date. Bounded; dropped wholesale when large."
+  (atom {}))
+
+(defn- date-tx-id-cache-key [origin-db date]
+  (let [cfg (dbi/-config origin-db)
+        sid (get-in cfg [:store :id])
+        mt  (:max-tx origin-db)]
+    (when (and sid mt) [sid (:branch cfg) mt date])))
+
+(defn- resolve-date-to-tx-id*
   [origin-db date]
   (let [txInstant-attr (if (:attribute-refs? (dbi/-config origin-db))
                          (dbi/-ref-for origin-db :db/txInstant)
@@ -551,6 +701,20 @@
     (if (seq matching)
       (long (.-e ^Datom (last matching)))
       (long tx0))))
+
+(defn- resolve-date-to-tx-id
+  "Resolve a Date time-point to the max numeric tx-id where :db/txInstant <= date.
+   Scans AEVT for :db/txInstant datoms on the origin DB. Returns tx0 if none.
+   Memoized per (origin-db :commit-id, date) — see `date-tx-id-cache`."
+  [origin-db date]
+  (let [k   (date-tx-id-cache-key origin-db date)
+        hit (when k (get @date-tx-id-cache k))]
+    (if (some? hit)
+      hit
+      (let [v (resolve-date-to-tx-id* origin-db date)]
+        (when k
+          (swap! date-tx-id-cache (fn [m] (assoc (if (> (count m) 2048) {} m) k v))))
+        v))))
 
 (defn- temporal-info
   "Extract temporal metadata from a DB wrapper.
@@ -728,6 +892,23 @@
 
       ;; regular DB
       (maybe-post-process current-slice db origin-db))))
+
+(defn- visible-eavt-datom
+  "Find the visible temporal EAVT datom for one card-one merge key.
+   `temporal-merge-slice` already assembles the [eid ra] history down to the
+   single visible version (or none) for as-of, so we just return the datom that
+   also satisfies the scan-relative merge constraints (self-join value/tx checks)."
+  [origin-db db temporal-type temporal-eavt
+   eid ra vg? vgv check-v? check-tx? scan-d temporal-tx-filter added-filter]
+  (when temporal-eavt
+    (let [from-d (datom eid ra (when vg? vgv) tx0)
+          to-d (datom eid ra (when vg? vgv) txmax)
+          slice (temporal-merge-slice origin-db from-d to-d temporal-type temporal-tx-filter db)]
+      (some (fn [^Datom td]
+              (when (temporal-merge-datom-match? td eid ra vg? vgv check-v? check-tx? scan-d
+                                                 temporal-tx-filter added-filter)
+                td))
+            slice))))
 
 (defn- build-scan-slice
   "Build the scan slice for execute-group-direct / execute-fused-scan-rel.
@@ -1198,7 +1379,138 @@
            (emit-tuple scan-d collect-set collect-datom-field collect-merge-idx merge-datoms
                        n-find find-source const-vals result-list))))))
 
+(defn- fast-eligible?
+  "True iff a temporal merge is the exact shape the cursor fast path handles:
+   a single, probe-less (fully unbound), card-many, temporal-only, NON-anti,
+   NON-optional merge with a pre-built ForwardCursor. Everything else (probe-bound
+   as-of, multi-merge, anti, get-else/optional, no cursor) delegates to the slow
+   path unchanged."
+  [n-merges temporal-ctx probe-set]
+  (and (== (int n-merges) 1)
+       (nil? probe-set)
+       (let [^objects tc temporal-ctx
+             ^objects merge-anti (aget tc 3)
+             ^objects merge-card-many (aget tc 4)
+             ^objects merge-temporal-only (aget tc 8)
+             ^objects temporal-cursors (aget tc 11)
+             ^objects merge-optional (when (> (alength tc) 16) (aget tc 16))]
+         (and (aget merge-card-many 0)
+              (aget merge-temporal-only 0)
+              (not (aget merge-anti 0))
+              (or (nil? merge-optional) (not (aget merge-optional 0)))
+              (some? temporal-cursors)
+              (some? (aget temporal-cursors 0))))))
+
+#?(:clj
+   (defn- execute-temporal-merge-fast
+     "Fast path for a single card-many temporal-only non-anti non-optional merge
+      with a forward cursor (already created by execute-group-direct). Replaces the
+      ~N root-anchored per-entity -slice calls (one per scanned datom) with ONE
+      monotonically advancing ForwardCursor: the scan emits entities in ascending
+      `e` and temporal-eavt is EAVT-sorted, so seekGE never re-seeks from root.
+
+      Peek-ahead handles the history cartesian: a singleton entity (next scan datom
+      is a different eid) emits directly while walking the cursor (single touch); a
+      repeated entity (next scan datom is the same eid — multiple name × age
+      versions) materializes the matched datoms into a small replay buffer once,
+      then replays it for each repeat without moving the cursor."
+     [eavt-pss slice ground-filter strict-filter
+      probe-set probe-datom-field
+      collect-set collect-datom-field collect-merge-idx
+      merge-datoms n-find find-source const-vals
+      result-list max-n temporal-ctx cancel]
+     (let [^objects merge-attrs (aget ^objects temporal-ctx 0)
+           ^objects merge-v-ground (aget ^objects temporal-ctx 1)
+           ^objects merge-v-vals (aget ^objects temporal-ctx 2)
+           ^objects merge-added-filter (aget ^objects temporal-ctx 5)
+           ^objects merge-check-scan-v (aget ^objects temporal-ctx 6)
+           ^objects merge-check-scan-tx (aget ^objects temporal-ctx 7)
+           ^objects temporal-cursors (aget ^objects temporal-ctx 11)
+           temporal-tx-filter (aget ^objects temporal-ctx 13)
+           scan-added-val (aget ^objects temporal-ctx 14)
+           ^objects merge-datoms merge-datoms
+           ^ints find-source find-source
+           ^objects const-vals const-vals
+           ra (aget merge-attrs 0)
+           vg? (aget merge-v-ground 0)
+           vgv (aget merge-v-vals 0)
+           check-v? (aget merge-check-scan-v 0)
+           check-tx? (aget merge-check-scan-tx 0)
+           added-filter (aget merge-added-filter 0)
+           ^PersistentSortedSet$ForwardCursor cur (aget temporal-cursors 0)
+           buf (java.util.ArrayList.)]
+       (when-let [^java.util.Iterator it (some-> ^Iterable slice .iterator)]
+         (loop [^Datom cur-d (when (.hasNext it) (.next it))
+                buffer-eid -1]
+           (when (and cur-d (or (neg? max-n) (< (result-list-size result-list) max-n)))
+             (check-cancel! cancel)
+             (let [^Datom nxt-d (when (.hasNext it) (.next it))
+                   next-eid (if nxt-d (.-e nxt-d) -1)]
+               (if (and (scan-filter-temporal cur-d ground-filter strict-filter probe-set probe-datom-field temporal-tx-filter)
+                        (or (nil? scan-added-val) (= (datom/datom-added cur-d) scan-added-val)))
+                 (let [eid (.-e cur-d)
+                       scan-d cur-d]
+                   (if (== eid buffer-eid)
+                     ;; replay buffer (same entity, cursor already consumed)
+                     (do (dotimes [bi (.size buf)]
+                           (aset merge-datoms 0 ^Datom (.get buf bi))
+                           (emit-tuple scan-d collect-set collect-datom-field collect-merge-idx merge-datoms
+                                       n-find find-source const-vals result-list))
+                         (recur nxt-d buffer-eid))
+                     ;; advance cursor to this entity
+                     (let [probe (datom eid ra (when vg? vgv) tx0)
+                           ^Datom d0 (.seekGE cur probe)]
+                       (if (== next-eid eid)
+                         ;; repeats follow -> materialize buffer, emit
+                         (do (.clear buf)
+                             (loop [^Datom md d0]
+                               (when (and md (== (.-e md) eid) (= (.-a md) ra))
+                                 (when (temporal-merge-datom-match? md eid ra vg? vgv check-v? check-tx? scan-d temporal-tx-filter added-filter)
+                                   (.add buf md))
+                                 (recur (.next cur))))
+                             (dotimes [bi (.size buf)]
+                               (aset merge-datoms 0 ^Datom (.get buf bi))
+                               (emit-tuple scan-d collect-set collect-datom-field collect-merge-idx merge-datoms
+                                           n-find find-source const-vals result-list))
+                             (recur nxt-d eid))
+                         ;; singleton -> direct emit (single touch)
+                         (do (loop [^Datom md d0]
+                               (when (and md (== (.-e md) eid) (= (.-a md) ra))
+                                 (when (temporal-merge-datom-match? md eid ra vg? vgv check-v? check-tx? scan-d temporal-tx-filter added-filter)
+                                   (aset merge-datoms 0 md)
+                                   (emit-tuple scan-d collect-set collect-datom-field collect-merge-idx merge-datoms
+                                               n-find find-source const-vals result-list))
+                                 (recur (.next cur))))
+                             (recur nxt-d -1))))))
+                 ;; scan datom filtered out
+                 (recur nxt-d buffer-eid)))))))))
+
+(declare execute-temporal-merge-slow)
+
 (defn- execute-temporal-merge
+  "Temporal path 2 dispatcher: route the probe-less single card-many temporal-only
+   merge (the fully-unbound history/as-of entity-group, e.g. [?e :name ?n][?e :age ?a])
+   through the one-pass ForwardCursor fast path; every other shape runs the slow
+   path unchanged."
+  [db eavt-pss slice ground-filter strict-filter
+   probe-set probe-datom-field
+   collect-set collect-datom-field collect-merge-idx
+   merge-datoms n-find find-source const-vals
+   result-list max-n n-merges temporal-ctx cancel]
+  (if #?(:clj (fast-eligible? n-merges temporal-ctx probe-set) :cljs false)
+    #?(:clj (execute-temporal-merge-fast eavt-pss slice ground-filter strict-filter
+                                         probe-set probe-datom-field
+                                         collect-set collect-datom-field collect-merge-idx
+                                         merge-datoms n-find find-source const-vals
+                                         result-list max-n temporal-ctx cancel)
+       :cljs nil)
+    (execute-temporal-merge-slow db eavt-pss slice ground-filter strict-filter
+                                 probe-set probe-datom-field
+                                 collect-set collect-datom-field collect-merge-idx
+                                 merge-datoms n-find find-source const-vals
+                                 result-list max-n n-merges temporal-ctx cancel)))
+
+(defn- execute-temporal-merge-slow
   "Temporal path 2: merge with card-many/card-one, anti-merge, cursor cache.
    temporal-ctx packs temporal-specific arrays to stay under 20-param limit."
   [db eavt-pss slice ground-filter strict-filter
@@ -1292,9 +1604,18 @@
                                        (if anti?
                                          (when (not-any? (fn [^Datom d] (temporal-merge-datom-match? d eid ra vg? vgv check-v? check-tx? scan-d temporal-tx-filter added-filter)) mslice)
                                            (process-merges (inc mi)))
-                                         (doseq [^Datom d mslice]
-                                           (when (temporal-merge-datom-match? d eid ra vg? vgv check-v? check-tx? scan-d temporal-tx-filter added-filter)
-                                             (aset merge-datoms mi d)
+                                         (let [matched? (volatile! false)]
+                                           (doseq [^Datom d mslice]
+                                             (when (temporal-merge-datom-match? d eid ra vg? vgv check-v? check-tx? scan-d temporal-tx-filter added-filter)
+                                               (vreset! matched? true)
+                                               (aset merge-datoms mi d)
+                                               (process-merges (inc mi))))
+                                           ;; Optional merge (get-else): emit the default-valued
+                                           ;; datom when no version matched. :historical forces
+                                           ;; every merge card-many, so a card-one get-else (e.g.
+                                           ;; the valid-at :db.valid/to default) lands here.
+                                           (when (and (not @matched?) merge-optional (aget merge-optional mi))
+                                             (aset merge-datoms mi (datom eid ra (aget merge-defaults mi) tx0))
                                              (process-merges (inc mi))))))))
                                ;; Card-one merge
                                  (if (nil? temporal-type)
@@ -1330,27 +1651,20 @@
                                            (do (aset merge-datoms mi d)
                                                (process-merges (inc mi))))
                                        ;; Not in current or tx too new — check temporal index
-                                         (let [temporal-eavt (:temporal-eavt origin-db)]
-                                           (if temporal-eavt
-                                             (let [^Datom td (.lookupGE ^PersistentSortedSet temporal-eavt probe)
-                                                   found-t? (and td (temporal-merge-datom-match? td eid ra vg? vgv check-v? check-tx? scan-d temporal-tx-filter added-filter))]
-                                               (if found-t?
-                                                 (if anti? nil
-                                                     (do (aset merge-datoms mi td)
-                                                         (process-merges (inc mi))))
-                                                 (cond
-                                                   anti? (process-merges (inc mi))
-                                                   ;; Optional merge: emit default on miss
-                                                   (and merge-optional (aget merge-optional mi))
-                                                   (do (aset merge-datoms mi
-                                                             (datom eid ra (aget merge-defaults mi) tx0))
-                                                       (process-merges (inc mi))))))
-                                             (cond
-                                               anti? (process-merges (inc mi))
-                                               (and merge-optional (aget merge-optional mi))
-                                               (do (aset merge-datoms mi
-                                                         (datom eid ra (aget merge-defaults mi) tx0))
-                                                   (process-merges (inc mi))))))))
+                                         (if-let [found-t (when (= temporal-type :as-of)
+                                                            (visible-eavt-datom origin-db db temporal-type (:temporal-eavt origin-db)
+                                                                                eid ra vg? vgv check-v? check-tx? scan-d
+                                                                                temporal-tx-filter added-filter))]
+                                           (if anti? nil
+                                               (do (aset merge-datoms mi found-t)
+                                                   (process-merges (inc mi))))
+                                           (cond
+                                             anti? (process-merges (inc mi))
+                                             ;; Optional merge: emit default on miss
+                                             (and merge-optional (aget merge-optional mi))
+                                             (do (aset merge-datoms mi
+                                                       (datom eid ra (aget merge-defaults mi) tx0))
+                                                 (process-merges (inc mi)))))))
                                    ;; Historical: full temporal-merge-slice (needs all versions)
                                      (let [from-d (datom eid ra (when vg? vgv) tx0)
                                            to-d (datom eid ra (when vg? vgv) txmax)
@@ -1400,19 +1714,32 @@
                                (if anti?
                                  (when (not-any? (fn [^Datom d] (temporal-merge-datom-match? d eid ra vg? vgv check-v? check-tx? scan-d temporal-tx-filter added-filter)) mslice)
                                    (process-merges (inc mi)))
-                                 (doseq [^Datom d mslice]
-                                   (when (temporal-merge-datom-match? d eid ra vg? vgv check-v? check-tx? scan-d temporal-tx-filter added-filter)
-                                     (aset merge-datoms mi d) (process-merges (inc mi))))))
+                                 (let [matched? (volatile! false)]
+                                   (doseq [^Datom d mslice]
+                                     (when (temporal-merge-datom-match? d eid ra vg? vgv check-v? check-tx? scan-d temporal-tx-filter added-filter)
+                                       (vreset! matched? true)
+                                       (aset merge-datoms mi d) (process-merges (inc mi))))
+                                   ;; Optional merge (get-else): emit default when no version
+                                   ;; matched (:historical forces card-many, so card-one
+                                   ;; get-else like valid-at :db.valid/to lands here).
+                                   (when (and (not @matched?) merge-optional (aget merge-optional mi))
+                                     (aset merge-datoms mi (datom eid ra (aget merge-defaults mi) tx0))
+                                     (process-merges (inc mi))))))
                              (let [probe (datom eid ra vgv tx0)
                                    ^Datom d (pss-lookup-ge eavt-pss probe)
                                    check-v? (aget merge-check-scan-v mi)
                                    check-tx? (aget merge-check-scan-tx mi)
-                                   found? (and d (temporal-merge-datom-match? d eid ra vg? vgv check-v? check-tx? scan-d temporal-tx-filter added-filter))]
+                                   found-d (or (when (and d (temporal-merge-datom-match? d eid ra vg? vgv check-v? check-tx? scan-d temporal-tx-filter added-filter))
+                                                 d)
+                                               (when (= temporal-type :as-of)
+                                                 (visible-eavt-datom origin-db db temporal-type (:temporal-eavt origin-db)
+                                                                     eid ra vg? vgv check-v? check-tx? scan-d
+                                                                     temporal-tx-filter added-filter)))]
                                (if anti?
-                                 (when (not found?) (process-merges (inc mi)))
+                                 (when (not found-d) (process-merges (inc mi)))
                                  (cond
-                                   found?
-                                   (do (aset merge-datoms mi d) (process-merges (inc mi)))
+                                   found-d
+                                   (do (aset merge-datoms mi found-d) (process-merges (inc mi)))
                                    ;; Optional merge: emit synthetic default datom on miss
                                    (and merge-optional (aget merge-optional mi))
                                    (do (aset merge-datoms mi
@@ -1474,8 +1801,16 @@
         ^objects merge-check-scan-v merge-check-scan-v*
         ^objects merge-check-scan-tx merge-check-scan-tx*
         merge-card-many (to-array (mapv (fn [op]
-                                          (or (= temporal-type :historical)
-                                              (not (get-in op [:schema-info :card-one?] true))))
+                                          ;; History normally forces every merge card-many so all
+                                          ;; versions surface. `get-else` (`:optional?`) is a
+                                          ;; single-valued function, though — like the legacy
+                                          ;; `-get-else` (`(first (search …))`) it yields exactly one
+                                          ;; value (or the default) per entity, regardless of
+                                          ;; attribute cardinality or temporal type — so it never
+                                          ;; takes the card-many path.
+                                          (and (not (:optional? op))
+                                               (or (= temporal-type :historical)
+                                                   (not (get-in op [:schema-info :card-one?] true)))))
                                         merge-ops))
         ;; Optional merge arrays (for get-else optimization)
         ^objects merge-optional (to-array (mapv #(boolean (:optional? %)) merge-ops))
@@ -1535,11 +1870,25 @@
                                     (and probe-set
                                          resolved-a
                                          (or (= probe-field 0) (= probe-field 2)) ;; entity or value position
-                                         (if (= probe-field 2) (some? (:avet index-db)) true) ;; value needs AVET; entity always has EAVT
+                                         ;; Value-position seeks read the AVET index, which only
+                                         ;; contains :db/index / :db/unique attributes. For a
+                                         ;; non-indexed attr the AVET slice is empty, so gate on
+                                         ;; indexing? (matching scan-datoms' :seekable?) — otherwise
+                                         ;; fall through to the db-index scan + probe-set filter.
+                                         (if (= probe-field 2)
+                                           (and (some? (:avet index-db)) (dbu/indexing? index-db resolved-a))
+                                           true) ;; entity position always has EAVT
+                                         ;; For a TEMPORAL scan the non-probe path materializes the
+                                         ;; whole current+temporal history of the attribute — far
+                                         ;; costlier than per-value seeks — so prefer probe-driven
+                                         ;; whenever the probe set is smaller than the attribute, not
+                                         ;; just below the seek break-even for cheap current-DB slices.
                                          (let [est (long (or scan-estimate (di/-count db-index)))]
                                            (and (pos? est)
-                                                (< (* (long (probe-set-size probe-set)) (long probe-driven-threshold))
-                                                   est)))))
+                                                (if temporal
+                                                  (< (long (probe-set-size probe-set)) est)
+                                                  (< (* (long (probe-set-size probe-set)) (long probe-driven-threshold))
+                                                     est))))))
                              :cljs false)
         slice (if use-probe-driven?
                 (if temporal
@@ -1565,13 +1914,14 @@
                                  (.add result (.next iter)))))))
                        result)
                      :cljs nil)
-                  ;; Non-temporal probe-driven (CLJ-only — `use-probe-driven?` is
-                  ;; forced false in CLJS so this branch is dead; the conditional
-                  ;; just keeps the CLJS analyzer from seeing the CLJ-only var.)
-                  #?(:clj  (let [pf (int probe-datom-field)]
-                             (probe-driven-iterable
-                              (if (= pf 2) (:avet index-db) (:eavt index-db))
-                              resolved-a probe-set pf))
+                  ;; Non-temporal probe-driven. JVM-only fast path (ForwardCursor);
+                  ;; never taken on cljs (use-probe-driven? is :cljs false above), so
+                  ;; :cljs nil just keeps the dead branch compilable (no undeclared-var).
+                  #?(:clj
+                     (let [pf (int probe-datom-field)]
+                       (probe-driven-iterable
+                        (if (= pf 2) (:avet index-db) (:eavt index-db))
+                        resolved-a probe-set pf))
                      :cljs nil))
                 (if temporal
                   (build-scan-slice db db-index from-datom to-datom index
@@ -1872,49 +2222,55 @@
         (when (< write-i n)
           (result-list-trim result-list write-i))))))
 
-#?(:clj
-   (defn- post-filter-not-joins
-     "Apply NOT-JOIN anti-probe filtering on result-list.
-      For each NOT-JOIN op, executes its sub-plan to get exclusion values,
-      builds a HashSet of join-var tuples, and removes matching result tuples.
-      CLJ-only — uses `java.util.HashSet` for O(1) anti-probes; the CLJS
-      query path does not exercise NOT-JOIN post-filtering yet."
-     [result-list not-join-ops var-index db]
-     (doseq [nj-op not-join-ops]
-       (let [join-vars (:join-vars nj-op)
-             sub-plan (:sub-plan nj-op)
-             ;; Execute the NOT-JOIN's sub-plan via the Relation engine
-             neg-ctx (execute-plan sub-plan {:rels [] :sources {}} db)
-             neg-rel (when (and neg-ctx (seq (:rels neg-ctx)))
-                       (reduce rel/hash-join (:rels neg-ctx)))]
-         (when (and neg-rel (pos? (count (:tuples neg-rel))))
-           ;; Build exclusion set from the negation result
-           (let [neg-attrs (:attrs neg-rel)
-                 jv-vec (vec join-vars)
-                 n-jv (count jv-vec)
-                 excl-set (java.util.HashSet.)]
-             ;; Collect all join-var value tuples from negation result
-             (doseq [tuple (:tuples neg-rel)]
-               (if (= 1 n-jv)
-                 (.add excl-set (get tuple (get neg-attrs (first jv-vec))))
-                 (.add excl-set (mapv #(get tuple (get neg-attrs %)) jv-vec))))
-             ;; Filter result-list: remove tuples whose join-var values are in the exclusion set
-             (let [jv-indices (mapv #(int (get var-index %)) jv-vec)
-                   n (result-list-size result-list)]
-               (loop [read-i (int 0) write-i (int 0)]
-                 (if (< read-i n)
-                   (let [^objects tuple (result-list-get result-list read-i)
-                         probe (if (= 1 n-jv)
-                                 (aget tuple (int (first jv-indices)))
-                                 (mapv #(aget tuple (int %)) jv-indices))
-                         excluded? (.contains excl-set probe)]
-                     (if excluded?
-                       (recur (unchecked-inc-int read-i) write-i)
-                       (do (when (not= read-i write-i)
-                             (result-list-set result-list write-i tuple))
-                           (recur (unchecked-inc-int read-i) (unchecked-inc-int write-i)))))
-                   (when (< write-i n)
-                     (result-list-trim result-list write-i)))))))))))
+(defn- post-filter-not-joins
+  "Apply NOT-JOIN anti-probe filtering on result-list.
+   For each NOT-JOIN op, executes its sub-plan to get exclusion values,
+   builds a HashSet of join-var tuples, and removes matching result tuples."
+  [result-list not-join-ops var-index db]
+  (doseq [nj-op not-join-ops]
+    (let [join-vars (:join-vars nj-op)
+          sub-plan (:sub-plan nj-op)
+          ;; Execute the NOT-JOIN's sub-plan via the Relation engine
+          neg-ctx (execute-plan sub-plan {:rels [] :sources {}} db)
+          neg-rel (when (and neg-ctx (seq (:rels neg-ctx)))
+                    (reduce rel/hash-join (:rels neg-ctx)))]
+      (when (and neg-rel (pos? (count (:tuples neg-rel))))
+        ;; Build exclusion set from the negation result
+        (let [neg-attrs (:attrs neg-rel)
+              jv-vec (vec join-vars)
+              n-jv (count jv-vec)
+              neg-key (fn [tuple]
+                        (if (= 1 n-jv)
+                          (get tuple (get neg-attrs (first jv-vec)))
+                          (mapv #(get tuple (get neg-attrs %)) jv-vec)))
+              ;; Exclusion set. JVM keeps the fast java.util.HashSet (value equality
+              ;; via .equals/.hashCode, incl. vector keys); cljs uses a Clojure set —
+              ;; js/Set would key vectors by REFERENCE and never match (and HashSet is
+              ;; undeclared there). Correct on both; cljs is the acceptable slower side.
+              excl-set #?(:clj (let [^java.util.HashSet hs (java.util.HashSet.)]
+                                 (doseq [tuple (:tuples neg-rel)] (.add hs (neg-key tuple)))
+                                 hs)
+                          :cljs (persistent!
+                                 (reduce (fn [s tuple] (conj! s (neg-key tuple)))
+                                         (transient #{}) (:tuples neg-rel))))]
+          ;; Filter result-list: remove tuples whose join-var values are in the exclusion set
+          (let [jv-indices (mapv #(int (get var-index %)) jv-vec)
+                n (result-list-size result-list)]
+            (loop [read-i (int 0) write-i (int 0)]
+              (if (< read-i n)
+                (let [^objects tuple (result-list-get result-list read-i)
+                      probe (if (= 1 n-jv)
+                              (aget tuple (int (first jv-indices)))
+                              (mapv #(aget tuple (int %)) jv-indices))
+                      excluded? #?(:clj (.contains ^java.util.HashSet excl-set probe)
+                                   :cljs (contains? excl-set probe))]
+                  (if excluded?
+                    (recur (unchecked-inc-int read-i) write-i)
+                    (do (when (not= read-i write-i)
+                          (result-list-set result-list write-i tuple))
+                        (recur (unchecked-inc-int read-i) (unchecked-inc-int write-i)))))
+                (when (< write-i n)
+                  (result-list-trim result-list write-i))))))))))
 
 (defn- binding-vars
   "Extract the binding variable(s) from a binding form as a flat vector.
@@ -2435,8 +2791,7 @@
             (when (seq pred-ops)
               (post-filter-preds result-list pred-ops var-index))
             (when (seq not-join-ops)
-              #?(:clj  (post-filter-not-joins result-list not-join-ops var-index db)
-                 :cljs nil))
+              (post-filter-not-joins result-list not-join-ops var-index db))
             (let [var-index (if (seq fn-ops)
                               (post-apply-fns result-list fn-ops var-index)
                               var-index)]
@@ -2640,64 +2995,21 @@
             merged (rel/collapse-rels (:rels context) out-rel)]
         [(-> context (assoc :rels merged) (assoc :unique-results? true))
          (inc (count merge-ops))])
-      (let [;; SIP: extract probe values from context relations for selective seeks.
-            ;; Check both entity-var and value-var of the scan clause.
-            sip-probe
-            #?(:clj
-               (when (and resolved-a (seq (:rels context)))
-                 (let [v-var (get clause 2)
-                       extract-probe-values
-                       (fn [rel col-idx]
-                         (let [tuples (:tuples rel)
-                               n (if (instance? java.util.Collection tuples)
-                                   (.size ^java.util.Collection tuples)
-                                   (count tuples))]
-                           (when (and (pos? n)
-                                      (< (* (long n) (long probe-driven-threshold))
-                                         (long (di/-count db-index))))
-                             (let [hs (java.util.HashSet.)]
-                               (doseq [t tuples]
-                                 (let [v (cond
-                                           (instance? clojure.lang.Indexed t) (.nth ^clojure.lang.Indexed t col-idx)
-                                           (sequential? t) (nth t col-idx)
-                                           :else (get t col-idx))]
-                                   (when (some? v) (.add hs v))))
-                               (when (pos? (.size hs)) hs)))))
-                       ;; Check entity variable
-                       e-probe (when (and (symbol? e) (analyze/free-var? e))
-                                 (some (fn [rel]
-                                         (when-let [col-idx (get (:attrs rel) e)]
-                                           (when-let [vs (extract-probe-values rel col-idx)]
-                                             {:field 0 :values vs})))
-                                       (:rels context)))
-                       ;; Check value variable (needs AVET + attribute must be indexed)
-                       v-probe (when (and (not e-probe)
-                                          (symbol? v-var) (analyze/free-var? v-var)
-                                          (some? (:avet db))
-                                          resolved-a
-                                          (dbu/indexing? db resolved-a))
-                                 (some (fn [rel]
-                                         (when-let [col-idx (get (:attrs rel) v-var)]
-                                           (when-let [vs (extract-probe-values rel col-idx)]
-                                             {:field 2 :values vs})))
-                                       (:rels context)))]
-                   (or e-probe v-probe)))
-               :cljs nil)
-            filtered-datoms (cond->> (if sip-probe
-                                       ;; CLJ-only — `sip-probe` is forced nil in
-                                       ;; CLJS so this branch is dead; the
-                                       ;; conditional keeps the CLJS analyzer from
-                                       ;; seeing the CLJ-only var.
-                                       #?(:clj  (probe-driven-iterable
-                                                 (if (== (:field sip-probe) 2) (:avet db) (:eavt db))
-                                                 resolved-a (:values sip-probe) (:field sip-probe))
-                                          :cljs nil)
-                                       (di/-slice db-index from-datom to-datom index))
+      (let [;; SIP retrieval: drive the scan from the currently-bound context
+            ;; relations (index seek / semi-join filter / full scan) via the
+            ;; shared `scan-datoms` seam. The merge below runs once per emitted
+            ;; scan datom, so restricting the scan to the bound entities/values
+            ;; is what keeps an :in-bound join O(bound) rather than O(attribute).
+            filtered-datoms (cond->> (scan-datoms db clause index pushdown-preds
+                                                  (:rels context) (:estimated-card scan-op))
                               ground-filter (filter ground-filter)
                               strict-filter (filter strict-filter))
 
+            ;; `get-else` (`:optional?`) is single-valued (see execute-group-direct)
+            ;; — never card-many, regardless of the attribute's cardinality.
             merge-card-many (to-array (mapv (fn [op]
-                                              (not (get-in op [:schema-info :card-one?] true)))
+                                              (and (not (:optional? op))
+                                                   (not (get-in op [:schema-info :card-one?] true))))
                                             merge-ops))
             acc (make-result-list 2000)
             _ (letfn [(process-merges [scan-d eid mi tuple]
@@ -2760,7 +3072,7 @@
                                   #?(:clj (es/entity-bitset-contains? entity-filter (.-e scan-d))
                                      :cljs true))
                           (process-merges scan-d (.-e scan-d) (int 0)
-                                          [(.-e scan-d) (.-a scan-d) (.-v scan-d) (.-tx scan-d) true])))
+                                          [(.-e scan-d) (.-a scan-d) (.-v scan-d) (.-tx scan-d) (datom/datom-added scan-d)])))
                       filtered-datoms))]
         (let [out-rel (rel/->Relation out-attrs #?(:clj (vec (.toArray ^java.util.ArrayList acc))
                                                    :cljs (vec acc)))
@@ -2774,6 +3086,57 @@
                (assoc :rels merged)
                (assoc :unique-results? true))
            (inc (count merge-ops))])))))
+
+(defn- execute-temporal-group-rel
+  "Temporal entity-group / pattern-scan kept on the FUSED fast path. Runs the
+   temporal-aware `execute-group-direct` (current+temporal merge, inline tx /
+   added / retraction resolution, per-value temporal probe seeks) driven by a
+   SIP probe-set from the bound context rels, returning [ctx' consumed] like
+   `execute-fused-scan-rel`. Avoids the legacy per-clause `lookup-batch-search`
+   fallback that materializes the whole intermediate join then runs one
+   temporal-search over it (the cross-product blowup). `temporal` is a non-nil
+   `(temporal-info db)`; its :origin-db carries the PersistentSortedSet indexes.
+
+   Cross-platform: its callees (execute-group-direct, the temporal merge path) are
+   cljc; only the result-list drain differs (JVM ArrayList .toArray vs the cljs
+   #js [] dual, as elsewhere in this ns)."
+  [db op context temporal]
+  (let [scan-op     (entity-group-scan-op op)
+        merge-ops   (entity-group-merge-ops op)
+        scan-clause (:clause scan-op)
+        index-db    (or (:origin-db temporal) db)
+        a           (second scan-clause)
+        resolved-a  (when (and (some? a) (not (symbol? a))) (resolve-attr index-db a))
+        scan-n      (or (:estimated-card scan-op)
+                        (di/-count (get index-db (:index scan-op))))
+        ;; SIP probe-set is a JVM-only fast-path optimization (HashSet + ForwardCursor
+        ;; seeks). On cljs fall back to a full temporal scan — slower but identical
+        ;; results, since the probe only restricts the scan to already-bound values.
+        probe       #?(:clj  (pattern-probe-set index-db scan-clause resolved-a (:rels context) scan-n)
+                       :cljs nil)
+        ;; Project to ALL free vars across the scan + merge clauses (mirroring
+        ;; execute-fused-scan-rel's out-attrs), NOT (:vars op). (:vars op) is the
+        ;; group's declared interface and can omit the entity var (e.g. ?c when it
+        ;; is not in :find), but downstream ops — get-else / predicates / further
+        ;; joins — reference those clause vars, so the fused tuples must carry them.
+        find-vars   (vec (distinct (filter #(and (symbol? %) (analyze/free-var? %))
+                                           (concat scan-clause
+                                                   (mapcat :clause merge-ops)))))
+        result-list (make-result-list 4000)]
+    (execute-group-direct db scan-op merge-ops find-vars nil
+                          result-list
+                          (when probe (:values probe)) (if probe (int (:field probe)) (int 0))
+                          nil 0 -1 nil
+                          :temporal temporal :pipeline (:pipeline op)
+                          :cancel (:cancel context))
+    (let [attrs   (into {} (map-indexed (fn [i v] [v i]) find-vars))
+          out-rel (rel/->Relation attrs #?(:clj  (vec (.toArray ^java.util.ArrayList result-list))
+                                           :cljs (vec result-list)))
+          merged  (binding [rel/*implicit-source* db
+                            rel/*lookup-attrs* (lookup-attrs-for-clauses db scan-clause merge-ops)]
+                    (rel/collapse-rels (:rels context) out-rel))]
+      [(-> context (assoc :rels merged) (assoc :unique-results? true))
+       (inc (count merge-ops))])))
 
 ;; ---------------------------------------------------------------------------
 ;; OR / NOT execution (Relation-based fallback)
@@ -2859,7 +3222,17 @@
   [rel head-vars ^java.util.HashSet seen-set]
   (let [attrs (:attrs rel)
         indices #?(:clj (int-array (mapv #(get attrs %) head-vars))
-                   :cljs (mapv #(get attrs %) head-vars))
+                   ;; A head-var missing from :attrs is a planner bug upstream of
+                   ;; dedup (see the branch-bound note in lower.cljc). The CLJ
+                   ;; int-array coercion NPEs loudly; match that on CLJS instead
+                   ;; of letting (aget tuple nil) silently project `undefined`.
+                   :cljs (mapv (fn [hv]
+                                 (let [idx (get attrs hv)]
+                                   (when (nil? idx)
+                                     (throw (ex-info "rel-dedup-into!: head-var missing from relation attrs"
+                                                     {:head-var hv :attrs attrs})))
+                                   idx))
+                               head-vars))
         n-vars #?(:clj (alength indices) :cljs (count indices))
         tuples (:tuples rel)
         delta #?(:clj (java.util.ArrayList.) :cljs #js [])]
@@ -2871,9 +3244,16 @@
                                                   (aget ^objects tuple idx)
                                                   (nth tuple idx)))))
                                 arr)
+                         ;; Tuples are usually JS arrays here, but relations built
+                         ;; by legacy fns can carry persistent vectors — aget on a
+                         ;; vector reads a nonexistent JS property (undefined), so
+                         ;; mirror the CLJ branch's array?/nth split.
                          :cljs (let [arr (make-array n-vars)]
                                  (dotimes [j n-vars]
-                                   (aset arr j (aget tuple (nth indices j))))
+                                   (let [idx (nth indices j)]
+                                     (aset arr j (if (array? tuple)
+                                                   (aget tuple idx)
+                                                   (nth tuple idx)))))
                                  arr))
             wrapper #?(:clj (ArrayWrapper. projected (java.util.Arrays/hashCode projected))
                        :cljs projected)]
@@ -2916,19 +3296,25 @@
    or non-binary rule). When applicable, returns:
    {:ground-positions {pos value}, :head-vars [...], :propagation-pos int}"
   [call-args head-vars scc-rule-names]
-  ;; Only apply magic sets to single-rule SCCs with binary head vars
-  (when (and (= 1 (count scc-rule-names))
-             (= 2 (count head-vars)))
-    (let [ground-positions (into {}
-                                 (keep-indexed (fn [i arg]
-                                                 (when-not (analyze/free-var? arg)
-                                                   [i arg])))
-                                 call-args)]
-      (when (= 1 (count ground-positions))
-        (let [ground-pos (ffirst ground-positions)
-              prop-pos (if (= ground-pos 0) 1 0)]
-          {:ground-positions ground-positions
-           :propagation-pos prop-pos})))))
+  ;; Magic-set optimization is JVM-only — the magic-base-scan / demand-set machinery
+  ;; (java.util.HashSet, ArrayList) has :cljs nil bodies, so activating it on cljs
+  ;; collapses recursive rules to an EMPTY rel (silently incomplete results). Return
+  ;; nil on cljs so they take the correct (slower) full base-branch fixpoint instead.
+  #?(:cljs nil
+     :clj
+     ;; Only apply magic sets to single-rule SCCs with binary head vars
+     (when (and (= 1 (count scc-rule-names))
+                (= 2 (count head-vars)))
+       (let [ground-positions (into {}
+                                    (keep-indexed (fn [i arg]
+                                                    (when-not (analyze/free-var? arg)
+                                                      [i arg])))
+                                    call-args)]
+         (when (= 1 (count ground-positions))
+           (let [ground-pos (ffirst ground-positions)
+                 prop-pos (if (= ground-pos 0) 1 0)]
+             {:ground-positions ground-positions
+              :propagation-pos prop-pos}))))))
 
 (defn- magic-direction-ok?
   "Is the magic-set demand scheme sound for this rule topology?
@@ -3026,7 +3412,12 @@
      (when (and expand-info (seq (:tuples delta-rel)))
        (let [{:keys [attr link-pattern-pos link-call-pos pattern-head-pos]} expand-info
              reverse? (= :v link-pattern-pos)
-             pss (if reverse? (:avet db) (:eavt db))
+             ;; Resolve indexes through any temporal wrapper (see magic-base-scan):
+             ;; on a temporal DB the :avet/:eavt live on the origin-db and the
+             ;; slice needs the current+temporal merge via build-scan-slice.
+             ti (temporal-info db)
+             index-db (if ti (:origin-db ti) db)
+             pss (if reverse? (:avet index-db) (:eavt index-db))
              pass-call-pos (- 1 (int link-call-pos))
              out-pattern-pos (int pattern-head-pos)
              out-pass-pos (- 1 out-pattern-pos)
@@ -3040,10 +3431,10 @@
                             (nth tuple pass-call-pos))]
              (if reverse?
                ;; link at V — find entities pointing AT link-val
-               (let [slice (di/-slice pss
-                                      (datom e0 attr link-val tx0)
-                                      (datom emax attr link-val txmax)
-                                      :avet)]
+               (let [slice (build-scan-slice db pss
+                                             (datom e0 attr link-val tx0)
+                                             (datom emax attr link-val txmax)
+                                             :avet ti index-db attr)]
                  (doseq [^Datom sd slice]
                    (when (and (= (.-a sd) attr) (= (.-v sd) link-val))
                      (let [arr (object-array 2)]
@@ -3052,10 +3443,10 @@
                        (.add result arr)))))
                ;; link at E — follow link-val's own attr values
                (let [e (if (number? link-val) (long link-val) link-val)
-                     slice (di/-slice pss
-                                      (datom e attr nil tx0)
-                                      (datom e attr nil txmax)
-                                      :eavt)]
+                     slice (build-scan-slice db pss
+                                             (datom e attr nil tx0)
+                                             (datom e attr nil txmax)
+                                             :eavt ti index-db attr)]
                  (doseq [^Datom sd slice]
                    (when (and (= (.-e sd) e) (= (.-a sd) attr))
                      (let [arr (object-array 2)]
@@ -3090,7 +3481,14 @@
   #?(:clj
      (when-let [{:keys [attr e-head-pos]} base-info]
        (let [forward? (= (int ground-pos) (int e-head-pos))
-             pss (if forward? (:eavt db) (:avet db))
+             ;; Resolve the index through any temporal wrapper: AsOfDB/SinceDB/
+             ;; HistoricalDB carry no :eavt/:avet of their own (they live on the
+             ;; origin-db), and the slice must merge current+temporal history and
+             ;; post-process by the time-point. build-scan-slice is the one seam
+             ;; that does this; it is a plain passthrough for a regular DB (ti nil).
+             ti (temporal-info db)
+             index-db (if ti (:origin-db ti) db)
+             pss (if forward? (:eavt index-db) (:avet index-db))
              e-pos (int e-head-pos)
              v-pos (- 1 e-pos)
              result (java.util.ArrayList.)
@@ -3102,20 +3500,20 @@
                        (.add ^java.util.HashSet scanned-set d))
                (if forward?
                  (let [e (if (number? d) (long d) d)
-                       slice (di/-slice pss
-                                        (datom e attr nil tx0)
-                                        (datom e attr nil txmax)
-                                        :eavt)]
+                       slice (build-scan-slice db pss
+                                               (datom e attr nil tx0)
+                                               (datom e attr nil txmax)
+                                               :eavt ti index-db attr)]
                    (doseq [^Datom sd slice]
                      (when (and (= (.-e sd) e) (= (.-a sd) attr))
                        (let [arr (object-array 2)]
                          (aset arr e-pos (Long/valueOf (.-e sd)))
                          (aset arr v-pos (.-v sd))
                          (.add result arr)))))
-                 (let [slice (di/-slice pss
-                                        (datom e0 attr d tx0)
-                                        (datom emax attr d txmax)
-                                        :avet)]
+                 (let [slice (build-scan-slice db pss
+                                               (datom e0 attr d tx0)
+                                               (datom emax attr d txmax)
+                                               :avet ti index-db attr)]
                    (doseq [^Datom sd slice]
                      (when (and (= (.-a sd) attr) (= (.-v sd) d))
                        (let [arr (object-array 2)]
@@ -3124,6 +3522,38 @@
                          (.add result arr)))))))))
          (when (pos? (.size result))
            (rel/->Relation (zipmap head-vars (range)) (vec result)))))
+     :cljs nil))
+
+(defn- magic-base-scan-general
+  "Demand-restricted base evaluation for the magic-set fixpoint, correct for ANY
+   base shape — value-join (`[?a :id ?x][?c :id ?x]`), multi-branch, or non-ref
+   edge — unlike the single-ref-edge `magic-base-scan` point-lookup (which feeds a
+   demand entity into the EAVT entity slot and maps [entity value] onto the head
+   vars, breaking whenever the propagated head var is not the scanned attr's value).
+
+   Computes the NEW demand entities (those not yet in `scanned-set`), marks them
+   scanned, then runs ALL base branch plans with the ground head var constrained to
+   that batch via `inject-magic-relation`. Range-restricted datalog guarantees every
+   base branch binds both head vars, so the injected demand relation always shares
+   the ground var and hash-joins (never a Cartesian product) — the same mechanism
+   the loop already uses to demand-restrict the recursive clause versions (aug-ctx).
+   Keeps the base O(demand). Returns a Relation or nil when there is nothing new."
+  [db base-plans head-vars ground-pos ^java.util.HashSet demand-set ^java.util.HashSet scanned-set ctx]
+  #?(:clj
+     (let [new-batch (java.util.ArrayList.)
+           it (.iterator demand-set)]
+       ;; Select the new-entity batch BEFORE marking, so an entity that appears in
+       ;; two branches (or twice in one) is still scanned exactly once and never
+       ;; marked-before-emitted.
+       (while (.hasNext it)
+         (let [e (.next it)]
+           (when (and scanned-set (not (.contains scanned-set e)))
+             (.add new-batch e))))
+       (when (pos? (.size new-batch))
+         (doseq [e new-batch] (.add scanned-set e))
+         (let [demand' (java.util.HashSet. new-batch)
+               ctx' (inject-magic-relation ctx head-vars ground-pos demand')]
+           (execute-branch-plans db base-plans ctx' head-vars))))
      :cljs nil))
 
 (defn- extract-demand-values
@@ -3227,13 +3657,21 @@
             (into {}
                   (map (fn [rn]
                          (let [{:keys [head-vars base-plans]} (get scc-rule-plans rn)
-                               base-rel (if (and magic-demand (= rn rule-name))
-                                 ;; Magic: direct index point lookups for demand values
-                                 ;; (magic-info is only non-nil when base-scan-info is)
+                               base-rel (cond
+                                  ;; Magic, single ref-edge base: direction-aware index
+                                  ;; point lookups for demand values (base-scan-info is
+                                  ;; non-nil, see magic-direction-ok? gating above)
+                                          (and magic-demand base-scan-info (= rn rule-name))
                                           (or (magic-base-scan db head-vars base-scan-info
                                                                magic-ground-pos magic-demand magic-scanned)
                                               (rel/->Relation (zipmap head-vars (range)) []))
-                                 ;; Normal: full base branch plan execution
+                                  ;; Magic, any other base shape: demand-restricted base branches
+                                          (and magic-demand (= rn rule-name))
+                                          (or (magic-base-scan-general db base-plans head-vars magic-ground-pos
+                                                                       magic-demand magic-scanned scoped-ctx)
+                                              (rel/->Relation (zipmap head-vars (range)) []))
+                                  ;; No magic: full base branch plan execution
+                                          :else
                                           (execute-branch-plans db base-plans scoped-ctx head-vars))
                                delta-rel (rel-dedup-into! base-rel head-vars (get seen-sets rn))]
                   ;; Propagate magic demand from base results
@@ -3281,13 +3719,26 @@
                         new-states
                         (into {}
                               (map (fn [rn]
-                                     (let [{:keys [head-vars rec-clause-versions]} (get scc-rule-plans rn)
+                                     (let [{:keys [head-vars rec-clause-versions base-plans]} (get scc-rule-plans rn)
                                   ;; With magic: scan newly demanded entities AND run
                                   ;; recursive branches (constrained by demand relation).
                                            magic-base-rel
-                                           (when (and use-magic? (= rn rule-name))
+                                           (cond
+                                  ;; Single ref-edge fast path (direction-aware)
+                                             (and use-magic? base-scan-info (= rn rule-name))
                                              (magic-base-scan db head-vars base-scan-info
-                                                              magic-ground-pos magic-demand magic-scanned))
+                                                              magic-ground-pos magic-demand magic-scanned)
+                                  ;; General demand-restricted base for newly demanded entities
+                                             (and use-magic? (= rn rule-name))
+                                             (magic-base-scan-general db base-plans head-vars magic-ground-pos
+                                                                      magic-demand magic-scanned scoped-ctx)
+                                  ;; Magic abandoned by the explosion guard (use-magic? now false)
+                                  ;; on the general path: the recursive step below runs
+                                  ;; unrestricted, so backfill the FULL base once per round
+                                  ;; (dedup makes it idempotent) so reflexive / leaf base
+                                  ;; facts exist for every entity the closure can reach.
+                                             (and (not use-magic?) magic-demand (not base-scan-info) (= rn rule-name))
+                                             (execute-branch-plans db base-plans scoped-ctx head-vars))
                                   ;; Execute recursive clause versions
                                   ;; Optimization: delta-driven expansion for simple binary rules
                                   ;; Instead of full index scan + hash-join, iterate delta tuples
@@ -3610,10 +4061,110 @@
       (or (> ratio replan-threshold)
           (< ratio (/ 1.0 replan-threshold))))))
 
+(defn- ctx-var-cards
+  "{var → distinct-value count} over the materialized relations in `ctx`. Seeds
+   the probe-triggered re-order so a function's input-row estimate reflects the
+   ACTUAL bound cardinalities (not the card-1 default), and so every already-
+   bound var is in the re-order's runnability seed."
+  [ctx]
+  (persistent!
+   (reduce (fn [m rel]
+             (let [tuples (:tuples rel)]
+               (reduce-kv (fn [m v idx]
+                            (assoc! m v (count (into #{} (map #(nth % idx)) tuples))))
+                          m (:attrs rel))))
+           (transient {}) (:rels ctx))))
+
+(defn- probe-card
+  "MEASURE the relation cardinality running `op` would produce against the
+   already-materialized `ctx` — exact, not estimated. For an index-backed
+   pattern-scan this is a single SIP read (restricted to the bound probe-set),
+   so a row-reducing join returns its small true size and a row-expanding join
+   its true blow-up. Pure read over immutable indexes; the result is discarded.
+   Returns nil for op types we don't probe."
+  [op-db op ctx]
+  (case (:op op)
+    :pattern-scan (count (:tuples (execute-pattern-scan op-db op (:cancel ctx) (:rels ctx))))
+    :entity-group (ctx-total-tuples (first (execute-fused-scan-rel op-db (:scan-op op) (:merge-ops op) ctx)))
+    nil))
+
+(defn- probe-candidate?
+  "Can `op` be run early to (potentially) change a function's input? It must be
+   an index-backed producer sharing a free var with `in-vars`, on the default
+   source, whose own required vars are already bound."
+  [op in-vars bound]
+  (and (#{:pattern-scan :entity-group} (:op op))
+       (not (:source op))
+       (some in-vars (:vars op))
+       (let [[req pol] (plan/op-required-vars op)]
+         (case pol
+           :none true
+           :all  (every? bound req)
+           :any  (boolean (some bound req))
+           true))))
+
+(defn- ctx-rows-over
+  "Rows the function would iterate over `in-vars` = the size of the production it
+   runs against = the product of the (disjoint) ctx relations that hold any of
+   those vars. Using the product (not the first/any rel) is essential: a graph
+   arg like ?g sits in its own 1-tuple rel, so picking that rel alone would make
+   every reducing join look like an expander and wrongly hoist the function."
+  [ctx in-vars]
+  (max 1 (long (->> (:rels ctx)
+                    (filter (fn [rel] (some in-vars (keys (:attrs rel)))))
+                    (map (fn [rel] (count (:tuples rel))))
+                    (reduce * 1)))))
+
+(defn- hoist-expensive-fn
+  "The runtime HALF of the single cost model: static `op-cost` correctly defers an
+   expensive function behind row-reducing joins and cheaper functions, but it also
+   over-defers it behind an input-EXPANDING join (which static stats can't tell
+   from a reducing one). Before running group `op` at `idx`, if a pending
+   downstream expensive function is ready and `op` would EXPAND its input
+   (measured rows > the function's current input rows), pull that function ahead
+   of `op` so it runs on the smaller pre-expansion relation. Row-reducing groups
+   are left ahead of the function — the beneficial order. Returns a reordered plan
+   or nil. Gated on :exec-cost-fn + a direct shared input var, so MUTUAL-style
+   deferral behind a cheaper function's OUTPUT filter is untouched."
+  [plan idx ctx db op]
+  (when (and (#{:pattern-scan :entity-group} (:op op)) (pss-instance? (:eavt db)))
+    (let [ops (:ops plan)
+          rest-ops (subvec ops idx)
+          bound (into #{} (mapcat (comp keys :attrs)) (:rels ctx))
+          ready-expensive-fn?
+          (fn [o] (and (= :function (:op o)) (:exec-cost-fn o) (not (:probed? o)) (nil? (:source o))
+                       (let [[req pol] (plan/op-required-vars o)]
+                         (case pol :none true :all (every? bound req)
+                               :any (boolean (some bound req)) true))))
+          cand-fns (filter (fn [o]
+                             (and (ready-expensive-fn? o)
+                                  (some (set (plan/args-free-vars (:args o))) (:vars op))))
+                           (rest rest-ops))]
+      (when (seq cand-fns)
+        (when-let [op-rows (probe-card db op ctx)]
+          (let [hoistable (filter (fn [f]
+                                    (> (long op-rows)
+                                       (long (ctx-rows-over ctx (set (plan/args-free-vars (:args f)))))))
+                                  cand-fns)]
+            (when (seq hoistable)
+              (let [vc (ctx-var-cards ctx)
+                    f (apply min-key #(plan/op-cost % bound vc) hoistable)
+                    rest' (into [(assoc f :probed? true)]
+                                (filterv #(not (identical? % f)) rest-ops))]
+                (assoc plan :ops (into (subvec ops 0 idx) rest'))))))))))
+
 (defn execute-plan
   "Execute a query plan with adaptive replanning.
    After each op, compares actual cardinality to estimate. If the ratio
    exceeds replan-threshold (10x), re-orders remaining ops.
+
+   Expensive functions (those carrying :datahike/cost via :exec-cost-fn) are
+   additionally PROBE-SUNK: before running one, the deferred index-backed joins
+   on its input are measured against the live relation; a join that REDUCES the
+   input is re-ordered ahead of the function (so it runs on fewer rows), while
+   one that EXPANDS it stays behind. This resolves the row-reducing-vs-expanding
+   join ambiguity that no static cost model can (correlation/skew is invisible
+   to per-attribute stats) — see plan/op-required-vars and the cost oracle.
    Takes and returns a query context."
   [plan context db]
   (if (:has-passthrough? plan)
@@ -3647,19 +4198,42 @@
                                           {:source src :available (set (keys (:sources ctx)))})
                                 db))
                         db)]
-            (case (:op op)
+            ;; Runtime corrector for the one thing static cost can't know: pull an
+            ;; expensive function ahead of a group that would EXPAND its input.
+            (if-let [plan' (hoist-expensive-fn plan idx ctx op-db op)]
+              (recur ctx plan' idx)
+              (case (:op op)
               ;; Entity group — fused scan+merges (only works with concrete DB sources
               ;; that have PersistentSortedSet indexes — temporal DBs like SinceDB/AsOfDB
               ;; filter via context, not index structure, so fused scan would bypass filters)
-              :entity-group
-              (if (pss-instance? (:eavt op-db))
-                (let [[ctx' consumed] (execute-fused-scan-rel op-db (:scan-op op) (:merge-ops op) ctx)
-                      actual-card (ctx-total-tuples ctx')
-                      plan' (if (and (> (- (count (:ops plan)) idx) 2)
-                                     (should-replan? actual-card estimated-card))
-                              (replan-fn plan idx actual-card op-db)
-                              plan)]
-                  (recur ctx' plan' (inc idx)))
+                :entity-group
+                (let [ti (temporal-info op-db)]
+                  (cond
+                ;; Single temporal wrapper over a PSS-backed origin — stay on the
+                ;; FUSED path (temporal-aware execute-group-direct + SIP probe)
+                ;; rather than the per-clause legacy lookup-batch-search fallback.
+                    (and (some? ti) (pss-instance? (:eavt (:origin-db ti))))
+                    (let [[ctx' _] (execute-temporal-group-rel op-db op ctx ti)
+                          actual-card (ctx-total-tuples ctx')
+                      ;; Re-plan cardinality estimation reads index subtree counts
+                      ;; (estimate-pattern → -has-subtree-counts?), which live on the
+                      ;; origin's PSS indexes — the temporal wrapper has none. Estimate
+                      ;; against the origin (filtering only changes counts, not the
+                      ;; relative ordering the re-plan decides); execution still uses op-db.
+                          plan' (if (and (> (- (count (:ops plan)) idx) 2)
+                                         (should-replan? actual-card estimated-card))
+                                  (replan-fn plan idx actual-card (:origin-db ti))
+                                  plan)]
+                      (recur ctx' plan' (inc idx)))
+
+                    (pss-instance? (:eavt op-db))
+                    (let [[ctx' consumed] (execute-fused-scan-rel op-db (:scan-op op) (:merge-ops op) ctx)
+                          actual-card (ctx-total-tuples ctx')
+                          plan' (if (and (> (- (count (:ops plan)) idx) 2)
+                                         (should-replan? actual-card estimated-card))
+                                  (replan-fn plan idx actual-card op-db)
+                                  plan)]
+                      (recur ctx' plan' (inc idx)))
                 ;; Temporal/non-standard DB — fall back to per-clause legacy lookup.
                 ;; lookup-batch-search takes [source context orig-pattern resolved-pattern];
                 ;; passing clause twice is intentional (no resolution needed in fallback).
@@ -3668,20 +4242,21 @@
                 ;; semantics with a default-on-miss. lookup-batch-search is inner-join,
                 ;; so we route optional merges through bind-by-fn (which evaluates
                 ;; -get-else per row, mirroring the legacy engine).
-                (let [scan-clause (:clause (:scan-op op))
-                      scan-evar (first scan-clause)
-                      all-merge-ops (:merge-ops op)
-                      regular-merge-clauses (mapv :clause
-                                                  (filter (fn [m] (not (or (:anti? m) (:optional? m))))
-                                                          all-merge-ops))
-                      optional-merge-ops (filterv :optional? all-merge-ops)
-                      anti-clauses (mapv :clause (filter :anti? all-merge-ops))
+                    :else
+                    (let [scan-clause (:clause (:scan-op op))
+                          scan-evar (first scan-clause)
+                          all-merge-ops (:merge-ops op)
+                          regular-merge-clauses (mapv :clause
+                                                      (filter (fn [m] (not (or (:anti? m) (:optional? m))))
+                                                              all-merge-ops))
+                          optional-merge-ops (filterv :optional? all-merge-ops)
+                          anti-clauses (mapv :clause (filter :anti? all-merge-ops))
                       ;; Run scan with full ctx so upstream constants/constraints
                       ;; (e.g. const-bound safe-vars, lookup-refs in v) feed into
                       ;; the scan's substitution.
-                      ctx-after-scan (binding [rel/*implicit-source* op-db]
-                                       (#?(:clj legacy/lookup-batch-search :cljs (rel/get-legacy-fn :lookup-batch-search))
-                                        op-db ctx scan-clause scan-clause))
+                          ctx-after-scan (binding [rel/*implicit-source* op-db]
+                                           (#?(:clj legacy/lookup-batch-search :cljs (rel/get-legacy-fn :lookup-batch-search))
+                                            op-db ctx scan-clause scan-clause))
                       ;; For each merge clause, trim ctx to rels connected to the
                       ;; scan entity-var. Independent upstream rels (no shared var
                       ;; with scan-derived rels) would otherwise cause
@@ -3692,40 +4267,40 @@
                       ;; (e.g. the merge-introduced v-var) — semantically
                       ;; equivalent to cartesian-then-filter, but avoids the
                       ;; quadratic substitution.
-                      contains-scan-evar? (fn [r] (contains? (set (keys (:attrs r))) scan-evar))
-                      ctx' (binding [rel/*implicit-source* op-db]
-                             (reduce (fn [c clause]
-                                       (let [{scan-rels true other-rels false}
-                                             (group-by contains-scan-evar? (:rels c))
-                                             trimmed-ctx (assoc c :rels (vec scan-rels))
-                                             after-merge (#?(:clj legacy/lookup-batch-search :cljs (rel/get-legacy-fn :lookup-batch-search))
-                                                          op-db trimmed-ctx clause clause)
-                                             final-rels (reduce rel/collapse-rels
-                                                                (:rels after-merge)
-                                                                (or other-rels []))]
-                                         (assoc c :rels final-rels)))
-                                     ctx-after-scan regular-merge-clauses))
+                          contains-scan-evar? (fn [r] (contains? (set (keys (:attrs r))) scan-evar))
+                          ctx' (binding [rel/*implicit-source* op-db]
+                                 (reduce (fn [c clause]
+                                           (let [{scan-rels true other-rels false}
+                                                 (group-by contains-scan-evar? (:rels c))
+                                                 trimmed-ctx (assoc c :rels (vec scan-rels))
+                                                 after-merge (#?(:clj legacy/lookup-batch-search :cljs (rel/get-legacy-fn :lookup-batch-search))
+                                                              op-db trimmed-ctx clause clause)
+                                                 final-rels (reduce rel/collapse-rels
+                                                                    (:rels after-merge)
+                                                                    (or other-rels []))]
+                                             (assoc c :rels final-rels)))
+                                         ctx-after-scan regular-merge-clauses))
                       ;; Optional merges via per-row bind-by-fn(get-else). Synthetic
                       ;; clause is [e-var attr bind-var] (attr already resolved to eid
                       ;; in :attribute-refs? mode by logical.cljc).
-                      ctx' (binding [rel/*implicit-source* op-db]
-                             (reduce (fn [c opt-merge]
-                                       (let [[e-var attr bind-var] (:clause opt-merge)
-                                             default-val (:default-value opt-merge)
-                                             fn-clause [(list 'get-else '$ e-var attr default-val) bind-var]]
-                                         (#?(:clj legacy/bind-by-fn :cljs (rel/get-legacy-fn :bind-by-fn)) c fn-clause)))
-                                     ctx' optional-merge-ops))
+                          ctx' (binding [rel/*implicit-source* op-db]
+                                 (reduce (fn [c opt-merge]
+                                           (let [[e-var attr bind-var] (:clause opt-merge)
+                                                 default-val (:default-value opt-merge)
+                                                 fn-clause [(list 'get-else '$ e-var attr default-val) bind-var]]
+                                             (#?(:clj legacy/bind-by-fn :cljs (rel/get-legacy-fn :bind-by-fn)) c fn-clause)))
+                                         ctx' optional-merge-ops))
                       ;; Apply anti-merges: look up each anti clause and subtract its matches
-                      ctx' (binding [rel/*implicit-source* op-db]
-                             (reduce (fn [c anti-clause]
-                                       (let [join-rel (reduce rel/hash-join (:rels c))
-                                             neg-ctx (#?(:clj legacy/lookup-batch-search :cljs (rel/get-legacy-fn :lookup-batch-search))
-                                                      op-db (assoc c :rels [join-rel]) anti-clause anti-clause)
-                                             neg-join (when (and neg-ctx (seq (:rels neg-ctx)))
-                                                        (reduce rel/hash-join (:rels neg-ctx)))
-                                             result (if neg-join (rel/subtract-rel join-rel neg-join) join-rel)]
-                                         (assoc c :rels [result])))
-                                     ctx' anti-clauses))
+                          ctx' (binding [rel/*implicit-source* op-db]
+                                 (reduce (fn [c anti-clause]
+                                           (let [join-rel (reduce rel/hash-join (:rels c))
+                                                 neg-ctx (#?(:clj legacy/lookup-batch-search :cljs (rel/get-legacy-fn :lookup-batch-search))
+                                                          op-db (assoc c :rels [join-rel]) anti-clause anti-clause)
+                                                 neg-join (when (and neg-ctx (seq (:rels neg-ctx)))
+                                                            (reduce rel/hash-join (:rels neg-ctx)))
+                                                 result (if neg-join (rel/subtract-rel join-rel neg-join) join-rel)]
+                                             (assoc c :rels [result])))
+                                         ctx' anti-clauses))
                       ;; Apply pushed-down predicates as post-filters. The
                       ;; planner records each push-down predicate's original
                       ;; clause in the scan-op's :pushdown-preds list and adds
@@ -3739,30 +4314,50 @@
                       ;; dropped — surfaced in jobtech daynotes tests as rows
                       ;; matching ?inst < ?from-version that should have been
                       ;; filtered out.
-                      pushdown-pred-clauses
-                      (concat (mapv :pred-clause (:pushdown-preds (:scan-op op)))
-                              (mapcat #(mapv :pred-clause (:pushdown-preds %)) all-merge-ops))
-                      ctx' (binding [rel/*implicit-source* op-db]
-                             (reduce (fn [c pred-clause]
-                                       (#?(:clj legacy/filter-by-pred :cljs (rel/get-legacy-fn :filter-by-pred))
-                                        c pred-clause))
-                                     ctx' (filter some? pushdown-pred-clauses)))]
-                  (recur ctx' plan (inc idx))))
+                          pushdown-pred-clauses
+                          (concat (mapv :pred-clause (:pushdown-preds (:scan-op op)))
+                                  (mapcat #(mapv :pred-clause (:pushdown-preds %)) all-merge-ops))
+                          ctx' (binding [rel/*implicit-source* op-db]
+                                 (reduce (fn [c pred-clause]
+                                           (#?(:clj legacy/filter-by-pred :cljs (rel/get-legacy-fn :filter-by-pred))
+                                            c pred-clause))
+                                         ctx' (filter some? pushdown-pred-clauses)))]
+                      (recur ctx' plan (inc idx)))))
 
               ;; Single pattern scan
-              :pattern-scan
-              (if (and op-db (not (dbu/db? op-db)))
+                :pattern-scan
+                (if (and op-db (not (dbu/db? op-db)))
                 ;; Non-db source (e.g. collection $b) — use legacy lookup
                 ;; lookup-pattern-coll takes [source orig-pattern resolved-pattern];
                 ;; passing clause twice — no resolution needed in fallback.
-                (let [new-rel (#?(:clj legacy/lookup-pattern-coll :cljs (rel/get-legacy-fn :lookup-pattern-coll)) op-db (:clause op) (:clause op))
-                      ctx' (binding [rel/*implicit-source* op-db
-                                     rel/*lookup-attrs* (lookup-attrs-for-clauses op-db (:clause op) nil)]
-                             (update ctx :rels rel/collapse-rels new-rel))]
-                  (recur ctx' plan (inc idx)))
-                (if (or (:optional? op) (not (pss-instance? (:eavt op-db))))
-                  ;; Temporal/non-standard DB, or a standalone optional scan —
-                  ;; use legacy lookup with search context.
+                  (let [new-rel (#?(:clj legacy/lookup-pattern-coll :cljs (rel/get-legacy-fn :lookup-pattern-coll)) op-db (:clause op) (:clause op))
+                        ctx' (binding [rel/*implicit-source* op-db
+                                       rel/*lookup-attrs* (lookup-attrs-for-clauses op-db (:clause op) nil)]
+                               (update ctx :rels rel/collapse-rels new-rel))]
+                    (recur ctx' plan (inc idx)))
+                  ;; Standalone optional scans (get-else) must not hit the raw
+                  ;; index-slice path on ANY db type (PSS included) — it inner-joins
+                  ;; and drops entities lacking the attr; route them to the
+                  ;; bind-by-fn fallback below (the temporal fused branch already
+                  ;; excludes :optional?).
+                  (if (or (:optional? op) (not (pss-instance? (:eavt op-db))))
+                    (let [ti (temporal-info op-db)
+                          scan-attr (second (:clause op))]
+                      (if (and (some? ti)
+                               (pss-instance? (:eavt (:origin-db ti)))
+                               (not (:optional? op))
+                               (some? scan-attr) (not (symbol? scan-attr)))
+                    ;; Temporal DB with a PSS-backed origin and a concrete-attr,
+                    ;; non-optional pattern: stay on the FUSED seek path (per bound
+                    ;; entity/value temporal index seeks via execute-group-direct +
+                    ;; build-scan-slice) instead of the per-clause legacy
+                    ;; lookup-batch-search, which cannot seek on a temporal wrapper
+                    ;; and full-scans the attribute every call (catastrophic inside
+                    ;; a recursive-rule fixpoint). Optional (get-else) and
+                    ;; variable-attribute patterns stay on legacy below.
+                        (let [[ctx' _] (execute-temporal-group-rel op-db op ctx ti)]
+                          (recur ctx' plan (inc idx)))
+                  ;; Temporal/non-standard DB — use legacy lookup with search context.
                   ;; lookup-batch-search takes [source context orig-pattern resolved-pattern];
                   ;; passing clause twice — no resolution needed in fallback.
                   ;; If this op is a standalone LOptionalScan-derived pattern-scan
@@ -3774,107 +4369,150 @@
                   ;; slice with no default-on-miss). Route through bind-by-fn for
                   ;; left-outer-with-default semantics, matching the legacy
                   ;; engine's behavior for [(get-else …) ?v].
-                  (let [ctx' (binding [rel/*implicit-source* op-db]
-                               (if (:optional? op)
-                                 (let [[e-var attr bind-var] (:clause op)
-                                       default-val (:default-value op)
-                                       fn-clause [(list 'get-else '$ e-var attr default-val) bind-var]]
-                                   (#?(:clj legacy/bind-by-fn :cljs (rel/get-legacy-fn :bind-by-fn)) ctx fn-clause))
-                                 (#?(:clj legacy/lookup-batch-search :cljs (rel/get-legacy-fn :lookup-batch-search)) op-db ctx (:clause op) (:clause op))))
+                        (let [ctx' (binding [rel/*implicit-source* op-db]
+                                     (if (:optional? op)
+                                       (let [[e-var attr bind-var] (:clause op)
+                                             default-val (:default-value op)
+                                             fn-clause [(list 'get-else '$ e-var attr default-val) bind-var]]
+                                         (#?(:clj legacy/bind-by-fn :cljs (rel/get-legacy-fn :bind-by-fn)) ctx fn-clause))
+                                       (#?(:clj legacy/lookup-batch-search :cljs (rel/get-legacy-fn :lookup-batch-search)) op-db ctx (:clause op) (:clause op))))
                         ;; Re-apply pushed-down predicates as a post-filter.
                         ;; lookup-batch-search doesn't honor :pushdown-preds and
                         ;; the planner has already consumed the clause-level
                         ;; predicate (:consumed-preds), so without this filter
                         ;; the predicate is silently dropped. Symmetric with
                         ;; the entity-group branch above.
-                        ctx' (binding [rel/*implicit-source* op-db]
-                               (reduce (fn [c pred-clause]
-                                         (#?(:clj legacy/filter-by-pred :cljs (rel/get-legacy-fn :filter-by-pred))
-                                          c pred-clause))
-                                       ctx' (filter some? (mapv :pred-clause (:pushdown-preds op)))))]
-                    (recur ctx' plan (inc idx)))
+                              ctx' (binding [rel/*implicit-source* op-db]
+                                     (reduce (fn [c pred-clause]
+                                               (#?(:clj legacy/filter-by-pred :cljs (rel/get-legacy-fn :filter-by-pred))
+                                                c pred-clause))
+                                             ctx' (filter some? (mapv :pred-clause (:pushdown-preds op)))))]
+                          (recur ctx' plan (inc idx)))))
                 ;; DB source — use fused scan or single pattern scan
-                  (let [;; Check if next ops form an ad-hoc fusable group
-                        all-ops (:ops plan)
-                        e-var (first (:clause op))
-                        op-source (:source op)
-                        fusable (when (and (= :scan (:join-method op)) (empty? (:rels ctx)))
-                                  (loop [j (inc idx) fused []]
-                                    (if (>= j (count all-ops))
-                                      fused
-                                      (let [next-op (nth all-ops j)]
-                                        (if (and (= :pattern-scan (:op next-op))
-                                                 (= :lookup (:join-method next-op))
-                                                 (= e-var (first (:clause next-op)))
+                    (let [;; Check if next ops form an ad-hoc fusable group
+                          all-ops (:ops plan)
+                          e-var (first (:clause op))
+                          op-source (:source op)
+                          fusable (when (and (= :scan (:join-method op)) (empty? (:rels ctx)))
+                                    (loop [j (inc idx) fused []]
+                                      (if (>= j (count all-ops))
+                                        fused
+                                        (let [next-op (nth all-ops j)]
+                                          (if (and (= :pattern-scan (:op next-op))
+                                                   (= :lookup (:join-method next-op))
+                                                   (= e-var (first (:clause next-op)))
                                                ;; Only fuse ops on the same source
-                                                 (= op-source (:source next-op)))
-                                          (recur (inc j) (conj fused next-op))
-                                          fused)))))]
-                    (if (seq fusable)
-                      (let [[ctx' consumed] (execute-fused-scan-rel op-db op fusable ctx)
-                            actual-card (ctx-total-tuples ctx')
-                            plan' (if (and (> (- (count (:ops plan)) (+ idx consumed)) 1)
-                                           (should-replan? actual-card estimated-card))
-                                    (replan-fn plan (+ idx (dec consumed)) actual-card op-db)
-                                    plan)]
-                        (recur ctx' plan' (long (+ idx consumed))))
-                      (let [new-rel (execute-pattern-scan op-db op (:cancel ctx))
-                            ctx' (binding [rel/*implicit-source* op-db
-                                           rel/*lookup-attrs* (lookup-attrs-for-clauses op-db (:clause op) nil)]
-                                   (update ctx :rels rel/collapse-rels new-rel))
-                            actual-card (count (:tuples new-rel))
-                            plan' (if (and (> (- (count (:ops plan)) idx) 2)
-                                           (should-replan? actual-card estimated-card))
-                                    (replan-fn plan idx actual-card op-db)
-                                    plan)]
-                        (recur ctx' plan' (inc idx)))))))
+                                                   (= op-source (:source next-op)))
+                                            (recur (inc j) (conj fused next-op))
+                                            fused)))))]
+                      (if (seq fusable)
+                        (let [[ctx' consumed] (execute-fused-scan-rel op-db op fusable ctx)
+                              actual-card (ctx-total-tuples ctx')
+                              plan' (if (and (> (- (count (:ops plan)) (+ idx consumed)) 1)
+                                             (should-replan? actual-card estimated-card))
+                                      (replan-fn plan (+ idx (dec consumed)) actual-card op-db)
+                                      plan)]
+                          (recur ctx' plan' (long (+ idx consumed))))
+                        (let [new-rel (execute-pattern-scan op-db op (:cancel ctx) (:rels ctx))
+                              ctx' (binding [rel/*implicit-source* op-db
+                                             rel/*lookup-attrs* (lookup-attrs-for-clauses op-db (:clause op) nil)]
+                                     (update ctx :rels rel/collapse-rels new-rel))
+                              actual-card (count (:tuples new-rel))
+                              plan' (if (and (> (- (count (:ops plan)) idx) 2)
+                                             (should-replan? actual-card estimated-card))
+                                      (replan-fn plan idx actual-card op-db)
+                                      plan)]
+                          (recur ctx' plan' (inc idx)))))))
 
-              :predicate
-              (recur (#?(:clj legacy/filter-by-pred
-                         :cljs (rel/get-legacy-fn :filter-by-pred))
-                      ctx (:clause op))
-                     plan (inc idx))
+                :predicate
+                (recur (#?(:clj legacy/filter-by-pred
+                           :cljs (rel/get-legacy-fn :filter-by-pred))
+                        ctx (:clause op))
+                       plan (inc idx))
 
-              :function
-              (recur (#?(:clj legacy/bind-by-fn
-                         :cljs (rel/get-legacy-fn :bind-by-fn))
-                      ctx (:clause op))
-                     plan (inc idx))
+                :function
+                (let [run-fn (fn [c o] (#?(:clj legacy/bind-by-fn
+                                           :cljs (rel/get-legacy-fn :bind-by-fn))
+                                        c (:clause o)))
+                      in-vars (set (plan/args-free-vars (:args op)))
+                      rest-ops (subvec (:ops plan) (inc idx))
+                    ;; Only probe when it can pay off: the function is expensive
+                    ;; (:exec-cost-fn), not already probed, on a PSS default
+                    ;; source, AND some deferred index-backed op shares its input.
+                      probe? (and (:exec-cost-fn op)
+                                  (not (:probed? op))
+                                  (nil? (:source op))
+                                  (pss-instance? (:eavt op-db))
+                                  (some #(and (#{:pattern-scan :entity-group} (:op %))
+                                              (some in-vars (:vars %)))
+                                        rest-ops))]
+                  (if-not probe?
+                    (recur (run-fn ctx op) plan (inc idx))
+                    (let [cur-cards (ctx-var-cards ctx)
+                          bound (set (keys cur-cards))
+                        ;; Measure each candidate's true join size and inject it
+                        ;; as the ordering cost (group-effective-card reads
+                        ;; :scan-card first, then :estimated-card; op-output-cards
+                        ;; reads :output-var-cards).
+                          rest' (mapv (fn [o]
+                                        (if (probe-candidate? o in-vars bound)
+                                          (if-let [c (probe-card op-db o ctx)]
+                                            (assoc o :scan-card c :estimated-card c
+                                                   :output-var-cards (zipmap (:vars o) (repeat c)))
+                                            o)
+                                          o))
+                                      rest-ops)
+                        ;; Re-order the function together with the remaining ops,
+                        ;; seeded with the live per-var cardinalities (MAP seed so
+                        ;; the function's input-rows estimate is real; db=nil so
+                        ;; the injected measured cards aren't re-derived away).
+                          to-order (into [(assoc op :probed? true)] rest')
+                          reordered (plan/order-plan-ops to-order cur-cards nil)
+                          moved? (not= :function (:op (first reordered)))]
+                      (if moved?
+                      ;; A reducing join sank ahead of the function — splice the
+                      ;; new order in and re-run from the function's slot.
+                        (recur ctx
+                               (assoc plan :ops (into (subvec (:ops plan) 0 idx) reordered))
+                               idx)
+                      ;; Nothing reduces the input (or only expansions remain) —
+                      ;; run the function now; mark probed so we don't re-probe.
+                        (recur (run-fn ctx op) plan (inc idx))))))
 
-              :or (recur (execute-or op-db op ctx) plan (inc idx))
-              :or-join (recur (execute-or-join op-db op ctx) plan (inc idx))
-              :not (recur (execute-not op-db op ctx) plan (inc idx))
-              :not-join (recur (execute-not-join op-db op ctx) plan (inc idx))
+                :or (recur (execute-or op-db op ctx) plan (inc idx))
+                :or-join (recur (execute-or-join op-db op ctx) plan (inc idx))
+                :not (recur (execute-not op-db op ctx) plan (inc idx))
+                :not-join (recur (execute-not-join op-db op ctx) plan (inc idx))
 
-              :rule-lookup
-              (let [acc-map (get-in ctx [:rule-accumulators (:rule-name op)])
-                    acc-rel (when acc-map
-                              (get acc-map (:mode op)))
+                :rule-lookup
+                (let [acc-map (get-in ctx [:rule-accumulators (:rule-name op)])
+                      acc-rel (when acc-map
+                                (get acc-map (:mode op)))
                     ;; Map accumulator output-vars to call-args vars
-                    mapped-rel (when acc-rel
-                                 (let [acc-vars (:output-vars acc-map)
-                                       call-args (:call-args op)
+                      mapped-rel (when acc-rel
+                                   (let [acc-vars (:output-vars acc-map)
+                                         call-args (:call-args op)
                                        ;; Build attr mapping: call-arg-var → position in acc-rel
-                                       new-attrs (into {}
-                                                       (keep (fn [[acc-var call-var]]
-                                                               (when (analyze/free-var? call-var)
-                                                                 [call-var (get (:attrs acc-rel) acc-var)])))
-                                                       (map vector acc-vars call-args))]
-                                   (rel/->Relation new-attrs (:tuples acc-rel))))]
-                (recur (if mapped-rel
-                         (update ctx :rels rel/collapse-rels mapped-rel)
-                         ctx)
-                       plan (inc idx)))
+                                         new-attrs (into {}
+                                                         (keep (fn [[acc-var call-var]]
+                                                                 (when (analyze/free-var? call-var)
+                                                                   [call-var (get (:attrs acc-rel) acc-var)])))
+                                                         (map vector acc-vars call-args))]
+                                     (rel/->Relation new-attrs (:tuples acc-rel))))]
+                  (recur (if mapped-rel
+                           (update ctx :rels rel/collapse-rels mapped-rel)
+                           ctx)
+                         plan (inc idx)))
 
-              :recursive-rule
-              (recur (execute-recursive-rule op-db op ctx) plan (inc idx))
+                :recursive-rule
+                (recur (execute-recursive-rule op-db op ctx) plan (inc idx))
 
-              :external-engine
-              (recur (#?(:clj execute-external-engine
-                         :cljs (fn [_ _ c] c)) op-db op ctx) plan (inc idx))
+                :external-engine
+                (recur (#?(:clj execute-external-engine
+                           :cljs (fn [_ _ c] c)) op-db op ctx) plan (inc idx))
 
               ;; Unknown op — skip
-              (recur ctx plan (inc idx)))))))))
+                (recur ctx plan (inc idx))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Columnar aggregate execution (JVM only)
@@ -4017,4 +4655,3 @@
 
               ;; Call the external aggregate engine
                  (aggregate-fn column-map group-keys agg-specs)))))))))
-

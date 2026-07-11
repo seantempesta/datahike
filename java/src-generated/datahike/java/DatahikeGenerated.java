@@ -52,6 +52,7 @@ class DatahikeGenerated {
     protected static final IFn queryStatsFn = Clojure.var("datahike.api", "query-stats");
     protected static final IFn releaseFn = Clojure.var("datahike.api", "release");
     protected static final IFn reverseSchemaFn = Clojure.var("datahike.api", "reverse-schema");
+    protected static final IFn rseekDatomsFn = Clojure.var("datahike.api", "rseek-datoms");
     protected static final IFn schemaFn = Clojure.var("datahike.api", "schema");
     protected static final IFn seekDatomsFn = Clojure.var("datahike.api", "seek-datoms");
     protected static final IFn sinceFn = Clojure.var("datahike.api", "since");
@@ -789,6 +790,32 @@ class DatahikeGenerated {
      */
     public static Map<?,?> reverseSchema(Object arg0) {
         return (Map<?,?>) reverseSchemaFn.invoke(arg0);
+    }
+
+    /**
+     * Like seek-datoms, but iterates BACKWARDS: datoms &amp;lt;= the given components, descending to the beginning of the index. Lazy on the persistent-sorted-set index — the primitive for windowed backwards pagination (latest-N, N-before-cursor).
+     * 
+     * <h3>Examples:</h3>
+     * <pre>{@code
+     * // Latest room messages, newest first
+     * (take 20 (rseek-datoms db {:index :avet :components [:message/room room-eid]}))
+     * }</pre>
+     */
+    public static Object rseekDatoms(Object arg0, Object arg1) {
+        return (Object) rseekDatomsFn.invoke(arg0, arg1);
+    }
+
+    /**
+     * Like seek-datoms, but iterates BACKWARDS: datoms &amp;lt;= the given components, descending to the beginning of the index. Lazy on the persistent-sorted-set index — the primitive for windowed backwards pagination (latest-N, N-before-cursor).
+     * 
+     * <h3>Examples:</h3>
+     * <pre>{@code
+     * // Latest room messages, newest first
+     * (take 20 (rseek-datoms db {:index :avet :components [:message/room room-eid]}))
+     * }</pre>
+     */
+    public static Object rseekDatoms(Object arg0, Object arg1, Object arg2) {
+        return (Object) rseekDatomsFn.invoke(arg0, arg1, arg2);
     }
 
     /**

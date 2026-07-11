@@ -14,10 +14,13 @@
 (def -temporal-upsert di/-temporal-upsert)
 (def -remove di/-remove)
 (def -slice di/-slice)
+(def -rslice di/-rslice)
 (def -flush di/-flush)
 (def -transient di/-transient)
 (def -persistent! di/-persistent!)
 (def -mark di/-mark)
+(def -root-node di/-root-node)
+(def -seed-root! di/-seed-root!)
 
 ;; Aliases for multimethods
 
@@ -26,6 +29,7 @@
 (def add-konserve-handlers di/add-konserve-handlers)
 (def konserve-backend di/konserve-backend)
 (def default-index-config di/default-index-config)
+(def with-storage di/with-storage)
 
 ;; Other functions
 

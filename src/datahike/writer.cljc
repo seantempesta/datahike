@@ -22,7 +22,11 @@
   PWriter
   (-dispatch! [_ arg-map]
     (let [p (promise-chan)]
-      (put! transaction-queue (assoc arg-map :callback p))
+      ;; put! on a CLOSED queue returns false and would leave p silent — the
+      ;; caller's deref would hang forever. Deliver the failure instead.
+      (when-not (put! transaction-queue (assoc arg-map :callback p))
+        (put! p (ex-info "Writer is shut down (a previous fatal error closed it); release and reconnect."
+                         {:type :writer-shut-down})))
       p))
   (-shutdown [_]
     (close! transaction-queue)
@@ -82,8 +86,13 @@
                                                            :error      e})
                                                  e)))
                               ;; Re-throw Errors (AssertionError, OutOfMemoryError, etc.) to crash the writer
-                              ;; Only Exceptions should be handled and allow the writer to continue
+                              ;; Only Exceptions should be handled and allow the writer to continue.
+                              ;; CLOSE the queues first: a dead loop with open queues would accept
+                              ;; further transacts whose callbacks can never be delivered — every
+                              ;; subsequent transact would hang silently instead of failing loudly.
                                       #?(:clj (when (instance? Error e)
+                                                (close! transaction-queue)
+                                                (close! commit-queue)
                                                 (throw e)))
                                       :error))]
                         (cond (chan? res)
@@ -106,7 +115,12 @@
                       (log/debug :datahike/writer-closed "Writer thread gracefully closed")))))
         ;; commit loop
         (go-try S
-                (loop [tx (<?- commit-queue)]
+                (loop [tx (<?- commit-queue)
+                       ;; last committed cid of OUR branch: nil on the first
+                       ;; iteration (commit! falls back to the storage read),
+                       ;; threaded through afterwards so ordinary commits skip
+                       ;; the per-commit branch-head read (S3: 3 requests)
+                       last-cid nil]
                   (when tx
                     (let [txs (into [tx] (take-while some?) (repeatedly #(poll! commit-queue)))]
               ;; empty channel of pending transactions
@@ -122,7 +136,7 @@
                         (try
                           (let [start-ts (get-time-ms)
                                 {{:keys [datahike/commit-id]} :meta
-                                 :as commit-db} (<?- (w/commit! db merge-parents false))
+                                 :as commit-db} (<?- (w/commit! db merge-parents false last-cid))
                                 commit-time (- (get-time-ms) start-ts)]
                             (log/trace :datahike/commit-time {:duration-ms commit-time})
                             (reset! connection commit-db)
@@ -133,16 +147,25 @@
                                                   (assoc :db-after commit-db))]
                                 (>! callback tx-report))))
                           (catch #?(:clj Throwable :cljs js/Error) e
+                            ;; Close the queues BEFORE delivering the failed
+                            ;; callbacks. Delivering first unblocks the caller
+                            ;; while the queues are still open, so a subsequent
+                            ;; transact could race into the still-open queue and
+                            ;; commit AFTER the fatal error (writer_error_test
+                            ;; saw the "dead" writer accept a further write).
+                            ;; Closing first makes that transact observe the
+                            ;; closed queue and fail loudly (:writer-shut-down).
+                            (close! commit-queue)
+                            (close! transaction-queue)
                             (doseq [[_ callback] txs]
                               (put! callback e))
                             (log/error :datahike/writer-shutdown {:error e})
-                            (close! commit-queue)
-                            (close! transaction-queue)
                             ;; Re-throw Errors (AssertionError, OutOfMemoryError, etc.) to crash the writer
                             #?(:clj (when (instance? Error e)
                                       (throw e)))))
                         (<! (timeout commit-wait-time))
-                        (recur (<?- commit-queue)))))))))]))
+                        (recur (<?- commit-queue)
+                               (get-in @connection [:meta :datahike/commit-id])))))))))]))
 
 ;; public API to internal mapping
 (def default-write-fn-map {'transact!     w/transact!

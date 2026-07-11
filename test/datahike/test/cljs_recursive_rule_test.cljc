@@ -37,8 +37,9 @@
       and the fixpoint scopes the outer context's rels to those sharing
       vars with the rule's plans.
 
-   On CLJ the planner is opt-in (`*force-legacy*` defaults true), so these
-   tests bind it false on CLJ to exercise the same engine both platforms.
+   The planner is the default engine on both platforms (upstream #844); these
+   tests bind `*disable-planner*` false on CLJ so an env override cannot
+   silently reroute them.
    `*fixpoint-shortcuts?*` distinguishes the JVM shortcut paths from the
    plain fixpoint (the path CLJS always runs)."
   (:require
@@ -48,7 +49,7 @@
    [datahike.db]
    [datahike.query]
    [datahike.query.execute :as execute]
-   #?(:clj [datahike.query.relation :as rel])))
+   [datahike.query.relation :as rel]))
 
 (def ^:private schema
   {:node/parent {:db/valueType :db.type/ref}
@@ -80,7 +81,7 @@
    Result cache off so every run actually executes."
   [query & args]
   (binding [datahike.query/*query-result-cache?* false]
-    #?(:clj  (binding [datahike.query/*force-legacy* false]
+    #?(:clj  (binding [datahike.query/*disable-planner* false]
                (apply d/q query args))
        :cljs (apply d/q query args))))
 
@@ -90,7 +91,7 @@
   [query & args]
   (binding [execute/*fixpoint-shortcuts?* false
             datahike.query/*query-result-cache?* false]
-    #?(:clj  (binding [datahike.query/*force-legacy* false]
+    #?(:clj  (binding [datahike.query/*disable-planner* false]
                (apply d/q query args))
        :cljs (apply d/q query args))))
 
@@ -306,6 +307,27 @@
          (is (< @max-tuples 500)
              (str "intermediate relations must stay bounded by the data; "
                   "largest seen: " @max-tuples " tuples"))))))
+
+(deftest rel-dedup-projection-is-loud-and-vector-safe
+  ;; rel-dedup-into! projects fixpoint tuples onto head-vars. Two historical
+  ;; silent-corruption modes on CLJS (2026-07-11 merge ride-along):
+  ;;  - a head-var missing from the relation's :attrs indexed with nil —
+  ;;    (aget tuple nil) projected `undefined` silently (CLJ NPEs loudly);
+  ;;  - relations built by legacy fns carry persistent-VECTOR tuples, and
+  ;;    aget on a vector reads a nonexistent JS property (undefined).
+  (let [dedup #?(:clj @#'execute/rel-dedup-into!
+                 :cljs execute/rel-dedup-into!)]
+    (testing "vector tuples project correctly"
+      (let [r (rel/->Relation '{?a 0 ?b 1} [[1 2] [1 2] [3 4]])
+            seen #?(:clj (java.util.HashSet.) :cljs (js/Set.))
+            out (dedup r '[?a ?b] seen)]
+        (is (= [[1 2] [3 4]]
+               (mapv vec (:tuples out))))))
+    (testing "missing head-var throws instead of projecting silently"
+      (let [r (rel/->Relation '{?a 0} [[1]])
+            seen #?(:clj (java.util.HashSet.) :cljs (js/Set.))]
+        (is (thrown? #?(:clj Exception :cljs js/Error)
+                     (dedup r '[?a ?missing] seen)))))))
 
 (comment
   ;; CLJ REPL:

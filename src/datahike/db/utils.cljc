@@ -180,7 +180,7 @@
                {:error :transact/syntax, :attribute a-ident, :context at}))
   (when (and (= :write (:schema-flexibility (dbi/-config db)))
              (not (or (ds/meta-attr? a-ident) (ds/schema-attr? a-ident) (ds/entity-spec-attr? a-ident)
-                      (ds/secondary-index-attr? a-ident))))
+                      (ds/secondary-index-attr? a-ident) (ds/reference-attr? a-ident))))
     (if-let [db-idents (:db/ident (dbi/-rschema db))]
       (let [attr (if (reverse-ref? a-ident)
                    (reverse-ref a-ident)
@@ -233,6 +233,27 @@
               current-datoms)
       history-datoms)
      current-datoms)))
+
+(defn distinct-datoms-desc
+  "Like `distinct-datoms`, but for DESCENDING inputs. `current-datoms`
+   and `history-datoms` are each distinct and sorted DESCENDING by the
+   index's temporal comparator (e.g. from `-rslice`); returns a lazy,
+   distinct, descending merge. Mirrors `distinct-datoms` exactly, only
+   with the merge comparator reversed — so `(take n …)` touches just the
+   n datoms nearest the seek point (no realization of the bounded range)."
+  [db index-type current-datoms history-datoms]
+  (if (dbi/-keep-history? db)
+    (let [cmp  (index-type->cmp-quick index-type false)
+          rcmp (fn [a b] (cmp b a))]
+      (merge-distinct-sorted-seqs
+       rcmp
+       (filter (fn [datom]
+                 (let [a (:a datom)]
+                   (or (no-history? db a)
+                       (multival? db a))))
+               current-datoms)
+       history-datoms))
+    current-datoms))
 
 (defn temporal-datoms [db index-type cs]
   (let [index (get db index-type)

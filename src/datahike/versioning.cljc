@@ -11,17 +11,18 @@
                                       write-pending-kvs!]]
             [datahike.writer]
             [datahike.index.secondary :as sec]
+            ;; cljs: S is a VAR (the supervisor) → :refer; go-try-/<?-/<?/go-loop-try
+            ;; are MACROS → :refer-macros. (Was missing <? entirely and putting S
+            ;; under :refer-macros, so both were :undeclared-var on cljs.)
             #?(:clj  [superv.async :refer [go-try- <?- <? S go-loop-try]]
-               :cljs [superv.async :refer [S]
-                                   :refer-macros [go-try- <?- <? go-loop-try]])
+               :cljs [superv.async :refer [S] :refer-macros [go-try- <?- <? go-loop-try]])
             [datahike.db.utils :refer [db?]]
             [datahike.tools :as dt]
             [replikativ.logging :as log]
             [konserve.utils :refer [#?(:clj async+sync) multi-key-capable? *default-sync-translation*]
              #?@(:cljs [:refer-macros [async+sync]])]
             #?(:cljs [clojure.core.async :refer [<!]]))
-  #?(:cljs (:require-macros [clojure.core.async :refer [go]]))
-  #?(:clj (:import [datahike.connector Connection])))
+  #?(:cljs (:require-macros [clojure.core.async :refer [go]])))
 
 (defn- branch-check [branch]
   (when-not (keyword? branch)
@@ -42,10 +43,17 @@
                {:type :commit-id-must-be-uuid :commit-id commit-id})))
 
 (defn- extract-store
-  "Extract konserve store from a connection or db value."
+  "Extract konserve store from a connection or db value.
+
+   A connection is detected via `IDeref` rather than the concrete
+   `Connection` class: `deftype` recompilation (circular loads, REPL
+   reloads) can drift the class identity so `instance? Connection` sees a
+   stale class and silently misroutes a live connection to the raw-store
+   branch — which surfaced as a konserve `get-lock` NPE from
+   `commit-as-db`. A db value is not `IDeref`, so the two stay distinct."
   [conn-or-db]
   (cond
-    #?(:clj (instance? Connection conn-or-db) :cljs (satisfies? IDeref conn-or-db))
+    #?(:clj (instance? clojure.lang.IDeref conn-or-db) :cljs (satisfies? IDeref conn-or-db))
     (:store @conn-or-db)
 
     (db? conn-or-db)
@@ -102,9 +110,12 @@
                                                                  :new-branch new-branch}))
                         stored-db (<?- (k/get store from nil opts))]
                     (when-not (stored-db? stored-db)
-                      (throw (ex-info "From does not point to an existing branch or commit."
+                      (throw (ex-info (if (false? (get (:config @conn) :commit-graph? true))
+                                        "From does not point to an existing branch, and this store was created with :commit-graph? false — commit records are not persisted, so branching from a commit-id is unavailable; branch from a branch keyword instead."
+                                        "From does not point to an existing branch or commit.")
                                       {:type :from-branch-does-not-point-to-existing-branch-or-commit
-                                       :from from})))
+                                       :from from
+                                       :commit-graph? (get (:config @conn) :commit-graph? true)})))
                   ;; Branch secondary indices via their native CoW support.
                   ;; Prefer live indices from the connection (they hold the write lock).
                     (let [sec-keys (:secondary-index-keys stored-db)
@@ -179,7 +190,10 @@
                         cid (create-commit-id db-with-parents pre-cid-store)
                         db-to-store (assoc-in pre-cid-store
                                               [:meta :datahike/commit-id] cid)
-                        pending-kvs (get-and-clear-pending-kvs! store)]
+                        pending-kvs (get-and-clear-pending-kvs! store)
+                        ;; Same opt-out as datahike.writing/commit!: no
+                        ;; commit-graph store → no separate cid record.
+                        commit-graph? (get (:config db) :commit-graph? true)]
 
                   ;; Update the set of known branches
                     (<?- (k/update store :branches #(conj (set %) branch) opts))
@@ -188,14 +202,15 @@
                     (if (multi-key-capable? store)
                       (let [writes-map (cond-> (into {} pending-kvs)
                                          schema-meta-kv-to-write (assoc (first schema-meta-kv-to-write) (second schema-meta-kv-to-write))
-                                         true                    (assoc cid db-to-store)
+                                         commit-graph?           (assoc cid db-to-store)
                                          true                    (assoc branch db-to-store))]
                         (<?- (k/multi-assoc store writes-map opts)))
                       (do
                         (<?- (write-pending-kvs! store pending-kvs sync?))
                         (when schema-meta-kv-to-write
                           (<?- (k/assoc store (first schema-meta-kv-to-write) (second schema-meta-kv-to-write) opts)))
-                        (<?- (k/assoc store cid db-to-store opts))
+                        (when commit-graph?
+                          (<?- (k/assoc store cid db-to-store opts)))
                         (<?- (k/assoc store branch db-to-store opts))))
                     nil))))))
 

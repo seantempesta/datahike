@@ -1,14 +1,22 @@
 {:deps {org.clojure/clojure                         {:mvn/version "1.12.4"}
         org.replikativ/hasch                        {:mvn/version "0.4.98"
                                                      :exclusions [org.clojure/clojurescript]}
-        org.replikativ/konserve                     {:mvn/version "0.9.346"
+        org.replikativ/konserve                     {:mvn/version "0.9.353"
                                                      :exclusions [org.clojure/clojurescript
                                                                   org.clojars.mmb90/cljs-cache]}
                                                      
         org.replikativ/superv.async                 {:mvn/version "0.3.50"
                                                      :exclusions [org.clojure/clojurescript]}
         org.replikativ/datalog-parser               {:mvn/version "0.2.37"}
-        org.replikativ/persistent-sorted-set        {:mvn/version "0.4.122"}
+        ;; canonical fressian node+root handlers + MST boundary (0.4.126); diff-buf write-buffering
+        ;; (opt-in, Settings diffBufSize); 0.4.132 serializes the CACHED root count (may be -1) so
+        ;; writing a storage-detached root never forces a recompute (cures the cljs side too);
+        ;; 0.4.133 makes the diff-buf {slots, entries} pair atomically published (BufState);
+        ;; 0.4.136 folds ALL per-child state {addresses, children, buf} into one atomically
+        ;; published NodeState — a pipelining writer's copies can never observe a torn settle;
+        ;; 0.4.137 projects diff-buf diffs onto a COPY of the restored node, so tree versions
+        ;; sharing a durable anchor through the node cache can't clobber each other's reads
+        org.replikativ/persistent-sorted-set        {:mvn/version "0.4.137"}
         environ/environ                             {:mvn/version "1.2.0"}
         nrepl/bencode                               {:mvn/version "1.2.0"}
         org.replikativ/logging                      {:mvn/version "0.1.3"}
@@ -38,20 +46,21 @@
                                thheller/shadow-cljs      {:mvn/version "3.4.10"}
                                org.clojure/core.async    {:mvn/version "1.10.870-alpha2"}}
                   ;; The new tests use ^:async deftest + (await ...) from
-                  ;; CLJS 1.12.145 (CLJS-3470 / CLJS-3476). That bump
-                  ;; exposes a latent bug in is.simm/partial-cps where
-                  ;; its macro-probing during CPS transformation invokes
-                  ;; cljs.core/await directly, which asserts on (:async &env)
-                  ;; and throws. Until the upstream fix lands, override to
-                  ;; a fork that catches probe failures defensively.
-                  ;; Upstream commit + PR-in-progress:
-                  ;;   https://github.com/seantempesta/partial-cps/commit/c0d941d4b591351267bc828fdfdf029be53a132f
-                  ;; If/when simm-is/partial-cps releases a version with the
-                  ;; fix, switch back to :mvn/version and drop this block.
+                  ;; CLJS 1.12.145 (CLJS-3470 / CLJS-3476). partial-cps
+                  ;; upstream now carries the two fixes this needs:
+                  ;;   fded4224 — treat cljs.core/await (cljs >= 1.12) as a
+                  ;;     terminal CPS breakpoint (supersedes the old
+                  ;;     seantempesta/partial-cps defensive-probe fork);
+                  ;;   57c79e6a — guard symbol? in the cljs macro-check so a
+                  ;;     keyword-fn over await no longer throws
+                  ;;     ClassCastException (hit by persistent-sorted-set
+                  ;;     0.4.137's diff-buf node.cljc under this CLJS).
+                  ;; Pinned by sha until a release ships; then switch to
+                  ;; :mvn/version and drop this block.
                   :override-deps
                   {is.simm/partial-cps
-                   {:git/url "https://github.com/seantempesta/partial-cps"
-                    :git/sha "c0d941d4b591351267bc828fdfdf029be53a132f"}}
+                   {:git/url "https://github.com/simm-is/partial-cps"
+                    :git/sha "1e119b03ea908ad925b98f9ba0a26371c65441e3"}}
                   :extra-paths ["test"]}
 
            :dev {:extra-paths ["dev" "benchmark/src"]
@@ -92,8 +101,8 @@
 
                                ;; kabel integration for distributed datahike
                                org.replikativ/kabel          {:mvn/version "0.3.95"}
-                               is.simm/distributed-scope     {:mvn/version "0.1.2"}
-                               org.replikativ/konserve-sync  {:mvn/version "0.1.15"}
+                               is.simm/distributed-scope     {:mvn/version "0.1.6"}
+                               org.replikativ/konserve-sync  {:mvn/version "0.1.30"}
                                http-kit/http-kit             {:mvn/version "2.8.1"}}}
 
            :datomic {:extra-deps {com.datomic/datomic-free {:mvn/version "0.9.5703"}}}
@@ -154,11 +163,28 @@
                        :main-opts ["-m" "benchmark.cli"]}
 
            ;; Benchmark deps (no :main-opts so it composes with -e / nREPL).
+           ;; Lightweight bench alias for the planner-regression gate: it needs only
+           ;; datahike + benchmark/src. The datalevin/datomic comparators in
+           ;; benchmark.datascript-bench are dynamically required, so they (and
+           ;; stratum's native libs from :bench-compare) stay off the classpath —
+           ;; keeping the CI job fast to load. Run: clj -M:bench -m benchmark.planner-regression --assert
+           :bench {:extra-paths ["benchmark/src"]}
+
            ;; Run via: clj -M:bench-compare -m benchmark.datascript-bench all
-           :bench-compare {:extra-paths ["benchmark/src"]
-                           :extra-deps {datalevin/datalevin {:mvn/version "0.10.7"
-                                                             :exclusions [com.taoensso/timbre]}
-                                        com.datomic/peer {:mvn/version "1.0.7277"}
+           :bench-compare {:extra-paths ["benchmark/src" "src-secondary"]
+                           :jvm-opts ["--add-modules" "jdk.incubator.vector"]
+                           :extra-deps {datalevin/datalevin {:mvn/version "0.10.18"}
+                                        com.datomic/peer {:mvn/version "1.0.7387"}
+                                        ;; stratum columnar secondary index — lets the
+                                        ;; aggregate suite measure the DH+stratum column
+                                        ;; instead of reporting N/A (ns datahike.index.secondary.stratum
+                                        ;; lives on src-secondary above). Exclude its
+                                        ;; slf4j-reload4j binding: with datomic's log4j-over-slf4j
+                                        ;; on the same classpath the two form an org.apache.log4j.MDC
+                                        ;; bridge loop (StackOverflowError on Datomic init).
+                                        org.replikativ/stratum {:mvn/version "0.3.69"
+                                                                :exclusions [org.slf4j/slf4j-reload4j
+                                                                             ch.qos.reload4j/reload4j]}
                                         com.clojure-goes-fast/clj-async-profiler {:mvn/version "1.6.1"}
                                         }}
 

@@ -12,13 +12,16 @@
   (-temporal-upsert [index datom index-type op-count old-datom] "Inserts or updates a datom in a history index")
   (-remove [index datom index-type op-count] "Removes a datom from the index")
   (-slice [index from to index-type] "Returns a slice of the index")
+  (-rslice [index from to index-type] "Returns a REVERSE slice of the index: a lazy backwards iterator over datoms d with to <= d <= from, starting at `from` and descending. Mirrors persistent-sorted-set's rslice argument order (from = upper bound).")
   (-lookup [index key cmp] "Look up a single key with custom comparator. Returns the stored element or nil.")
   (-count-slice [index from to cmp] "O(log n) count of elements in [from, to] range using the given comparator.")
   (-has-subtree-counts? [index] "Returns true if count-slice is O(log n). False means counts are missing and count-slice would degrade to O(n).")
   (-flush [index backend] "Saves the changes to the index to the given konserve backend")
   (-transient [index] "Returns a transient version of the index")
   (-persistent! [index] "Returns a persistent version of the index")
-  (-mark [index] "Return konserve addresses that should be whitelisted for mark and sweep gc."))
+  (-mark [index] "Return konserve addresses that should be whitelisted for mark and sweep gc.")
+  (-root-node [index] "Returns the in-memory root node of a flushed index, for root fusion (inlining the root into the db-record).")
+  (-seed-root! [index root-node] "Seeds the in-memory root node after restoring a db-record that inlined it (root fusion). MUTATES the index — call it only on an OWNED, unpublished copy (e.g. the with-storage copy made at attach), never on a stored record's index: records may be shared through the store's cache by every reader of that key. Returns the index."))
 
 (defmulti empty-index
   "Creates an empty index"
@@ -41,6 +44,20 @@
 (defmulti default-index-config
   "Returns the default index configuration."
   (fn [index-name] index-name))
+
+(defmulti with-storage
+  "Return `index` bound to `storage` as a shallow copy sharing the
+   (immutable) node tree. Storage is connection-scoped context, not part
+   of the index value: bind an index to the live connection's storage
+   when materializing it from a store, and detach it (storage nil) before
+   writing it into a store, so a stored value never carries a foreign
+   storage handle — even through identity-preserving stores that skip
+   serialization (e.g. a tiered memory frontend). Never mutates the
+   input; returns the index unchanged for index types without embedded
+   storage and for nil."
+  (fn [index-name _index _storage] index-name))
+
+(defmethod with-storage :default [_index-name index _storage] index)
 
 ;; Default handlers for missing index implementations
 

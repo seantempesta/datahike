@@ -1,5 +1,6 @@
 (ns datahike.test.migrate-test
   (:require [clojure.test :refer :all]
+            [clj-cbor.core :as cbor]
             [datahike.api :as d]
             [datahike.datom :as datom]
             [datahike.migrate :as m]
@@ -103,7 +104,25 @@
               [:db/ident :db.secondary/config 536870912 true]
               [:db/ident :db.secondary/status 536870912 true]
               [:db/ident :db.secondary/building-since-tx 536870912 true]
-              [:db/ident :db.secondary/only 536870912 true]])
+              [:db/ident :db.secondary/only 536870912 true]
+              ;; Cross-database reference attrs — the :dh.ref/* family
+              ;; graduated into system-schema (datahike.reference), full
+              ;; declarations like :db.valid/*. Five idents + four doc
+              ;; strings + ONE new distinct valueType ref-datom
+              ;; (29 = :db.type/uuid); the keyword/string valueTypes,
+              ;; cardinality (11) and `:db/index true` ref-datoms collapse
+              ;; with existing entries when materialised through `into #{}`.
+              [:db/ident :dh.ref/db 536870912 true]
+              [:db/ident :dh.ref/attr 536870912 true]
+              [:db/ident :dh.ref/value 536870912 true]
+              [:db/ident :dh.ref/temporal 536870912 true]
+              [:db/ident :dh.ref/type 536870912 true]
+              [:db/valueType 29 536870912 true]
+              [:db/doc "Cross-db reference: target database (store :id)" 536870912 true]
+              [:db/doc "Cross-db reference: unique attribute of the target lookup ref" 536870912 true]
+              [:db/doc "Cross-db reference: lookup-ref value, canonically encoded" 536870912 true]
+              [:db/doc "Cross-db reference: temporal qualifier (tx:/date:/valid:/branch:); absent = live head" 536870912 true]
+              [:db/doc "Cross-db reference: link predicate (application vocabulary)" 536870912 true]])
 
 (deftest export-import-test
   (let [os-prefix (case (System/getProperty "os.name")
@@ -318,3 +337,28 @@
                                       (d/datoms @import-conn :eavt)))))
     (d/release conn)
     (d/release import-conn)))
+
+(deftest import-db-batches-with-dynamic-size
+  (let [export-path (str "/tmp/import-batch-test-" (utils/get-time))
+        datoms (mapv #(vec (rest %)) tx-data)
+        imported-tx (apply max (map #(nth % 3) datoms))
+        config {:store {:backend :memory
+                        :id #uuid "00210000-0000-0000-0000-000000000022"}
+                :schema-flexibility :read
+                :keep-history? false}
+        conn (utils/setup-db config)
+        batch-size 5]
+    (try
+      (cbor/spit-all export-path datoms)
+      (binding [m/*import-batch-size* batch-size]
+        (is (= {:tx-data (mapv #(apply datom/datom %) (last (partition-all batch-size datoms)))}
+               (select-keys (m/import-db conn export-path) [:tx-data])))
+        (is (= (+ imported-tx (count (partition-all batch-size datoms)))
+               (:max-tx @conn))))
+      (is (= (set (map #(apply datom/datom %) datoms))
+             (set (filter #(< (:e %) (:max-tx @conn))
+                          (d/datoms @conn :eavt)))))
+      (finally
+        (d/release conn)
+        (d/delete-database config)
+        (.delete (java.io.File. export-path))))))

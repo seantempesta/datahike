@@ -23,8 +23,7 @@
   #?(:cljs (:require-macros [superv.async :refer [go-try- <?-]]
                             [clojure.core.async :refer [go]]))
   #?(:clj
-     (:import [clojure.lang Keyword PersistentArrayMap]
-              [datahike.db HistoricalDB AsOfDB SinceDB FilteredDB]
+     (:import [datahike.db HistoricalDB AsOfDB SinceDB FilteredDB]
               [datahike.impl.entity Entity])))
 
 (defn transact! [connection arg-map]
@@ -80,18 +79,20 @@
   #?(:clj  @(writing/database-exists? config)
      :cljs (writing/database-exists? config)))
 
+;; Dispatch on the ARG SHAPE (map vs index+components), not the concrete map
+;; class: a small map literal is PersistentArrayMap on the JVM but can be
+;; PersistentHashMap on cljs, so the old `(type arg-map)`-keyed dispatch silently
+;; missed the arg-map form there. `map?` is value-level and cross-platform.
 (defmulti datoms
   (fn
-    ([_db arg-map]
-     (type arg-map))
-    ([_db index & _components]
-     (type index))))
+    ([_db arg-map] (if (map? arg-map) ::arg-map ::index))
+    ([_db _index & _components] ::index)))
 
-(defmethod datoms PersistentArrayMap
+(defmethod datoms ::arg-map
   [db {:keys [index components]}]
   (dbi/datoms db index components))
 
-(defmethod datoms Keyword
+(defmethod datoms ::index
   [db index & components]
   (if (nil? components)
     (dbi/datoms db index [])
@@ -99,16 +100,29 @@
 
 (defmulti seek-datoms
   (fn
-    ([_db arg-map]
-     (type arg-map))
-    ([_db index & _components]
-     (type index))))
+    ([_db arg-map] (if (map? arg-map) ::arg-map ::index))
+    ([_db _index & _components] ::index)))
 
-(defmethod seek-datoms PersistentArrayMap
+(defmethod seek-datoms ::arg-map
   [db {:keys [index components]}]
   (dbi/seek-datoms db index components))
 
-(defmethod seek-datoms Keyword
+(defmulti rseek-datoms
+  (fn
+    ([_db arg-map] (if (map? arg-map) ::arg-map ::index))
+    ([_db _index & _components] ::index)))
+
+(defmethod rseek-datoms ::arg-map
+  [db {:keys [index components]}]
+  (dbi/rseek-datoms db index components))
+
+(defmethod rseek-datoms ::index
+  [db index & components]
+  (if (nil? components)
+    (dbi/rseek-datoms db index [])
+    (dbi/rseek-datoms db index components)))
+
+(defmethod seek-datoms ::index
   [db index & components]
   (if (nil? components)
     (dbi/seek-datoms db index [])
@@ -173,9 +187,15 @@
     (log/raise "as-of is only allowed on temporal indexed databases." {:config (dbi/-config db)})))
 
 (defn history [db]
-  (if (dbi/-temporal-index? db)
-    (HistoricalDB. db)
-    (log/raise "history is only allowed on temporal indexed databases." {:config (dbi/-config db)})))
+  (cond
+    ;; History of a history is just the history — return as-is rather than
+    ;; double-wrapping. Besides being the correct idempotent semantics, the
+    ;; redundant HistoricalDB-around-HistoricalDB pushes queries onto the
+    ;; legacy lookup path on cljs (the fused temporal path needs the origin's
+    ;; :eavt to be a real PersistentSortedSet, which a nested wrapper isn't).
+    (instance? HistoricalDB db) db
+    (dbi/-temporal-index? db) (HistoricalDB. db)
+    :else (log/raise "history is only allowed on temporal indexed databases." {:config (dbi/-config db)})))
 
 ;; `vt-meta-attrs`, `tx-covers-at?`, `find-eav-winner`, `mk-vt-pred`,
 ;; `mk-vt-overlap-pred` and `mk-vt-during-pred` live in the leaf
@@ -287,6 +307,7 @@
             (not (or (ds/entity-spec-attr? k)
                      (ds/schema-attr? k)
                      (ds/secondary-index-attr? k)
+                     (ds/reference-attr? k)
                      (ds/sys-ident? k)))) (update m k #(merge % v))
        (number? k)                        (update m v #(merge % {:db/id k}))
        :else                              m))
@@ -300,6 +321,7 @@
                       (remove #(or (ds/entity-spec-attr? %)
                                    (ds/sys-ident? %)
                                    (ds/secondary-index-attr? %)
+                                   (ds/reference-attr? %)
                                    (ds/schema-attr? %)))
                       (into #{}))]
        (if (empty? attrs)
