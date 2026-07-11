@@ -35,6 +35,7 @@ class DatahikeGenerated {
     protected static final IFn explainFn = Clojure.var("datahike.api", "explain");
     protected static final IFn filterFn = Clojure.var("datahike.api", "filter");
     protected static final IFn forceBranchAsyncFn = Clojure.var("datahike.api", "force-branch!");
+    protected static final IFn forkDatabaseFn = Clojure.var("datahike.api", "fork-database");
     protected static final IFn gcStorageFn = Clojure.var("datahike.api", "gc-storage");
     protected static final IFn historyFn = Clojure.var("datahike.api", "history");
     protected static final IFn indexRangeFn = Clojure.var("datahike.api", "index-range");
@@ -58,6 +59,10 @@ class DatahikeGenerated {
     protected static final IFn transactFn = Clojure.var("datahike.api", "transact");
     protected static final IFn transactAsyncFn = Clojure.var("datahike.api", "transact!");
     protected static final IFn unlistenFn = Clojure.var("datahike.api", "unlisten");
+    protected static final IFn validAllFn = Clojure.var("datahike.api", "valid-all");
+    protected static final IFn validAtFn = Clojure.var("datahike.api", "valid-at");
+    protected static final IFn validBetweenFn = Clojure.var("datahike.api", "valid-between");
+    protected static final IFn validDuringFn = Clojure.var("datahike.api", "valid-during");
     protected static final IFn withFn = Clojure.var("datahike.api", "with");
 
     // ===== Static Initialization =====
@@ -420,6 +425,36 @@ class DatahikeGenerated {
      */
     public static void forceBranchAsync(Object arg0, Object arg1, Set<?> arg2) {
         forceBranchAsyncFn.invoke(arg0, arg1, arg2);
+    }
+
+    /**
+     * Forks the source database into an independent, writable target database. Copies the source store, then points the target's :db branch at the commit selected by :at in the options map — a tx-id long (exact :max-tx match), an inst (newest commit at or before it), or absent for the head. The fork preserves entity ids, transaction ids, tx-meta, schema and history byte-faithfully as of the fork point; new transactions continue from there. The target gets a fresh store identity (minted when the target config carries no [:store :id]). Returns the target's effective config — connect with exactly that value.
+     * 
+     * <h3>Examples:</h3>
+     * <pre>{@code
+     * // Fork at head
+     * (fork-database {:store {:backend :file :path "/data/src" :id source-id}} {:store {:backend :file :path "/data/fork"}})
+     * // Fork at a transaction id
+     * (fork-database src-cfg tgt-cfg {:at 536870950})
+     * }</pre>
+     */
+    public static Object forkDatabase(Map<String,Object> arg0, Map<String,Object> arg1) {
+        return (Object) forkDatabaseFn.invoke(Util.normalizeCollections(arg0), Util.normalizeCollections(arg1));
+    }
+
+    /**
+     * Forks the source database into an independent, writable target database. Copies the source store, then points the target's :db branch at the commit selected by :at in the options map — a tx-id long (exact :max-tx match), an inst (newest commit at or before it), or absent for the head. The fork preserves entity ids, transaction ids, tx-meta, schema and history byte-faithfully as of the fork point; new transactions continue from there. The target gets a fresh store identity (minted when the target config carries no [:store :id]). Returns the target's effective config — connect with exactly that value.
+     * 
+     * <h3>Examples:</h3>
+     * <pre>{@code
+     * // Fork at head
+     * (fork-database {:store {:backend :file :path "/data/src" :id source-id}} {:store {:backend :file :path "/data/fork"}})
+     * // Fork at a transaction id
+     * (fork-database src-cfg tgt-cfg {:at 536870950})
+     * }</pre>
+     */
+    public static Object forkDatabase(Map<String,Object> arg0, Map<String,Object> arg1, Map<?,?> arg2) {
+        return (Object) forkDatabaseFn.invoke(Util.normalizeCollections(arg0), Util.normalizeCollections(arg1), Util.normalizeCollections(arg2));
     }
 
     /**
@@ -879,6 +914,70 @@ class DatahikeGenerated {
      */
     public static Map<?,?> unlisten(Object arg0, Object arg1) {
         return (Map<?,?>) unlistenFn.invoke(arg0, arg1);
+    }
+
+    /**
+     * Strip any valid-time markers from `db` so the full vt-history is
+     *            visible. Idempotent. Does not unwrap an existing FilteredDB; to
+     *            drop an active filter, start from the unwrapped db.
+     * 
+     * <h3>Examples:</h3>
+     * <pre>{@code
+     * // Drop vt-marker for full-history query
+     * (q '[:find ?n :where [_ :name ?n]] (valid-all {@literal @}conn))
+     * }</pre>
+     */
+    public static Object validAll(Object arg0) {
+        return (Object) validAllFn.invoke(arg0);
+    }
+
+    /**
+     * Tag `db` with a `:datahike/valid-at` marker so vt-aware secondary
+     *            indices push the filter through `-search-at-vt`. Valid-time is a
+     *            secondary-index axis; regular datalog patterns still require the
+     *            built-in `(valid-at ?tx ?at)` rule to filter by vt explicitly.
+     * 
+     * <h3>Examples:</h3>
+     * <pre>{@code
+     * // Query as of valid-time
+     * (q '[:find ?n :where [_ :name ?n]] (valid-at {@literal @}conn #inst "2024-04-15"))
+     * }</pre>
+     */
+    public static Object validAt(Object arg0, Object arg1) {
+        return (Object) validAtFn.invoke(arg0, arg1);
+    }
+
+    /**
+     * Filter `db` to datoms whose asserting tx's vt-window overlaps the
+     *            half-open interval `[from, to)`. SQL:2011 `FOR VALID_TIME BETWEEN
+     *            from AND to` maps to this. Carries
+     *            `:datahike/valid-between [from to]` on the result for vt-aware
+     *            secondary-index pushdown.
+     * 
+     * <h3>Examples:</h3>
+     * <pre>{@code
+     * // Datoms whose tx vt-window overlaps Q2 2024
+     * (q '[:find ?n :where [_ :name ?n]] (valid-between {@literal @}conn #inst "2024-04-01" #inst "2024-07-01"))
+     * }</pre>
+     */
+    public static Object validBetween(Object arg0, Object arg1, Object arg2) {
+        return (Object) validBetweenFn.invoke(arg0, arg1, arg2);
+    }
+
+    /**
+     * Filter `db` to datoms whose tx's vt-window is *fully contained*
+     *            in `[from, to)`. Stricter than `valid-between` — overlapping
+     *            windows that extend past either endpoint are excluded. Useful
+     *            for 'corrections wholly within Q2' style queries.
+     * 
+     * <h3>Examples:</h3>
+     * <pre>{@code
+     * // Corrections whose vt-window was wholly inside Q2
+     * (q '[:find ?e :where [?e :name _]] (valid-during {@literal @}conn #inst "2024-04-01" #inst "2024-07-01"))
+     * }</pre>
+     */
+    public static Object validDuring(Object arg0, Object arg1, Object arg2) {
+        return (Object) validDuringFn.invoke(arg0, arg1, arg2);
     }
 
     /**

@@ -100,7 +100,67 @@
 ;; ---------------------------------------------------------------------------
 ;; Relational algebra
 
+(defn distinct-rel
+  "Relation with duplicate tuples removed. Datalog relations are SETS —
+   multiplicity is an execution artifact, and hash-join/sum-rel preserve it,
+   so duplicates MULTIPLY through every subsequent join (dup₁ × dup₂ per
+   logical row). Deduping at rule/OR-branch boundaries keeps intermediates
+   bounded by the data (the 2026-07-11 pod OOM manufactured 15.4M tuples
+   from 783 distinct pairs this way). Keys by tuple CONTENT; preserves the
+   original tuple objects."
+  [rel]
+  (let [tuples (:tuples rel)]
+    (if (<= (count tuples) 1)
+      rel
+      (let [seen (volatile! (transient #{}))
+            deduped (persistent!
+                     (reduce (fn [acc tuple]
+                               (let [k (vec tuple)]
+                                 (if (contains? @seen k)
+                                   acc
+                                   (do (vswap! seen conj! k)
+                                       (conj! acc tuple)))))
+                             (transient [])
+                             tuples))]
+        (if (== (count deduped) (count tuples))
+          rel
+          (Relation. (:attrs rel) deduped))))))
+
+(defn prod-rel
+  "Explicit Cartesian product of two relations with disjoint attrs, over
+   each side's DISTINCT tuples (set semantics — bounds the product by the
+   data, not by accumulated multiplicity)."
+  [rel1 rel2]
+  (let [attrs1 (:attrs rel1)
+        attrs2 (:attrs rel2)
+        keep-attrs1 (vec (keys attrs1))
+        keep-attrs2 (vec (keys attrs2))
+        idxs1 (to-array (map attrs1 keep-attrs1))
+        idxs2 (to-array (map attrs2 keep-attrs2))
+        tuples1 (:tuples (distinct-rel rel1))
+        tuples2 (:tuples (distinct-rel rel2))
+        new-tuples (persistent!
+                    (reduce (fn [acc t1]
+                              (reduce (fn [acc t2]
+                                        (conj! acc (join-tuples t1 idxs1 t2 idxs2)))
+                                      acc tuples2))
+                            (transient [])
+                            tuples1))]
+    (Relation. (zipmap (concat keep-attrs1 keep-attrs2) (range))
+               new-tuples)))
+
+(declare hash-join-common)
+
 (defn hash-join [rel1 rel2]
+  (if (empty? (intersect-keys (:attrs rel1) (:attrs rel2)))
+    ;; No shared attrs: `tuple-key-fn` over zero getters degenerates to a
+    ;; CONSTANT key, silently turning the hash-join into a full Cartesian
+    ;; product that multiplies accumulated duplicates (the 2026-07-11 pod
+    ;; OOM). Route to the explicit deduped product instead.
+    (prod-rel rel1 rel2)
+    (hash-join-common rel1 rel2)))
+
+(defn- hash-join-common [rel1 rel2]
   (let [tuples1      (:tuples rel1)
         tuples2      (:tuples rel2)
         attrs1       (:attrs rel1)

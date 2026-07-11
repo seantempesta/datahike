@@ -2790,7 +2790,10 @@
                                   (rel/limit-rel joined or-vars)))))
                           (:branches op))
         valid (filterv some? branch-rels)
-        union (when (seq valid) (reduce rel/sum-rel valid))]
+        ;; OR result is a set — the limit-rel projection above collapses
+        ;; branch-local temp vars, so the union routinely carries duplicate
+        ;; tuples that would multiply through later joins (rel/distinct-rel).
+        union (when (seq valid) (rel/distinct-rel (reduce rel/sum-rel valid)))]
     (if union (update ctx :rels rel/collapse-rels union) ctx)))
 
 (defn- execute-or-join [db op ctx]
@@ -2803,7 +2806,8 @@
                                   (rel/limit-rel joined join-vars)))))
                           (:branches op))
         valid (filterv some? branch-rels)
-        union (when (seq valid) (reduce rel/sum-rel valid))]
+        ;; Same set semantics as execute-or (see the comment there).
+        union (when (seq valid) (rel/distinct-rel (reduce rel/sum-rel valid)))]
     (if union (update ctx :rels rel/collapse-rels union) ctx)))
 
 (defn- execute-not [db op ctx]
@@ -2831,6 +2835,14 @@
 
 ;; ---------------------------------------------------------------------------
 ;; Recursive rule execution (semi-naive fixpoint with clause versions)
+
+(def ^:dynamic *fixpoint-shortcuts?*
+  "When true (default), `execute-recursive-rule` may take the JVM-only
+   delta-driven-expand / magic-set shortcut paths (when their structural
+   guards allow). Bind false to force the plain semi-naive fixpoint — the
+   known-correct reference path (also what CLJS always runs) — for tests
+   and forensics that need to compare or pin both paths."
+  true)
 
 #?(:clj
    (deftype ArrayWrapper [^objects a ^int h]
@@ -2881,7 +2893,10 @@
 
 (defn- execute-branch-plans
   "Execute a list of branch plans (sub-plans), union results, project to output-vars.
-   Returns a Relation."
+   Returns a Relation. The union is DEDUPED: rule results are sets, and the
+   projection to output-vars routinely collapses distinct body tuples onto
+   identical head tuples — carrying that multiplicity forward multiplies
+   through every later join (see rel/distinct-rel)."
   [db plans ctx output-vars]
   (let [branch-rels
         (into []
@@ -2892,7 +2907,7 @@
                             (rel/limit-rel joined output-vars))))))
               plans)]
     (if (seq branch-rels)
-      (reduce rel/sum-rel branch-rels)
+      (rel/distinct-rel (reduce rel/sum-rel branch-rels))
       (rel/->Relation (zipmap output-vars (range)) []))))
 
 (defn- compute-magic-info
@@ -2914,6 +2929,52 @@
               prop-pos (if (= ground-pos 0) 1 0)]
           {:ground-positions ground-positions
            :propagation-pos prop-pos})))))
+
+(defn- magic-direction-ok?
+  "Is the magic-set demand scheme sound for this rule topology?
+
+   The demand machinery (demand-seeded `magic-base-scan` + delta
+   propagation via `extract-demand-values` at the non-ground position +
+   the injected demand relation constraining the recursive branch) is only
+   complete for two structurally-verifiable cases, checked PER recursive
+   clause version against `base-info`/`ground-pos`:
+
+   - CHAIN case — the ground head var is the pattern-side var AND the
+     link sits at the same call position (`pattern-head-pos` =
+     `link-call-pos` = `ground-pos`): demand grows one pattern-step per
+     iteration, and the base facts seeded from demand provide exactly the
+     link values the next step needs — PROVIDED the recursive pattern uses
+     the SAME attribute as the base pattern and steps in the SAME
+     direction from the demanded side.
+   - PASS-THROUGH case — the ground head var rides the recursive call
+     unchanged (`pattern-head-pos` = `link-call-pos` = 1 − `ground-pos`):
+     every needed subgoal keeps the ground value at the ground position,
+     so the initial demand already covers it.
+
+   Any other topology (or a nil `base-info`/`rec-infos` — non-simple
+   shapes) must run the plain fixpoint: firing magic there truncates
+   results (e.g. `(reach ?x GROUND)` returned #{} — the base scan seeded
+   the wrong side of the closure, 2026-07-11)."
+  [ground-pos base-info rec-infos]
+  (boolean
+   (and base-info
+        (seq rec-infos)
+        (let [g (int ground-pos)
+              base-forward? (= g (int (:e-head-pos base-info)))]
+          (every? (fn [{:keys [attr link-pattern-pos link-call-pos
+                               pattern-head-pos]}]
+                    (or ;; chain case
+                     (and (= g (int pattern-head-pos))
+                          (= g (int link-call-pos))
+                          (= attr (:attr base-info))
+                          ;; step direction from the demanded side must
+                          ;; match the base scan's direction from it:
+                          ;; link at V ⇒ forward step (h_p at E)
+                          (= (= :v link-pattern-pos) base-forward?))
+                     ;; pass-through case
+                     (and (= (- 1 g) (int pattern-head-pos))
+                          (= (- 1 g) (int link-call-pos)))))
+                  rec-infos)))))
 
 (defn- inject-magic-relation
   "Add a magic demand relation to the context that constrains head-var at
@@ -2938,71 +2999,129 @@
     (update ctx :rels rel/collapse-rels demand-rel)))
 
 (defn- delta-driven-expand
-  "For the recursive clause [?x :attr ?t] (follows-DELTA ?t ?y):
-   Instead of scanning all edges and hash-joining with delta,
-   iterate delta tuples and do reverse index lookups.
-   For each (?t_val, ?y_val) in delta, find all ?x where [?x :attr ?t_val]
-   using AVET index, producing (?x, ?y_val) output tuples.
+  "Expand ONE recursive clause version from delta tuples via point lookups.
 
-   head-vars: [?x ?y] — the rule head variables
-   attr: the :follows attribute keyword/id
-   delta-rel: Relation with delta tuples from previous iteration
-   join-pos: position in delta tuples that joins with the index (the ?t position)
-   output-pos: position in delta tuples that propagates to output (the ?y position)"
-  [db head-vars attr delta-rel join-pos output-pos]
+   Instead of scanning all edges and hash-joining with delta, iterate the
+   delta tuples and look each one's link value up in the index. The clause
+   topology comes from `expand-info` (computed structurally at lowering
+   time, see `rec-expand-info` in lower.cljc) — the recursion direction is
+   NOT assumed:
+
+   - `:link-pattern-pos :v` — reverse form `[?x :attr ?t] (rule ?t ?y)`:
+     for each delta (t, y), AVET-lookup all ?x where [?x :attr t],
+     emit (x, y).
+   - `:link-pattern-pos :e` — forward form `[?m :attr ?a] (rule ?m ?d)`:
+     for each delta (m, d), EAVT-lookup m's :attr values ?a, emit (a, d).
+
+   Assuming the reverse form for both directions was the depth-truncation
+   bug (2026-07-11, see cljs-recursive-rule-test): the forward form's
+   expansion re-emitted already-seen pairs, dedup emptied the delta, and
+   the fixpoint silently terminated mid-closure.
+
+   head-vars: the rule head variables (delta tuple positions = head positions)
+   expand-info: {:attr :link-pattern-pos :link-call-pos :pattern-head-pos}
+   delta-rel: Relation with delta tuples from the previous iteration"
+  [db head-vars expand-info delta-rel]
   #?(:clj
-     (when (and attr (seq (:tuples delta-rel)))
-       (let [avet-pss (:avet db)
-             result (java.util.ArrayList.)
-             tuples (:tuples delta-rel)]
-         (doseq [tuple tuples]
-           (let [t-val (if (instance? object-array-class tuple)
-                         (aget ^objects tuple (int join-pos))
-                         (nth tuple join-pos))
-                 y-val (if (instance? object-array-class tuple)
-                         (aget ^objects tuple (int output-pos))
-                         (nth tuple output-pos))
-                 ;; Reverse lookup: find all entities where :attr = t-val
-                 from-datom (datom e0 attr t-val tx0)
-                 to-datom (datom emax attr t-val txmax)
-                 slice (di/-slice avet-pss from-datom to-datom :avet)]
-             (doseq [^Datom sd slice]
-               (when (and (= (.-a sd) attr) (= (.-v sd) t-val))
-                 (let [arr (object-array 2)
-                       eid (.-e sd)]
-                   (aset arr 0 (Long/valueOf eid))   ;; ?x = entity that follows t-val
-                   (aset arr 1 y-val)      ;; ?y = propagated from delta
-                   (.add result arr))))))
+     (when (and expand-info (seq (:tuples delta-rel)))
+       (let [{:keys [attr link-pattern-pos link-call-pos pattern-head-pos]} expand-info
+             reverse? (= :v link-pattern-pos)
+             pss (if reverse? (:avet db) (:eavt db))
+             pass-call-pos (- 1 (int link-call-pos))
+             out-pattern-pos (int pattern-head-pos)
+             out-pass-pos (- 1 out-pattern-pos)
+             result (java.util.ArrayList.)]
+         (doseq [tuple (:tuples delta-rel)]
+           (let [link-val (if (instance? object-array-class tuple)
+                            (aget ^objects tuple (int link-call-pos))
+                            (nth tuple link-call-pos))
+                 pass-val (if (instance? object-array-class tuple)
+                            (aget ^objects tuple (int pass-call-pos))
+                            (nth tuple pass-call-pos))]
+             (if reverse?
+               ;; link at V — find entities pointing AT link-val
+               (let [slice (di/-slice pss
+                                      (datom e0 attr link-val tx0)
+                                      (datom emax attr link-val txmax)
+                                      :avet)]
+                 (doseq [^Datom sd slice]
+                   (when (and (= (.-a sd) attr) (= (.-v sd) link-val))
+                     (let [arr (object-array 2)]
+                       (aset arr out-pattern-pos (Long/valueOf (.-e sd)))
+                       (aset arr out-pass-pos pass-val)
+                       (.add result arr)))))
+               ;; link at E — follow link-val's own attr values
+               (let [e (if (number? link-val) (long link-val) link-val)
+                     slice (di/-slice pss
+                                      (datom e attr nil tx0)
+                                      (datom e attr nil txmax)
+                                      :eavt)]
+                 (doseq [^Datom sd slice]
+                   (when (and (= (.-e sd) e) (= (.-a sd) attr))
+                     (let [arr (object-array 2)]
+                       (aset arr out-pattern-pos (.-v sd))
+                       (aset arr out-pass-pos pass-val)
+                       (.add result arr))))))))
          (when (pos? (.size result))
            (rel/->Relation (zipmap head-vars (range)) (vec result)))))
      :cljs nil))
 
 (defn- magic-base-scan
-  "Directly scan edges for entities in the demand set using EAVT point lookups.
-   Only scans entities not yet in the scanned set (if provided).
+  "Directly scan base facts for values in the demand set via point lookups.
+   Only scans demand values not yet in the scanned set (if provided).
    Much faster than re-executing the full base branch plan for large graphs.
-   Only works for simple binary base patterns like [?x :attr ?y]."
-  [db head-vars attr demand-set scanned-set]
+
+   `base-info` ({:attr :e-head-pos}, see `base-scan-info` in lower.cljc)
+   carries the base pattern's topology; `ground-pos` is the head position
+   the demand values constrain. The lookup direction follows from where
+   that head position sits in the pattern:
+
+   - demand var at E (`ground-pos` = `:e-head-pos`) — EAVT point lookups
+     of each demanded entity's own attr datoms (e.g. `[?x :edge ?y]` with
+     ?x demanded).
+   - demand var at V — reverse AVET lookups of entities pointing AT each
+     demanded value (e.g. `[?d :parent ?a]` with ?a demanded — the
+     descendant direction; forward-scanning here returned the demanded
+     node's OWN parent instead of its children, 2026-07-11).
+
+   Emitted tuples always place the datom's E at head position
+   `:e-head-pos` and its V at the other position."
+  [db head-vars base-info ground-pos demand-set scanned-set]
   #?(:clj
-     (when attr
-       (let [eavt-pss (:eavt db)
+     (when-let [{:keys [attr e-head-pos]} base-info]
+       (let [forward? (= (int ground-pos) (int e-head-pos))
+             pss (if forward? (:eavt db) (:avet db))
+             e-pos (int e-head-pos)
+             v-pos (- 1 e-pos)
              result (java.util.ArrayList.)
              iter (.iterator ^java.util.HashSet demand-set)]
-         ;; Point-lookup each NEW entity's edges (skip already-scanned)
+         ;; Point-lookup each NEW demand value's datoms (skip already-scanned)
          (while (.hasNext iter)
-           (let [e (.next iter)]
+           (let [d (.next iter)]
              (when (or (nil? scanned-set)
-                       (.add ^java.util.HashSet scanned-set e))
-               (let [from-datom (datom (if (number? e) (long e) e) attr nil tx0)
-                     to-datom (datom (if (number? e) (long e) e) attr nil txmax)
-                     slice (di/-slice eavt-pss from-datom to-datom :eavt)]
-                 (doseq [^Datom sd slice]
-                   (when (and (= (.-e sd) e) (= (.-a sd) attr))
-                     (let [arr (object-array 2)
-                           eid (.-e sd)]
-                       (aset arr 0 (Long/valueOf eid))
-                       (aset arr 1 (.-v sd))
-                       (.add result arr))))))))
+                       (.add ^java.util.HashSet scanned-set d))
+               (if forward?
+                 (let [e (if (number? d) (long d) d)
+                       slice (di/-slice pss
+                                        (datom e attr nil tx0)
+                                        (datom e attr nil txmax)
+                                        :eavt)]
+                   (doseq [^Datom sd slice]
+                     (when (and (= (.-e sd) e) (= (.-a sd) attr))
+                       (let [arr (object-array 2)]
+                         (aset arr e-pos (Long/valueOf (.-e sd)))
+                         (aset arr v-pos (.-v sd))
+                         (.add result arr)))))
+                 (let [slice (di/-slice pss
+                                        (datom e0 attr d tx0)
+                                        (datom emax attr d txmax)
+                                        :avet)]
+                   (doseq [^Datom sd slice]
+                     (when (and (= (.-a sd) attr) (= (.-v sd) d))
+                       (let [arr (object-array 2)]
+                         (aset arr e-pos (Long/valueOf (.-e sd)))
+                         (aset arr v-pos (.-v sd))
+                         (.add result arr)))))))))
          (when (pos? (.size result))
            (rel/->Relation (zipmap head-vars (range)) (vec result)))))
      :cljs nil))
@@ -3012,14 +3131,14 @@
    Adds them to the demand set. Returns true if new values were added."
   [delta-rel prop-pos ^java.util.HashSet demand-set]
   (let [tuples (:tuples delta-rel)
-        initial-size (.size demand-set)]
+        initial-size #?(:clj (.size demand-set) :cljs (.-size demand-set))]
     (doseq [tuple tuples]
       (let [v #?(:clj (if (instance? object-array-class tuple)
                         (aget ^objects tuple (int prop-pos))
                         (nth tuple prop-pos))
                  :cljs (aget tuple prop-pos))]
         (.add demand-set v)))
-    (> (.size demand-set) initial-size)))
+    (> #?(:clj (.size demand-set) :cljs (.-size demand-set)) initial-size)))
 
 (defn- execute-recursive-rule
   "Execute a recursive rule via semi-naive fixpoint with clause versions.
@@ -3037,7 +3156,7 @@
    Each rule has its own accumulator."
   [db op ctx]
   (let [{:keys [scc-rule-plans scc-rule-names call-args head-vars rule-name
-                base-scan-attr]} op]
+                base-scan-info rec-expand-infos]} op]
     (if (nil? scc-rule-plans)
       ;; No pre-built plans — fall back to legacy
       (let [clause (:clause op)]
@@ -3045,9 +3164,23 @@
           (#?(:clj legacy/solve-rule :cljs (rel/get-legacy-fn :solve-rule)) ctx clause)))
       ;; Semi-naive fixpoint over ALL SCC rules
       ;; Uses mutable HashSet for deduplication (avoids PersistentVector allocation)
-      (let [;; Magic set detection — only for single-rule SCCs with binary head vars
-            ;; and at least one ground call-arg
-            magic-info (compute-magic-info call-args head-vars scc-rule-names)
+      (let [;; Magic set detection — only for single-rule SCCs with binary head
+            ;; vars, exactly one ground call-arg, AND a rule topology the demand
+            ;; scheme is provably sound for (see `magic-direction-ok?`). Reverse
+            ;; base scans additionally need the attr AVET-indexed.
+            ;; CLJS: disabled — magic-base-scan (and the reverse AVET lookup) are
+            ;; `:cljs nil`, so the demand-driven base scan returns nothing, and the
+            ;; demand machinery used JVM HashSet interop (`.size` threw on js/Set;
+            ;; 2026-07-11, see cljs-recursive-rule-test). Port all three with
+            ;; platform-correct interop before enabling.
+            magic-info #?(:clj (when-let [mi (when *fixpoint-shortcuts?*
+                                               (compute-magic-info call-args head-vars scc-rule-names))]
+                                 (let [g (ffirst (:ground-positions mi))]
+                                   (when (and (magic-direction-ok? g base-scan-info rec-expand-infos)
+                                              (or (= g (:e-head-pos base-scan-info))
+                                                  (dbu/indexing? db (:attr base-scan-info))))
+                                     mi)))
+                          :cljs nil)
             magic-demand (when magic-info
                            (let [hs #?(:clj (java.util.HashSet. 64) :cljs (js/Set.))
                                  ground-pos (ffirst (:ground-positions magic-info))
@@ -3059,6 +3192,30 @@
                             #?(:clj (java.util.HashSet. 64) :cljs (js/Set.)))
             magic-ground-pos (when magic-info (ffirst (:ground-positions magic-info)))
             magic-prop-pos (when magic-info (:propagation-pos magic-info))
+            ;; Restrict the outer context's relations to those sharing at
+            ;; least one var with the SCC's plans (head vars + renamed body
+            ;; vars). Rule branch bodies are var-renamed, so an unrelated
+            ;; outer relation can never CONSTRAIN them — feeding it in only
+            ;; cross-products every branch execution on every fixpoint
+            ;; iteration (the 2026-07-11 pod OOM's amplification source).
+            ;; The legacy engine scopes rule contexts this way by
+            ;; construction. Dropping a shared-nothing EMPTY relation is
+            ;; also sound: it still empties the overall result when the
+            ;; final rel joins back into the untouched outer ctx below.
+            plan-vars (into #{}
+                            (mapcat (fn [[_ {:keys [head-vars base-plans
+                                                    rec-clause-versions]}]]
+                                      (concat head-vars
+                                              (mapcat (fn [p] (mapcat :vars (:ops p)))
+                                                      base-plans)
+                                              (mapcat (fn [p] (mapcat :vars (:ops p)))
+                                                      rec-clause-versions))))
+                            scc-rule-plans)
+            scoped-ctx (update ctx :rels
+                               (fn [rels]
+                                 (filterv (fn [rel]
+                                            (boolean (some plan-vars (keys (:attrs rel)))))
+                                          rels)))
             ;; Create per-rule seen-sets for deduplication across iterations
             seen-sets (into {} (map (fn [rn]
                                       [rn #?(:clj (java.util.HashSet. 256)
@@ -3070,12 +3227,14 @@
             (into {}
                   (map (fn [rn]
                          (let [{:keys [head-vars base-plans]} (get scc-rule-plans rn)
-                               base-rel (if (and magic-demand base-scan-attr (= rn rule-name))
-                                 ;; Magic: direct EAVT point lookups for demand entities
-                                          (or (magic-base-scan db head-vars base-scan-attr magic-demand magic-scanned)
+                               base-rel (if (and magic-demand (= rn rule-name))
+                                 ;; Magic: direct index point lookups for demand values
+                                 ;; (magic-info is only non-nil when base-scan-info is)
+                                          (or (magic-base-scan db head-vars base-scan-info
+                                                               magic-ground-pos magic-demand magic-scanned)
                                               (rel/->Relation (zipmap head-vars (range)) []))
                                  ;; Normal: full base branch plan execution
-                                          (execute-branch-plans db base-plans ctx head-vars))
+                                          (execute-branch-plans db base-plans scoped-ctx head-vars))
                                delta-rel (rel-dedup-into! base-rel head-vars (get seen-sets rn))]
                   ;; Propagate magic demand from base results
                            (when (and magic-demand (= rn rule-name))
@@ -3112,7 +3271,7 @@
                                             :delta (:delta-rel s)
                                             :output-vars hv}])))
                               states)
-                        base-aug-ctx (assoc ctx :rule-accumulators acc-map)
+                        base-aug-ctx (assoc scoped-ctx :rule-accumulators acc-map)
                         ;; With magic: inject demand relation to constrain recursive scans
                         aug-ctx (if use-magic?
                                   (inject-magic-relation base-aug-ctx head-vars
@@ -3126,9 +3285,9 @@
                                   ;; With magic: scan newly demanded entities AND run
                                   ;; recursive branches (constrained by demand relation).
                                            magic-base-rel
-                                           (when (and use-magic? base-scan-attr (= rn rule-name))
-                                             (magic-base-scan db head-vars base-scan-attr
-                                                              magic-demand magic-scanned))
+                                           (when (and use-magic? (= rn rule-name))
+                                             (magic-base-scan db head-vars base-scan-info
+                                                              magic-ground-pos magic-demand magic-scanned))
                                   ;; Execute recursive clause versions
                                   ;; Optimization: delta-driven expansion for simple binary rules
                                   ;; Instead of full index scan + hash-join, iterate delta tuples
@@ -3140,60 +3299,48 @@
                                   ;; Heuristic: delta-driven wins when delta is very small.
                                   ;; Each AVET lookup costs ~20µs vs scan-all at ~0.3µs/edge.
                                   ;; For 1K edges, break-even is ~15 lookups. Use threshold 16.
-                                  ;; Only delta-driven when ALL rec clause versions have
-                                  ;; a DB pattern (entity-group/pattern-scan). Pure rule-lookup
-                                  ;; clauses (e.g., symmetric rule (follow ?e2 ?e1)) don't
-                                  ;; have DB patterns — delta-driven would skip them entirely.
-                                           rec-has-db-pattern?
-                                           (every? (fn [cv-plan]
-                                                     (some #(#{:entity-group :pattern-scan} (:op %))
-                                                           (:ops cv-plan)))
-                                                   rec-clause-versions)
-                                  ;; delta-driven-expand emits `[entity-id,
-                                  ;; propagated-y]` per AVET hit. That's correct
-                                  ;; only for simple transitive closure shapes
-                                  ;; — `(rule ?x ?y) [?x :attr ?prev-y]
-                                  ;; (rule ?prev-y ?z)` and the like, where the
-                                  ;; recursive body is exhausted by the
-                                  ;; reverse-index step. Any `:function` (e.g.
-                                  ;; arithmetic on a counter, get-else
-                                  ;; column-extraction), `:predicate`
-                                  ;; (filtering on a get-else output), or
-                                  ;; `:attached-preds` on the entity-group is
-                                  ;; SILENTLY SKIPPED by the shortcut, producing
-                                  ;; wrong tuples (eg `[entity-id, 0]` instead
-                                  ;; of `[node-id, depth+1]` for a tree-walk
-                                  ;; CTE). Only fire the optimization when every
-                                  ;; recursive-clause version is reducible to
-                                  ;; `:rule-lookup` + one `:entity-group` /
-                                  ;; `:pattern-scan` with no attached predicates.
-                                           rec-shape-simple?
-                                           (every? (fn [cv-plan]
-                                                     (every? (fn [op]
-                                                               (case (:op op)
-                                                                 (:rule-lookup :pattern-scan)
-                                                                 true
-                                                                 :entity-group
-                                                                 (empty? (:attached-preds op))
-                                                                 false))
-                                                             (:ops cv-plan)))
-                                                   rec-clause-versions)
-                                           use-delta-driven? (and base-scan-attr
-                                                                  rec-has-db-pattern?
-                                                                  rec-shape-simple?
-                                                                  (= rn rule-name)
-                                                                  (= 1 (count scc-rule-names))
-                                                                  (= 2 (count head-vars))
-                                                                  (pos? delta-size)
-                                                                  (< delta-size 16)
-                                                         ;; AVET reverse lookup requires indexed attr
-                                                                  (dbu/indexing? db base-scan-attr))
+                                  ;;
+                                  ;; `rec-expand-infos` (lowering-time, see rec-expand-info
+                                  ;; in lower.cljc) is non-nil only when EVERY recursive
+                                  ;; clause version is exactly one simple binary pattern +
+                                  ;; one rule-lookup, and it carries each version's join
+                                  ;; topology so the expansion steps in the clause's ACTUAL
+                                  ;; direction. That subsumes the old op-type-only guards
+                                  ;; (rec-has-db-pattern? / rec-shape-simple?), which never
+                                  ;; checked direction — the forward form
+                                  ;; `[?m :attr ?a] (rule ?m ?d)` took the reverse-lookup
+                                  ;; shortcut and truncated the closure (2026-07-11; see
+                                  ;; cljs-recursive-rule-test).
+                                  ;; CLJS: delta-driven-expand is `:cljs nil` — taking the
+                                  ;; shortcut there returns an EMPTY rec-rel and silently
+                                  ;; TERMINATES the fixpoint mid-closure (depth-1 truncation
+                                  ;; bug, 2026-07-11; see cljs-recursive-rule-test). Port the
+                                  ;; expansion with platform-correct interop before enabling.
+                                           use-delta-driven?
+                                           #?(:cljs false
+                                              :clj (and *fixpoint-shortcuts?*
+                                                        rec-expand-infos
+                                                        (= rn rule-name)
+                                                        (= 1 (count scc-rule-names))
+                                                        (= 2 (count head-vars))
+                                                        (pos? delta-size)
+                                                        (< delta-size 16)
+                                                        ;; reverse (AVET) expansion requires an
+                                                        ;; indexed attr; forward EAVT always works
+                                                        (every? (fn [{:keys [attr link-pattern-pos]}]
+                                                                  (or (= :e link-pattern-pos)
+                                                                      (dbu/indexing? db attr)))
+                                                                rec-expand-infos)))
                                            rec-rel (if use-delta-driven?
-                                            ;; Delta-driven: for each delta(?t,?y), AVET lookup ?x
-                                                     (or (delta-driven-expand db head-vars base-scan-attr
-                                                                              (:delta-rel delta-state)
-                                                                              0 1)
-                                                         (rel/->Relation (zipmap head-vars (range)) []))
+                                            ;; Delta-driven: point-lookup expansion per version
+                                                     (let [rels (into []
+                                                                      (keep #(delta-driven-expand
+                                                                              db head-vars %
+                                                                              (:delta-rel delta-state)))
+                                                                      rec-expand-infos)]
+                                                       (if (seq rels)
+                                                         (reduce rel/sum-rel rels)
+                                                         (rel/->Relation (zipmap head-vars (range)) [])))
                                             ;; Normal: full branch plan execution
                                                      (execute-branch-plans db rec-clause-versions aug-ctx head-vars))
                                   ;; Union base and rec results

@@ -30,7 +30,8 @@
             ;; tests' `<!` on a Promise throws. They are excluded from
             ;; this runner; port them to `await`/`^:async` (as this ns
             ;; was) if/when the Promise-contract equivalents are needed.
-            [datahike.test.query-getelse-test]))
+            [datahike.test.query-getelse-test]
+            [datahike.test.cljs-recursive-rule-test]))
 
 ;; Hook cljs.test's end-of-run callback so the Node process exits with
 ;; status 0 only when all tests pass.
@@ -307,4 +308,5 @@
                ;; optimistic-test / valid-time-test excluded — upstream
                ;; channel-contract tests, incompatible with this fork's
                ;; Promise contract (see require block above).
-               'datahike.test.query-getelse-test))
+               'datahike.test.query-getelse-test
+               'datahike.test.cljs-recursive-rule-test))

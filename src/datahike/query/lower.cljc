@@ -292,6 +292,113 @@
     ;; Put const-bindings first so synthetic vars are bound before body uses them
     (into const-bindings renamed)))
 
+(defn- simple-binary-pattern
+  "If `op` is a bare pattern scan over `[?e :attr ?v]` — free entity and
+   value vars, ground attribute, no pushdown predicates, not optional —
+   return {:e ?e :attr attr :v ?v}. Otherwise nil.
+
+   Used to derive the structural topology info that gates the fixpoint
+   executor's delta-driven and magic-set shortcuts (see
+   `execute-recursive-rule`). Anything richer than this shape (predicates,
+   functions, entity groups, ground endpoints) must take the plain plan
+   path, so returning nil is always safe."
+  [op]
+  (when (and (= :pattern-scan (:op op))
+             (empty? (:pushdown-preds op))
+             (not (:optional? op)))
+    (let [clause (:clause op)]
+      (when (and (sequential? clause) (= 3 (count clause)))
+        (let [[e a v] clause]
+          (when (and (analyze/free-var? e)
+                     (analyze/free-var? v)
+                     (not= e v)
+                     (some? a)
+                     (not (analyze/free-var? a)))
+            {:e e :attr a :v v}))))))
+
+(defn- base-scan-info
+  "Structural info for the magic-set demand-driven base scan.
+
+   Applicable only when the rule has EXACTLY ONE base branch whose plan is
+   a single simple binary pattern over both head vars. Returns
+   {:attr attr :e-head-pos 0|1} — `:e-head-pos` is the head position whose
+   var sits at the pattern's ENTITY slot, which tells the executor whether
+   a demanded head value is looked up forward (EAVT, demand var at E) or
+   reverse (AVET, demand var at V). Nil disables the magic base scan
+   (plain base-plan execution, always correct)."
+  [head-vars base-plans]
+  (when (and (= 1 (count base-plans))
+             (= 2 (count head-vars)))
+    (let [ops (vec (:ops (first base-plans)))]
+      (when (= 1 (count ops))
+        (when-let [{:keys [e v] :as info} (simple-binary-pattern (first ops))]
+          (when (= (set head-vars) #{e v})
+            {:attr (:attr info)
+             :e-head-pos (if (= e (nth head-vars 0)) 0 1)}))))))
+
+(defn- rec-expand-info
+  "Structural topology of ONE recursive clause version, when it is exactly
+   `[pattern] (rule ?c0 ?c1)` — one simple binary pattern plus one
+   rule-lookup — linked by a single fresh var. Returns
+
+     {:attr             pattern attribute
+      :link-pattern-pos :e | :v   — where the link var sits in the pattern
+      :link-call-pos    0 | 1     — where the link var sits in the call
+      :pattern-head-pos 0 | 1     — head position the pattern's OTHER var
+                                    (a head var) occupies}
+
+   or nil for any other shape. The delta-driven expansion solves the
+   pattern's head var from a delta tuple's link value: `:v` means the link
+   is the pattern VALUE (reverse AVET lookup of entities pointing at it,
+   e.g. `[?x :edge ?z] (reach ?z ?y)`), `:e` means the link is the pattern
+   ENTITY (forward EAVT lookup of its attr values, e.g.
+   `[?m :parent ?a] (descendant ?m ?d)`). The two forms recurse in
+   opposite directions — this info is what makes the executor's shortcuts
+   direction-aware instead of assuming the `:v` form (2026-07-11)."
+  [head-vars cv-plan]
+  (let [ops (vec (:ops cv-plan))]
+    (when (= 2 (count ops))
+      (let [rl (first (filter #(= :rule-lookup (:op %)) ops))
+            ps (first (filter #(= :pattern-scan (:op %)) ops))]
+        (when (and rl ps)
+          (when-let [{:keys [e attr v]} (simple-binary-pattern ps)]
+            (let [call-args (:call-args rl)]
+              (when (and (= 2 (count call-args))
+                         (every? analyze/free-var? call-args)
+                         (apply distinct? call-args))
+                (let [head-set (set head-vars)
+                      pattern-vars #{e v}
+                      links (filterv #(and (pattern-vars %)
+                                           (not (head-set %)))
+                                     call-args)]
+                  (when (= 1 (count links))
+                    (let [link (first links)
+                          link-call-pos (if (= link (nth call-args 0)) 0 1)
+                          pass (nth call-args (- 1 link-call-pos))
+                          pattern-head-var (if (= link e) v e)]
+                      (when (head-set pattern-head-var)
+                        (let [p (if (= pattern-head-var (nth head-vars 0)) 0 1)]
+                          ;; the call's pass-through arg must be the OTHER
+                          ;; head var — then a delta tuple fully determines
+                          ;; the emitted head tuple
+                          (when (= pass (nth head-vars (- 1 p)))
+                            {:attr attr
+                             :link-pattern-pos (if (= link e) :e :v)
+                             :link-call-pos link-call-pos
+                             :pattern-head-pos p}))))))))))))))
+
+(defn- rec-expand-infos
+  "Per-version `rec-expand-info` for ALL recursive clause versions, or nil
+   if ANY version doesn't conform. All-or-nothing: the delta-driven
+   shortcut replaces the whole rec-branch execution, so it may only fire
+   when every version is expandable."
+  [head-vars rec-clause-versions]
+  (when (and (= 2 (count head-vars))
+             (seq rec-clause-versions))
+    (let [infos (mapv #(rec-expand-info head-vars %) rec-clause-versions)]
+      (when (every? some? infos)
+        infos))))
+
 (defn plan-rule-op [db clause-info bound-vars rules scc-info]
   (let [[rule-name & call-args] (:clause clause-info)
         ;; Validate: non-var rule args must be scalars (not collections/maps)
@@ -428,21 +535,22 @@
                 ;; an empty ctx, `legacy/bind-by-fn` produces a single-tuple
                 ;; Relation, and the recursive branch's `rule-lookup` ops feed
                 ;; off the accumulator as usual. Magic sets are silently
-                ;; skipped when `base-scan-attr` is nil (the
-                ;; `and magic-demand base-scan-attr …` check in
-                ;; `execute-recursive-rule`). The guard was redundant and
+                ;; skipped when `base-info` is nil (the
+                ;; `magic-direction-ok?` gate in `execute-recursive-rule`).
+                ;; An earlier `has-scanless-base?` guard was redundant and
                 ;; introduced a real regression for scanless-base recursion.
-                ;; Extract base scan attribute for magic set optimization
-                base-scan-attr
+                ;;
+                ;; Structural topology info for the executor's shortcuts
+                ;; (magic-set base scan + delta-driven expansion). Nil for
+                ;; any non-conforming shape → plain fixpoint, always correct.
+                base-info
                 (when scc-rule-plans
-                  (let [bp (first (:base-plans (get scc-rule-plans rule-name)))]
-                    (when bp
-                      (some (fn [op]
-                              (case (:op op)
-                                :entity-group (get (:clause (:scan-op op)) 1)
-                                :pattern-scan (get (:clause op) 1)
-                                nil))
-                            (:ops bp)))))]
+                  (let [{:keys [head-vars base-plans]} (get scc-rule-plans rule-name)]
+                    (base-scan-info head-vars base-plans)))
+                rec-infos
+                (when scc-rule-plans
+                  (let [{:keys [head-vars rec-clause-versions]} (get scc-rule-plans rule-name)]
+                    (rec-expand-infos head-vars rec-clause-versions)))]
             {:op :recursive-rule
              :clause (:clause clause-info)
              :rule-name rule-name
@@ -452,7 +560,8 @@
              :scc-rule-plans scc-rule-plans
              :base-plans (when scc-rule-plans (:base-plans (get scc-rule-plans rule-name)))
              :rec-clause-versions (when scc-rule-plans (:rec-clause-versions (get scc-rule-plans rule-name)))
-             :base-scan-attr base-scan-attr
+             :base-scan-info base-info
+             :rec-expand-infos rec-infos
              :vars (:vars clause-info)
              :estimated-card nil})
           ;; Non-recursive — expand to OR
