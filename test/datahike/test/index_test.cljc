@@ -317,6 +317,28 @@
               [5 :age 20]
               [4 :age 45]])))))
 
+(deftest test-false-valued-temporal-upsert
+  (let [base (db/empty-db {:flag {}}
+                          {:keep-history? true
+                           :schema-flexibility :read})
+        asserted (d/db-with base [[:db/add 1 :flag false]])
+        reasserted (d/db-with asserted [[:db/add 1 :flag false]])
+        changed (d/db-with reasserted [[:db/add 1 :flag true]])
+        events (fn [db]
+                 (into #{}
+                       (map (juxt :v :tx :added))
+                       (d/datoms (d/history db) :eavt 1 :flag)))
+        initial-events (events asserted)
+        changed-tx (:max-tx changed)]
+    (testing "reasserting false is history-idempotent"
+      (is (= initial-events (events reasserted))))
+    (testing "replacing false records both sides of the change"
+      (is (= (conj initial-events
+                   [false changed-tx false]
+                   [true changed-tx true])
+             (events changed)))
+      (is (true? (:flag (d/entity changed 1)))))))
+
 (deftest test-upsert-replace-comparators
   (testing "Replace comparators return 0 for old/new datom pairs"
     (let [old-datom (dd/datom 1 :name "Ivan" 100 true)

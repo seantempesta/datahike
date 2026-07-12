@@ -151,10 +151,11 @@
          :cljs (psset/replace pset old-datom datom (dd/index-type->cmp-replace index-type))))
     (psset/conj pset datom (index-type->cmp-quick index-type))))
 
-(defn temporal-upsert [pset ^Datom datom index-type {old-val :v}]
-  (let [{:keys [e a v tx added]} datom]
+(defn temporal-upsert [pset ^Datom datom index-type old-datom]
+  (let [{:keys [e a v tx added]} datom
+        old-val (:v old-datom)]
     (if added
-      (if old-val
+      (if (some? old-datom)
         (if (= v old-val)
           pset
           (-> pset
@@ -163,7 +164,7 @@
               (psset/conj datom
                           (index-type->cmp-quick index-type false))))
         (psset/conj pset datom (index-type->cmp-quick index-type false)))
-      (if old-val
+      (if (some? old-datom)
         (psset/conj pset
                     (dd/datom e a old-val tx false)
                     (index-type->cmp-quick index-type false))
