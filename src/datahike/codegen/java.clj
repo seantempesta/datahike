@@ -217,23 +217,27 @@
       (str/replace #"&" "&amp;")
       (str/replace #"@" "{@literal @}")))
 
+(defn- javadoc-line [line]
+  (let [escaped (escape-javadoc line)]
+    (str "     *" (when (seq escaped) (str " " escaped)))))
+
 (defn format-javadoc
   "Format a docstring and examples as javadoc comment."
   [doc examples]
   (when doc
     (let [lines (str/split-lines doc)
-          doc-lines (map #(str "     * " (escape-javadoc %)) lines)
+          doc-lines (map javadoc-line lines)
           ;; Add examples if available
           example-lines (when (seq examples)
                           (concat
-                           ["     * "
+                           ["     *"
                             "     * <h3>Examples:</h3>"
                             "     * <pre>{@code"]
                            (mapcat
                             (fn [{:keys [desc code]}]
                               (concat
                                [(str "     * // " (escape-javadoc desc))]
-                               (map #(str "     * " (escape-javadoc %))
+                               (map javadoc-line
                                     (str/split-lines code))))
                             (take 2 examples))
                            ["     * }</pre>"]))]

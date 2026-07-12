@@ -92,7 +92,7 @@ class DatahikeGenerated {
 
     /**
      * Create a new branch from an existing branch or commit. Secondary indices are CoW-branched automatically.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Branch from main
@@ -107,7 +107,7 @@ class DatahikeGenerated {
 
     /**
      * Load the database at a branch head. First argument can be a connection, db value, or raw store.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Load db at branch
@@ -120,7 +120,7 @@ class DatahikeGenerated {
 
     /**
      * List all known branch names. Returns set of keywords.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // List branches
@@ -133,7 +133,7 @@ class DatahikeGenerated {
 
     /**
      * Load the database at a specific commit. First argument can be a connection, db value, or raw store.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Load db at commit
@@ -146,7 +146,7 @@ class DatahikeGenerated {
 
     /**
      * Retrieve the commit-id for this database value.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Get commit id
@@ -159,7 +159,7 @@ class DatahikeGenerated {
 
     /**
      * Connects to a Datahike database via configuration map.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Connect to default in-memory database
@@ -174,7 +174,7 @@ class DatahikeGenerated {
 
     /**
      * Connects to a Datahike database via configuration map.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Connect to default in-memory database
@@ -189,7 +189,7 @@ class DatahikeGenerated {
 
     /**
      * Connects to a Datahike database via configuration map.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Connect to default in-memory database
@@ -204,7 +204,7 @@ class DatahikeGenerated {
 
     /**
      * Creates a database via configuration map.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Create empty database
@@ -219,7 +219,7 @@ class DatahikeGenerated {
 
     /**
      * Creates a database via configuration map.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Create empty database
@@ -234,7 +234,7 @@ class DatahikeGenerated {
 
     /**
      * Checks if a database exists via configuration map.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Check if in-memory database exists
@@ -249,7 +249,7 @@ class DatahikeGenerated {
 
     /**
      * Checks if a database exists via configuration map.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Check if in-memory database exists
@@ -264,7 +264,7 @@ class DatahikeGenerated {
 
     /**
      * Index lookup. Returns sequence of datoms matching index components.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Find all datoms for entity
@@ -279,7 +279,7 @@ class DatahikeGenerated {
 
     /**
      * Index lookup. Returns sequence of datoms matching index components.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Find all datoms for entity
@@ -294,7 +294,7 @@ class DatahikeGenerated {
 
     /**
      * Returns the underlying immutable database value from a connection. Prefer using {@literal @}conn directly.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Get database from connection
@@ -309,7 +309,7 @@ class DatahikeGenerated {
 
     /**
      * Applies transaction to immutable db value, returns new db. Same as (:db-after (with db tx-data)).
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Get db after transaction
@@ -322,7 +322,7 @@ class DatahikeGenerated {
 
     /**
      * Remove a branch after releasing any connection to that branch. The branch data remains accessible until the next GC.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Delete branch
@@ -335,7 +335,7 @@ class DatahikeGenerated {
 
     /**
      * Deletes a database given via configuration map. All connections to the database must be released first.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Delete database
@@ -348,7 +348,7 @@ class DatahikeGenerated {
 
     /**
      * Deletes a database given via configuration map. All connections to the database must be released first.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Delete database
@@ -361,7 +361,7 @@ class DatahikeGenerated {
 
     /**
      * Retrieves an entity by its id. Returns lazy map-like structure.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Get entity by id
@@ -376,7 +376,7 @@ class DatahikeGenerated {
 
     /**
      * Returns database that entity was created from.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Get entity's database
@@ -389,7 +389,7 @@ class DatahikeGenerated {
 
     /**
      * Returns a human-readable string explaining the query plan. Shows index selection, scan/merge ordering, recursive rule structure (SCC, base cases, clause versions), and estimated cardinalities. Takes the same arguments as `q`.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Explain a simple query
@@ -404,7 +404,7 @@ class DatahikeGenerated {
 
     /**
      * Returns filtered view over database. Only includes datoms where (pred db datom) is true.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Filter to recent datoms
@@ -443,7 +443,7 @@ class DatahikeGenerated {
 
     /**
      * Forks the source database into an independent, writable target database. Copies the source store, then points the target's :db branch at the commit selected by :at in the options map — a tx-id long (exact :max-tx match), an inst (newest commit at or before it), or absent for the head. The fork preserves entity ids, transaction ids, tx-meta, schema and history byte-faithfully as of the fork point; new transactions continue from there. The target gets a fresh store identity (minted when the target config carries no [:store :id]). Returns the target's effective config — connect with exactly that value.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Fork at head
@@ -458,7 +458,7 @@ class DatahikeGenerated {
 
     /**
      * Forks the source database into an independent, writable target database. Copies the source store, then points the target's :db branch at the commit selected by :at in the options map — a tx-id long (exact :max-tx match), an inst (newest commit at or before it), or absent for the head. The fork preserves entity ids, transaction ids, tx-meta, schema and history byte-faithfully as of the fork point; new transactions continue from there. The target gets a fresh store identity (minted when the target config carries no [:store :id]). Returns the target's effective config — connect with exactly that value.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Fork at head
@@ -473,7 +473,7 @@ class DatahikeGenerated {
 
     /**
      * Invokes garbage collection on connection's store. Removes old snapshots before given time point.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // GC all old snapshots
@@ -488,7 +488,7 @@ class DatahikeGenerated {
 
     /**
      * Invokes garbage collection on connection's store. Removes old snapshots before given time point.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // GC all old snapshots
@@ -503,7 +503,7 @@ class DatahikeGenerated {
 
     /**
      * Returns full historical state of database including all assertions and retractions.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Query historical data
@@ -516,7 +516,7 @@ class DatahikeGenerated {
 
     /**
      * Returns part of :avet index between start and end values.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Find datoms in value range
@@ -531,7 +531,7 @@ class DatahikeGenerated {
 
     /**
      * Returns true if database was filtered using filter, false otherwise.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Check if filtered
@@ -544,7 +544,7 @@ class DatahikeGenerated {
 
     /**
      * Listen for changes on connection. Callback called with transaction report on each transact. WARNING: Inside the callback, use only async operations (transact!, merge-db!) — synchronous writer operations will deadlock.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Listen with callback
@@ -559,7 +559,7 @@ class DatahikeGenerated {
 
     /**
      * Listen for changes on connection. Callback called with transaction report on each transact. WARNING: Inside the callback, use only async operations (transact!, merge-db!) — synchronous writer operations will deadlock.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Listen with callback
@@ -574,7 +574,7 @@ class DatahikeGenerated {
 
     /**
      * Load entities directly (bulk load).
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Bulk load entities
@@ -587,7 +587,7 @@ class DatahikeGenerated {
 
     /**
      * Create a merge commit combining the current branch with parent branches/commits. The caller provides the merged tx-data. Routed through the writer for serialization. Blocks until committed. WARNING: Do not call from listener callbacks — use merge-db! instead to avoid deadlocks.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Merge feature into main
@@ -602,7 +602,7 @@ class DatahikeGenerated {
 
     /**
      * Create a merge commit combining the current branch with parent branches/commits. The caller provides the merged tx-data. Routed through the writer for serialization. Blocks until committed. WARNING: Do not call from listener callbacks — use merge-db! instead to avoid deadlocks.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Merge feature into main
@@ -617,7 +617,7 @@ class DatahikeGenerated {
 
     /**
      * Async version of merge-db. Returns a promise (CLJ) or channel (CLJS). Safe to call from listener callbacks and go blocks.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Async merge
@@ -630,7 +630,7 @@ class DatahikeGenerated {
 
     /**
      * Async version of merge-db. Returns a promise (CLJ) or channel (CLJS). Safe to call from listener callbacks and go blocks.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Async merge
@@ -643,7 +643,7 @@ class DatahikeGenerated {
 
     /**
      * Returns database metrics (datom counts, index sizes, etc).
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Get metrics
@@ -656,7 +656,7 @@ class DatahikeGenerated {
 
     /**
      * Retrieve parent commit ids from this database value.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Get parent commits
@@ -669,7 +669,7 @@ class DatahikeGenerated {
 
     /**
      * Fetches data using recursive declarative pull pattern.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Pull with pattern
@@ -684,7 +684,7 @@ class DatahikeGenerated {
 
     /**
      * Fetches data using recursive declarative pull pattern.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Pull with pattern
@@ -699,7 +699,7 @@ class DatahikeGenerated {
 
     /**
      * Same as pull, but accepts sequence of ids and returns sequence of maps.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Pull multiple entities
@@ -712,7 +712,7 @@ class DatahikeGenerated {
 
     /**
      * Same as pull, but accepts sequence of ids and returns sequence of maps.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Pull multiple entities
@@ -725,7 +725,7 @@ class DatahikeGenerated {
 
     /**
      * Executes a datalog query.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Query with vector syntax
@@ -740,7 +740,7 @@ class DatahikeGenerated {
 
     /**
      * Executes a datalog query.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Query with vector syntax
@@ -755,7 +755,7 @@ class DatahikeGenerated {
 
     /**
      * Executes query and returns execution statistics.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Query with stats
@@ -768,7 +768,7 @@ class DatahikeGenerated {
 
     /**
      * Executes query and returns execution statistics.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Query with stats
@@ -781,7 +781,7 @@ class DatahikeGenerated {
 
     /**
      * Releases a database connection.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Release connection
@@ -794,7 +794,7 @@ class DatahikeGenerated {
 
     /**
      * Returns reverse schema definition (attribute id to ident mapping).
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Get reverse schema
@@ -807,7 +807,7 @@ class DatahikeGenerated {
 
     /**
      * Like seek-datoms, but iterates BACKWARDS: datoms &amp;lt;= the given components, descending to the beginning of the index. Lazy on the persistent-sorted-set index — the primitive for windowed backwards pagination (latest-N, N-before-cursor).
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Latest room messages, newest first
@@ -820,7 +820,7 @@ class DatahikeGenerated {
 
     /**
      * Like seek-datoms, but iterates BACKWARDS: datoms &amp;lt;= the given components, descending to the beginning of the index. Lazy on the persistent-sorted-set index — the primitive for windowed backwards pagination (latest-N, N-before-cursor).
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Latest room messages, newest first
@@ -833,7 +833,7 @@ class DatahikeGenerated {
 
     /**
      * Returns current schema definition.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Get schema
@@ -846,7 +846,7 @@ class DatahikeGenerated {
 
     /**
      * Like datoms, but returns datoms starting from specified components through end of index.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Seek from entity
@@ -859,7 +859,7 @@ class DatahikeGenerated {
 
     /**
      * Like datoms, but returns datoms starting from specified components through end of index.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Seek from entity
@@ -872,7 +872,7 @@ class DatahikeGenerated {
 
     /**
      * Returns database state since given time point (Date or transaction ID). Contains only datoms added since that point.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Query since date
@@ -887,7 +887,7 @@ class DatahikeGenerated {
 
     /**
      * Allocates temporary id (negative integer). Prefer using negative integers directly.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Generate tempid
@@ -902,7 +902,7 @@ class DatahikeGenerated {
 
     /**
      * Allocates temporary id (negative integer). Prefer using negative integers directly.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Generate tempid
@@ -917,7 +917,7 @@ class DatahikeGenerated {
 
     /**
      * Applies transaction to the database and updates connection. Blocks until committed. WARNING: Do not call from listener callbacks or transaction functions — use transact! instead to avoid deadlocks.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Add single datom
@@ -932,7 +932,7 @@ class DatahikeGenerated {
 
     /**
      * Same as transact, but asynchronously returns a future. Safe to call from listener callbacks and go blocks.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Async transaction
@@ -945,7 +945,7 @@ class DatahikeGenerated {
 
     /**
      * Removes registered listener from connection.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Remove listener
@@ -960,7 +960,7 @@ class DatahikeGenerated {
      * Strip any valid-time markers from `db` so the full vt-history is
      *            visible. Idempotent. Does not unwrap an existing FilteredDB; to
      *            drop an active filter, start from the unwrapped db.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Drop vt-marker for full-history query
@@ -976,7 +976,7 @@ class DatahikeGenerated {
      *            indices push the filter through `-search-at-vt`. Valid-time is a
      *            secondary-index axis; regular datalog patterns still require the
      *            built-in `(valid-at ?tx ?at)` rule to filter by vt explicitly.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Query as of valid-time
@@ -993,7 +993,7 @@ class DatahikeGenerated {
      *            from AND to` maps to this. Carries
      *            `:datahike/valid-between [from to]` on the result for vt-aware
      *            secondary-index pushdown.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Datoms whose tx vt-window overlaps Q2 2024
@@ -1009,7 +1009,7 @@ class DatahikeGenerated {
      *            in `[from, to)`. Stricter than `valid-between` — overlapping
      *            windows that extend past either endpoint are excluded. Useful
      *            for 'corrections wholly within Q2' style queries.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Corrections whose vt-window was wholly inside Q2
@@ -1022,7 +1022,7 @@ class DatahikeGenerated {
 
     /**
      * Applies transaction to immutable db value. Returns transaction report.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Transaction on db value
@@ -1037,7 +1037,7 @@ class DatahikeGenerated {
 
     /**
      * Applies transaction to immutable db value. Returns transaction report.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Transaction on db value
@@ -1052,7 +1052,7 @@ class DatahikeGenerated {
 
     /**
      * Applies transaction to immutable db value. Returns transaction report.
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Transaction on db value
