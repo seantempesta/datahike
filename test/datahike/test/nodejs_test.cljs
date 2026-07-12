@@ -228,11 +228,10 @@
               cdb (await (d/commit-as-db conn cid))]
           (is (some? cdb) "commit-as-db returns a db"))
 
+        (await (d/release feat-conn))
         (await (d/delete-branch! conn :feature))
         (let [bs (await (d/branches conn))]
-          (is (= #{:db} bs) "Feature branch deleted"))
-
-        (await (d/release feat-conn)))
+          (is (= #{:db} bs) "Feature branch deleted")))
       (await (await (d/release conn))))
 
     (await (d/delete-database cfg))))

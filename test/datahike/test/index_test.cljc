@@ -141,7 +141,8 @@
              [[:age 44]
               [:age 25]])))
 
-    (d/release conn)
+    #?(:clj (d/release conn)
+       :cljs (<!? (d/release conn)))
     #?(:clj (d/delete-database cfg)
        :cljs (<!? (d/delete-database cfg)))))
 
@@ -183,7 +184,8 @@
       (testing "lazy take returns a prefix"
         (is (= (map dvec (take 4 (d/rseek-datoms hist :eavt)))
                (take 4 (map dvec (d/rseek-datoms hist :eavt)))))))
-    (d/release conn)
+    #?(:clj (d/release conn)
+       :cljs (<!? (d/release conn)))
     #?(:clj (d/delete-database cfg)
        :cljs (<!? (d/delete-database cfg)))))
 

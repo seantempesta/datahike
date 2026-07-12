@@ -42,7 +42,7 @@
            (<!? (d/transact! conn [{:db/ident :name :db/valueType :db.type/string
                                    :db/cardinality :db.cardinality/one}
                                   {:name "Alice"}]))
-           (d/release conn))
+           (<!? (d/release conn)))
 
          ;; COLD read #1 — plain :file store over the same backend
          (let [conn (<!? (d/connect backend {:sync? false}))
@@ -50,12 +50,12 @@
                          (catch :default e (str "THREW " (.-message e))))]
            (is (= #{["Alice"]} res)
                "tiered write must reach the durable backend (cold :file read)")
-           (d/release conn))
+           (<!? (d/release conn)))
 
          ;; write again through a RECONNECTED tiered store …
          (let [conn (<!? (d/connect tiered {:sync? false}))]
            (<!? (d/transact! conn [{:name "Bob"}]))
-           (d/release conn))
+           (<!? (d/release conn)))
 
          ;; COLD read #2 — the post-reconnect write must also be durable
          (let [conn (<!? (d/connect backend {:sync? false}))
@@ -63,7 +63,7 @@
                          (catch :default e (str "THREW " (.-message e))))]
            (is (= #{["Alice"] ["Bob"]} res)
                "post-cold-reconnect write must also be durable")
-           (d/release conn))
+           (<!? (d/release conn)))
 
          (<!? (d/delete-database tiered))
          (catch :default e (is false (str "unexpected throw: " (.-message e)))))
