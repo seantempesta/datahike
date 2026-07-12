@@ -16,9 +16,10 @@
             [datahike.writing :as dw]
             [datahike.query :as dq]
             [datahike.kabel.fressian-handlers :as fh]
+            [konserve-sync.transport.kabel-pubsub :as kp]
             [datahike.tools :refer [throwable-promise]]
             [is.simm.distributed-scope :as ds]
-            [superv.async :refer [<?-]]
+            [superv.async :refer [go-try- <?-]]
             #?(:clj [clojure.core.async :refer [go put! promise-chan close!]]
                :cljs [clojure.core.async :refer [go put! promise-chan close!]])
             #?(:clj [replikativ.logging :as log]
@@ -73,7 +74,9 @@
             pending-txs    ; atom: {expected-max-tx -> {:tx-report ... :ch promise-chan}}
             current-max-tx ; atom: current synced max-tx from konserve-sync
             listeners      ; atom: set of listen! callbacks to fire on tx completion
-            conn-atom]     ; atom: reference to the connection (set after connect)
+            conn-atom      ; atom: reference to the connection (set after connect)
+            local-peer     ; kabel client peer used by the sync subscription
+            store-topic]   ; topic to unsubscribe during shutdown
 
   PWriter
 
@@ -142,13 +145,17 @@
       (doseq [[max-tx {:keys [ch]}] @pending-txs]
         (put! ch shutdown-error))
       (reset! pending-txs {})
-      ;; Unregister store from fressian handlers
-      (when store-config
-        (fh/unregister-store! store-config))
-      ;; Return closed channel to signal completion
-      (let [ch (promise-chan)]
-        (put! ch true)
-        ch))))
+      ;; Shutdown owns the subscription it created. Await unsubscription before
+      ;; unregistering the store handlers so no late update can deserialize
+      ;; against a released store.
+      (go-try-
+       (try
+         (when (and local-peer store-topic)
+           (<?- (kp/unsubscribe-store! local-peer store-topic)))
+         true
+         (finally
+           (when store-config
+             (fh/unregister-store! store-config))))))))
 
 ;; =============================================================================
 ;; Connection Reference
@@ -260,24 +267,26 @@
    - store-config: Store config for fressian handler registry cleanup on shutdown
 
    Returns a KabelWriter instance."
-  [peer-id store-id store-config]
+  [peer-id store-id store-config local-peer store-topic]
   (->KabelWriter peer-id
                  store-id
                  store-config
                  (atom {})   ; pending-txs
                  (atom 0)    ; current-max-tx
                  (atom #{})  ; listeners
-                 (atom nil))) ; conn-atom - set via set-connection! after d/connect
+                 (atom nil)  ; conn-atom - set via set-connection! after d/connect
+                 local-peer
+                 store-topic))
 
 ;; =============================================================================
 ;; Multimethod Extensions
 ;; =============================================================================
 
 (defmethod writer/create-writer :kabel
-  [{:keys [peer-id store-config]} _connection]
+  [{:keys [peer-id store-config local-peer store-topic]} _connection]
   ;; Extract store-id from store config :id
   (let [store-id (:id store-config)]
-    (kabel-writer peer-id store-id store-config)))
+    (kabel-writer peer-id store-id store-config local-peer store-topic)))
 
 (defmethod writer/create-database :kabel
   [config & _args]

@@ -191,11 +191,18 @@
 ;; GC: scriptum uses filesystem, nothing in konserve to mark
 (defmethod sec/mark-from-key-map :scriptum [_ _] #{})
 
-;; Branch: open source, fork via scriptum's native segment-sharing fork
-(defmethod sec/branch-from-key-map :scriptum [key-map _store _from-branch new-branch]
-  (let [writer (sc/open-branch (:path key-map) (:branch key-map))]
-    (let [forked (sc/fork writer (name new-branch))]
-      (sc/commit! forked "branch" {"datahike.branch" (name new-branch)})
-      (sc/close! forked))
-    (sc/close! writer)
-    (assoc key-map :branch (name new-branch))))
+;; Scriptum's public API can fork a LIVE writer, which -sec-branch above uses
+;; for an attached current branch. It cannot fork a stored historical Lucene
+;; generation. Opening (:path, :branch) here would both contend with an already
+;; live writer's lock and, worse, silently fork the latest head instead of the
+;; Datahike commit selected by the caller. Reject that unsupported operation
+;; explicitly until Scriptum exposes a generation-pinned writable fork.
+(defmethod sec/check-branch-from-key-map :scriptum [key-map _store from-branch new-branch]
+  (throw (ex-info "Scriptum cannot branch from a detached or historical key map."
+                  {:type :historical-scriptum-branch-unsupported
+                   :from from-branch
+                   :new-branch new-branch
+                   :scriptum-branch (:branch key-map)})))
+
+(defmethod sec/branch-from-key-map :scriptum [key-map _store from-branch new-branch]
+  (sec/check-branch-from-key-map key-map nil from-branch new-branch))

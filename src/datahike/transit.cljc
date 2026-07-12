@@ -1,6 +1,6 @@
 (ns datahike.transit
   "Transit related translations."
-  (:require [datahike.store :refer [store-identity]]
+  (:require [datahike.store :refer [connection-id]]
             [datahike.readers :as readers]
             [datahike.connector]
             [datahike.datom :as dd]
@@ -29,8 +29,7 @@
    (transit/read-handler datahike.db/map->TxReport)})
 
 (defn config->store-id [config]
-  [(store-identity (:store config))
-   (:branch config)])
+  (connection-id config))
 
 (defn db->map [db]
   (let [{:keys [config meta max-eid max-tx]} db]

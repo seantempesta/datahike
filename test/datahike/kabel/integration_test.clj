@@ -239,7 +239,6 @@
       ;; =====================================================================
 
       (release client-conn)
-      (sync/unsubscribe-store! client-peer store-topic)
       (handlers/unregister-store-for-remote-access! store-id server-peer)
       (<?? S (peer/stop server-peer))
       (release server-conn)
@@ -316,7 +315,6 @@
 
       ;; Cleanup
       (release client-conn)
-      (sync/unsubscribe-store! client-peer store-topic)
       (handlers/unregister-store-for-remote-access! store-id server-peer)
       (<?? S (peer/stop server-peer))
       (release server-conn)
@@ -394,7 +392,6 @@
       ;; Cleanup
       (d/unlisten client-conn listener-key)
       (release client-conn)
-      (sync/unsubscribe-store! client-peer store-topic)
       (handlers/unregister-store-for-remote-access! store-id server-peer)
       (<?? S (peer/stop server-peer))
       (release server-conn)
@@ -493,10 +490,9 @@
       ;; =====================================================================
       ;; DISCONNECT FIRST CLIENT - keep server running for reconnect test
       ;; =====================================================================
-      (sync/unsubscribe-store! client-peer-1 store-topic)
+      (release client-conn-1)
       (Thread/sleep 200)  ;; Allow pending callbacks to complete
       (<?? S (peer/stop client-peer-1))
-      (release client-conn-1)
 
       ;; NOTE: Skip server transact here - there's a race condition between
       ;; unsubscribe and write-hook publish that blocks the server transact.
@@ -548,10 +544,9 @@
           (is (some #(= ["Carol" 35] %) all-people) "Carol should exist from cache"))
 
         ;; Cleanup second connection
-        (sync/unsubscribe-store! client-peer-2 store-topic)
+        (release client-conn-2)
         (Thread/sleep 100)
-        (<?? S (peer/stop client-peer-2))
-        (release client-conn-2))
+        (<?? S (peer/stop client-peer-2)))
 
       ;; =====================================================================
       ;; FINAL CLEANUP
@@ -644,9 +639,20 @@
         (> (System/currentTimeMillis) deadline) false
         :else (do (Thread/sleep 100) (recur))))))
 
+(defn- await-key-value
+  "Poll until a key's value satisfies pred, up to timeout-ms."
+  [store key pred timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+    (loop []
+      (let [value (<!! (k/get store key))]
+        (cond
+          (and value (pred value)) true
+          (> (System/currentTimeMillis) deadline) false
+          :else (do (Thread/sleep 100) (recur)))))))
+
 (deftest test-fork-branch-reflects-to-subscriber
   (testing "a server-side FORK branch syncs to a subscribed client and materializes
-            (handshake/walker path AND incremental/key-sort-fn path)"
+            (ordered handshake/walker path and ordered incremental path)"
     (let [port (get-free-port)
           url (str "ws://localhost:" port)
           store-id #uuid "7e570000-0000-0000-0000-000000000003"
@@ -664,6 +670,7 @@
           _ (branch! server-conn :db :pre-fork)
           pre-conn (d/connect (assoc server-config :branch :pre-fork))
           _ (d/transact pre-conn [{:person/name "PreFork" :person/age 10}])
+          _ (release pre-conn)
 
           handler (create-http-kit-handler! S url server-id)
           server-peer (peer/server-peer S handler server-id
@@ -699,11 +706,17 @@
               "client reconstructs the pre-fork branch from synced blocks")
           (release pre)))
 
-      (testing "INCREMENTAL: a fork created AFTER connect propagates (key-sort root-last gate)"
+      (testing "INCREMENTAL: a fork created AFTER connect propagates (ordered root-last gate)"
         (branch! server-conn :db :post-fork)
-        (let [post-conn (d/connect (assoc server-config :branch :post-fork))]
-          (d/transact post-conn [{:person/name "PostFork" :person/age 20}]))
-        (is (await-key client-store :post-fork 8000) ":post-fork head synced incrementally")
+        (let [post-conn (d/connect (assoc server-config :branch :post-fork))
+              post-max-tx (get-in (d/transact post-conn
+                                              [{:person/name "PostFork" :person/age 20}])
+                                  [:db-after :max-tx])]
+          (release post-conn)
+          (is (await-key-value client-store :post-fork
+                               #(>= (:max-tx %) post-max-tx)
+                               8000)
+              ":post-fork updated head synced incrementally"))
         ;; the gate property: when the head key is present, its blocks already are →
         ;; connecting to (materializing) the branch must succeed.
         (let [post (<!! (d/connect (-> client-config (dissoc :writer) (assoc :branch :post-fork))
@@ -715,7 +728,6 @@
 
       ;; cleanup
       (release client-conn)
-      (sync/unsubscribe-store! client-peer store-topic)
       (handlers/unregister-store-for-remote-access! store-id server-peer)
       (<?? S (peer/stop server-peer))
       (release server-conn)

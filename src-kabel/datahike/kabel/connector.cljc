@@ -5,8 +5,8 @@
    It is called by datahike.connector when a kabel writer is detected."
   (:require [datahike.db :as db]
             [datahike.config :as dc]
-            [datahike.connections :refer [add-connection!]]
-            [datahike.connector :refer [->Connection]]
+            [datahike.connections :as connections]
+            [datahike.connector :as connector :refer [->Connection]]
             [datahike.kabel.fressian-handlers :as fh]
             [datahike.kabel.writer :as kw]
             [datahike.store :as ds]
@@ -15,6 +15,7 @@
             [konserve-sync.transport.kabel-pubsub :as kp]
             [konserve-sync.walkers.datahike :as dh-walker]
             [konserve.core :as k]
+            [konserve.protocols :as kproto]
             [konserve.store :as ks]
             [konserve.tiered :as kt]
             #?(:clj [clojure.core.async :refer [promise-chan put!]]
@@ -81,7 +82,7 @@
 ;; Connection
 ;; =============================================================================
 
-(defn connect-kabel
+(defn- open-kabel-connection
   "Connect to a remote database via KabelWriter.
 
    This is a special connection flow for :kabel writer backends where the
@@ -105,16 +106,16 @@
 
    Always returns a channel - kabel connections are inherently async due to
    network sync. Caller must take from the channel to get the connection."
-  [raw-config opts]
+  [raw-config opts write-hooks]
   (log/info "connect-kabel called" {:store-backend (get-in raw-config [:store :backend])
                                     :opts opts})
   (go-try-
-   (let [;; Normalize config with defaults (cache sizes, etc.)
+   (let [resources (volatile! {})]
+     (try
+       (let [;; Normalize config with defaults (cache sizes, etc.)
          config (dissoc (dc/load-config raw-config) :initial-tx :remote-peer :name)
          store-config (:store config)
-         store-id (ds/store-identity store-config)
          branch (or (:branch config) :db)
-         conn-id [store-id branch]
          ;; Extract store UUID for kabel topic from store config
          store-id (:id store-config)
          {:keys [peer-id local-peer]} (:writer config)
@@ -144,12 +145,15 @@
          raw-store (if store-exists?
                      (<?- (ks/connect-store store-config opts))
                      (<?- (ks/create-store store-config opts)))
+         _ (vswap! resources assoc :store raw-store :store-config store-config)
          _ (log/trace "Store ready" {:raw-store (some? raw-store)})
          _ (when-not raw-store
              (log/raise "Failed to create/connect store." {:type :store-creation-failed
                                                            :backend (:backend store-config)
                                                            :id (:id store-config)}))
-         store (ds/add-cache-and-handlers raw-store config)
+         store (kproto/-set-write-hooks!
+                (ds/add-cache-and-handlers raw-store config)
+                write-hooks)
          _ (log/trace "Store ready, adding handlers...")
 
           ;; The store konserve-sync applies pushed nodes to — and dedups against.
@@ -179,6 +183,7 @@
           ;; 1c. Register store with fressian handlers for BTSet reconstruction
           ;; This is needed BEFORE subscribing because sync messages contain BTSet addresses
          _ (fh/register-store! store-config store)
+         _ (vswap! resources assoc :registered? true :store store)
          _ (log/trace "Store registered with fressian handlers")
 
           ;; 1d. Check if we already have the branch key in cache (for tiered stores)
@@ -226,7 +231,11 @@
                            ;; Fired once the initial handshake has fully drained:
                            ;; every reachable index node, then the :db head, applied.
                            (fn [] (put! handshake-complete-ch :handshake-done))}))
-         _ (log/trace "subscribe-store! returned" {:subscribed? (some? sub-result)})
+         subscribed? (boolean (:ok sub-result))
+         _ (log/trace "subscribe-store! returned" {:subscribed? subscribed?})
+         _ (when subscribed?
+             (vswap! resources assoc
+                     :subscribed? true :local-peer local-peer :store-topic store-topic))
 
           ;; 3. Gate db exposure on the FULL handshake drain (konserve-sync :on-complete):
           ;; every reachable index node applied, THEN the :db head. This is the guarantee we
@@ -246,9 +255,10 @@
           ;;
           ;; Requires kabel with the per-subscription :on-handshake-complete fix — before it,
           ;; subscribe! dropped the callback and this signal could never arrive.
-         _ (when-not sub-result
+         _ (when-not subscribed?
              (log/raise "KabelWriter store subscription failed — no handshake will arrive"
-                       {:type :kabel-subscribe-failed :store-id store-id :branch branch}))
+                       {:type :kabel-subscribe-failed
+                        :store-id store-id :branch branch :result sub-result}))
          _ (log/trace "Waiting for handshake to fully drain...")
          _ (<?- handshake-complete-ch)
          stored-db (or @stored-db-atom
@@ -286,12 +296,17 @@
          _ (log/info "Connection created, checking db config"
                      {:db-store-backend (get-in live-db [:config :store :backend])})
          conn (->Connection (atom live-db :meta {:listeners (atom {})}))
+         _ (vswap! resources assoc :conn conn)
 
           ;; 5. Create writer and wire up ongoing sync
           ;; Pass store-config for cleanup on shutdown
          _ (log/trace "Creating KabelWriter" {:peer-id peer-id :store-id store-id})
-         writer-config (assoc (:writer config) :store-config store-config)
+         writer-config (assoc (:writer config)
+                              :store-config store-config
+                              :local-peer local-peer
+                              :store-topic store-topic)
          writer (w/create-writer writer-config conn)
+         _ (vswap! resources assoc :writer writer)
          _ (log/trace "Writer created")
          _ (swap! (:wrapped-atom conn) assoc :writer writer :store store)
          _ (log/trace "Writer attached to connection")
@@ -305,12 +320,79 @@
          _ (reset! conn-atom conn)
          _ (log/trace "Connection atom set, ongoing sync enabled")]
 
-      ;; 7. Register connection
-     (add-connection! conn-id conn)
-
      (log/info "KabelWriter connection complete" {:store-id store-id :max-tx (:max-tx stored-db)})
       ;; Return connection - caller must take from channel
-     conn)))
+         conn)
+       (catch #?(:clj Throwable :cljs js/Error) e
+         (let [{:keys [writer conn store store-config subscribed? local-peer
+                       store-topic registered?]} @resources]
+           (if writer
+             (try
+               (<?- (w/shutdown writer))
+               (catch #?(:clj Throwable :cljs js/Error) cleanup-error
+                 (log/warn :datahike/kabel-open-writer-cleanup-failed
+                           {:error cleanup-error})))
+             (do
+               (when subscribed?
+                 (try
+                   (<?- (kp/unsubscribe-store! local-peer store-topic))
+                   (catch #?(:clj Throwable :cljs js/Error) cleanup-error
+                     (log/warn :datahike/kabel-open-unsubscribe-failed
+                               {:error cleanup-error}))))
+               (when registered?
+                 (fh/unregister-store! store-config))))
+           (when conn
+             (connector/close-secondary-indices @(:wrapped-atom conn)))
+           (when store
+             (try
+               (<?- (ks/release-store store-config store opts))
+               (catch #?(:clj Throwable :cljs js/Error) cleanup-error
+                 (log/warn :datahike/kabel-open-store-cleanup-failed
+                           {:error cleanup-error})))))
+         (throw e))))))
+
+(defn connect-kabel
+  "Acquire or open one shared Kabel connection through the common registry."
+  [raw-config opts]
+  (go-try-
+   (let [config (dissoc (dc/load-config raw-config) :initial-tx :remote-peer :name)
+         conn-id (ds/connection-id config)
+         acquisition-key (connector/connection-acquisition-key config)
+         physical-store-key (ds/physical-store-key (:store config))
+         requested-completion (promise-chan)
+         {:keys [state conn completion existing-key write-hooks]}
+         (connections/reserve-connection-opening! conn-id requested-completion
+                                                  acquisition-key physical-store-key)]
+     (case state
+       :existing conn
+
+       :opening
+       (let [opened (<?- completion)]
+         (if opened
+           opened
+           (log/raise "Kabel connection opening completed without a connection."
+                      {:type :connection-opening-not-published :conn-id conn-id})))
+
+       :config-mismatch
+       (log/raise "Configuration does not match existing connections."
+                  {:type :config-does-not-match-existing-connections
+                   :config acquisition-key
+                   :existing-connections-config existing-key})
+
+       :releasing
+       (log/raise "Connection is being released."
+                  {:type :connection-is-being-released :conn-id conn-id})
+
+       :owner
+       (try
+         (let [opened (<?- (open-kabel-connection config opts write-hooks))]
+           (connections/complete-connection-opening! conn-id completion opened)
+           (put! completion opened)
+           opened)
+         (catch #?(:clj Throwable :cljs js/Error) e
+           (connections/fail-connection-opening! conn-id completion)
+           (put! completion e)
+           (throw e)))))))
 
 ;; =============================================================================
 ;; Multimethod Integration

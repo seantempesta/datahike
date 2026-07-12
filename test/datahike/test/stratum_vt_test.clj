@@ -271,6 +271,39 @@
         (d/release conn)
         (d/delete-database cfg)))))
 
+(deftest historical-commit-branch-uses-matching-secondary-root
+  (let [cfg (file-cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)]
+    (try
+      (register-vt-index! conn)
+      (d/transact conn {:tx-data [{:emp/name "Bob" :emp/salary 100000}]
+                        :tx-meta {:db.valid/from #inst "2024-01-01"}})
+      (let [historical-cid (dv/commit-id @conn)]
+        (d/transact conn {:tx-data [{:emp/name "Bob" :emp/salary 110000}]
+                          :tx-meta {:db.valid/from #inst "2024-07-01"}})
+        (testing "head has advanced in both primary and secondary state"
+          (is (= #{110000}
+                 (set (d/q '[:find [?salary ...]
+                             :where [_ :emp/salary ?salary]] @conn))))
+          (is (= #{100000 110000}
+                 (set (map :salary (vt-rows conn :idx/employees))))))
+        (dv/branch! conn historical-cid :historical)
+        (let [historical (d/connect (assoc cfg :branch :historical))]
+          (try
+            (testing "historical primary state comes from the selected commit"
+              (is (= #{100000}
+                     (set (d/q '[:find [?salary ...]
+                                 :where [_ :emp/salary ?salary]] @historical)))))
+            (testing "historical secondary state comes from that same commit"
+              (is (= #{100000}
+                     (set (map :salary (vt-rows historical :idx/employees))))))
+            (finally
+              (d/release historical)))))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
+
 ;; ============================================================================
 ;; System-time symmetry on SCD2 surgery (DH-5 / Phase E)
 ;;

@@ -89,6 +89,7 @@
       (is (nil? (d/q count-query @conn)))
       (is (= 1000 (d/q count-query @conn-branch1)))
       (is (= 1000 (d/q count-query @conn-branch2)))
+      (d/release conn-branch2)
       (delete-branch! conn :branch2)
       (<?? S (d/gc-storage conn (Date.))))
 
@@ -137,6 +138,7 @@
     (merge! conn #{:branch1} [])
     (let [db-history       (<?? S (branch-history conn))
           branch1-history  (<?? S (branch-history conn-branch1))
+          _ (d/release conn-branch1)
           _ (delete-branch! conn :branch1)
           _ (testing "Check branch counts"
               (is (= 9 (count db-history)))

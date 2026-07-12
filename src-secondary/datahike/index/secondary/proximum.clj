@@ -21,9 +21,21 @@
    [proximum.versioning :as pver]
    [proximum.hnsw.internal :as phi]
    [replikativ.logging :as log]
-   [clojure.core.async :as async]))
+   [clojure.core.async :as async]
+   [clojure.java.io :as io]))
 
 (def ^:private float-array-class (Class/forName "[F"))
+
+(defn- effective-mmap-dir
+  "Return the explicit mmap directory or a durable store-local default."
+  [config]
+  (or (:mmap-dir config)
+      (let [{:keys [backend path]} (:store-config config)]
+        (when (and (= :file backend) path)
+          ;; Keep mmap files beside, not inside, the konserve directory:
+          ;; creating a child would pre-create the file-store path and make
+          ;; Proximum's subsequent create-store fail with "already exists".
+          (str path "-mmap")))))
 
 (defn- ->float-array
   "Coerce an embedding value to a Java float[] for Proximum. Datahike validates
@@ -78,7 +90,15 @@
         ;; datahike's immutable assoc-in; the atom only bridges the flush gap
         ;; WITHIN one reify's lifetime.
         !idx (atom prox-idx)]
-    (reify sec/ISecondaryIndex
+    (reify
+      java.io.Closeable
+      (close [_]
+        ;; Proximum close! is asynchronous.  A Datahike connection release is
+        ;; synchronous from the caller's perspective, so do not return while
+        ;; the mmap index can still hold file descriptors or locks.
+        (async/<!! (pproto/close! @!idx)))
+
+      sec/ISecondaryIndex
       (-search [_ query-spec entity-filter]
         ;; query-spec: {:vector float-array, :k int}
         ;; Returns EntityBitSet of matching entity IDs
@@ -169,12 +189,15 @@
            :branch (name branch)
            :commit-id cid
            :merkle-root cid
+           :mmap-dir (effective-mmap-dir config)
            :store-config (:store-config config)}))
 
       (-sec-restore [_ _store key-map]
         ;; Restore from proximum's own store using commit ID
         (let [restored (pwr/load-commit (:store-config key-map) (:commit-id key-map)
-                                        {:branch (keyword (:branch key-map))})]
+                                        {:branch (keyword (:branch key-map))
+                                         :mmap-dir (or (:mmap-dir key-map)
+                                                       (effective-mmap-dir config))})]
           (make-proximum-index restored config)))
 
       (-sec-branch [_ _store _from-branch new-branch]
@@ -275,7 +298,9 @@
         ;; The real restore: load the committed HNSW from proximum's own
         ;; durable store. Identical to the live index's `-sec-restore`.
         (let [restored (pwr/load-commit (:store-config key-map) (:commit-id key-map)
-                                        {:branch (keyword (:branch key-map))})]
+                                        {:branch (keyword (:branch key-map))
+                                         :mmap-dir (or (:mmap-dir key-map)
+                                                       (effective-mmap-dir config))})]
           (make-proximum-index restored config)))
       (-sec-branch [_ _store _from _new] (bug! "-sec-branch"))
       (-sec-mark [_] #{}))))
@@ -293,7 +318,9 @@
    ;;      and the real `-sec-restore`→`load-commit` never runs (the bug).
    ;; Branching on a committed store is correct for both: no committed index →
    ;; create; a committed index → passive skeleton, let `-sec-restore` populate.
-   (let [prox-config (merge {:type :hnsw}
+   (let [mmap-dir (effective-mmap-dir config)
+         config (cond-> config mmap-dir (assoc :mmap-dir mmap-dir))
+         prox-config (merge {:type :hnsw}
                             ;; Keys must match proximum.hnsw/create-index's destructure
                             ;; (hnsw.clj:1159): it reads :M (uppercase), not :m — the old
                             ;; :m here was silently dropped, pinning M at the default 16.
@@ -301,7 +328,8 @@
                                                  :capacity :M :ef-construction :ef-search]))]
      (if (committed-index-exists?* (:store-config config))
        (make-restore-skeleton config)
-       (let [prox-idx (prox/create-index prox-config)]
+       (let [_ (when mmap-dir (.mkdirs (io/file mmap-dir)))
+             prox-idx (prox/create-index prox-config)]
          (make-proximum-index prox-idx config))))))
 
 ;; GC: proximum uses its own store, not datahike's konserve
@@ -310,11 +338,22 @@
 ;; Branch: load from stored commit, branch via proximum native
 (defmethod sec/branch-from-key-map :proximum [key-map _store _from-branch new-branch]
   (let [idx (pwr/load-commit (:store-config key-map) (:commit-id key-map)
-                             {:branch (keyword (:branch key-map))})
-        branched (pver/branch! idx (keyword new-branch))
-        synced (async/<!! (pproto/sync! branched))
-        new-commit-id (phi/commit-id synced)]
-    (pproto/close! synced)
-    (assoc key-map
-           :branch (name new-branch)
-           :commit-id new-commit-id)))
+                             {:branch (keyword (:branch key-map))
+                              :mmap-dir (effective-mmap-dir key-map)})
+        fork-owner (volatile! nil)]
+    (try
+      (let [branched (pver/branch! idx (keyword new-branch))
+            _ (vreset! fork-owner branched)
+            synced (async/<!! (pproto/sync! branched))
+            _ (vreset! fork-owner synced)
+            new-commit-id (phi/commit-id synced)]
+        (assoc key-map
+               :branch (name new-branch)
+               :commit-id new-commit-id
+               :merkle-root new-commit-id))
+      (finally
+        ;; sync! returns the new resource owner. Close exactly that value (or
+        ;; the pre-sync fork when sync failed), plus the independent source.
+        (when-let [owner @fork-owner]
+          (async/<!! (pproto/close! owner)))
+        (async/<!! (pproto/close! idx))))))

@@ -1,5 +1,5 @@
 (ns ^:no-doc datahike.writer
-  (:require [superv.async :refer [S thread-try <?- go-try]]
+  (:require [superv.async :refer [S <?- go-try]]
             [replikativ.logging :as log]
             [datahike.core]
             [datahike.writing :as w]
@@ -17,20 +17,44 @@
   (-shutdown [_] "Returns a channel that resolves when the writer has shut down.")
   (-streaming? [_] "Returns whether the transactor is streaming updates directly into the connection, so it does not need to fetch from store on read."))
 
-(defrecord LocalWriter [thread streaming? transaction-queue-size commit-queue-size
-                        transaction-queue commit-queue]
+(defrecord LocalWriter [processing-thread commit-thread streaming?
+                        transaction-queue-size commit-queue-size
+                        transaction-queue commit-queue inflight-ops]
   PWriter
   (-dispatch! [_ arg-map]
-    (let [p (promise-chan)]
-      ;; put! on a CLOSED queue returns false and would leave p silent — the
-      ;; caller's deref would hang forever. Deliver the failure instead.
-      (when-not (put! transaction-queue (assoc arg-map :callback p))
-        (put! p (ex-info "Writer is shut down (a previous fatal error closed it); release and reconnect."
-                         {:type :writer-shut-down})))
+    (let [p (promise-chan)
+          closed-error
+          (fn []
+            (ex-info "Writer is shut down; release and reconnect."
+                     {:type :writer-shut-down}))]
+      ;; Admission and shutdown can race after put! returns. Its completion
+      ;; callback is the authoritative result: false means the queue closed
+      ;; without accepting this invocation, so always resolve the caller.
+      (put! transaction-queue (assoc arg-map :callback p)
+            (fn [accepted?]
+              (when-not accepted?
+                (put! p (closed-error)))))
       p))
   (-shutdown [_]
     (close! transaction-queue)
-    thread)
+    (go-try S
+            (let [;; Retain and join both loops explicitly.  The processing
+                  ;; loop's finally closes commit-queue even when it fails. Do
+                  ;; not let that first failure skip joining the commit loop.
+                  processing-error
+                  (try (<?- processing-thread) nil
+                       (catch #?(:clj Throwable :cljs js/Error) e e))
+                  commit-error
+                  (try (<?- commit-thread) nil
+                       (catch #?(:clj Throwable :cljs js/Error) e e))]
+              ;; Channel-returning writer ops run outside the commit loop. Once
+              ;; both loops have stopped, the set is closed to new members;
+              ;; join every accepted op before surfacing a loop failure.
+              (doseq [done @inflight-ops]
+                (<?- done))
+              (when-let [error (or processing-error commit-error)]
+                (throw error))
+              true)))
   (-streaming? [_] streaming?))
 
 (def ^:const DEFAULT_QUEUE_SIZE 120000)
@@ -46,18 +70,17 @@
   (let [transaction-queue-buffer    (buffer transaction-queue-size)
         transaction-queue           (chan transaction-queue-buffer)
         commit-queue-buffer         (buffer commit-queue-size)
-        commit-queue                (chan commit-queue-buffer)]
-    [transaction-queue commit-queue
-     (#?(:clj thread-try :cljs try)
-      S
-      (do
+        commit-queue                (chan commit-queue-buffer)
+        inflight-ops                (atom #{})
         ;; processing loop
+        processing-thread
         (go-try S
-         ;; delay processing until the writer we are part of in connection is set
-                (while (not (:writer @(:wrapped-atom connection)))
-                  (<! (timeout 10)))
-                (loop [old @(:wrapped-atom connection)]
-                  (if-let [{:keys [op args callback] :as invocation} (<?- transaction-queue)]
+                (try
+                  ;; delay processing until the writer we are part of in connection is set
+                  (while (not (:writer @(:wrapped-atom connection)))
+                    (<! (timeout 10)))
+                  (loop [old @(:wrapped-atom connection)]
+                    (if-let [{:keys [op args callback] :as invocation} (<?- transaction-queue)]
                     (do
                       (when (> (count transaction-queue-buffer) (* 0.9 transaction-queue-size))
                         (log/warn :datahike/tx-queue-pressure "Transaction queue buffer >90% full" {:count (count transaction-queue-buffer) :size transaction-queue-size}))
@@ -97,8 +120,19 @@
                                       :error))]
                         (cond (chan? res)
                               ;; async op, run in parallel in background, no sequential commit handling needed
-                              (do
-                                (go (>! callback (<! res)))
+                              (let [done (promise-chan)]
+                                (swap! inflight-ops conj done)
+                                (go
+                                  (try
+                                    (if-some [result (<! res)]
+                                      (>! callback result)
+                                      (>! callback
+                                          (ex-info "Asynchronous writer operation closed without a result."
+                                                   {:type :async-writer-op-closed
+                                                    :op op})))
+                                    (finally
+                                      (swap! inflight-ops disj done)
+                                      (put! done true))))
                                 (recur old))
 
                               (not= res :error)
@@ -110,10 +144,11 @@
                                 (recur (:db-after res)))
                               :else
                               (recur old))))
-                    (do
-                      (close! commit-queue)
-                      (log/debug :datahike/writer-closed "Writer thread gracefully closed")))))
+                      (log/debug :datahike/writer-closed "Writer thread gracefully closed")))
+                  (finally
+                    (close! commit-queue))))
         ;; commit loop
+        commit-thread
         (go-try S
                 (loop [tx (<?- commit-queue)
                        ;; last committed cid of OUR branch: nil on the first
@@ -165,7 +200,8 @@
                                       (throw e)))))
                         (<! (timeout commit-wait-time))
                         (recur (<?- commit-queue)
-                               (get-in @connection [:meta :datahike/commit-id])))))))))]))
+                               (get-in @connection [:meta :datahike/commit-id])))))))]
+    [transaction-queue commit-queue inflight-ops processing-thread commit-thread]))
 
 ;; public API to internal mapping
 (def default-write-fn-map {'transact!     w/transact!
@@ -187,7 +223,7 @@
   (let [transaction-queue-size (or transaction-queue-size DEFAULT_QUEUE_SIZE)
         commit-queue-size (or commit-queue-size DEFAULT_QUEUE_SIZE)
         commit-wait-time (or commit-wait-time DEFAULT_COMMIT_WAIT_TIME)
-        [transaction-queue commit-queue thread]
+        [transaction-queue commit-queue inflight-ops processing-thread commit-thread]
         (create-thread connection
                        (merge default-write-fn-map
                               write-fn-map)
@@ -199,7 +235,9 @@
       :transaction-queue-size transaction-queue-size
       :commit-queue commit-queue
       :commit-queue-size commit-queue-size
-      :thread thread
+      :processing-thread processing-thread
+      :commit-thread commit-thread
+      :inflight-ops inflight-ops
       :streaming? true})))
 
 ;; Note: :kabel backend is implemented in datahike.kabel.writer

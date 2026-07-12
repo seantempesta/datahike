@@ -139,7 +139,7 @@
      :stability :stable
      :supports-remote? true
      :referentially-transparent? false
-     :doc "Deletes a database given via configuration map."
+     :doc "Deletes a database given via configuration map. All connections to the database must be released first."
      :examples [{:desc "Delete database"
                  :code "(delete-database {:store {:backend :memory :id \"example\"}})"}]
      :impl datahike.api.impl/delete-database}
@@ -633,21 +633,26 @@
      :stability :stable
      :supports-remote? true
      :referentially-transparent? false
-     :doc "Remove a branch. The branch data remains accessible until the next GC."
+     :doc "Remove a branch after releasing any connection to that branch. The branch data remains accessible until the next GC."
      :examples [{:desc "Delete branch"
                  :code "(delete-branch! conn :experiment)"}]
      :impl datahike.api.impl/delete-branch!}
 
     force-branch!
-    {:args [:=> [:cat :datahike/SDB :keyword [:set :any]] :nil]
+    {:args [:function
+            [:=> [:cat :datahike/SDB :keyword [:set :any]] :nil]
+            [:=> [:cat :datahike/SDB :keyword [:set :any]
+                  [:map {:closed true}
+                   [:expected-current-commit {:optional true} [:maybe :uuid]]]]
+             :nil]]
      :ret :nil
      :categories [:versioning :write :advanced]
      :stability :stable
      :supports-remote? false
      :referentially-transparent? false
-     :doc "Force a branch to point to the provided db value. WARNING: This overwrites the branch head unconditionally, like git reset --hard. Existing connections to this branch will see stale state and must be released and reconnected."
-     :examples [{:desc "Force branch to current db"
-                 :code "(force-branch! @conn :experiment #{:db})"}]
+     :doc "Force a branch to point to the provided db value while the caller holds exclusive write access to the store. Pass :expected-current-commit in an options map to reject a stale planned head; the written head is read back and verified. Parent branch names are resolved to immutable commit ids before storage. WARNING: without the guard this overwrites the branch head unconditionally, like git reset --hard. Existing connections to this branch will see stale state and must be released and reconnected."
+     :examples [{:desc "Force only if the branch has not moved"
+                 :code "(force-branch! target-db :db #{target-cid} {:expected-current-commit current-cid})"}]
      :impl datahike.api.impl/force-branch!}
 
     merge-db

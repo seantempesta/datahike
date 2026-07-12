@@ -2,7 +2,7 @@
   "JSON related translations."
   (:require [clojure.edn :as edn]
             [clojure.walk :as walk]
-            [datahike.store :refer [store-identity]]
+            [datahike.store :refer [connection-id]]
             [datahike.readers :as readers]
             [datahike.connector]
             [datahike.datom :as dd]
@@ -17,8 +17,7 @@
               [datahike.db HistoricalDB AsOfDB SinceDB])))
 
 (defn config->store-id [config]
-  [(store-identity (:store config))
-   (:branch config)])
+  (connection-id config))
 
 (defn db->map [db]
   (let [{:keys [config meta max-eid max-tx]} db]
@@ -207,4 +206,3 @@
                                                   {:event :handlers/transact :data tx-data})))]
             (xf-fn % valtype-attrs-map db))
          tx-data)))
-

@@ -175,7 +175,10 @@
                   store (:store @(:wrapped-atom conn))
                   _ (sync/register-store! peer store-id store
                                           {:walk-fn dh-walker/datahike-walk-fn
-                                           :key-sort-fn (fn [k] (if (keyword? k) 1 0))})
+                                           ;; Branch heads are mutable pointer cells.
+                                           ;; Re-send them on every handshake: wall-clock
+                                           ;; timestamps cannot prove version equality.
+                                           :always-send-mutable? true})
                   _ (log/trace "Registered for sync" {:store-id store-id})
 
             ;; Register tx-report topic for pubsub (use UUID directly)
@@ -333,9 +336,11 @@
                    dh-walker/datahike-walk-fn)]
      (sync/register-store! peer store-id store
                            {:walk-fn walk-fn
-                            ;; sort ALL branch pointers (keywords) last, not just :db,
-                            ;; so non-trunk branch HEADs fetch-gate correctly on sync
-                            :key-sort-fn (fn [k] (if (keyword? k) 1 0))}))
+                            ;; The 0.1.35 Datahike walker already emits nodes
+                            ;; first and mutable pointers last. Always re-send
+                            ;; those pointers because cross-host timestamps do
+                            ;; not establish that their values are current.
+                            :always-send-mutable? true}))
 
   ;; Register tx-report topic for pubsub
    (tx-broadcast/register-tx-report-topic! peer store-id)))

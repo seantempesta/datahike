@@ -7,7 +7,9 @@
    [datahike.index.secondary :as sec]
    [datahike.index.entity-set :as es]
    [datahike.index.secondary.scriptum]
-   [datahike.index.secondary.stratum]))
+   [datahike.index.secondary.stratum]
+   [datahike.versioning :as dv]
+   [konserve.core :as k]))
 
 ;; Proximum requires Java 22+ (class file version 66.0).
 ;; Load lazily so the test file compiles on older JVMs.
@@ -16,6 +18,13 @@
     (require 'datahike.index.secondary.proximum)
     true
     (catch Throwable _ false)))
+
+(def ^:private detached-branch-side-effects (atom []))
+
+(defmethod sec/branch-from-key-map ::side-effect
+  [key-map _store _from-branch new-branch]
+  (swap! detached-branch-side-effects conj new-branch)
+  (assoc key-map :branch new-branch))
 
 ;; ---------------------------------------------------------------------------
 ;; Proximum (Vector Search) Tests
@@ -76,6 +85,82 @@
                 results (sec/-search idx2 {:vector (float-array [1.0 0.0 0.0 0.0]) :k 10} nil)]
             (is (= 3 (es/entity-bitset-cardinality results)))))))))
 
+(deftest historical-branch-restores-selected-proximum-commit
+  (when-not proximum-available?
+    (is (not proximum-available?) "SKIP: proximum requires Java 22+"))
+  (when proximum-available?
+    (let [prox-path (str (System/getProperty "java.io.tmpdir")
+                         "/datahike-proximum-branch-" (random-uuid))
+          prox-store {:backend :file :path prox-path :id (random-uuid)}
+          cfg {:store {:backend :memory :id (random-uuid)}
+               :schema-flexibility :read
+               :keep-history? true}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)]
+      (try
+        (d/transact conn
+                    [{:db/ident :idx/vectors
+                      :db.secondary/type :proximum
+                      :db.secondary/attrs [:person/embedding]
+                      :db.secondary/config {:dim 4
+                                            :distance :cosine
+                                            :store-config prox-store}
+                      :db.secondary/status :ready}])
+        (d/transact conn [{:db/id 1
+                           :person/embedding [1.0 0.0 0.0 0.0]}])
+        (let [historical-cid (dv/commit-id @conn)]
+          ;; Move entity 1 away from the query and put entity 2 at its old
+          ;; position. A historical branch that accidentally reuses the live
+          ;; HNSW head will now return the wrong nearest entity, not merely an
+          ;; extra member hidden by an unordered set assertion.
+          (d/transact conn [{:db/id 1
+                             :person/embedding [0.0 1.0 0.0 0.0]}
+                            {:db/id 2
+                             :person/embedding [1.0 0.0 0.0 0.0]}])
+          (let [head-index (get-in @conn [:secondary-indices :idx/vectors])]
+            (is (= #{2}
+                   (set (es/entity-bitset-seq
+                         (sec/-search head-index
+                                      {:vector (float-array [1.0 0.0 0.0 0.0])
+                                       :k 1}
+                                      nil))))))
+          ;; Compatibility proof for commits written before Datahike persisted
+          ;; :mmap-dir in the key map: the file store path deterministically
+          ;; recovers the same store-local mmap directory.
+          (k/update (:store @conn) historical-cid
+                    #(update-in % [:secondary-index-keys :idx/vectors]
+                                dissoc :mmap-dir)
+                    {:sync? true})
+          (dv/branch! conn historical-cid :historical)
+          (let [historical (d/connect (assoc cfg :branch :historical))]
+            (try
+              (testing "primary and Proximum both stop at the selected commit"
+                (is (= 1
+                       (d/q '[:find (count ?e) .
+                              :where [?e :person/embedding _]]
+                            @historical)))
+                (let [historical-index (get-in @historical
+                                               [:secondary-indices :idx/vectors])]
+                  (is (= #{1}
+                         (set (es/entity-bitset-seq
+                               (sec/-search historical-index
+                                            {:vector (float-array [1.0 0.0 0.0 0.0])
+                                             :k 1}
+                                            nil)))))))
+              (testing "branching the stored commit does not mutate the attached head"
+                (let [head-index (get-in @conn [:secondary-indices :idx/vectors])]
+                  (is (= #{2}
+                         (set (es/entity-bitset-seq
+                               (sec/-search head-index
+                                            {:vector (float-array [1.0 0.0 0.0 0.0])
+                                             :k 1}
+                                            nil)))))))
+              (finally
+                (d/release historical)))))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Scriptum (Full-Text Search) Tests
 
@@ -128,6 +213,47 @@
         (sec/-transact idx {:datom d1 :added? false})
         (let [results (sec/-search idx {:query "Alice" :field :value :limit 10} nil)]
           (is (zero? (es/entity-bitset-cardinality results))))))))
+
+(deftest historical-scriptum-branch-fails-before-forking-current-head
+  (let [cfg {:store {:backend :memory :id (random-uuid)}
+             :schema-flexibility :read
+             :keep-history? true}
+        scriptum-path (str "/tmp/scriptum-historical-branch-" (random-uuid))
+        _ (d/create-database cfg)
+        conn (d/connect cfg)]
+    (try
+      (d/transact conn [{:db/ident :idx/fulltext
+                         :db.secondary/type :scriptum
+                         :db.secondary/attrs [:person/bio]
+                         :db.secondary/config {:path scriptum-path}
+                         :db.secondary/status :ready}])
+      (d/transact conn [{:db/id 1 :person/bio "historical document"}])
+      (let [historical-cid (dv/commit-id @conn)]
+        (d/transact conn [{:db/id 2 :person/bio "head only document"}])
+        ;; Put a mutating detached adapter before Scriptum in the selected
+        ;; key-map. The capability preflight must reject Scriptum before the
+        ;; first adapter is allowed to fork anything.
+        (reset! detached-branch-side-effects [])
+        (k/update (:store @conn) historical-cid
+                  (fn [stored]
+                    (let [scriptum-key (get-in stored
+                                               [:secondary-index-keys :idx/fulltext])]
+                      (assoc stored :secondary-index-keys
+                             (array-map :idx/side-effect
+                                        {:type ::side-effect :branch :main}
+                                        :idx/fulltext scriptum-key))))
+                  {:sync? true})
+        (is (= :historical-scriptum-branch-unsupported
+               (try
+                 (dv/branch! conn historical-cid :historical-scriptum)
+                 (catch Exception e (:type (ex-data e))))))
+        (is (empty? @detached-branch-side-effects)
+            "all secondary capabilities are checked before the first fork")
+        (is (not (contains? (dv/branches conn) :historical-scriptum))
+            "a rejected historical secondary fork must not publish a primary branch"))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
 
 ;; ---------------------------------------------------------------------------
 ;; Cross-Index Composition Tests

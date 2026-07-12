@@ -276,6 +276,14 @@
 ;; ---------------------------------------------------------------------------
 ;; Static branch-from-key-map (for branch! without loading full index)
 
+(defmulti check-branch-from-key-map
+  "Preflight a detached/static secondary branch without mutating storage.
+   Implementations must reject unsupported source coordinates here so a
+   multi-index branch cannot partially fork an earlier index before failing."
+  (fn [key-map store from-branch new-branch] (:type key-map)))
+
+(defmethod check-branch-from-key-map :default [_ _ _ _] nil)
+
 (defmulti branch-from-key-map
   "Given a stored key-map, create a CoW branch in the index's native storage.
    Returns a new key-map for the branched index. Dispatches on (:type key-map).

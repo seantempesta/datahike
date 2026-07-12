@@ -61,7 +61,7 @@
          (when-let [txs (:initial-tx config)]
            (let [conn (<! (dc/connect config {:sync? false}))]
              (<! (transact! conn txs))
-             (dc/release conn)))
+             (<! (dc/release conn))))
          config))))
 
 (defn delete-database [& args]
@@ -345,9 +345,12 @@
   #?(:clj  (dv/delete-branch! conn branch {:sync? true})
      :cljs (dv/delete-branch! conn branch {:sync? false})))
 
-(defn force-branch! [db branch parents]
-  #?(:clj  (dv/force-branch! db branch parents {:sync? true})
-     :cljs (dv/force-branch! db branch parents {:sync? false})))
+(defn force-branch!
+  ([db branch parents]
+   (force-branch! db branch parents {}))
+  ([db branch parents opts]
+   #?(:clj  (dv/force-branch! db branch parents (assoc opts :sync? true))
+      :cljs (dv/force-branch! db branch parents (assoc opts :sync? false)))))
 
 (defn merge-db
   ([conn parents tx-data]

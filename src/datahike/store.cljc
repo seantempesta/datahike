@@ -8,6 +8,7 @@
    - store-identity: Returns store UUID from config
    - ready-store: Tiered-specific initialization (populate cache from backend)"
   (:require [konserve.tiered :as kt]
+            [clojure.walk :as walk]
             [datahike.index :as di]
             [konserve.cache :as kc]
             #?(:clj [clojure.core.cache :as cache]
@@ -45,6 +46,35 @@
    distributed coordination, and store matching."
   [config]
   (:id config))
+
+(defn connection-id
+  "Return the process-local identity of a connection.
+
+   Self-writer connections retain the historical `[store-id branch]` shape.
+   Remote writer backends append their backend so a server and a synced client
+   for the same logical store can coexist in one process without sharing or
+   overwriting each other's connection resources."
+  [config]
+  (let [base [(store-identity (:store config)) (:branch config)]
+        writer-backend (get-in config [:writer :backend] :self)]
+    (cond-> base
+      (not= :self writer-backend) (conj writer-backend))))
+
+(defn physical-store-key
+  "Identify one physical backing location for internal resource sharing.
+
+   A logical store id can intentionally exist in several replicas (for
+   example a Kabel server and a client cache), so runtime resources such as
+   write hooks may only be shared by handles for the same backing location."
+  [config]
+  ;; Keep the complete pure store config so unfamiliar backends (JDBC, S3,
+  ;; GCS, plugins) never false-collide merely because they do not use :path.
+  ;; Strip only per-call runtime opts, recursively for tiered configs. Values
+  ;; that are runtime objects compare by identity and therefore yield a safe
+  ;; false negative rather than unsafe resource sharing.
+  (walk/postwalk (fn [value]
+                   (if (map? value) (dissoc value :opts) value))
+                 config))
 
 ;; =============================================================================
 ;; Ready Store (Tiered-Specific)

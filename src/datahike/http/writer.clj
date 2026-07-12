@@ -26,7 +26,10 @@
               (catch Exception e
                 e)))
       p))
-  (-shutdown [_])
+  (-shutdown [_]
+    (let [done (promise-chan)]
+      (put! done true)
+      done))
   (-streaming? [_] false))
 
 (defmethod create-writer :datahike-server

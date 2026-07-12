@@ -41,7 +41,10 @@
         (is (= 2 (count (parent-commit-ids @conn)))))
       (testing "Force branch."
         (force-branch! @conn :foo2 #{:foo})
-        (is (db? (branch-as-db store :foo2))))
+        (let [forced (branch-as-db store :foo2)]
+          (is (db? forced))
+          (is (every? uuid? (parent-commit-ids forced))
+              "branch parents are frozen to immutable commit ids")))
       (testing "Load different references on current db."
         (is (= (commit-as-db store (commit-id @conn))
                (branch-as-db store :db)
@@ -55,6 +58,104 @@
         (is (= (k/get store :branches nil {:sync? true})
                #{:db :foo2})))
       (d/release conn))))
+
+#?(:clj
+   (deftest branch-preflights-commit-records
+     (let [cfg {:store {:backend :memory :id (random-uuid)}
+                :keep-history? true
+                :schema-flexibility :read}
+           _ (d/create-database cfg)
+           conn (d/connect cfg)]
+       (try
+         (let [missing (random-uuid)]
+           (is (= :commit-not-found
+                  (try
+                    (branch! conn missing :missing)
+                    (catch Exception e (:type (ex-data e))))))
+           (is (= #{:db} (set (datahike.versioning/branches conn)))))
+         (finally
+           (d/release conn)
+           (d/delete-database cfg))))))
+
+#?(:clj
+   (deftest commit-branching-rejects-commit-graph-opt-out
+     (let [cfg {:store {:backend :memory :id (random-uuid)}
+                :keep-history? true
+                :commit-graph? false
+                :schema-flexibility :write}
+           _ (d/create-database cfg)
+           conn (d/connect cfg)]
+       (try
+         (let [cid (commit-id @conn)]
+           (is (= :commit-graph-disabled
+                  (try
+                    (branch! conn cid :unavailable)
+                    (catch Exception e (:type (ex-data e))))))
+           (is (= #{:db} (set (datahike.versioning/branches conn))))
+           (branch! conn :db :from-head)
+           (is (= #{:db :from-head}
+                  (set (datahike.versioning/branches conn)))))
+         (finally
+           (d/release conn)
+           (d/delete-database cfg))))))
+
+#?(:clj
+   (deftest guarded-force-rejects-a-stale-head
+     (let [cfg {:store {:backend :memory :id (random-uuid)}
+                :keep-history? true
+                :schema-flexibility :read}
+           _ (d/create-database cfg)
+           conn (d/connect cfg)]
+       (try
+         (d/transact conn [{:db/id 1 :value :at-t}])
+         (let [cid-t (commit-id @conn)
+               db-t (commit-as-db conn cid-t)]
+           (d/transact conn [{:db/id 1 :value :at-head}])
+           (let [cid-head (commit-id @conn)]
+             (is (= :invalid-force-branch-options
+                    (try
+                      (force-branch! db-t :db #{cid-t}
+                                     {:expected-current-commit cid-head
+                                      :expected-commit cid-head})
+                      (catch Exception e (:type (ex-data e)))))
+                 "unknown guard keys are rejected instead of silently disabling safety")
+             (is (= :stale-branch-head
+                    (try
+                      (force-branch! db-t :db #{cid-t}
+                                     {:expected-current-commit cid-t})
+                      (catch Exception e (:type (ex-data e))))))
+             (is (= cid-head (commit-id (branch-as-db conn :db))))
+             (is (= #{:at-head}
+                    (set (d/q '[:find [?v ...] :where [_ :value ?v]]
+                              (branch-as-db conn :db)))))
+
+             (let [events (atom [])
+                   multi-assoc k/multi-assoc
+                   update-store k/update]
+               (with-redefs [k/multi-assoc
+                             (fn [store entries & args]
+                               (swap! events conj [:batch (mapv first entries)])
+                               (apply multi-assoc store entries args))
+                             k/update
+                             (fn [store key update-fn & args]
+                               (swap! events conj [:update key])
+                               (apply update-store store key update-fn args))]
+                 (force-branch! db-t :db #{cid-t}
+                                {:expected-current-commit cid-head}))
+               (is (= [:branches :db]
+                      (->> @events
+                           (keep #(when (= :update (first %)) (second %)))
+                           (partition-by identity)
+                           (map first)
+                           (take-last 2)))
+                   "the known-branches roster precedes the atomic forced head"))
+             (let [forced (branch-as-db conn :db)]
+               (is (= #{:at-t}
+                      (set (d/q '[:find [?v ...] :where [_ :value ?v]] forced))))
+               (is (not= cid-head (commit-id forced))))))
+         (finally
+           (d/release conn)
+           (d/delete-database cfg))))))
 
 #?(:clj
    (deftest datahike-fork-database-test

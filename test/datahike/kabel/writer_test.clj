@@ -2,7 +2,9 @@
   "Unit tests for KabelWriter."
   (:require [clojure.test :refer [deftest testing is]]
             [datahike.kabel.writer :as kw]
+            [datahike.kabel.fressian-handlers :as fh]
             [datahike.writer :as writer]
+            [konserve-sync.transport.kabel-pubsub :as kp]
             [clojure.core.async :refer [<!! >!! chan go put! timeout alts!! promise-chan]]))
 
 (def test-peer-id #uuid "10000000-0000-0000-0000-000000000001")
@@ -10,7 +12,7 @@
 
 (deftest test-kabel-writer-construction
   (testing "kabel-writer creates proper instance"
-    (let [w (kw/kabel-writer test-peer-id test-store-id nil)]
+    (let [w (kw/kabel-writer test-peer-id test-store-id nil nil nil)]
       (is (instance? datahike.kabel.writer.KabelWriter w))
       (is (= test-peer-id (:peer-id w)))
       (is (= test-store-id (:store-id w)))
@@ -30,7 +32,7 @@
 
 (deftest test-on-sync-update
   (testing "on-sync-update! resolves pending transactions"
-    (let [w (kw/kabel-writer test-peer-id test-store-id nil)
+    (let [w (kw/kabel-writer test-peer-id test-store-id nil nil nil)
           wait-ch (promise-chan)]
 
       ;; Simulate a pending transaction waiting for max-tx 100
@@ -50,7 +52,7 @@
       (is (= 100 @(:current-max-tx w)))))
 
   (testing "on-sync-update! resolves multiple pending transactions"
-    (let [w (kw/kabel-writer test-peer-id test-store-id nil)
+    (let [w (kw/kabel-writer test-peer-id test-store-id nil nil nil)
           wait-ch-1 (promise-chan)
           wait-ch-2 (promise-chan)
           wait-ch-3 (promise-chan)]
@@ -78,7 +80,7 @@
 
 (deftest test-listener-management
   (testing "add-listener! and remove-listener!"
-    (let [w (kw/kabel-writer test-peer-id test-store-id nil)
+    (let [w (kw/kabel-writer test-peer-id test-store-id nil nil nil)
           callback-1 (fn [_])
           callback-2 (fn [_])]
 
@@ -98,7 +100,7 @@
 
 (deftest test-shutdown
   (testing "-shutdown cancels pending transactions"
-    (let [w (kw/kabel-writer test-peer-id test-store-id nil)
+    (let [w (kw/kabel-writer test-peer-id test-store-id nil nil nil)
           wait-ch-1 (promise-chan)
           wait-ch-2 (promise-chan)]
 
@@ -121,7 +123,22 @@
         (is (= :writer-shutdown (:type (ex-data result-1))))
         (is (instance? clojure.lang.ExceptionInfo result-2))))))
 
+(deftest shutdown-surfaces-unsubscribe-failure-and-always-unregisters-handlers
+  (let [unregistered (atom [])
+        failure (ex-info "unsubscribe failed" {:type :unsubscribe-failed})
+        result (promise-chan)
+        writer (kw/kabel-writer test-peer-id test-store-id
+                                {:id test-store-id} ::peer ::topic)]
+    (put! result failure)
+    (with-redefs [kp/unsubscribe-store! (fn [_ _] result)
+                  fh/unregister-store! (fn [config]
+                                         (swap! unregistered conj config))]
+      (let [shutdown-result (<!! (writer/-shutdown writer))]
+        (is (instance? Throwable shutdown-result))
+        (is (= :unsubscribe-failed (:type (ex-data shutdown-result))))
+        (is (= [{:id test-store-id}] @unregistered))))))
+
 (deftest test-streaming
   (testing "-streaming? returns true"
-    (let [w (kw/kabel-writer test-peer-id test-store-id nil)]
+    (let [w (kw/kabel-writer test-peer-id test-store-id nil nil nil)]
       (is (true? (writer/-streaming? w))))))

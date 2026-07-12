@@ -1,5 +1,9 @@
 (ns ^:no-doc datahike.connector
-  (:require [datahike.connections :refer [get-connection add-connection! delete-connection!
+  (:require [datahike.connections :refer [delete-connection!
+                                          release-connection-reference!
+                                          reserve-connection-opening!
+                                          complete-connection-opening!
+                                          fail-connection-opening!
                                           *connections*]]
             [datahike.readers]
             [datahike.store :as ds]
@@ -8,6 +12,7 @@
             [datahike.tools :as dt #?(:clj :refer :cljs :refer-macros) [meta-data]]
             [datahike.writer :as w]
             [konserve.core :as k]
+            [konserve.protocols :as kp]
             [konserve.store :as ks]
             [replikativ.logging :as log]
             [clojure.spec.alpha :as s]
@@ -21,6 +26,12 @@
 ;; connection
 
 (declare deref-conn)
+
+#?(:clj
+   (defn- blocking-take
+     "Take a runtime completion only from async+sync's translated sync branch."
+     [channel]
+     (async/<!! channel)))
 
 (deftype Connection [wrapped-atom]
   IDeref
@@ -64,7 +75,7 @@
      [^Connection conn ^java.io.Writer w]
      (let [config (:config @(:wrapped-atom conn))]
        (.write w "#datahike/Connection")
-       (.write w (pr-str [(ds/store-identity (:store config)) (:branch config)])))))
+       (.write w (pr-str (ds/connection-id config))))))
 
 (defn deref-conn [^Connection conn]
   (let [wrapped-atom (.-wrapped-atom conn)]
@@ -218,43 +229,96 @@
               config
               store-fixed-record-keys))))
 
-(defn- normalize-config [cfg]
-  (-> cfg
-      ;; :index-config and the store-fixed-record-keys are store-fixed and
-      ;; adopted on a fresh connect (adopt-create-time-fixed), so an existing
-      ;; connection may carry adopted keys the caller's config omits;
-      ;; conflicts are guarded on the fresh-connect path, not here.
-      (dissoc :writer :store :store-cache-size :search-cache-size
-              :index-config :fuse-index-roots? :commit-graph?)))
+(defn connection-acquisition-key
+  "Return the semantic config used to share one physical connection safely."
+  [cfg]
+  (let [writer-backend (get-in cfg [:writer :backend] :self)
+        ;; Runtime handles such as Kabel's :local-peer are not comparable, but
+        ;; the remote endpoint is: two callers targeting different peers/URLs
+        ;; must never share one physical writer.
+        writer-key (when-not (= :self writer-backend)
+                     (select-keys (:writer cfg) [:backend :peer-id :url]))]
+    (cond->
+     (-> cfg
+         ;; :index-config and the store-fixed-record-keys are store-fixed and
+         ;; adopted on a fresh connect (adopt-create-time-fixed), so an existing
+         ;; connection may carry adopted keys the caller's config omits;
+         ;; conflicts are guarded on the fresh-connect path, not here.
+         (dissoc :writer :store :store-cache-size :search-cache-size
+                 :index-config :fuse-index-roots? :commit-graph?))
+      writer-key (assoc :writer writer-key))))
+
+(defn close-secondary-indices
+  "Close every resource-owning secondary index and return cleanup failures."
+  [db]
+  #?(:clj
+     (into []
+           (keep (fn [[ident idx]]
+                   (when (instance? java.io.Closeable idx)
+                     (try
+                       (.close ^java.io.Closeable idx)
+                       nil
+                       (catch Throwable e
+                         (log/warn :datahike/secondary-index-close-failed
+                                   {:ident ident :error (.getMessage e)})
+                         e)))))
+           (:secondary-indices db))
+     :cljs []))
 
 (defn -connect-impl* [config opts]
   (async+sync (:sync? opts) *default-sync-translation*
               (go-try-
                (let [_ (log/debug :datahike/connect {:config (update-in config [:store] dissoc :password)})
                      store-config (:store config)
-                     store-id (ds/store-identity store-config)
-                     conn-id [store-id (:branch config)]]
-                 (if-let [conn (get-connection conn-id)]
-                   (let [conn-config (:config @(:wrapped-atom conn))
-               ;; replace store config with its identity
-                         cfg (normalize-config config)
-                         conn-cfg (normalize-config conn-config)]
-                     (when-not (= cfg conn-cfg)
-                       (log/raise "Configuration does not match existing connections."
-                                  {:type :config-does-not-match-existing-connections
-                                   :config cfg
-                                   :existing-connections-config conn-cfg
-                                   :diff (diff cfg conn-cfg)}))
-                     conn)
-                   (let [raw-store (<?- (ks/connect-store store-config opts))
+                     conn-id (ds/connection-id config)
+                     acquisition-key (connection-acquisition-key config)
+                     physical-store-key (ds/physical-store-key store-config)
+                     requested-completion (async/promise-chan)
+                     {:keys [state conn completion existing-key write-hooks]}
+                     (reserve-connection-opening! conn-id requested-completion
+                                                  acquisition-key physical-store-key)]
+                 (case state
+                   :existing
+                   conn
+
+                   :opening
+                   (let [opened #?(:clj (if (:sync? opts)
+                                          (blocking-take completion)
+                                          (<?- completion))
+                                    :cljs (<?- completion))]
+                     (when (instance? #?(:clj Throwable :cljs js/Error) opened)
+                       (throw opened))
+                     (if opened
+                       opened
+                       (log/raise "Connection opening completed without a published connection."
+                                  {:type :connection-opening-not-published
+                                   :conn-id conn-id})))
+
+                   :config-mismatch
+                   (log/raise "Configuration does not match existing connections."
+                              {:type :config-does-not-match-existing-connections
+                               :config acquisition-key
+                               :existing-connections-config existing-key
+                               :diff (diff acquisition-key existing-key)})
+
+                   :releasing
+                   (log/raise "Connection is being released."
+                              {:type :connection-is-being-released
+                               :conn-id conn-id})
+
+                   :owner
+                   (let [resources (volatile! {})]
+                     (try
+                       (let [raw-store (<?- (ks/connect-store store-config opts))
+                         _         (vswap! resources assoc :store raw-store)
                          _         (when-not raw-store
                                      (log/raise "Backend does not exist." {:type   :backend-does-not-exist
                                                                            :config store-config}))
                          store     (ds/add-cache-and-handlers raw-store config)
+                         _         (vswap! resources assoc :store store)
                          _ (<?- (ds/ready-store (assoc store-config :opts opts) store))
                          stored-db (<?- (k/get store (:branch config) nil opts))
                          _         (when-not stored-db
-                                     (ks/release-store store-config store opts)
                                      (log/raise "Database does not exist." {:type   :db-does-not-exist
                                                                             :config config}))
                          [config store stored-db]
@@ -283,10 +347,13 @@
                                    _ (<?- (ds/ready-store (assoc store-config :opts opts) store))
                                    stored-db (<?- (k/get store (:branch config') nil opts))]
                                [config' store stored-db])))
+                         store (kp/-set-write-hooks! store write-hooks)
+                         _ (vswap! resources assoc :store store)
                          _ (version-check stored-db)
                          _ (when-not (:allow-unsafe-config config)
                              (ensure-stored-config-consistency config (:config stored-db)))
-                         conn      (conn-from-db (dsi/stored->db (assoc stored-db :config config) store))]
+                         conn      (conn-from-db (dsi/stored->db (assoc stored-db :config config) store))
+                         _         (vswap! resources assoc :conn conn)]
                      (swap! (:wrapped-atom conn) assoc :writer
                             (w/create-writer (:writer config) conn))
                      ;; Recovery: backfill secondary indices that are :building
@@ -310,8 +377,35 @@
                                 (when (map? build-result)
                                   (w/dispatch! writer {:op 'install-secondary-index!
                                                        :args [build-result]})))))))
-                     (add-connection! conn-id conn)
-                     conn))))))
+                         (complete-connection-opening! conn-id completion conn)
+                         (async/put! completion conn)
+                         conn)
+                       (catch #?(:clj Throwable :cljs js/Error) e
+                         (let [{opened-conn :conn opened-store :store} @resources
+                               opened-db (some-> opened-conn :wrapped-atom deref)
+                               writer (:writer opened-db)]
+                           (when writer
+                             (try
+                               #?(:clj (if (:sync? opts)
+                                         (blocking-take (w/shutdown writer))
+                                         (<?- (w/shutdown writer)))
+                                  :cljs (<?- (w/shutdown writer)))
+                               (catch #?(:clj Throwable :cljs js/Error) cleanup-error
+                                 (log/warn :datahike/connection-open-writer-cleanup-failed
+                                           {:error cleanup-error}))))
+                           ;; stored->db can restore resource-owning secondary
+                           ;; handles before a later config/writer/publication
+                           ;; failure. Close them before releasing their store.
+                           (close-secondary-indices opened-db)
+                           (when opened-store
+                             (try
+                               (<?- (ks/release-store store-config opened-store opts))
+                               (catch #?(:clj Throwable :cljs js/Error) cleanup-error
+                                 (log/warn :datahike/connection-open-store-cleanup-failed
+                                           {:error cleanup-error})))))
+                         (fail-connection-opening! conn-id completion)
+                         (async/put! completion e)
+                         (throw e)))))))))
 
 ;; Multimethod dispatch for different writer backends
 
@@ -344,29 +438,73 @@
 (defn release
   ([connection] (release connection false))
   ([connection release-all?]
-   (when-not (= @(:wrapped-atom connection) :released)
-     (let [db      @(:wrapped-atom connection)
-           _ (log/trace :datahike/release-connection {:backend (get-in db [:config :store :backend])})
-           conn-id [(ds/store-identity (get-in db [:config :store]))
-                    (get-in db [:config :branch])]]
-       (if-not (get @*connections* conn-id)
-         (log/trace :datahike/connection-already-released {:conn-id conn-id})
-         (let [new-conns (swap! *connections* update-in [conn-id :count] dec)]
-           (when (or release-all? (zero? (get-in new-conns [conn-id :count])))
-             (delete-connection! conn-id)
-             ;; Close secondary index writers to release file locks (e.g., Lucene write.lock)
-             #?(:clj
-                (doseq [[_ident idx] (:secondary-indices db)]
-                  (when (instance? java.io.Closeable idx)
-                    (try (.close ^java.io.Closeable idx)
-                         (catch Exception e
-                           (log/warn :datahike/secondary-index-close-failed {:error (.getMessage e)}))))))
-             (w/shutdown (:writer db))
-             ;; Release the underlying store to clean up resources (memory registry, etc.).
-             ;; NB: we do NOT unregister the PSS storage here — multiple connections (branches)
-             ;; share ONE store-id, so releasing one must not drop the storage a sibling still
-             ;; uses for root reads. A reconnect overwrites the entry; a never-reconnected store
-             ;; leaves one bounded entry (keyed by the stable store UUID). TODO: ref-counted
-             ;; unregister on the last release.
-             (ks/release-store (get-in db [:config :store]) (:store db))
-             nil)))))))
+   (let [opts {:sync? #?(:clj true :cljs false)}]
+     (async+sync (:sync? opts) *default-sync-translation*
+                 (go-try-
+                  (when-not (= @(:wrapped-atom connection) :released)
+                    (let [db @(:wrapped-atom connection)
+                          _ (log/trace :datahike/release-connection
+                                       {:backend (get-in db [:config :store :backend])})
+                          conn-id (ds/connection-id (:config db))
+                          requested-completion (async/promise-chan)
+                          {:keys [state completion]}
+                          (release-connection-reference! conn-id release-all?
+                                                         requested-completion)]
+                      (case state
+                        :absent
+                        (log/trace :datahike/connection-already-released {:conn-id conn-id})
+
+                        :in-progress
+                        (do
+                          (log/trace :datahike/connection-release-in-progress {:conn-id conn-id})
+                          (let [result #?(:clj (if (:sync? opts)
+                                                (blocking-take completion)
+                                                (<?- completion))
+                                          :cljs (<?- completion))]
+                            (when (instance? #?(:clj Throwable :cljs js/Error) result)
+                              (throw result))))
+
+                        :last
+                        (let [shutdown-error
+                              (try
+                            ;; shutdown closes admission synchronously; await its
+                            ;; completion so every already-accepted write has
+                            ;; either committed or failed before release returns.
+                                #?(:clj
+                                   (let [result (if (:sync? opts)
+                                                  (blocking-take (w/shutdown (:writer db)))
+                                                  (<?- (w/shutdown (:writer db))))]
+                                     (when (instance? Throwable result)
+                                       (throw result)))
+                                   :cljs
+                                   (<?- (w/shutdown (:writer db))))
+                                nil
+                                (catch #?(:clj Throwable :cljs js/Error) e e))
+                            ;; Secondary writers may be touched by queued writes,
+                            ;; so close them only after the primary writer drains.
+                              secondary-errors (close-secondary-indices db)
+                            ;; Release the underlying store only after the writer
+                            ;; can no longer address it.
+                              store-error
+                              (try
+                                (<?- (ks/release-store (get-in db [:config :store])
+                                                       (:store db) opts))
+                                nil
+                                (catch #?(:clj Throwable :cljs js/Error) e e))
+                              errors (vec (remove nil?
+                                                  (into [shutdown-error store-error]
+                                                        secondary-errors)))
+                              outcome (when (seq errors)
+                                        (ex-info "Connection release failed."
+                                                 {:type :connection-release-failed
+                                                  :conn-id conn-id
+                                                  :error-count (count errors)
+                                                  :errors errors}
+                                                 (first errors)))]
+                          (delete-connection! conn-id)
+                          (async/put! completion (or outcome :released))
+                          (when outcome
+                            (throw outcome)))
+
+                        :retained nil)))
+                  nil)))))

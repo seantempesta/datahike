@@ -77,7 +77,7 @@ class DatahikeGenerated {
 
     /**
      * Returns database state at given time point (Date or transaction ID).
-     * 
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
      * // Query as of date
@@ -321,7 +321,7 @@ class DatahikeGenerated {
     }
 
     /**
-     * Remove a branch. The branch data remains accessible until the next GC.
+     * Remove a branch after releasing any connection to that branch. The branch data remains accessible until the next GC.
      * 
      * <h3>Examples:</h3>
      * <pre>{@code
@@ -334,7 +334,7 @@ class DatahikeGenerated {
     }
 
     /**
-     * Deletes a database given via configuration map.
+     * Deletes a database given via configuration map. All connections to the database must be released first.
      * 
      * <h3>Examples:</h3>
      * <pre>{@code
@@ -347,7 +347,7 @@ class DatahikeGenerated {
     }
 
     /**
-     * Deletes a database given via configuration map.
+     * Deletes a database given via configuration map. All connections to the database must be released first.
      * 
      * <h3>Examples:</h3>
      * <pre>{@code
@@ -416,16 +416,29 @@ class DatahikeGenerated {
     }
 
     /**
-     * Force a branch to point to the provided db value. WARNING: This overwrites the branch head unconditionally, like git reset --hard. Existing connections to this branch will see stale state and must be released and reconnected.
-     * 
+     * Force a branch to point to the provided db value while the caller holds exclusive write access to the store. Pass :expected-current-commit in an options map to reject a stale planned head; the written head is read back and verified. Parent branch names are resolved to immutable commit ids before storage. WARNING: without the guard this overwrites the branch head unconditionally, like git reset --hard. Existing connections to this branch will see stale state and must be released and reconnected.
+     *
      * <h3>Examples:</h3>
      * <pre>{@code
-     * // Force branch to current db
-     * (force-branch! {@literal @}conn :experiment #{:db})
+     * // Force only if the branch has not moved
+     * (force-branch! target-db :db #{target-cid} {:expected-current-commit current-cid})
      * }</pre>
      */
     public static void forceBranchAsync(Object arg0, Object arg1, Set<?> arg2) {
         forceBranchAsyncFn.invoke(arg0, arg1, arg2);
+    }
+
+    /**
+     * Force a branch to point to the provided db value while the caller holds exclusive write access to the store. Pass :expected-current-commit in an options map to reject a stale planned head; the written head is read back and verified. Parent branch names are resolved to immutable commit ids before storage. WARNING: without the guard this overwrites the branch head unconditionally, like git reset --hard. Existing connections to this branch will see stale state and must be released and reconnected.
+     *
+     * <h3>Examples:</h3>
+     * <pre>{@code
+     * // Force only if the branch has not moved
+     * (force-branch! target-db :db #{target-cid} {:expected-current-commit current-cid})
+     * }</pre>
+     */
+    public static void forceBranchAsync(Object arg0, Object arg1, Set<?> arg2, Map<?,?> arg3) {
+        forceBranchAsyncFn.invoke(arg0, arg1, arg2, Util.normalizeCollections(arg3));
     }
 
     /**
