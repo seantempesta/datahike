@@ -152,6 +152,22 @@
          store (ds/add-cache-and-handlers raw-store config)
          _ (log/trace "Store ready, adding handlers...")
 
+          ;; The store konserve-sync applies pushed nodes to — and dedups against.
+          ;; For a :frontend-only tiered store the backend is a SHARED, read-only
+          ;; truth (the writer's S3): the peer must never write it, and it already
+          ;; holds every node. If we subscribed the tiered store, konserve-sync's
+          ;; immutable-skip (`k/exists?` before store) would fall through the
+          ;; frontend-first read to that shared backend, see the node "present", and
+          ;; skip it — leaving the local frontend cache permanently COLD (warmed only
+          ;; by lazy read-through). Subscribe the FRONTEND directly so applies land
+          ;; in — and existence is checked against — the local cache. Other tiered
+          ;; modes (e.g. {memory, indexeddb} write-through, where the backend IS the
+          ;; local durable tier) keep subscribing the whole store.
+         sync-store (if (and is-tiered?
+                             (= :frontend-only (:write-policy store-config)))
+                      (:frontend-store store)
+                      store)
+
           ;; 1b. For tiered stores, populate memory from backend BEFORE sync
           ;; This ensures sync handshake sends accurate timestamps for cached keys
           ;; For non-tiered stores, just call ready-store normally
@@ -178,7 +194,7 @@
           ;; 2. Set up sync subscription and wait for initial :db
           ;; Use a single subscription that handles both initial sync and ongoing updates
           ;; The conn-atom switches behavior after connection is set up
-         sync-complete-ch (promise-chan)
+         handshake-complete-ch (promise-chan)  ;; fires when the initial sync has FULLY applied
          stored-db-atom (atom cached-stored-db)  ;; Pre-fill with cached value if available
          conn-atom (atom nil)  ;; Set after connection is created
          ;; Use UUID directly as topic (kabel pubsub supports any EDN value)
@@ -187,7 +203,7 @@
 
          _ (log/trace "Calling subscribe-store!")
          sub-result (<?- (kp/subscribe-store!
-                          local-peer store-topic store
+                          local-peer store-topic sync-store
                           {:on-key-update
                            (fn [key value _op]
                              (when (= key branch)
@@ -199,27 +215,46 @@
                                    (do
                                      (log/trace "Ongoing sync update" {:branch branch :max-tx (:max-tx value)})
                                      (kw/on-db-sync! conn value-with-client-config))
-                                   ;; Initial sync - signal completion
+                                   ;; Initial sync — stash the head. Exposure is gated on
+                                   ;; :on-complete (full handshake drain), not on this: the
+                                   ;; head alone says nothing about the nodes it points at.
                                    (do
                                      (log/trace "Initial branch received via sync" {:branch branch
                                                                                     :max-tx (:max-tx value)})
-                                     (reset! stored-db-atom value-with-client-config)
-                                     (put! sync-complete-ch :synced))))))}))
+                                     (reset! stored-db-atom value-with-client-config))))))
+                           :on-complete
+                           ;; Fired once the initial handshake has fully drained:
+                           ;; every reachable index node, then the :db head, applied.
+                           (fn [] (put! handshake-complete-ch :handshake-done))}))
          _ (log/trace "subscribe-store! returned" {:subscribed? (some? sub-result)})
 
-          ;; 3. Wait for initial sync (or skip if we have cached data)
-          ;; If we already have the branch from cache, no need to wait for sync
-          ;; (handshake will verify timestamps and send only newer data if any)
-         stored-db (if cached-stored-db
-                     (do
-                       (log/trace "Using cached branch key, skipping sync wait"
-                                  {:max-tx (:max-tx cached-stored-db)})
-                       cached-stored-db)
-                     (do
-                       (log/trace "Waiting for initial sync...")
-                       (<?- sync-complete-ch)
-                       (log/trace "Initial sync complete" {:max-tx (:max-tx @stored-db-atom)})
-                       @stored-db-atom))
+          ;; 3. Gate db exposure on the FULL handshake drain (konserve-sync :on-complete):
+          ;; every reachable index node applied, THEN the :db head. This is the guarantee we
+          ;; need — a db must never be visible that its indices don't back.
+          ;;
+          ;; Waiting on the head alone is NOT that guarantee. On the cold path it happened to
+          ;; be safe (nodes ship before the head), but a peer reconnecting onto a warm cache
+          ;; used to publish its cached root immediately, with no node check at all: a PARTIAL
+          ;; cache (a root whose subtree an interrupted sync never finished writing) yielded a
+          ;; db whose first query walked into an absent node.
+          ;;
+          ;; The drain signal is exact: kabel acks a handshake batch only after applying every
+          ;; item in it, and the server sends handshake-complete only after that ack — so
+          ;; :on-complete arrives strictly after the last node AND the head have landed.
+          ;; The cached root is now merely a PRE-FILL of stored-db-atom (avoiding a re-fetch
+          ;; when the subscriber is current), never a publish shortcut.
+          ;;
+          ;; Requires kabel with the per-subscription :on-handshake-complete fix — before it,
+          ;; subscribe! dropped the callback and this signal could never arrive.
+         _ (when-not sub-result
+             (log/raise "KabelWriter store subscription failed — no handshake will arrive"
+                       {:type :kabel-subscribe-failed :store-id store-id :branch branch}))
+         _ (log/trace "Waiting for handshake to fully drain...")
+         _ (<?- handshake-complete-ch)
+         stored-db (or @stored-db-atom
+                       (log/raise "Handshake drained but no :db head is present"
+                                 {:type :kabel-no-head :store-id store-id :branch branch}))
+         _ (log/trace "Handshake drained — indices complete" {:max-tx (:max-tx stored-db)})
 
           ;; 4. Reconstruct deferred indexes and create connection
          _ (log/trace "Stored-db received" {:key-count (count (keys stored-db))
@@ -266,7 +301,7 @@
 
           ;; 6. Switch the subscription callback to use on-db-sync! for ongoing updates
           ;; By setting conn-atom, the on-key-update callback now calls on-db-sync!
-          ;; instead of signaling sync-complete-ch (which was already delivered)
+          ;; instead of just stashing the head for the initial handshake
          _ (reset! conn-atom conn)
          _ (log/trace "Connection atom set, ongoing sync enabled")]
 
