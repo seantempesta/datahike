@@ -6,8 +6,15 @@
    queued transact hung. commit! now converts Errors to ex-info at the go
    boundary, so callbacks receive the error and the writer shuts down."
   (:require [datahike.api :as d]
+            [datahike.writer :as writer]
             [datahike.writing :as dw]
+            [clojure.core.async :as async]
             [clojure.test :refer [deftest is testing]]))
+
+(defn- take-with-timeout [channel]
+  (let [timeout (async/timeout 10000)
+        [value port] (async/alts!! [channel timeout])]
+    (if (= port timeout) ::timeout value)))
 
 (deftest fatal-error-in-commit-fails-loudly
   (testing "a fatal Error during commit propagates to the caller within a bounded time"
@@ -61,3 +68,134 @@
           (is (= :failed-loudly result) "commit-thread Error must not hang the transact"))
         (try (d/release conn) (catch Exception _)))
       (d/delete-database cfg))))
+
+(deftest commit-failure-resolves-every-accepted-write
+  (testing "a failed commit terminates the writer without losing queued callbacks"
+    (let [cfg {:store {:backend :memory :id (random-uuid)}
+               :schema-flexibility :read
+               :writer {:backend :self}}
+          _ (d/create-database cfg)
+          processed (atom 0)
+          all-processed (promise)
+          commit-entered (promise)
+          release-failure (promise)
+          total 8
+          conn (d/connect
+                (assoc-in cfg [:writer :write-fn-map]
+                          {'tracked-transact
+                           (fn [db arg]
+                             (let [result (dw/transact! db arg)]
+                               (when (= total (swap! processed inc))
+                                 (deliver all-processed true))
+                               result))}))
+          local-writer (:writer @conn)]
+      (try
+        ;; Establish a durable baseline that the synthetic failure must not
+        ;; move. The redefinition starts only after this commit completes.
+        (d/transact conn [{:db/id 1 :n 0}])
+        (let [callbacks
+              (with-redefs [dw/create-commit-id
+                            (fn [& _]
+                              (deliver commit-entered true)
+                              @release-failure
+                              (throw (ex-info "synthetic commit failure"
+                                              {:type :synthetic-commit-failure})))]
+                (let [first-callback
+                      (writer/dispatch! local-writer
+                                        {:op 'tracked-transact
+                                         :args [{:tx-data [{:db/id 2 :n 1}]}]})]
+                  (is (true? (deref commit-entered 10000 false))
+                      "the first commit is blocked before more writes are queued")
+                  (let [remaining
+                        (mapv (fn [n]
+                                (writer/dispatch! local-writer
+                                                  {:op 'tracked-transact
+                                                   :args [{:tx-data [{:db/id (+ n 2)
+                                                                      :n (inc n)}]}]}))
+                              (range (dec total)))]
+                    (is (true? (deref all-processed 10000 false))
+                        "all accepted writes reach the commit stage behind the blocked failure")
+                    (deliver release-failure true)
+                    (into [first-callback] remaining))))
+              results (mapv take-with-timeout callbacks)]
+          (is (every? #(and (instance? Throwable %)
+                            (not= ::timeout %))
+                      results)
+              "every accepted callback resolves with a failure")
+          (let [released (future
+                           (try
+                             (d/release conn)
+                             :released
+                             (catch Throwable _ :failed-loudly)))]
+            (is (not= ::timeout (deref released 10000 ::timeout))
+                "writer shutdown joins both failed loops"))
+          (let [fresh (d/connect cfg)]
+            (try
+              (is (= #{0}
+                     (set (d/q '[:find [?n ...] :where [_ :n ?n]] @fresh)))
+                  "no staged transaction commits after the first failure")
+              (finally
+                (d/release fresh)))))
+        (finally
+          (deliver release-failure true)
+          (try (d/release conn) (catch Throwable _))
+          (when (d/database-exists? cfg)
+            (d/delete-database cfg)))))))
+
+(deftest fatal-processing-error-resolves-buffered-writes
+  (testing "a fatal writer operation resolves invocations accepted behind it"
+    (let [started (promise)
+          release-error (promise)
+          cfg {:store {:backend :memory :id (random-uuid)}
+               :schema-flexibility :read
+               :writer {:backend :self
+                        :write-fn-map
+                        {'fatal-op
+                         (fn [_db]
+                           (deliver started true)
+                           @release-error
+                           (throw (AssertionError. "synthetic processing error")))}}}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          local-writer (:writer @conn)]
+      (try
+        (d/transact conn [{:db/id 1 :n 0}])
+        (let [fatal-callback (writer/dispatch! local-writer
+                                                {:op 'fatal-op :args []})]
+          (is (true? (deref started 10000 false)))
+          ;; The fatal op owns the only processing loop until released. These
+          ;; puts therefore enter the open buffered transaction queue before
+          ;; the loop can close it.
+          (let [buffered-callbacks
+                (mapv (fn [n]
+                        (writer/dispatch! local-writer
+                                          {:op 'transact!
+                                           :args [{:tx-data [{:db/id (+ n 2)
+                                                              :n (inc n)}]}]}))
+                      (range 7))]
+            (deliver release-error true)
+            (let [results (mapv take-with-timeout
+                                (into [fatal-callback] buffered-callbacks))]
+              (is (every? #(and (instance? Throwable %)
+                                (not= ::timeout %))
+                          results)
+                  "the failed invocation and every buffered invocation resolve"))))
+        (let [released (future
+                         (try
+                           (d/release conn)
+                           :released
+                           (catch Throwable _ :failed-loudly)))]
+          (is (not= ::timeout (deref released 10000 ::timeout))
+              "fatal processing shutdown completes"))
+        (let [fresh (d/connect cfg)]
+          (try
+            (is (= #{0}
+                   (set (d/q '[:find [?n ...] :where [_ :n ?n]] @fresh)))
+                "buffered writes were failed rather than processed")
+            (finally
+              (d/release fresh))))
+        (finally
+          (deliver release-error true)
+          (try (d/release conn) (catch Throwable _))
+          (when (d/database-exists? cfg)
+            (d/delete-database cfg)))))))

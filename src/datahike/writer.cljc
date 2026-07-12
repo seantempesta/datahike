@@ -17,23 +17,39 @@
   (-shutdown [_] "Returns a channel that resolves when the writer has shut down.")
   (-streaming? [_] "Returns whether the transactor is streaming updates directly into the connection, so it does not need to fetch from store on read."))
 
+(defn- writer-shut-down-error []
+  (ex-info "Writer is shut down; release and reconnect."
+           {:type :writer-shut-down}))
+
+(defn- fail-pending-transactions!
+  "Resolve every accepted invocation still buffered in the transaction queue."
+  [transaction-queue error]
+  (loop []
+    (when-let [{:keys [callback]} (poll! transaction-queue)]
+      (put! callback error)
+      (recur))))
+
+(defn- fail-pending-commits!
+  "Resolve every transaction report already staged for a commit that cannot run."
+  [commit-queue error]
+  (loop []
+    (when-let [[_ callback] (poll! commit-queue)]
+      (put! callback error)
+      (recur))))
+
 (defrecord LocalWriter [processing-thread commit-thread streaming?
                         transaction-queue-size commit-queue-size
                         transaction-queue commit-queue inflight-ops]
   PWriter
   (-dispatch! [_ arg-map]
-    (let [p (promise-chan)
-          closed-error
-          (fn []
-            (ex-info "Writer is shut down; release and reconnect."
-                     {:type :writer-shut-down}))]
+    (let [p (promise-chan)]
       ;; Admission and shutdown can race after put! returns. Its completion
       ;; callback is the authoritative result: false means the queue closed
       ;; without accepting this invocation, so always resolve the caller.
       (put! transaction-queue (assoc arg-map :callback p)
             (fn [accepted?]
               (when-not accepted?
-                (put! p (closed-error)))))
+                (put! p (writer-shut-down-error)))))
       p))
   (-shutdown [_]
     (close! transaction-queue)
@@ -140,11 +156,29 @@
                                 (when (> (count commit-queue-buffer) (/ commit-queue-size 2))
                                   (log/warn :datahike/commit-queue-pressure "Commit queue buffer >50% full" {:count (count commit-queue-buffer) :size commit-queue-size})
                                   (<! (timeout 50)))
-                                (put! commit-queue [res callback])
-                                (recur (:db-after res)))
+                                ;; A transaction is not admitted to the commit
+                                ;; stage until core.async confirms this put.
+                                ;; Closing a full queue wakes a parked put with
+                                ;; false; ignoring that result strands the
+                                ;; callback forever.
+                                (if (>! commit-queue [res callback])
+                                  (recur (:db-after res))
+                                  (let [error (writer-shut-down-error)]
+                                    (put! callback error)
+                                    (close! transaction-queue)
+                                    (fail-pending-transactions! transaction-queue error))))
                               :else
                               (recur old))))
                       (log/debug :datahike/writer-closed "Writer thread gracefully closed")))
+                  (catch #?(:clj Throwable :cljs js/Error) e
+                    ;; The current invocation was resolved at the point where
+                    ;; it failed. Closing does not discard a core.async
+                    ;; buffer, so explicitly fail every other invocation that
+                    ;; dispatch accepted before this fatal exit.
+                    (close! transaction-queue)
+                    (close! commit-queue)
+                    (fail-pending-transactions! transaction-queue e)
+                    (throw e))
                   (finally
                     (close! commit-queue))))
         ;; commit loop
@@ -194,10 +228,13 @@
                             (close! transaction-queue)
                             (doseq [[_ callback] txs]
                               (put! callback e))
+                            (fail-pending-commits! commit-queue e)
                             (log/error :datahike/writer-shutdown {:error e})
-                            ;; Re-throw Errors (AssertionError, OutOfMemoryError, etc.) to crash the writer
-                            #?(:clj (when (instance? Error e)
-                                      (throw e)))))
+                            ;; A failed commit is terminal even when the cause
+                            ;; is an Exception. Continuing would apply staged
+                            ;; reports after a durability failure and would
+                            ;; leave the writer's in-memory chain ambiguous.
+                            (throw e)))
                         (<! (timeout commit-wait-time))
                         (recur (<?- commit-queue)
                                (get-in @connection [:meta :datahike/commit-id])))))))]
