@@ -196,6 +196,28 @@
            #{["Devil"] ["Tupen"]}))
     (d/release conn)))
 
+#?(:clj
+   (deftest transaction-expected-basis-is-an-atomic-head-fence
+     (let [conn (du/setup-db)
+           expected (:max-tx @conn)
+           report (d/transact conn
+                              {:tx-data [[:db/add 1 :name "accepted"]]
+                               :datahike/expected-basis-t expected})
+           committed (:max-tx (:db-after report))]
+       (is (= (inc expected) committed))
+       (is (= "accepted" (:name (d/entity @conn 1))))
+       (is (thrown-with-msg?
+             Throwable
+             #"Transaction basis is stale"
+             (d/transact conn
+                         {:tx-data [[:db/add 2 :name "must-not-land"]]
+                          :datahike/expected-basis-t expected})))
+       (is (= committed (:max-tx @conn))
+           "a rejected fence performs no transaction")
+       (is (nil? (:name (d/entity @conn 2)))
+           "none of the fenced transaction's facts land")
+       (d/release conn))))
+
 (deftest test-db-fn-cas
   (let [conn (du/setup-db)]
     (d/transact conn {:tx-data [[:db/cas 1 :weight nil 100]]})

@@ -783,9 +783,23 @@
     (update tx-report :db-after
             assoc-in [:meta :datahike/merge-parents] all-parents)))
 
-(defn transact! [old {:keys [tx-data tx-meta]}]
+(defn transact!
+  "Apply one transaction to the writer's current immutable database value.
+
+   `:datahike/expected-basis-t`, when present, is a full-head precondition. The
+   serialized writer rejects the transaction unless its current `:max-tx`
+   equals that value. The check and transaction therefore share the same
+   writer operation; callers never need to persist a synthetic head entity."
+  [old {:keys [tx-data tx-meta] expected-basis-t :datahike/expected-basis-t}]
   (log/debug :datahike/transact {:tx-count (count tx-data)})
   (log/trace :datahike/transact-detail {:tx-data tx-data :tx-meta tx-meta})
+  (when (and (some? expected-basis-t)
+             (not= expected-basis-t (:max-tx old)))
+    (throw
+      (ex-info "Transaction basis is stale."
+               {:error :transaction/stale-basis
+                :datahike/expected-basis-t expected-basis-t
+                :datahike/current-basis-t (:max-tx old)})))
   (complete-db-update old (core/with old tx-data tx-meta)))
 
 (defn load-entities [old entities]
