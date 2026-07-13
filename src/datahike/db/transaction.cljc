@@ -369,7 +369,7 @@
     (dd/datom (.-e datom) (.-a datom) (secondary-only-hash (.-v datom)) (.-tx datom) (datom-added datom))
     datom))
 
-(defn- with-datom [db ^Datom datom]
+(defn- with-datom [db ^Datom datom current-datom]
   (validate-datom db datom)
   (let [{a-ident :ident} (dbu/attr-info db (.-a datom) :error-on-missing)
         indexing? (dbu/indexing? db a-ident)
@@ -397,7 +397,7 @@
                     update-rschema)
         true (update :op-count inc))
 
-      (if-some [removing ^Datom (first (dbi/search db [(.-e prim) (.-a prim) (.-v prim)]))]
+      (if-some [removing ^Datom current-datom]
         (cond-> db
           true (update-in [:eavt] #(di/-remove % removing :eavt op-count))
           true (update-in [:aevt] #(di/-remove % removing :aevt op-count))
@@ -466,7 +466,7 @@
                     :attribute (.-a datom)
                     :datom     datom})))))
 
-(defn- with-datom-upsert [db ^Datom datom]
+(defn- with-datom-upsert [db ^Datom datom old-datom]
   (validate-datom-upsert db datom)
   (let [indexing?     (dbu/indexing? db (.-a datom))
         {a-ident :ident} (dbu/attr-info db (.-a datom) :error-on-missing)
@@ -475,10 +475,6 @@
         keep-history? (and (dbi/-keep-history? db) (not (dbu/no-history? db a-ident))
                            (not= :db/txInstant a-ident))
         op-count      (:op-count db)
-        old-datom (first (di/-slice (:eavt db)
-                                    (dd/datom (.-e datom) (.-a datom) nil (.-tx datom))
-                                    (dd/datom (.-e datom) (.-a datom) nil (.-tx datom))
-                                    :eavt))
         has-secondary? (seq (get-in db [:rschema :db.secondary/index a-ident]))
         secondary-only? (dbu/secondary-only? db a-ident)
         ;; primary indexes hold the content hash for :db.secondary/only attrs;
@@ -519,10 +515,34 @@
    (let [db      (:db-after report)
          a       (:a datom)
          update-fn (if upsert? with-datom-upsert with-datom)
-         report' (-> report
-                     (update-in [:db-after] update-fn datom)
-                     (update-in [:tx-data] conj datom))]
-     (if (dbu/tuple-source? db a)
+         {a-ident :ident} (dbu/attr-info db a :error-on-missing)
+         primary-datom (project-primary (dbu/secondary-only? db a-ident) datom)
+         current-datom (if upsert?
+                         (first (di/-slice (:eavt db)
+                                           (dd/datom (.-e primary-datom)
+                                                     (.-a primary-datom) nil
+                                                     (.-tx primary-datom))
+                                           (dd/datom (.-e primary-datom)
+                                                     (.-a primary-datom) nil
+                                                     (.-tx primary-datom))
+                                           :eavt))
+                         (first (dbi/search db [(.-e primary-datom)
+                                                (.-a primary-datom)
+                                                (.-v primary-datom)])))
+         changed? (if (datom-added datom)
+                    (if upsert?
+                      (not= (some-> ^Datom current-datom .-v)
+                            (.-v primary-datom))
+                      (nil? current-datom))
+                    (some? current-datom))
+         ;; `:db.ensure/attrs` below validates what the transaction ATTEMPTED,
+         ;; including an idempotent reassertion. Keep that internal view in
+         ;; :tx-data while the reducer is running, but separately accumulate
+         ;; only effective datoms for the public TxReport and listeners.
+         report' (cond-> (update-in report [:tx-data] conj datom)
+                   changed? (assoc :db-after (update-fn db datom current-datom))
+                   changed? (update ::effective-tx-data (fnil conj []) datom))]
+     (if (and changed? (dbu/tuple-source? db a))
        (let [e      (:e datom)
              v      (if (datom-added datom) (:v datom) nil)
              queue  (or (-> report' ::queued-tuples (get e)) {})
@@ -1150,6 +1170,8 @@
             (validate-cross-tx-vt-windows! report)
             (-> report
                 (dissoc ::pending-vt-validation)
+                (assoc :tx-data (vec (::effective-tx-data report)))
+                (dissoc ::effective-tx-data)
                 (assoc-in [:tempids :db/current-tx] (current-tx report))
                 (update-in [:db-after :max-tx] inc)
                 (update :db-after persistent!)
@@ -1220,6 +1242,8 @@
          migration-state (get-in initial-report [:db-before :migration] {})]
     (if (empty? es)
       (-> report
+          (assoc :tx-data (vec (::effective-tx-data report)))
+          (dissoc ::effective-tx-data)
           (update-in [:db-after :max-tx] inc)
           (update-in [:db-after :migration] #(if %
                                                (merge % migration-state)

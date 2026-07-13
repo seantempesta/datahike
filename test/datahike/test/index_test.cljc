@@ -341,6 +341,32 @@
              (events changed)))
       (is (true? (:flag (d/entity changed 1)))))))
 
+(deftest test-redundant-assertions-are-not-transaction-changes
+  (let [base (db/empty-db {:thing/id   {:db/unique :db.unique/identity}
+                           :thing/tags {:db/cardinality :db.cardinality/many}}
+                          {:keep-history? true
+                           :schema-flexibility :read})
+        asserted-report (d/with base [{:thing/id "thing-1"
+                                       :thing/tags ["stable"]}])
+        asserted (:db-after asserted-report)
+        eid (:e (first (d/datoms asserted :avet :thing/id "thing-1")))
+        id-tx (:tx (first (d/datoms asserted :eavt eid :thing/id)))
+        tag-tx (:tx (first (d/datoms asserted :eavt eid :thing/tags)))
+        reasserted-report (d/with asserted [{:thing/id "thing-1"
+                                             :thing/tags ["stable"]}])
+        reasserted (:db-after reasserted-report)
+        domain-datoms (filter #(contains? #{:thing/id :thing/tags} (:a %))
+                              (:tx-data reasserted-report))]
+    (testing "idempotent entity-map assertions are absent from the TxReport"
+      (is (empty? domain-datoms))
+      (is (= #{:db/txInstant} (set (map :a (:tx-data reasserted-report))))))
+    (testing "the current datoms retain the transaction that asserted the fact"
+      (is (= id-tx (:tx (first (d/datoms reasserted :eavt eid :thing/id)))))
+      (is (= tag-tx (:tx (first (d/datoms reasserted :eavt eid :thing/tags))))))
+    (testing "a redundant retract is absent from the TxReport"
+      (let [report (d/with reasserted [[:db/retract eid :thing/tags "missing"]])]
+        (is (empty? (filter #(= :thing/tags (:a %)) (:tx-data report))))))))
+
 (deftest test-upsert-replace-comparators
   (testing "Replace comparators return 0 for old/new datom pairs"
     (let [old-datom (dd/datom 1 :name "Ivan" 100 true)

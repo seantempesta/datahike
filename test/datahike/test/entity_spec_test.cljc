@@ -42,8 +42,12 @@
                       (assoc :initial-tx schema))
               conn (setup-db cfg)]
           (testing "assert valid account"
-            (let [{:keys [db-after]} (tx-with-ensure conn valid-account)]
-              (is (= valid-account (d/pull db-after '[:account/email :account/balance] [:account/email (:account/email valid-account)])))))
+            (let [{:keys [db-after]} (tx-with-ensure conn valid-account)
+                  reasserted (tx-with-ensure conn valid-account)]
+              (is (= valid-account (d/pull db-after '[:account/email :account/balance] [:account/email (:account/email valid-account)])))
+              (is (empty? (filter #(contains? #{:account/email :account/balance} (:a %))
+                                  (:tx-data reasserted)))
+                  "db.ensure still sees attempted attributes while the public report omits no-ops")))
           (testing "assert invalid account"
             (is (thrown-with-msg? Throwable
                                   #"Entity 5 missing attributes #\{:account/balance\} of spec :account/guard"
@@ -60,8 +64,12 @@
                       (assoc :initial-tx schema))
               conn (setup-db cfg)]
           (testing "assert valid account"
-            (let [{:keys [db-after]} (tx-with-ensure conn valid-account)]
-              (is (= valid-account (d/pull db-after '[:account/email :account/balance] [:account/email (:account/email valid-account)])))))
+            (let [{:keys [db-after]} (tx-with-ensure conn valid-account)
+                  reasserted (tx-with-ensure conn valid-account)]
+              (is (= valid-account (d/pull db-after '[:account/email :account/balance] [:account/email (:account/email valid-account)])))
+              (is (empty? (filter #(contains? #{:account/email :account/balance} (:a %))
+                                  (:tx-data reasserted)))
+                  "db.ensure still sees attempted attributes while the public report omits no-ops")))
           (testing "assert invalid account"
             (is (thrown-with-msg? Throwable
                                   #"Entity 5 missing attributes #\{:account/balance\} of spec :account/guard"
