@@ -111,7 +111,17 @@
                             ;; Catch all Throwables to handle AssertionError and other Errors
                             ;; These should crash the writer, but we deliver to callback first to prevent hangs
                                     (catch #?(:clj Throwable :cljs js/Error) e
-                                      (log/error :datahike/write-error {:invocation invocation :error e :args args})
+                                      ;; A stale expected basis is an ordinary
+                                      ;; optimistic-concurrency rejection. The
+                                      ;; caller receives and handles the error;
+                                      ;; logging the entire rejected tx-data at
+                                      ;; error level is noisy and can be huge.
+                                      (when-not (= :transaction/stale-basis
+                                                   (:error (ex-data e)))
+                                        (log/error :datahike/write-error
+                                                   {:invocation invocation
+                                                    :error e
+                                                    :args args}))
                               ;; take a guess that a NPE was triggered by an invalid connection
                               ;; short circuit on errors
                                       #?(:cljs (put! callback e)
