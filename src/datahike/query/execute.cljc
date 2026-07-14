@@ -2884,7 +2884,12 @@
             ;; For single-group plans only (multi-group needs more work)
             _ (when (> (count groups) 1)
                 (throw (ex-info "multi-group direct-rel not yet supported" {})))]
-        (when (= 1 (count groups))
+        ;; A fully ground group has no produced columns. The direct emitter
+        ;; intentionally skips zero-width tuples, but the Relation engine must
+        ;; preserve one empty tuple when the ground clause exists so a
+        ;; const-bound :find (including find-pull) can project its :in value.
+        ;; Return nil here and let execute-plan preserve that existence row.
+        (when (and (= 1 (count groups)) (seq all-vars))
           (let [g (first groups)
                 scan-op (entity-group-scan-op g)
                 merge-ops (entity-group-merge-ops g)
