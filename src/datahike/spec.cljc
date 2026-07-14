@@ -31,7 +31,11 @@
    {:name ::pull-options
     :keys-default ds/req
     :spec {:selector coll? ;; TODO: spec more of selector
-           :eid SEId}}))
+           (ds/opt :eid) SEId
+           (ds/opt :eids) sequential?
+           (ds/opt :max-work) pos-int?
+           (ds/opt :max-results) pos-int?
+           (ds/opt :max-result-weight) pos-int?}}))
 
 (def SDatom datom?)
 

@@ -65,6 +65,35 @@
 
 (def test-db (db/init-db test-datoms test-schema))
 
+(defn- budget-exceeded?
+  [error budget-name]
+  (and (true? (:datahike/budget-exceeded (ex-data error)))
+       (= budget-name (:datahike.budget/name (ex-data error)))))
+
+(deftest global-pull-budget
+  (testing "wildcard component expansion stops at the synchronous work budget"
+    (let [error (try
+                  (d/pull test-db {:selector '[*]
+                                   :eid 10
+                                   :max-work 4})
+                  nil
+                  (catch #?(:clj Exception :cljs :default) error error))]
+      (is (budget-exceeded? error :query-work))))
+  (testing "an unlimited attribute selector cannot disable the global budget"
+    (let [error (try
+                  (d/pull test-db {:selector '[[:aka :limit nil]]
+                                   :eid 1
+                                   :max-result-weight 3})
+                  nil
+                  (catch #?(:clj Exception :cljs :default) error error))]
+      (is (budget-exceeded? error :result-weight))))
+  (testing "a later bounded pull succeeds after exhaustion"
+    (is (= {:name "Petr"}
+           (d/pull test-db {:selector '[:name]
+                            :eid 1
+                            :max-work 10
+                            :max-result-weight 20})))))
+
 (deftest test-pull-attr-spec
   (is (= {:name "Petr" :aka ["Devil" "Tupen"]}
          (d/pull test-db '[:name :aka] 1)))

@@ -11,6 +11,7 @@
    [datahike.query.analyze :as analyze]
    [datahike.query.plan :as plan]
    [datahike.query.relation :as rel]
+   [datahike.resource :as resource]
    #?(:clj [datahike.index.secondary :as sec])
    #?(:clj [datahike.index.entity-set :as es])
    #?(:clj [datahike.query :as legacy])
@@ -92,6 +93,7 @@
      :cljs #js []))
 
 (defn- result-list-add [list x]
+  (resource/charge-result! x)
   #?(:clj  (.add ^java.util.ArrayList list x)
      :cljs (.push list x)))
 

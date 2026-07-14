@@ -54,6 +54,70 @@
   (and (instance? clojure.lang.ExceptionInfo e)
        (true? (:datahike/canceled (ex-data e)))))
 
+(defn- budget-exception? [e budget-name]
+  (and (instance? clojure.lang.ExceptionInfo e)
+       (true? (:datahike/budget-exceeded (ex-data e)))
+       (= budget-name (:datahike.budget/name (ex-data e)))))
+
+(deftest synchronous-resource-budgets
+  (let [db (d/db *conn*)]
+    (testing "semantic limit does not bypass the work budget"
+      (let [error (try
+                    (d/q {:query '[:find ?e ?v :where [?e :x ?v]]
+                          :args [db]
+                          :limit 1
+                          :order-by '[?v :asc]
+                          :max-work 10})
+                    nil
+                    (catch Exception error error))]
+        (is (budget-exception? error :query-work))))
+    (testing "output exhaustion is structured and never a partial result"
+      (let [error (try
+                    (d/q {:query '[:find ?e ?v :where [?e :x ?v]]
+                          :args [db]
+                          :max-work 100
+                          :max-results 5})
+                    nil
+                    (catch Exception error error))]
+        (is (budget-exception? error :query-results))))
+    (testing "relation and legacy collectors charge before retaining output"
+      (doseq [[disable-planner? query]
+              [[false '[:find (count ?e) :where [?e :x]]]
+               [true '[:find ?e ?v :where [?e :x ?v]]]]]
+        (binding [q/*disable-planner* disable-planner?]
+          (let [error (try
+                        (d/q {:query query
+                              :args [db]
+                              :max-results 5})
+                        nil
+                        (catch Exception error error))]
+            (is (budget-exception? error :query-results))))))
+    (testing "aggregate work is bounded despite scalar output"
+      (let [error (try
+                    (d/q {:query '[:find (count ?e) . :where [?e :x]]
+                          :args [db]
+                          :max-work 10
+                          :max-results 2})
+                    nil
+                    (catch Exception error error))]
+        (is (budget-exception? error :query-work))))
+    (testing "find-pull inherits the active result-weight budget"
+      (let [error (try
+                    (d/q {:query '[:find (pull ?e [:x :y])
+                                   :where [?e :x 0]]
+                          :args [db]
+                          :max-result-weight 4})
+                    nil
+                    (catch Exception error error))]
+        (is (budget-exception? error :result-weight))))
+    (testing "a later bounded query succeeds after exhaustion"
+      (is (= 1 (count (d/q {:query '[:find ?e ?v :where [?e :x ?v]]
+                            :args [db]
+                            :limit 1
+                            :max-work 100000
+                            :max-results 5
+                            :max-result-weight 100})))))))
+
 (deftest cancel-nil-is-free
   (testing ":cancel nil (default) does not affect results"
     (binding [q/*disable-planner* false]

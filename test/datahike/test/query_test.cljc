@@ -514,6 +514,20 @@
                                   :offset 0
                                   :limit 100
                                   :args [:db]}
+                                 [])))
+    (is (= {:query {:find '[?n]
+                    :where '[[?e :name ?n]]}
+            :args [:db]
+            :limit 5
+            :max-work 20
+            :max-results 7}
+           (dq/normalize-q-input {:query '{:find [?n]
+                                           :where [[?e :name ?n]]
+                                           :limit 5
+                                           :max-work 10}
+                                  :args [:db]
+                                  :max-work 20
+                                  :max-results 7}
                                  []))))
 
   (testing "query in top-level map"

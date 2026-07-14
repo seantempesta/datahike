@@ -3,12 +3,19 @@
    #?(:cljs [cljs.test :as t :refer-macros [is deftest]]
       :clj  [clojure.test :as t :refer [is deftest]])
    [datahike.lru :as lru]
+   [datahike.resource :as resource]
    #?(:clj [datahike.api :as d])
    #?(:clj [datahike.query :as q])))
 
 (defn- weighted-state [c] (.-state c))
 (defn- total-weight [c] (:total-weight (weighted-state c)))
 (defn- entry-count [c] (count (:key-value (weighted-state c))))
+
+(deftest bounded-weight-inspection-is-total-and-non-realizing
+  (is (nil? (resource/shallow-weight-within
+             [nil (apply str (repeat 64 "x"))] 16)))
+  (is (nil? (resource/shallow-weight-within
+             (map identity (range 1000)) 16))))
 
 (deftest count-bound-evicts-oldest
   (let [c (-> (lru/weighted-lru 2 0) (assoc :a 1) (assoc :b 2) (assoc :c 3))]
@@ -100,6 +107,31 @@
              (is (= 42 (d/q '[:find ?x . :where [_ :pos/x ?x]] db)))
              (is (= 42 (d/q '[:find ?x . :where [_ :pos/x ?x]] db)))   ; cache-hit path
              (is (= #{[42]} (d/q '[:find ?x :where [_ :pos/x ?x]] db)))) ; other finds still fine
+           (d/release conn))
+         (finally
+           (d/delete-database cfg)
+           (q/set-query-cache-weight-limit! orig-limit)
+           (q/clear-query-cache!))))))
+
+#?(:clj
+   (deftest overweight-one-row-result-is-not-cached
+     (let [orig-limit @#'q/*query-cache-weight-limit*
+           cfg {:store {:backend :memory :id (random-uuid)}
+                :schema-flexibility :write
+                :keep-history? false}]
+       (try
+         (q/set-query-cache-weight-limit! 32)
+         (q/clear-query-cache!)
+         (d/create-database cfg)
+         (let [conn (d/connect cfg)
+               huge (apply str (repeat 128 "x"))]
+           (d/transact conn [{:db/ident :cache/huge
+                              :db/valueType :db.type/string
+                              :db/cardinality :db.cardinality/one}])
+           (d/transact conn [{:cache/huge huge}])
+           (is (= #{[huge]}
+                  (d/q '[:find ?v :where [_ :cache/huge ?v]] @conn)))
+           (is (zero? (-> @q/query-result-cache .-state :total-weight)))
            (d/release conn))
          (finally
            (d/delete-database cfg)

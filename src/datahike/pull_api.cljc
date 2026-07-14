@@ -2,6 +2,7 @@
   (:require
    [datahike.db.utils :as dbu]
    [datahike.db.interface :as dbi]
+   [datahike.resource :as resource]
    [datalog.parser.pull :as dpp #?@(:cljs [:refer [PullSpec]])])
   #?(:clj
      (:import
@@ -62,6 +63,7 @@
   "Add eid to result set if entity already seen. Else return nil."
   [frame frames eid]
   (when (seen-eid? frame eid)
+    (resource/charge-result-node!)
     (conj frames (update frame :results conj! {:db/id eid}))))
 
 (defn single-frame-result
@@ -137,8 +139,13 @@
   (let [limit (get opts :limit +default-limit+)
         attr-key (or (:as opts) attr-key)
         found (not-empty
-               (cond->> datoms
-                 limit (into [] (take limit))))]
+               (into []
+                     (comp (map (fn [datom]
+                                  (resource/charge-work!)
+                                  (resource/charge-value! (.-v ^Datom datom))
+                                  datom))
+                           (if limit (take limit) identity))
+                     datoms))]
     (if found
       (let [ref?       (dbu/ref? db attr)
             system-attrib-ref? (dbu/system-attrib-ref? db attr)
@@ -171,14 +178,16 @@
                             #(db-ident-and-id db (datom-val %))
                             datom-val)
                 single?   (not multi?)]
-            (->> (cond-> (into [] (map as-value) found)
-                   single? first)
-                 (update parent :kvps assoc! attr-key)
-                 (conj frames)))))
-      (->> (cond-> parent
-             (contains? opts :default)
-             (update :kvps assoc! attr-key (:default opts)))
-           (conj frames)))))
+            (let [value (cond-> (into [] (map as-value) found)
+                          single? first)]
+              (resource/charge-result-node!)
+              (conj frames (update parent :kvps assoc! attr-key value))))))
+      (if (contains? opts :default)
+        (do
+          (resource/charge-result-node!)
+          (resource/charge-value! (:default opts))
+          (conj frames (update parent :kvps assoc! attr-key (:default opts))))
+        (conj frames parent)))))
 
 (defn pull-attr
   "Retrieve datoms for given entity id and specification from database"
@@ -186,8 +195,10 @@
   (let [[attr-key opts] spec]
     (if (= :db/id attr-key)
       (if (not-empty (dbi/datoms db :eavt [eid]))
-        (conj (rest frames)
-              (update (first frames) :kvps assoc! :db/id eid))
+        (do
+          (resource/charge-result-node!)
+          (conj (rest frames)
+                (update (first frames) :kvps assoc! :db/id eid)))
         frames)
       (let [attr     (:attr opts)
             forward? (= attr-key attr)
@@ -252,13 +263,18 @@
 
 (defn pull-wildcard-expand
   [db frame frames eid pattern]
-  (let [datoms (group-by (fn [d] (if (:attribute-refs? (dbi/-config db))
-                                   (dbi/ident-for db (.-a ^Datom d) :error-on-missing)
-                                   (.-a ^Datom d)))
-                         (dbi/datoms db :eavt [eid]))
+  (let [datoms (reduce (fn [grouped ^Datom datom]
+                         (resource/charge-work!)
+                         (let [attr (if (:attribute-refs? (dbi/-config db))
+                                      (dbi/ident-for db (.-a datom) :error-on-missing)
+                                      (.-a datom))]
+                           (update grouped attr (fnil conj []) datom)))
+                       {}
+                       (dbi/datoms db :eavt [eid]))
         {:keys [attr recursion]} frame
         rec (cond-> recursion
               (some? attr) (push-recursion attr eid))]
+    (resource/charge-result-node!)
     (->> {:state :expand :kvps (transient {:db/id eid})
           :eid eid :pattern pattern :datoms (seq datoms)
           :recursion rec}
@@ -293,6 +309,7 @@
 
 (defn pull-pattern
   [db frames]
+  (resource/charge-work!)
   (case (:state (first frames))
     :expand     (recur db (pull-expand-frame db frames))
     :expand-rev (recur db (pull-expand-reverse-frame db frames))
@@ -309,17 +326,34 @@
                     result))))
 
 (defn pull-spec
-  [db pattern eids multi?]
-  (let [eids (into [] (map #(dbu/entid-strict db %)) eids)]
-    (pull-pattern db (list (initial-frame pattern eids multi?)))))
+  ([db pattern eids multi?]
+   (pull-spec db pattern eids multi? nil))
+  ([db pattern eids multi? options]
+   (let [eids (into [] (map #(dbu/entid-strict db %)) eids)
+         budget (resource/make-budget options)]
+     (binding [resource/*budget* (or budget resource/*budget*)]
+       (resource/certify-result!
+        (pull-pattern db (list (initial-frame pattern eids multi?)))
+        (dissoc options :max-results))))))
 
 (defn pull
-  ([db {:keys [selector eid]}]
-   (pull db selector eid))
+  ([db {:keys [selector eid max-work max-results max-result-weight]}]
+   {:pre [(dbu/db? db)]}
+   (pull-spec db (dpp/parse-pull selector) [eid] false
+              {:max-work max-work
+               :max-results max-results
+               :max-result-weight max-result-weight}))
   ([db selector eid]
    {:pre [(dbu/db? db)]}
    (pull-spec db (dpp/parse-pull selector) [eid] false)))
 
-(defn pull-many [db selector eids]
-  {:pre [(dbu/db? db)]}
-  (pull-spec db (dpp/parse-pull selector) eids true))
+(defn pull-many
+  ([db {:keys [selector eids max-work max-results max-result-weight]}]
+   {:pre [(dbu/db? db)]}
+   (pull-spec db (dpp/parse-pull selector) eids true
+              {:max-work max-work
+               :max-results max-results
+               :max-result-weight max-result-weight}))
+  ([db selector eids]
+   {:pre [(dbu/db? db)]}
+   (pull-spec db (dpp/parse-pull selector) eids true)))

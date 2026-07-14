@@ -24,6 +24,7 @@
                                          RulesVar SrcVar Variable]])
    [datahike.constants :as const]
    [datahike.query.relation :as rel]
+   [datahike.resource :as resource]
    [datahike.query.plan :as plan]
    [datahike.query.analyze :as analyze]
    #?(:clj [datahike.query.logical :as logical])
@@ -103,11 +104,14 @@
                      (log/warn :datahike/query-input-ignored {:query query}))
                    (:args query-input))
                arg-inputs)
-        extra-ks [:offset :limit :order-by :stats? :count-fns? :settings :cancel]]
-    (-> (cond-> {:query (apply dissoc query extra-ks)
-                 :args args}
-          (map? query-input)
-          (merge (select-keys query-input extra-ks)))
+        extra-ks [:offset :limit :order-by :stats? :count-fns? :settings :cancel
+                  :max-work :max-results :max-result-weight]
+        query-options (when (map? query) (select-keys query extra-ks))
+        outer-options (when (map? query-input) (select-keys query-input extra-ks))]
+    (-> (merge {:query (apply dissoc query extra-ks)
+                :args args}
+               query-options
+               outer-options)
         auto-inject-built-in-rules)))
 
 (defn q [query & inputs]
@@ -394,6 +398,7 @@
        (reduce
         (fn [acc t1]
           (reduce (fn [acc t2]
+                    (resource/charge-work!)
                     (conj! acc (join-tuples t1 idxs1 t2 idxs2)))
                   acc (:tuples rel2)))
         (transient []) (:tuples rel1)))))))
@@ -860,7 +865,8 @@
   (loop [tuples tuples
          hash-table (transient {})]
     (if-some [tuple (first tuples)]
-      (let [key (key-fn tuple)]
+      (let [_ (resource/charge-work!)
+            key (key-fn tuple)]
         (recur (next tuples)
                (assoc! hash-table key (conj (get hash-table key '()) tuple))))
       (persistent! hash-table))))
@@ -886,6 +892,7 @@
                                   (let [key (key-fn2 tuple2)]
                                     (if-some [tuples1 (get hash key)]
                                       (reduce (fn [acc tuple1]
+                                                (resource/charge-work!)
                                                 (conj! acc (join-tuples tuple1 keep-idxs1 tuple2 keep-idxs2)))
                                               acc tuples1)
                                       acc)))
@@ -899,6 +906,7 @@
                                   (let [key (key-fn1 tuple1)]
                                     (if-some [tuples2 (get hash key)]
                                       (reduce (fn [acc tuple2]
+                                                (resource/charge-work!)
                                                 (conj! acc (join-tuples tuple1 keep-idxs1 tuple2 keep-idxs2)))
                                               acc tuples2)
                                       acc)))
@@ -1115,7 +1123,11 @@
                                          #?(:clj (catch ClassCastException _ false)
                                             :cljs (catch :default _ false))
                                          #?(:clj (catch IllegalArgumentException _ false))))]
-                    (update production :tuples #(filter safe-pred %)))
+                    (update production :tuples
+                            #(filter (fn [tuple]
+                                       (resource/charge-work!)
+                                       (safe-pred tuple))
+                                     %)))
                   (assoc production :tuples []))]
     (update context :rels conj new-rel)))
 
@@ -1152,6 +1164,7 @@
             new-rel (if fun
                       (let [tuple-fn (-call-fn context production fun args)
                             rels (for [tuple (:tuples production)
+                                       :let [_ (resource/charge-work!)]
                                        :let [val (tuple-fn tuple)]
                                        :when (not (nil? val))]
                                    (prod-rel (rel/->Relation (:attrs production) [tuple])
@@ -1909,10 +1922,13 @@
       ([dst e a v tx added? datom-predicate]
        (let [inner-step (if datom-predicate
                           (fn [dst datom]
+                            (resource/charge-work!)
                             (if (datom-predicate datom)
                               (step dst datom)
                               dst))
-                          step)
+                          (fn [dst datom]
+                            (resource/charge-work!)
+                            (step dst datom)))
              datoms (try
                       (backend-fn e a v tx added?)
                       (catch #?(:clj Exception :cljs js/Error) e
@@ -2219,6 +2235,7 @@
                                 (-resolve-clause* context clause orig-clause)))))
 
 (defn resolve-clause [context clause]
+  (resource/charge-work!)
   (if (rule? context clause)
     (if (source? (first clause))
       (binding [rel/*implicit-source* (get (:sources context) (first clause))]
@@ -2255,6 +2272,7 @@
                              :clj ^{:tag "[[Ljava.lang.Object;"} t1) acc
                           t2 (:tuples rel)]
                       (let [res (aclone t1)]
+                        (resource/charge-work!)
                         (dotimes [i len]
                           (when-some [idx (aget copy-map i)]
                             (aset res i (get t2 idx))))
@@ -2378,9 +2396,9 @@
       64)))
 
 (def ^:dynamic *query-cache-weight-limit*
-  "Maximum total number of cached result tuples retained across all DB snapshots
-   in the query result cache. 0 disables the budget, leaving only the
-   snapshot-count cap *query-cache-size*. Set DATAHIKE_QUERY_CACHE_WEIGHT_LIMIT
+  "Maximum total shallow structural weight retained across all DB snapshots
+   in the query result cache. 0 disables result caching. Set
+   DATAHIKE_QUERY_CACHE_WEIGHT_LIMIT
    env var or call set-query-cache-weight-limit! to change. Default: 1000000."
   (let [env-val #?(:clj (System/getenv "DATAHIKE_QUERY_CACHE_WEIGHT_LIMIT") :cljs nil)]
     (if env-val
@@ -2389,29 +2407,21 @@
       1000000)))
 
 (defn- result-weight
-  "Cached-tuple weight of one query result. Relation / collection finds
-   return countable collections (weight = tuple count); scalar-find (`.`)
-   and single-tuple / single-pull finds return a non-collection value
-   that weighs 1. Computed once at cache-put time and stored on the entry
-   as :weight, so the weigh path never calls `count` on a raw result
-   (a scalar `:result` would otherwise throw)."
+  "Bounded shallow structural weight of one query result, or nil when the
+   result cannot be certified without realizing lazy data. Computed once at
+   cache-put time and stored on the entry as :weight."
   [result]
-  (cond
-    (nil? result)     0
-    (counted? result) (count result)
-    #?@(:clj [(instance? java.util.Collection result) (count result)])
-    (coll? result)    (count result)
-    :else             1))
+  (resource/shallow-weight-within result *query-cache-weight-limit*))
 
 (defn- bucket-weight
-  "Total cached-tuple weight of one DB-snapshot bucket — sums the
+  "Total cached structural weight of one DB-snapshot bucket — sums the
    per-entry :weight precomputed at cache-put time (see `result-weight`)."
   [bucket]
   (reduce-kv (fn [acc _ entry] (+ acc (:weight entry 0))) 0 bucket))
 
 (defonce ^{:doc "Global weighted LRU query result cache. Keys are [hash max-tx max-eid]
    identifying a DB snapshot. Values are maps of {cache-key -> {:result r :attrs #{...}}}.
-   Bounded by *query-cache-size* snapshots and *query-cache-weight-limit* total tuples.
+   Bounded by *query-cache-size* snapshots and *query-cache-weight-limit* total weight.
    Inspect with @datahike.query/query-result-cache."}
   query-result-cache
   (atom (datahike.lru/weighted-lru *query-cache-size* *query-cache-weight-limit* bucket-weight)))
@@ -2434,8 +2444,8 @@
           (datahike.lru/weighted-lru *query-cache-size* *query-cache-weight-limit* bucket-weight)))
 
 (defn set-query-cache-weight-limit!
-  "Set the maximum total number of cached result tuples across all DB snapshots.
-   0 disables the weight budget. Takes effect immediately by replacing the cache."
+  "Set the maximum total shallow structural weight across all DB snapshots.
+   0 disables result caching. Takes effect immediately by replacing the cache."
   [n]
   {:pre [(nat-int? n)]}
   #?(:clj (alter-var-root #'*query-cache-weight-limit* (constantly n))
@@ -2543,13 +2553,15 @@
 (defn- result-cache-put!
   "Store a query result in the cache for the given DB."
   [db cache-key result attr-deps]
-  (let [dk (db-cache-key db)]
-    (swap! query-result-cache
-           (fn [lru]
-             (let [existing (or (get lru dk) {})]
-               (assoc lru dk (assoc existing cache-key
-                                    {:result result :attrs attr-deps
-                                     :weight (result-weight result)})))))))
+  (when-let [weight (and (pos? *query-cache-weight-limit*)
+                         (result-weight result))]
+    (let [dk (db-cache-key db)]
+      (swap! query-result-cache
+             (fn [lru]
+               (let [existing (or (get lru dk) {})]
+                 (assoc lru dk (assoc existing cache-key
+                                      {:result result :attrs attr-deps
+                                       :weight weight}))))))))
 
 (defn propagate-query-cache
   "Propagate query result cache from parent DB to child DB after a transaction.
@@ -2599,7 +2611,10 @@
 
 (defn collect [context symbols]
   (->> (-collect context symbols)
-       (map vec)))
+       (map (fn [tuple]
+              (let [tuple (vec tuple)]
+                (resource/charge-result! tuple)
+                tuple)))))
 
 (def default-settings {})
 
@@ -3626,7 +3641,7 @@
 (defn- execute-planned-direct
   "Direct HashSet path: write tuples directly, no Relations.
    Returns result set or nil if not eligible."
-  [plan db qfind find-elements context-in query stats? qreturnmaps]
+  [plan db qfind find-elements context-in query order-spec offset limit stats? qreturnmaps]
   (let [direct-eligible? (and (instance? FindRel qfind)
                               (not stats?)
                               ;; the fused HashSet path applies fns via post-apply-fns,
@@ -3644,7 +3659,10 @@
       (let [exec-direct #?(:clj (requiring-resolve 'datahike.query.execute/execute-plan-direct)
                            :cljs execute/execute-plan-direct)
             find-var-syms (mapv (fn [^Variable el] (.-symbol el)) (:elements qfind))]
-        (exec-direct plan db find-var-syms nil (:consts context-in) (:cancel context-in))))))
+        (exec-direct plan db find-var-syms
+                     (when (and (not order-spec) limit (pos? limit))
+                       (+ (or offset 0) limit))
+                     (:consts context-in) (:cancel context-in))))))
 
 (defn- post-process-result
   "Shared post-processing pipeline for both planned-relation and legacy paths.
@@ -3749,7 +3767,7 @@
       (post-process-result deduped context-in context-out query qfind find-elements
                            result-arity order-spec offset limit stats? qreturnmaps))))
 
-(defn- raw-q* [{:keys [query args offset limit order-by stats? count-fns? settings cancel] :as _query-map}]
+(defn- raw-q-unbudgeted* [{:keys [query args offset limit order-by stats? count-fns? settings cancel] :as _query-map}]
   (let [t0 (when *profile?* #?(:clj (System/nanoTime) :cljs (* 1000 (.getTime (js/Date.)))))
         settings (merge default-settings settings)
         {:keys [qfind qwith qreturnmaps qin]} (memoized-parse-query query)
@@ -3869,7 +3887,7 @@
                                                   ;; stats? applies to the top-level
                                                   ;; query only.
                                                   (dissoc :stats?))]
-                                {:tuples (raw-q* sub-input)
+                                {:tuples (raw-q-unbudgeted* sub-input)
                                  :vars   sub-find}))
                             components extended-find)
                            wide-vars (vec (mapcat :vars sub-results))
@@ -3901,7 +3919,8 @@
           ;; Try paths in order of preference:
           ;; 1. Direct HashSet (non-aggregate simple queries)
             (if-let [direct-result (execute-planned-direct
-                                    plan db qfind find-elements context-in query stats? qreturnmaps)]
+                                    plan db qfind find-elements context-in query
+                                    order-spec offset limit stats? qreturnmaps)]
               (let [result (apply-result-transforms direct-result order-spec offset limit qreturnmaps)]
                 #?(:clj
                    (when *profile?*
@@ -3963,6 +3982,16 @@
                                     (/ (- t3 t0) 1e6))))))
             result))))))
 
+(defn- raw-q*
+  [{:keys [cancel max-work max-results max-result-weight] :as query-map}]
+  (let [options {:max-work max-work
+                 :max-results max-results
+                 :max-result-weight max-result-weight}
+        budget (resource/make-budget options)
+        query-map (assoc query-map :cancel (resource/work-signal cancel budget))]
+    (binding [resource/*budget* budget]
+      (resource/certify-result! (raw-q-unbudgeted* query-map) options))))
+
 #?(:clj
    (defn- try-secondary-index-aggregate-fast
      "Fast-path: check if query is a simple aggregate that a secondary index can handle.
@@ -3999,14 +4028,17 @@
                        (when-let [result (try-secondary-index-aggregate db plan find-elements)]
                          (-post-process qfind result)))))))))))))
 
-(defn raw-q [{:keys [query args stats? count-fns? offset limit order-by] :as query-map}]
+(defn raw-q [{:keys [query args stats? count-fns? offset limit order-by
+                     max-work max-results max-result-weight] :as query-map}]
   (let [uncached (fn []
-                   #?(:clj (or (try-secondary-index-aggregate-fast query-map)
+                   #?(:clj (or (when-not (or max-work max-results max-result-weight)
+                                 (try-secondary-index-aggregate-fast query-map))
                                (raw-q* query-map))
                       :cljs (raw-q* query-map)))]
     (if (or (not *query-result-cache?*)
             stats?
             count-fns?                         ;; counting needs re-execution; a cache hit wouldn't re-run the fn
+            max-work max-results max-result-weight
             #?(:clj *profile?* :cljs false))
       (uncached)
       ;; Try result cache
