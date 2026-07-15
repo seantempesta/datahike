@@ -87,6 +87,28 @@
                   nil
                   (catch #?(:clj Exception :cljs :default) error error))]
       (is (budget-exceeded? error :result-weight))))
+  (testing "wide acyclic recursion exhausts the global work budget"
+    (let [db (d/db-with test-db
+                        (mapv (fn [eid] [:db/add 1 :friend eid]) (range 2 10)))
+          error (try
+                  (d/pull db {:selector '[:db/id :name {:friend ...}]
+                              :eid 1
+                              :max-work 10})
+                  nil
+                  (catch #?(:clj Exception :cljs :default) error error))]
+      (is (budget-exceeded? error :query-work))))
+  (testing "cyclic recursion exhausts the same global work budget"
+    (let [db (d/db-with test-db
+                        (conj (mapv (fn [eid] [:db/add 1 :friend eid])
+                                    (range 2 10))
+                              [:db/add 9 :friend 1]))
+          error (try
+                  (d/pull db {:selector '[:db/id :name {:friend ...}]
+                              :eid 1
+                              :max-work 10})
+                  nil
+                  (catch #?(:clj Exception :cljs :default) error error))]
+      (is (budget-exceeded? error :query-work))))
   (testing "a later bounded pull succeeds after exhaustion"
     (is (= {:name "Petr"}
            (d/pull test-db {:selector '[:name]
