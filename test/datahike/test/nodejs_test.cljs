@@ -15,6 +15,8 @@
             [cljs.reader]
             [datahike.api :as d]
             [datahike.api.async :refer [chan->promise]]
+            [datahike.db :as db]
+            [datahike.query :as dq]
             [datahike.index.audit :as ia]
             [datahike.audit :as audit]
             [datahike.online-gc :as online-gc]
@@ -64,6 +66,54 @@
 (defn tmp-dir []
   (let [dir (path.join (os.tmpdir) (str "datahike-node-test-" (rand-int 100000)))]
     dir))
+
+(deftest ^:async committed-query-cache-lifecycle-test
+  (let [cfg {:store {:backend :memory :id (random-uuid)}
+             :keep-history? true
+             :schema-flexibility :write}]
+    (await (d/create-database cfg))
+    (try
+      (dq/clear-query-cache!)
+      (let [conn (await (d/connect cfg))]
+        (await (d/transact! conn [{:db/ident :cache/id
+                                  :db/valueType :db.type/string
+                                  :db/unique :db.unique/identity
+                                  :db/cardinality :db.cardinality/one}
+                                 {:db/ident :cache/value
+                                  :db/valueType :db.type/string
+                                  :db/cardinality :db.cardinality/one}
+                                 {:cache/id "one" :cache/value "before"}]))
+        (let [committed @conn
+              [connection-id generation-before _]
+              (db/committed-cache-identity committed)
+              speculative (:db-after
+                           (d/with committed [{:cache/id "one"
+                                               :cache/value "local"}]))]
+          (is connection-id)
+          (is (nil? (db/committed-cache-identity speculative)))
+          (is (nil? (db/committed-cache-identity
+                     (d/as-of committed (:max-tx committed)))))
+          (is (= #{["before"]}
+                 (d/q '[:find ?v :where [_ :cache/value ?v]] committed)))
+          (is (pos? (:snapshot-count (dq/query-cache-metrics))))
+          (await (d/transact! conn [{:cache/id "one"
+                                     :cache/value "after"}]))
+          (is (= #{["after"]}
+                 (d/q '[:find ?v :where [_ :cache/value ?v]] @conn)))
+          (await (d/release conn))
+          (is (zero? (:snapshot-count (dq/query-cache-metrics))))
+          (let [reconnected (await (d/connect cfg))
+                [_ generation-after _]
+                (db/committed-cache-identity @reconnected)]
+            (is (not= generation-before generation-after))
+            (d/q '[:find ?v :where [_ :cache/value ?v]] @reconnected)
+            (let [before-stale-close (dq/query-cache-metrics)]
+              (dq/close-query-cache-generation! connection-id generation-before)
+              (is (= before-stale-close (dq/query-cache-metrics))))
+            (await (d/release reconnected)))))
+      (finally
+        (await (d/delete-database cfg))
+        (dq/clear-query-cache!)))))
 
 (deftest ^:async roundtrip-test
   (let [dir (tmp-dir)
