@@ -284,10 +284,11 @@ branch from the immutable commit when the declared branch does not exist, and
 upgrades a generation-less legacy source with one explicit sync before branch
 or force. No unrelated vector write is required.
 
-This integration requires the Proximum guarded-force changes at commit
-`fb6572c` (based on Proximum 0.1.25) or a release containing that commit. Before
-publishing Datahike, replace the test-only local override with an immutable
-released Proximum coordinate and record that exact version in `deps.edn`.
+This integration is tested against the public Proximum Git coordinate
+`https://github.com/seantempesta/proximum` at
+`9846d3e79e1aee48474bc876d3d563d7137209c6`. Datahike records that immutable
+coordinate in its `:test` alias; consumers of the optional Proximum adapter
+should select the same revision or a release containing it.
 
 Generation publication is correctness-first and not free: Proximum currently
 hashes the full mmap on each vector-index sync, so sync cost is O(mmap bytes),
