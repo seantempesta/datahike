@@ -107,6 +107,7 @@
                    (:args query-input))
                arg-inputs)
         extra-ks [:offset :limit :order-by :stats? :count-fns? :settings :cancel
+                  :request-id
                   :max-work :max-results :max-result-weight]
         query-options (when (map? query) (select-keys query extra-ks))
         outer-options (when (map? query-input) (select-keys query-input extra-ks))]
@@ -118,6 +119,34 @@
 
 (defn q [query & inputs]
   (raw-q (normalize-q-input query inputs)))
+
+(defn q-with-evidence
+  "Executes a query and returns its result with bounded cache/resource evidence."
+  [query & inputs]
+  (let [cache-evidence (volatile! {:datahike.cache/outcome
+                                   :datahike.cache.outcome/uncacheable
+                                   :datahike.cache/stored? false
+                                   :datahike.cache/saved-computation? false})
+        resource-evidence (volatile! (resource/budget-evidence nil))]
+    (binding [resource/*evidence-sink* resource-evidence]
+      (let [result (raw-q (normalize-q-input query inputs) cache-evidence)]
+        {:datahike.query/result result
+         :datahike.query/cache-evidence @cache-evidence
+         :datahike.query/resource-evidence
+         (assoc @resource-evidence
+                :datahike.resource/scope
+                (case (:datahike.cache/outcome @cache-evidence)
+                  :datahike.cache.outcome/hit :datahike.resource.scope/none
+                  :datahike.cache.outcome/hit-after-acquire
+                  :datahike.resource.scope/none
+                  :datahike.cache.outcome/miss-joined
+                  :datahike.resource.scope/shared-computation
+                  :datahike.resource.scope/local-computation))}))))
+
+(defn cancel-query!
+  "Detaches and wakes one active query caller by its request identity."
+  [request-id]
+  (single-flight/cancel! request-id))
 
 (defn query-stats [query & inputs]
   (-> query
@@ -2478,19 +2507,35 @@
 (defn close-query-cache-generation!
   "Fence cache puts and evict all snapshots for one exact connection generation."
   [connection-id generation]
-  (swap! query-result-cache
-         (fn [{:keys [lru generations] :as state}]
-           (if (= generation (get generations connection-id))
-             (assoc state
-                    :generations (dissoc generations connection-id)
-                    :lru (lru/weighted-remove-where
-                          lru
-                          (fn [[cached-id cached-generation _]]
-                            (and (= connection-id cached-id)
-                                 (= generation cached-generation)))))
-             state)))
-  (single-flight/close-scope! connection-id generation)
-  nil)
+  (let [release (volatile! {:current? false :snapshots 0})]
+    (swap! query-result-cache
+           (fn [{:keys [lru generations] :as state}]
+             (if (= generation (get generations connection-id))
+               (let [before (count (lru/weighted-entries lru))
+                     next-lru
+                     (lru/weighted-remove-where
+                      lru
+                      (fn [[cached-id cached-generation _]]
+                        (and (= connection-id cached-id)
+                             (= generation cached-generation))))]
+                 (vreset! release {:current? true
+                                   :snapshots (- before
+                                                 (count (lru/weighted-entries
+                                                         next-lru)))})
+                 (assoc state
+                        :generations (dissoc generations connection-id)
+                        :lru next-lru))
+               state)))
+    (let [flights (single-flight/close-scope! connection-id generation)]
+      {:datahike.cache.release/connection-id connection-id
+       :datahike.cache.release/generation generation
+       :datahike.cache.release/current-generation? (:current? @release)
+       :datahike.cache.release/completed-snapshots-evicted
+       (:snapshots @release)
+       :datahike.cache.release/flights-detached
+       (:datahike.single-flight.release/flights flights 0)
+       :datahike.cache.release/callers-failed
+       (:datahike.single-flight.release/callers flights 0)})))
 
 (defn query-cache-metrics
   "Return bounded cache occupancy without exposing cached query results."
@@ -2500,6 +2545,19 @@
      :total-weight (lru/weighted-total-weight lru)
      :open-generation-count (count generations)
      :single-flight (single-flight/metrics)}))
+
+(defn query-cache-evidence
+  "Return bounded, namespaced cache and coordinator evidence as plain data."
+  []
+  (let [{:keys [snapshot-count total-weight open-generation-count
+                single-flight]}
+        (query-cache-metrics)]
+    (into {:datahike.cache/snapshot-count snapshot-count
+           :datahike.cache/total-weight total-weight
+           :datahike.cache/open-generation-count open-generation-count}
+          (map (fn [[key value]]
+                 [(keyword "datahike.single-flight" (name key)) value]))
+          (dissoc single-flight :active-by-database))))
 
 (defn- db-cache-key
   "Return exact committed identity, or nil for speculative and wrapped values."
@@ -4068,10 +4126,19 @@
   (let [options {:max-work max-work
                  :max-results max-results
                  :max-result-weight max-result-weight}
-        budget (resource/make-budget options)
+        budget (resource/make-budget (assoc options
+                                            :evidence?
+                                            (boolean resource/*evidence-sink*)))
         query-map (assoc query-map :cancel (resource/work-signal cancel budget))]
-    (binding [resource/*budget* budget]
-      (resource/certify-result! (raw-q-unbudgeted* query-map) options))))
+    (try
+      (binding [resource/*budget* budget]
+        ;; Evidence-only calls record the operation itself even when a tiny
+        ;; plan has no inner charged checkpoint. Normal q and existing budget
+        ;; limits retain their prior accounting behavior.
+        (when resource/*evidence-sink* (resource/charge-work!))
+        (resource/certify-result! (raw-q-unbudgeted* query-map) options))
+      (finally
+        (resource/publish-evidence! budget)))))
 
 #?(:clj
    (defn- try-secondary-index-aggregate-fast
@@ -4109,8 +4176,11 @@
                        (when-let [result (try-secondary-index-aggregate db plan find-elements)]
                          (-post-process qfind result)))))))))))))
 
-(defn raw-q [{:keys [query args stats? count-fns? offset limit order-by
-                     max-work max-results max-result-weight] :as query-map}]
+(defn raw-q
+  ([query-map] (raw-q query-map nil))
+  ([{:keys [query args stats? count-fns? offset limit order-by
+            request-id max-work max-results max-result-weight] :as query-map}
+    cache-evidence]
   (let [uncached (fn [shared-cancel]
                    (let [effective-query-map
                          (if shared-cancel
@@ -4125,12 +4195,24 @@
             count-fns?                         ;; counting needs re-execution; a cache hit wouldn't re-run the fn
             max-work max-results max-result-weight
             #?(:clj *profile?* :cljs false))
-      (uncached nil)
+      (do (when cache-evidence
+            (vreset! cache-evidence
+                     {:datahike.cache/outcome
+                      :datahike.cache.outcome/uncacheable
+                      :datahike.cache/stored? false
+                      :datahike.cache/saved-computation? false}))
+          (uncached nil))
       ;; Try result cache
       (let [db (first args)
             db-key (db-cache-key db)]
         (if-not db-key
-          (uncached nil)
+          (do (when cache-evidence
+                (vreset! cache-evidence
+                         {:datahike.cache/outcome
+                          :datahike.cache.outcome/uncacheable
+                          :datahike.cache/stored? false
+                          :datahike.cache/saved-computation? false}))
+              (uncached nil))
           (let [non-db-args (vec (rest args))
                 cache-epoch (:epoch @query-result-cache)
                 ;; scale-sensitive-key: BigDecimal args/consts of equal value but
@@ -4141,19 +4223,27 @@
                            [query non-db-args offset limit order-by *disable-planner*])
                 cached (result-cache-get db cache-key)]
             ;; Completed hits never enter the in-flight path and therefore do
-            ;; not allocate a promise, waiter identity, flight key, or delayed
+            ;; not allocate a promise, request identity, flight key, or delayed
             ;; dependency analysis. The coordinator rechecks on a miss to close
             ;; the race with a concurrent owner publishing after this read.
             (if cached
-              (:result cached)
+              (do (when cache-evidence
+                    (vreset! cache-evidence
+                             {:datahike.cache/outcome
+                              :datahike.cache.outcome/hit
+                              :datahike.cache/stored? true
+                              :datahike.cache/saved-computation? false}))
+                  (:result cached))
               (let [attr-deps (delay (query-attribute-dependencies query))]
                 (single-flight/execute!
                  [db-key cache-key]
+                 request-id
                  #(when-let [entry (result-cache-get db cache-key)]
                     {:value (:result entry)})
                  uncached
                  #(result-cache-put! db cache-key % @attr-deps
-                                     cache-epoch))))))))))
+                                     cache-epoch)
+                 #(when cache-evidence (vreset! cache-evidence %))))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Register legacy functions for CLJS execute.cljc (breaks circular dep)

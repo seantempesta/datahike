@@ -78,7 +78,7 @@
     (is (= 2 @calls))))
 
 (deftest cancellation-reentrancy-and-overflow-remain-bounded
-  (testing "waiters detach independently and the final waiter signals"
+  (testing "requests detach independently and the final request signals"
     (single-flight/clear!)
     (let [before (single-flight/metrics)
           owner (single-flight/acquire! [[:db :g :c] :cancel])
@@ -86,9 +86,9 @@
       (is (= :owner (:state owner)))
       (is (= :waiter (:state waiter)))
       (is (single-flight/cancel-waiter! [[:db :g :c] :cancel]
-                                        (:waiter-id waiter)))
+                                        (:request-id waiter)))
       (is (single-flight/cancel-waiter! [[:db :g :c] :cancel]
-                                        (:waiter-id owner)))
+                                        (:request-id owner)))
       (is (true? @(:cancel (:entry owner))))
       (is (= (inc (:last-waiters before))
              (:last-waiters (single-flight/metrics))))
@@ -185,3 +185,48 @@
       (single-flight/complete! key (:entry successor)
                                {:status :ok :value :new})
       (is (zero? (:active-flights (single-flight/metrics)))))))
+
+(deftest external-request-cancellation-wakes-only-that-caller
+  (single-flight/clear!)
+  (let [key [[:db :generation :commit] :addressable]
+        entered (CountDownLatch. 1)
+        release (CountDownLatch. 1)
+        owner-id (random-uuid)
+        waiter-id (random-uuid)
+        owner (future
+                (single-flight/execute!
+                 key owner-id (constantly nil)
+                 (fn [cancel]
+                   (.countDown entered)
+                   (.await release 10 TimeUnit/SECONDS)
+                   (is (true? @cancel))
+                   :owner-result)
+                 (fn [_] false) nil))]
+    (is (.await entered 10 TimeUnit/SECONDS))
+    (let [waiter (future
+                   (try
+                     (single-flight/execute!
+                      key waiter-id (constantly nil)
+                      (fn [_] :must-not-compute) (fn [_] false) nil)
+                     (catch Exception error (:type (ex-data error)))))]
+      (loop [attempts 100]
+        (when (and (pos? attempts)
+                   (< (:active-callers (single-flight/metrics)) 2))
+          (Thread/yield)
+          (recur (dec attempts))))
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"already active"
+           (single-flight/acquire! key waiter-id)))
+      (let [cancelled (single-flight/cancel! waiter-id)]
+        (is (:datahike.query.cancel/detached? cancelled))
+        (is (false? (:datahike.query.cancel/last-waiter? cancelled))))
+      (is (= :datahike/query-canceled @waiter))
+      (let [cancelled (single-flight/cancel! owner-id)]
+        (is (:datahike.query.cancel/last-waiter? cancelled))
+        (is (:datahike.query.cancel/cooperative-signal-set? cancelled)))
+      (.countDown release)
+      (is (= :owner-result @owner))
+      (is (false? (:datahike.query.cancel/found?
+                   (single-flight/cancel! waiter-id))))
+      (is (zero? (:active-flights (single-flight/metrics)))
+          "completion removes the flight after all callers detach"))))

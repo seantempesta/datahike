@@ -73,10 +73,14 @@
       :else
       '([& args]))))
 
-(def ^:private capability-fields
-  "The bounded semantic projection that is safe to expose as ordinary data."
-  [:capability-operation :capability-class :value-semantics
-   :result-semantics :cache-semantics :cancellable? :resource-options])
+(def ^:private capability-field-projection
+  "The bounded, namespaced semantic projection exposed as ordinary data."
+  {:categories :datahike.capability.operation/categories
+   :cancellable? :datahike.capability.operation/cancellable?
+   :cacheable? :datahike.capability.operation/cacheable?
+   :resource-options :datahike.capability.operation/resource-options
+   :returns-host-value? :datahike.capability.operation/returns-host-value?
+   :returns-lazy? :datahike.capability.operation/returns-lazy?})
 
 (declare api-specification)
 
@@ -92,8 +96,14 @@
          (keep (fn [[api-name operation]]
                  (when-let [capability-operation (:capability-operation operation)]
                    [capability-operation
-                    (assoc (select-keys operation capability-fields)
-                           :api-name (keyword (name api-name)))])))
+                    (reduce-kv
+                     (fn [result source-key target-key]
+                       (if (contains? operation source-key)
+                         (assoc result target-key (get operation source-key))
+                         result))
+                     {:datahike.capability.operation/api-name
+                      (keyword "datahike.api" (name api-name))}
+                     capability-field-projection)])))
          api-specification)})
 
 ;; =============================================================================
@@ -210,8 +220,7 @@
      :supports-remote? true
      :referentially-transparent? false
      :capability-operation :datahike.operation/acquire
-     :capability-class :lifecycle
-     :result-semantics :host-owned-connection
+     :returns-host-value? true
      :doc "Connects to a Datahike database via configuration map."
      :examples [{:desc "Connect to default in-memory database"
                  :code "(connect)"}
@@ -229,9 +238,7 @@
      :supports-remote? true
      :referentially-transparent? false
      :capability-operation :datahike.operation/resolve-head
-     :capability-class :lifecycle
-     :value-semantics :moving-head
-     :result-semantics :host-owned-value
+     :returns-host-value? true
      :doc "Returns the underlying immutable database value from a connection. Prefer using @conn directly."
      :examples [{:desc "Get database from connection"
                  :code "(db conn)"}
@@ -247,9 +254,6 @@
      :supports-remote? false
      :referentially-transparent? true
      :capability-operation :datahike.operation/exact-value-identity
-     :capability-class :lifecycle
-     :value-semantics :exact-committed-raw
-     :result-semantics :plain-identity
      :doc "Returns exact process-local identity for a committed raw database value, or nil for unsupported values."
      :impl datahike.db/committed-value-identity}
 
@@ -261,8 +265,6 @@
      :supports-remote? true
      :referentially-transparent? false
      :capability-operation :datahike.operation/release
-     :capability-class :lifecycle
-     :result-semantics :release-acknowledgement
      :doc "Releases a database connection."
      :examples [{:desc "Release connection"
                  :code "(release conn)"}]
@@ -280,8 +282,7 @@
      :supports-remote? true
      :referentially-transparent? false
      :capability-operation :datahike.operation/transact
-     :capability-class :write
-     :result-semantics :committed-transaction
+     :returns-host-value? true
      :doc "Applies transaction to the database and updates connection. Blocks until committed. WARNING: Do not call from listener callbacks or transaction functions — use transact! instead to avoid deadlocks."
      :examples [{:desc "Add single datom"
                  :code "(transact conn [[:db/add 1 :name \"Ivan\"]])"}
@@ -362,10 +363,7 @@
      :supports-remote? true
      :referentially-transparent? true
      :capability-operation :datahike.operation/query
-     :capability-class :read
-     :value-semantics :exact-immutable
-     :result-semantics :eager-value
-     :cache-semantics :exact-committed-single-flight
+     :cacheable? true
      :cancellable? true
      :doc "Executes a datalog query."
      :examples [{:desc "Query with vector syntax"
@@ -389,14 +387,44 @@
      :supports-remote? true
      :referentially-transparent? true
      :capability-operation :datahike.operation/query-with-evidence
-     :capability-class :read
-     :value-semantics :exact-immutable
-     :result-semantics :bounded-evidence-envelope
-     :cache-semantics :exact-committed-single-flight
+     :cacheable? true
      :cancellable? true
      :resource-options #{:max-work :max-results :max-result-weight}
      :doc "Executes a Datalog query and returns its value with bounded cache and resource evidence."
      :impl datahike.query/q-with-evidence}
+
+    cancel-query!
+    {:args [:=> [:cat :string] :map]
+     :ret :map
+     :categories [:query :cancellation]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? false
+     :capability-operation :datahike.operation/cancel-query
+     :doc "Detaches and wakes one active query caller by request identity."
+     :impl datahike.query/cancel-query!}
+
+    query-cache-evidence
+    {:args [:=> [:cat] :map]
+     :ret :map
+     :categories [:query :diagnostics]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? false
+     :capability-operation :datahike.operation/query-cache-evidence
+     :doc "Returns bounded aggregate completed-cache and single-flight evidence."
+     :impl datahike.query/query-cache-evidence}
+
+    close-query-cache-generation!
+    {:args [:=> [:cat :any :uuid] :map]
+     :ret :map
+     :categories [:query :lifecycle :diagnostics]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? false
+     :capability-operation :datahike.operation/release-query-cache-scope
+     :doc "Fences and evicts one exact query-cache connection generation."
+     :impl datahike.query/close-query-cache-generation!}
 
     query-attribute-dependencies
     {:args [:=> [:cat [:or [:vector :any] :map :string]]
@@ -450,9 +478,6 @@
      :supports-remote? true
      :referentially-transparent? true
      :capability-operation :datahike.operation/pull
-     :capability-class :read
-     :value-semantics :exact-immutable
-     :result-semantics :eager-value
      :doc "Fetches data using recursive declarative pull pattern."
      :examples [{:desc "Pull with pattern"
                  :code "(pull db [:db/id :name :likes {:friends [:db/id :name]}] 1)"}
@@ -470,9 +495,6 @@
      :supports-remote? true
      :referentially-transparent? true
      :capability-operation :datahike.operation/pull-many
-     :capability-class :read
-     :value-semantics :exact-immutable
-     :result-semantics :eager-value
      :doc "Same as pull, but accepts sequence of ids and returns sequence of maps."
      :examples [{:desc "Pull multiple entities"
                  :code "(pull-many db [:db/id :name] [1 2 3])"}]
@@ -520,9 +542,7 @@
      :supports-remote? true
      :referentially-transparent? true
      :capability-operation :datahike.operation/index-read
-     :capability-class :read
-     :value-semantics :exact-immutable
-     :result-semantics :lazy-datoms
+     :returns-lazy? true
      :doc "Index lookup. Returns sequence of datoms matching index components."
      :examples [{:desc "Find all datoms for entity"
                  :code "(datoms db {:index :eavt :components [1]})"}
@@ -542,9 +562,7 @@
      :supports-remote? true
      :referentially-transparent? true
      :capability-operation :datahike.operation/index-seek
-     :capability-class :read
-     :value-semantics :exact-immutable
-     :result-semantics :lazy-datoms
+     :returns-lazy? true
      :doc "Like datoms, but returns datoms starting from specified components through end of index."
      :examples [{:desc "Seek from entity"
                  :code "(seek-datoms db {:index :eavt :components [1]})"}]
@@ -560,9 +578,7 @@
      :supports-remote? true
      :referentially-transparent? true
      :capability-operation :datahike.operation/index-reverse-seek
-     :capability-class :read
-     :value-semantics :exact-immutable
-     :result-semantics :lazy-datoms
+     :returns-lazy? true
      :doc "Like seek-datoms, but iterates BACKWARDS: datoms <= the given components, descending to the beginning of the index. Lazy on the persistent-sorted-set index — the primitive for windowed backwards pagination (latest-N, N-before-cursor)."
      :examples [{:desc "Latest room messages, newest first"
                  :code "(take 20 (rseek-datoms db {:index :avet :components [:message/room room-eid]}))"}]
@@ -576,9 +592,7 @@
      :supports-remote? true
      :referentially-transparent? true
      :capability-operation :datahike.operation/index-range
-     :capability-class :read
-     :value-semantics :exact-immutable
-     :result-semantics :lazy-datoms
+     :returns-lazy? true
      :doc "Returns part of :avet index between start and end values."
      :examples [{:desc "Find datoms in value range"
                  :code "(index-range db {:attrid :likes :start \"a\" :end \"z\"})"}
@@ -626,9 +640,7 @@
      :supports-remote? true
      :referentially-transparent? true
      :capability-operation :datahike.operation/history
-     :capability-class :temporal
-     :value-semantics :derived-immutable
-     :result-semantics :host-owned-value
+     :returns-host-value? true
      :doc "Returns full historical state of database including all assertions and retractions."
      :examples [{:desc "Query historical data"
                  :code "(q '[:find ?n ?a :where [?e :name ?n] [?e :age ?a]] (history @conn))"}]
@@ -642,9 +654,7 @@
      :supports-remote? true
      :referentially-transparent? true
      :capability-operation :datahike.operation/since
-     :capability-class :temporal
-     :value-semantics :derived-immutable
-     :result-semantics :host-owned-value
+     :returns-host-value? true
      :doc "Returns database state since given time point (Date or transaction ID). Contains only datoms added since that point."
      :examples [{:desc "Query since date"
                  :code "(since @conn (java.util.Date.))"}
@@ -660,9 +670,7 @@
      :supports-remote? true
      :referentially-transparent? true
      :capability-operation :datahike.operation/as-of
-     :capability-class :temporal
-     :value-semantics :derived-immutable
-     :result-semantics :host-owned-value
+     :returns-host-value? true
      :doc "Returns database state at given time point (Date or transaction ID)."
      :examples [{:desc "Query as of date"
                  :code "(q '[:find ?n :where [_ :name ?n]] (as-of @conn date))"}

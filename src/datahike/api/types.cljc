@@ -114,6 +114,7 @@
   [:map
    [:query [:or :string [:vector :any] :map]]
    [:args {:optional true} [:sequential :any]]
+   [:request-id {:optional true} :string]
    [:limit {:optional true} :int]
    [:offset {:optional true} :int]
    [:max-work {:optional true} pos-int?]

@@ -4,6 +4,10 @@
   "The resource budget active for one synchronous database operation."
   nil)
 
+(def ^:dynamic *evidence-sink*
+  "Optional volatile receiving bounded evidence for one operation."
+  nil)
+
 (declare scalar-weight)
 
 (defn budget-exceeded!
@@ -17,21 +21,44 @@
 
 (defn make-budget
   "Creates mutable counters for one synchronous database operation."
-  [{:keys [max-work max-results max-result-weight]}]
-  (when (or max-work max-results max-result-weight)
+  [{:keys [max-work max-results max-result-weight evidence?]}]
+  (when (or evidence? max-work max-results max-result-weight)
     {:max-work max-work
      :max-results max-results
      :max-result-weight max-result-weight
-     :work (volatile! 0)
-     :results (volatile! 0)
-     :result-weight (volatile! 0)}))
+     :work (when (or evidence? max-work) (volatile! 0))
+     :results (when (or evidence? max-results) (volatile! 0))
+     :result-weight (when (or evidence? max-result-weight) (volatile! 0))}))
+
+(defn budget-evidence
+  "Returns bounded ordinary data for one operation's resource counters."
+  [budget]
+  {:datahike.resource/work (if-let [counter (:work budget)] @counter 0)
+   :datahike.resource/result-count
+   (if-let [counter (:results budget)] @counter 0)
+   :datahike.resource/result-weight
+   (if-let [counter (:result-weight budget)] @counter 0)
+   :datahike.resource/limits
+   (cond-> {}
+     (:max-work budget) (assoc :datahike.resource/max-work (:max-work budget))
+     (:max-results budget) (assoc :datahike.resource/max-results
+                                  (:max-results budget))
+     (:max-result-weight budget)
+     (assoc :datahike.resource/max-result-weight
+            (:max-result-weight budget)))})
+
+(defn publish-evidence!
+  "Publishes one bounded resource snapshot when an evidence owner is bound."
+  [budget]
+  (when *evidence-sink*
+    (vreset! *evidence-sink* (budget-evidence budget))))
 
 (defn- charge!
   [counter allowed budget-name amount]
-  (when (and counter allowed)
+  (when counter
     (let [observed (+ @counter amount)]
       (vreset! counter observed)
-      (when (> observed allowed)
+      (when (and allowed (> observed allowed))
         (budget-exceeded! budget-name observed allowed)))))
 
 (defn charge-work!
@@ -143,7 +170,7 @@
 (defn work-signal
   "Returns an IDeref that charges work and delegates cancellation."
   [cancel budget]
-  (if-not (:max-work budget)
+  (if-not budget
     cancel
     #?(:clj
        (reify clojure.lang.IDeref

@@ -21,11 +21,13 @@
         evidence (get operations :datahike.operation/query-with-evidence)]
     (is (= 1 (:datahike.capability/version catalog)))
     (is (plain-data? catalog))
-    (is (= :q (:api-name query)))
-    (is (= :exact-committed-single-flight (:cache-semantics query)))
-    (is (:cancellable? query))
+    (is (= :datahike.api/q
+           (:datahike.capability.operation/api-name query)))
+    (is (:datahike.capability.operation/cacheable? query))
+    (is (:datahike.capability.operation/cancellable? query))
     (is (= #{:max-work :max-results :max-result-weight}
-           (:resource-options evidence)))
+           (:datahike.capability.operation/resource-options evidence)))
+    (is (every? namespace (mapcat keys (vals operations))))
     (is (every? #(not (contains? % :impl)) (vals operations)))
     (is (every? #(not (contains? % :args)) (vals operations)))
     (is (every? #(not (contains? % :supports-remote?)) (vals operations)))))

@@ -19,8 +19,14 @@
     (is (= {:sequence 1} (reports/poll! source)))
     (is (= {:sequence 2} (reports/poll! source)))
     (is (nil? (reports/poll! source)))
-    (is (= {:status :gapped :queued 0 :offered 2 :delivered 2
-            :overflowed 1 :stale-rejected 1 :abandoned 0}
+    (is (= {:datahike.committed-report/status
+            :datahike.committed-report.status/gapped
+            :datahike.committed-report/queued 0
+            :datahike.committed-report/offered 2
+            :datahike.committed-report/delivered 2
+            :datahike.committed-report/overflowed 1
+            :datahike.committed-report/stale-rejected 1
+            :datahike.committed-report/abandoned 0}
            (reports/evidence source)))))
 
 (deftest generation-fence-and-compare-remove-prevent-aba
@@ -31,7 +37,9 @@
            (reports/offer! old-source new-generation {:sequence :stale})))
     (is (= :accepted
            (reports/offer! old-source old-generation {:sequence :old})))
-    (is (= :closed (:status (reports/close! old-source false))))
+    (is (= :datahike.committed-report.status/closed
+           (:datahike.committed-report/status
+            (reports/close! old-source false))))
     (let [new-source (reports/open! :connection new-generation 2)]
       (reports/close! old-source false)
       (is (= :accepted
@@ -44,12 +52,24 @@
         abandoning (reports/open! :abandon (random-uuid) 2)]
     (reports/offer! draining (second (:scope draining)) {:sequence 1})
     (reports/offer! abandoning (second (:scope abandoning)) {:sequence 2})
-    (is (= {:status :closed :queued 1 :offered 1 :delivered 0
-            :overflowed 0 :stale-rejected 0 :abandoned 0}
+    (is (= {:datahike.committed-report/status
+            :datahike.committed-report.status/closed
+            :datahike.committed-report/queued 1
+            :datahike.committed-report/offered 1
+            :datahike.committed-report/delivered 0
+            :datahike.committed-report/overflowed 0
+            :datahike.committed-report/stale-rejected 0
+            :datahike.committed-report/abandoned 0}
            (reports/close! draining true)))
     (is (= {:sequence 1} (reports/poll! draining)))
-    (is (= {:status :closed :queued 0 :offered 1 :delivered 0
-            :overflowed 0 :stale-rejected 0 :abandoned 1}
+    (is (= {:datahike.committed-report/status
+            :datahike.committed-report.status/closed
+            :datahike.committed-report/queued 0
+            :datahike.committed-report/offered 1
+            :datahike.committed-report/delivered 0
+            :datahike.committed-report/overflowed 0
+            :datahike.committed-report/stale-rejected 0
+            :datahike.committed-report/abandoned 1}
            (reports/close! abandoning false)))
     (is (nil? (reports/poll! abandoning)))
     (is (zero? (reports/active-source-count)))))
@@ -87,11 +107,31 @@
             "the source observes the durable writer publication order")
         (is (= [0 1 2] @legacy)
             "the publication source preserves legacy listeners")
-        (is (= {:status :open :queued 0 :offered 3 :delivered 3
-                :overflowed 0 :stale-rejected 0 :abandoned 0}
+        (is (= {:datahike.committed-report/status
+                :datahike.committed-report.status/open
+                :datahike.committed-report/queued 0
+                :datahike.committed-report/offered 3
+                :datahike.committed-report/delivered 3
+                :datahike.committed-report/overflowed 0
+                :datahike.committed-report/stale-rejected 0
+                :datahike.committed-report/abandoned 0}
                (reports/evidence source)))
         (finally
           (reports/close! source false)
           (d/unlisten connection ::legacy)
           (d/release connection)
           (d/delete-database configuration))))))
+
+(deftest final-connection-release-fences-and-abandons-its-source
+  (let [configuration {:store {:backend :memory :id (random-uuid)}
+                       :schema-flexibility :read}]
+    (d/create-database configuration)
+    (let [connection (d/connect configuration)
+          {:datahike.cache/keys [connection-id generation]}
+          (:cache-context @(:wrapped-atom connection))]
+      (reports/open! connection-id generation 2)
+      (d/transact connection [{:db/id 1 :value :accepted}])
+      (is (= 1 (reports/active-source-count)))
+      (d/release connection)
+      (is (zero? (reports/active-source-count)))
+      (d/delete-database configuration))))

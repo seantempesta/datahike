@@ -235,6 +235,76 @@
                               [:single-flight :active-flights]))))))))
 
 #?(:clj
+   (deftest evidence-returning-query-preserves-result-and-reports-local-work
+     (with-temp-db
+       (conj label-schema {:c/id "evidence" :c/note "value"})
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (let [database @conn
+               query '[:find ?n :where [_ :c/note ?n]]
+               owner (dq/q-with-evidence query database)
+               hit (dq/q-with-evidence query database)]
+           (is (= #{["value"]} (d/q query database)
+                  (:datahike.query/result owner)
+                  (:datahike.query/result hit)))
+           (is (= :datahike.cache.outcome/miss-owner
+                  (get-in owner [:datahike.query/cache-evidence
+                                 :datahike.cache/outcome])))
+           (is (= :datahike.cache.outcome/hit
+                  (get-in hit [:datahike.query/cache-evidence
+                               :datahike.cache/outcome])))
+           (is (pos? (get-in owner [:datahike.query/resource-evidence
+                                    :datahike.resource/work])))
+           (is (= 0 (get-in hit [:datahike.query/resource-evidence
+                                 :datahike.resource/work])))
+           (is (every? (fn [value]
+                         (or (number? value) (boolean? value)
+                             (keyword? value) (map? value)))
+                       (vals (:datahike.query/cache-evidence owner)))))))))
+
+#?(:clj
+   (deftest concurrent-evidence-distinguishes-owner-and-joined-callers
+     (with-temp-db
+       (conj label-schema {:c/id "joined-evidence" :c/note "value"})
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (let [database @conn
+               start (java.util.concurrent.CountDownLatch. 1)
+               calls (atom 0)
+               predicate (fn [_]
+                           (swap! calls inc)
+                           (Thread/sleep 75)
+                           true)
+               workers
+               (doall
+                (for [_ (range 8)]
+                  (future
+                    (.await start)
+                    (dq/q-with-evidence
+                     {:query '[:find ?n
+                               :in $ ?predicate
+                               :where [_ :c/note ?n]
+                                      [(?predicate ?n)]]
+                      :args [database predicate]
+                      :request-id (str (random-uuid))}))))]
+           (.countDown start)
+           (let [results (mapv deref workers)
+                 outcomes (frequencies
+                           (map #(get-in % [:datahike.query/cache-evidence
+                                            :datahike.cache/outcome])
+                                results))]
+             (is (= 1 @calls))
+             (is (= 1 (:datahike.cache.outcome/miss-owner outcomes)))
+             (is (= 7 (:datahike.cache.outcome/miss-joined outcomes)))
+             (is (= #{["value"]}
+                    (:datahike.query/result (first results))))
+             (is (= #{:datahike.resource.scope/local-computation
+                      :datahike.resource.scope/shared-computation}
+                    (set (map #(get-in % [:datahike.query/resource-evidence
+                                          :datahike.resource/scope])
+                              results))))))))))
+
+#?(:clj
    (deftest batched-writer-invalidates-the-union-of-request-attributes
      (let [cfg {:store {:backend :memory :id (random-uuid)}
                 :writer {:backend :self :commit-wait-time 500}

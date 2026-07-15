@@ -6,6 +6,7 @@
                                           fail-connection-opening!
                                           *connections*]]
             [datahike.readers]
+            [datahike.committed-report :as committed-report]
             [datahike.query :as query]
             [datahike.store :as ds]
             [datahike.writing :as dsi]
@@ -488,7 +489,13 @@
                               ;; ownerless generation.
                               _ (when (and connection-id generation)
                                   (query/close-query-cache-generation!
-                                   connection-id generation))
+                                   connection-id generation)
+                                  ;; Final release is a hard event fence. Any
+                                  ;; accepted but unconsumed reports are
+                                  ;; abandoned and recoverable from commit
+                                  ;; coordinates after reconnect.
+                                  (committed-report/close-scope!
+                                   connection-id generation false))
                               shutdown-error
                               (try
                             ;; shutdown closes admission synchronously; await its

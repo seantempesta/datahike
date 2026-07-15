@@ -5,6 +5,16 @@
 
 (defonce ^:private sources (atom {}))
 
+(defn- public-evidence [state]
+  {:datahike.committed-report/status
+   (keyword "datahike.committed-report.status" (name (:status state)))
+   :datahike.committed-report/queued (:queued state)
+   :datahike.committed-report/offered (:offered state)
+   :datahike.committed-report/delivered (:delivered state)
+   :datahike.committed-report/overflowed (:overflowed state)
+   :datahike.committed-report/stale-rejected (:stale-rejected state)
+   :datahike.committed-report/abandoned (:abandoned state)})
+
 (defn- scope-of [db]
   (let [{:datahike.cache/keys [connection-id generation]}
         (:cache-context db)]
@@ -102,16 +112,26 @@
              (cond-> (assoc state :status :closed)
                (not drain?) (-> (assoc :queue empty-queue :queued 0)
                                 (update :abandoned + queued)))))
-    (select-keys @(:state source)
-                 [:status :queued :offered :delivered :overflowed
-                  :stale-rejected :abandoned])))
+    (public-evidence @(:state source))))
+
+(defn close-scope!
+  "Fence and close the source for one exact connection generation, if open."
+  [connection-id generation drain?]
+  (if-let [source (get @sources [connection-id generation])]
+    (close! source drain?)
+    {:datahike.committed-report/status
+     :datahike.committed-report.status/absent
+     :datahike.committed-report/queued 0
+     :datahike.committed-report/offered 0
+     :datahike.committed-report/delivered 0
+     :datahike.committed-report/overflowed 0
+     :datahike.committed-report/stale-rejected 0
+     :datahike.committed-report/abandoned 0}))
 
 (defn evidence
   "Return ordinary bounded-source state without reports or runtime objects."
   [source]
-  (select-keys @(:state source)
-               [:status :queued :offered :delivered :overflowed
-                :stale-rejected :abandoned]))
+  (public-evidence @(:state source)))
 
 (defn active-source-count
   "Return the number of demand-opened committed-report sources."
