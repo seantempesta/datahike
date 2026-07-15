@@ -142,13 +142,13 @@
                                (apply update-store store key update-fn args))]
                  (force-branch! db-t :db #{cid-t}
                                 {:expected-current-commit cid-head}))
-               (is (= [:branches :db]
+               (is (= [:db :branches]
                       (->> @events
                            (keep #(when (= :update (first %)) (second %)))
                            (partition-by identity)
                            (map first)
                            (take-last 2)))
-                   "the known-branches roster precedes the atomic forced head"))
+                   "the forced head precedes the GC discovery roster"))
              (let [forced (branch-as-db conn :db)]
                (is (= #{:at-t}
                       (set (d/q '[:find [?v ...] :where [_ :value ?v]] forced))))
