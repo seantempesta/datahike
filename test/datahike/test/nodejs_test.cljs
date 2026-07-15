@@ -27,6 +27,7 @@
             [datahike.test.cljs-tiered-storage-test]
             [datahike.test.cljs-pattern-scan-test]
             [datahike.test.query-input-pull-test]
+            [datahike.test.pull-api-test]
             ;; NOTE: datahike.test.optimistic-test, valid-time-test,
             ;; reference-test, time-variance-test, query-aggregates-test,
             ;; query-rules-test and background-gc-test are UPSTREAM tests

@@ -32,7 +32,8 @@
     (d/transact conn (into []
                            (mapcat (fn [i]
                                      [[:db/add (inc i) :x i]
-                                      [:db/add (inc i) :y (str "v" i)]]))
+                                      [:db/add (inc i) :y (str "v" i)]
+                                      [:db/add (inc i) :group (mod i 10)]]))
                            (range n)))
     conn))
 
@@ -101,6 +102,36 @@
                     nil
                     (catch Exception error error))]
         (is (budget-exception? error :query-work))))
+    (testing "broad connected joins exhaust work before retaining their product"
+      (doseq [disable-planner? [false true]]
+        (binding [q/*disable-planner* disable-planner?]
+          (let [error (try
+                        (d/q {:query '[:find ?left ?right
+                                      :where
+                                      [?left :group ?group]
+                                      [?right :group ?group]]
+                              :args [db]
+                              :max-work 100})
+                        nil
+                        (catch Exception error error))]
+            (is (budget-exception? error :query-work)
+                (str "connected join is bounded with planner disabled? "
+                     disable-planner?))))))
+    (testing "disconnected Cartesian components exhaust the same work budget"
+      (doseq [disable-planner? [false true]]
+        (binding [q/*disable-planner* disable-planner?]
+          (let [error (try
+                        (d/q {:query '[:find ?left ?right
+                                      :where
+                                      [?left :x]
+                                      [?right :y]]
+                              :args [db]
+                              :max-work 100})
+                        nil
+                        (catch Exception error error))]
+            (is (budget-exception? error :query-work)
+                (str "Cartesian product is bounded with planner disabled? "
+                     disable-planner?))))))
     (testing "find-pull inherits the active result-weight budget"
       (let [error (try
                     (d/q {:query '[:find (pull ?e [:x :y])
