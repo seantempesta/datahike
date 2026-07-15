@@ -118,6 +118,23 @@
           {}
           (or stored-key-maps {}))))))
 
+#?(:clj
+   (defn- force-secondary-key-maps
+     "Guard and replace native secondary destinations before primary publish."
+     [source-key-maps current-key-maps store branch]
+     (doseq [[idx-ident source-key-map] source-key-maps]
+       (sec/check-force-from-key-map source-key-map
+                                     (get current-key-maps idx-ident)
+                                     store branch))
+     (reduce-kv
+      (fn [forced idx-ident source-key-map]
+        (assoc forced idx-ident
+               (sec/force-from-key-map source-key-map
+                                       (get current-key-maps idx-ident)
+                                       store branch)))
+      {}
+      source-key-maps)))
+
 ;; ========================= public API =========================
 
 (defn branches
@@ -274,8 +291,19 @@
                         db-with-parents (-> db
                                             (assoc-in [:config :branch] branch)
                                             (assoc-in [:meta :datahike/parents] resolved-parents))
-                        [schema-meta-kv-to-write pre-cid-store]
+                        [schema-meta-kv-to-write pre-cid-store*]
                         (db->stored db-with-parents true)
+                        pre-cid-store
+                        #?(:clj
+                           (if-let [source-key-maps
+                                    (seq (:secondary-index-keys pre-cid-store*))]
+                             (assoc pre-cid-store* :secondary-index-keys
+                                    (force-secondary-key-maps
+                                     (into {} source-key-maps)
+                                     (:secondary-index-keys current-stored)
+                                     store branch))
+                             pre-cid-store*)
+                           :cljs pre-cid-store*)
                         cid (create-commit-id db-with-parents pre-cid-store)
                         db-to-store (assoc-in pre-cid-store
                                               [:meta :datahike/commit-id] cid)
@@ -297,10 +325,10 @@
                         (<?- (write-pending-kvs! store pending-kvs sync?))
                         (when schema-meta-kv-to-write
                           (<?- (k/assoc store
-                                       (first schema-meta-kv-to-write)
-                                       (second schema-meta-kv-to-write)
-                                       {:immutable? true}
-                                       opts)))
+                                        (first schema-meta-kv-to-write)
+                                        (second schema-meta-kv-to-write)
+                                        {:immutable? true}
+                                        opts)))
                         (when commit-graph?
                           (<?- (k/assoc store cid db-to-store {:immutable? true} opts)))))
                     ;; The roster is a recoverable index over branch heads and

@@ -2,6 +2,7 @@
   "Integration tests for Proximum and Scriptum secondary index implementations."
   (:require
    [clojure.test :refer [deftest testing is]]
+   [clojure.core.async :as async]
    [datahike.api :as d]
    [datahike.db :as db]
    [datahike.index.secondary :as sec]
@@ -20,6 +21,30 @@
     (catch Throwable _ false)))
 
 (def ^:private detached-branch-side-effects (atom []))
+
+(defn- delete-tree!
+  [path]
+  (let [root (java.io.File. path)]
+    (when (.exists root)
+      (doseq [file (reverse (file-seq root))]
+        (java.nio.file.Files/deleteIfExists (.toPath file))))))
+
+(defn- prox-call
+  [sym & args]
+  (apply (requiring-resolve sym) args))
+
+(defn- await-prox
+  [channel]
+  (let [result (async/<!! channel)]
+    (if (instance? Throwable result)
+      (throw result)
+      result)))
+
+(defn- nearest-proximum-eids
+  [db vector]
+  (let [index (get-in db [:secondary-indices :idx/vectors])]
+    (set (es/entity-bitset-seq
+          (sec/-search index {:vector (float-array vector) :k 1} nil)))))
 
 (defmethod sec/branch-from-key-map ::side-effect
   [key-map _store _from-branch new-branch]
@@ -160,6 +185,258 @@
         (finally
           (d/release conn)
           (d/delete-database cfg))))))
+
+(deftest guarded-force-replaces-the-exact-proximum-generation
+  (when-not proximum-available?
+    (is (not proximum-available?) "SKIP: proximum requires Java 22+"))
+  (when proximum-available?
+    (let [prox-path (str (System/getProperty "java.io.tmpdir")
+                         "/datahike-proximum-force-" (random-uuid))
+          prox-store {:backend :file :path prox-path :id (random-uuid)}
+          cfg {:store {:backend :memory :id (random-uuid)}
+               :schema-flexibility :read
+               :keep-history? true}
+          _ (d/create-database cfg)
+          main (d/connect cfg)
+          main-released? (atom false)]
+      (try
+        (d/transact main
+                    [{:db/ident :idx/vectors
+                      :db.secondary/type :proximum
+                      :db.secondary/attrs [:person/embedding]
+                      :db.secondary/config {:dim 4
+                                            :capacity 64
+                                            :distance :cosine
+                                            :store-config prox-store}
+                      :db.secondary/status :ready}])
+        (d/transact main [{:db/id 1
+                           :person/embedding [1.0 0.0 0.0 0.0]}])
+        (dv/branch! main :db :prepared)
+        (let [prepared (d/connect (assoc cfg :branch :prepared))
+              prepared-released? (atom false)]
+          (try
+            (d/transact prepared [{:db/id 3
+                                   :person/embedding [0.0 0.0 1.0 0.0]}])
+            (d/transact main [{:db/id 1
+                               :person/embedding [0.0 1.0 0.0 0.0]}
+                              {:db/id 2
+                               :person/embedding [1.0 0.0 0.0 0.0]}])
+            (is (= #{1} (nearest-proximum-eids @prepared [1.0 0.0 0.0 0.0])))
+            (is (= #{2} (nearest-proximum-eids @main [1.0 0.0 0.0 0.0])))
+            (let [store (:store @main)
+                  expected-main (dv/commit-id @main)
+                  prepared-key-map (get-in (k/get store :prepared nil {:sync? true})
+                                           [:secondary-index-keys :idx/vectors])
+                  current-key-map (get-in (k/get store :db nil {:sync? true})
+                                          [:secondary-index-keys :idx/vectors])
+                  force-secondary sec/force-from-key-map]
+              (testing "mismatched native storage fails preflight"
+                (is (= :secondary-force/storage-mismatch
+                       (try
+                         (sec/check-force-from-key-map
+                          prepared-key-map
+                          (assoc current-key-map
+                                 :store-config {:backend :memory :id (random-uuid)})
+                          store :db)
+                         (catch Exception error (:type (ex-data error))))))
+                (is (= :secondary-force/storage-mismatch
+                       (try
+                         (sec/check-force-from-key-map
+                          prepared-key-map
+                          (assoc current-key-map
+                                 :mmap-dir (str prox-path "-other-mmap"))
+                          store :db)
+                         (catch Exception error (:type (ex-data error)))))))
+              (testing "a crash after native force leaves primary unchanged"
+                (is (= :injected-secondary-force-crash
+                       (try
+                         (with-redefs [sec/force-from-key-map
+                                       (fn [& args]
+                                         (apply force-secondary args)
+                                         (throw (ex-info "injected crash after native force"
+                                                         {:type :injected-secondary-force-crash})))]
+                           (dv/force-branch! @prepared :db #{(dv/commit-id @prepared)}
+                                             {:expected-current-commit expected-main}))
+                         (catch Exception error (:type (ex-data error))))))
+                (is (= expected-main
+                       (dv/commit-id (dv/branch-as-db main :db)))))
+
+              (testing "response-loss retry adopts the native generation"
+                (dv/force-branch! @prepared :db #{(dv/commit-id @prepared)}
+                                  {:expected-current-commit expected-main})
+                (let [forced-db (dv/branch-as-db main :db)
+                      forced-key-map (get-in (k/get store :db nil {:sync? true})
+                                             [:secondary-index-keys :idx/vectors])]
+                  (is (= (:commit-id prepared-key-map)
+                         (:commit-id forced-key-map))
+                      "primary and secondary records retain the selected Proximum root")
+                  (is (= "main" (:branch forced-key-map))
+                      "the key map names the existing native destination branch")
+                  (is (= #{1}
+                         (nearest-proximum-eids forced-db [1.0 0.0 0.0 0.0])))))
+
+              (testing "a stale native destination fails before primary mutation"
+                (let [forced-primary (dv/commit-id (dv/branch-as-db main :db))
+                      forced-key-map (get-in (k/get store :db nil {:sync? true})
+                                             [:secondary-index-keys :idx/vectors])
+                      destination-owner
+                      (prox-call 'proximum.writing/load-commit
+                                 (:store-config forced-key-map)
+                                 (:commit-id forced-key-map)
+                                 {:branch (keyword (:branch forced-key-map))
+                                  :mmap-dir (:mmap-dir forced-key-map)})
+                      dirty-owner (prox-call 'proximum.core/insert destination-owner
+                                             (float-array [0.0 0.0 0.0 1.0]) 99)
+                      advanced-owner (await-prox
+                                      (prox-call 'proximum.protocols/sync! dirty-owner))]
+                  (try
+                    (is (= :force-branch/stale-destination
+                           (try
+                             (dv/force-branch! @prepared :db
+                                               #{(dv/commit-id @prepared)}
+                                               {:expected-current-commit forced-primary})
+                             (catch Exception error (:type (ex-data error))))))
+                    (is (= forced-primary
+                           (dv/commit-id (dv/branch-as-db main :db))))
+                    (finally
+                      (await-prox (prox-call 'proximum.protocols/close!
+                                             advanced-owner))))))
+
+              (testing "release, cold reopen, and later writes stay isolated"
+                (d/release main)
+                (reset! main-released? true)
+                (let [reopened-main (d/connect cfg)]
+                  (try
+                    (is (= #{1}
+                           (nearest-proximum-eids @reopened-main
+                                                  [1.0 0.0 0.0 0.0]))
+                        "cold restore follows Datahike's exact stored root, not a stray native head")
+                    (is (= #{1}
+                           (nearest-proximum-eids @prepared
+                                                  [1.0 0.0 0.0 0.0])))
+                    (d/transact reopened-main [{:db/id 4
+                                                :person/embedding [0.0 0.0 0.0 1.0]}])
+                    (is (= #{4}
+                           (nearest-proximum-eids @reopened-main
+                                                  [0.0 0.0 0.0 1.0])))
+                    (is (= #{1}
+                           (nearest-proximum-eids @prepared
+                                                  [1.0 0.0 0.0 0.0])))
+                    (d/release prepared)
+                    (reset! prepared-released? true)
+                    (let [cold-prepared (d/connect (assoc cfg :branch :prepared))]
+                      (try
+                        (is (= #{1}
+                               (nearest-proximum-eids @cold-prepared
+                                                      [1.0 0.0 0.0 0.0]))
+                            "a destination write cannot retarget the prepared branch")
+                        (is (= 2
+                               (sec/-estimate
+                                (get-in @cold-prepared
+                                        [:secondary-indices :idx/vectors])
+                                {:k 100}))
+                            "the prepared branch reopens its own two-vector generation")
+                        (finally
+                          (d/release cold-prepared))))
+                    (finally
+                      (d/release reopened-main))))))
+            (finally
+              (when-not @prepared-released?
+                (d/release prepared)))))
+        (finally
+          (when-not @main-released?
+            (d/release main))
+          (d/delete-database cfg)
+          (delete-tree! prox-path)
+          (delete-tree! (str prox-path "-mmap")))))))
+
+(deftest legacy-main-branch-key-map-migrates-without-an-embedding-write
+  (when-not proximum-available?
+    (is (not proximum-available?) "SKIP: proximum requires Java 22+"))
+  (when proximum-available?
+    (let [prox-path (str (System/getProperty "java.io.tmpdir")
+                         "/datahike-proximum-legacy-force-" (random-uuid))
+          prox-store {:backend :file :path prox-path :id (random-uuid)}
+          cfg {:store {:backend :memory :id (random-uuid)}
+               :schema-flexibility :read
+               :keep-history? true}
+          _ (d/create-database cfg)
+          initial (d/connect cfg)]
+      (try
+        (d/transact initial
+                    [{:db/ident :idx/vectors
+                      :db.secondary/type :proximum
+                      :db.secondary/attrs [:person/embedding]
+                      :db.secondary/config {:dim 4
+                                            :capacity 64
+                                            :distance :cosine
+                                            :store-config prox-store}
+                      :db.secondary/status :ready}])
+        (d/transact initial [{:db/id 1
+                              :person/embedding [1.0 0.0 0.0 0.0]}])
+        (let [datahike-store (:store @initial)
+              key-map (get-in (k/get datahike-store :db nil {:sync? true})
+                              [:secondary-index-keys :idx/vectors])
+              proximum-store (prox-call 'proximum.writing/connect-store-sync prox-store)
+              legacy-snapshot #(dissoc % :mmap-generation
+                                       :mmap-generation-bytes
+                                       :mmap-generation-sha256)]
+          ;; Exact pre-fb6572c/old-bridge shape: native :main snapshot without
+          ;; generation evidence, while Datahike's opaque key map claims "db".
+          (k/update proximum-store (:commit-id key-map) legacy-snapshot {:sync? true})
+          (k/update proximum-store :main legacy-snapshot {:sync? true})
+          (k/update datahike-store :db
+                    #(assoc-in % [:secondary-index-keys :idx/vectors :branch] "db")
+                    {:sync? true}))
+        (d/release initial)
+        (let [main (d/connect cfg)]
+          (try
+            (is (= #{1} (nearest-proximum-eids @main [1.0 0.0 0.0 0.0])))
+            (dv/branch! main :db :legacy-prepared)
+            (let [prepared (d/connect (assoc cfg :branch :legacy-prepared))]
+              (try
+                (testing "branching alone upgrades the selected legacy source"
+                  (is (= #{1}
+                         (nearest-proximum-eids @prepared [1.0 0.0 0.0 0.0])))
+                  (let [prepared-key-map
+                        (get-in (k/get (:store @main) :legacy-prepared nil {:sync? true})
+                                [:secondary-index-keys :idx/vectors])
+                        snapshot (k/get (prox-call 'proximum.writing/connect-store-sync
+                                                   prox-store)
+                                        (:commit-id prepared-key-map) nil {:sync? true})]
+                    (is (= "legacy-prepared" (:branch prepared-key-map)))
+                    (is (uuid? (:mmap-generation snapshot)))))
+                (d/transact main [{:db/id 1
+                                   :person/embedding [0.0 1.0 0.0 0.0]}
+                                  {:db/id 2
+                                   :person/embedding [1.0 0.0 0.0 0.0]}])
+                (let [expected-main (dv/commit-id @main)
+                      source-root (get-in (k/get (:store @main) :legacy-prepared nil
+                                                 {:sync? true})
+                                          [:secondary-index-keys :idx/vectors :commit-id])]
+                  (dv/force-branch! @prepared :db #{(dv/commit-id @prepared)}
+                                    {:expected-current-commit expected-main})
+                  (let [forced-key-map
+                        (get-in (k/get (:store @main) :db nil {:sync? true})
+                                [:secondary-index-keys :idx/vectors])]
+                    (is (= source-root (:commit-id forced-key-map)))
+                    (is (= "main" (:branch forced-key-map)))))
+                (d/release main)
+                (let [reopened (d/connect cfg)]
+                  (try
+                    (is (= #{1}
+                           (nearest-proximum-eids @reopened [1.0 0.0 0.0 0.0])))
+                    (finally
+                      (d/release reopened))))
+                (finally
+                  (d/release prepared))))
+            (finally
+              (try (d/release main) (catch Exception _ nil)))))
+        (finally
+          (try (d/release initial) (catch Exception _ nil))
+          (d/delete-database cfg)
+          (delete-tree! prox-path)
+          (delete-tree! (str prox-path "-mmap")))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Scriptum (Full-Text Search) Tests
