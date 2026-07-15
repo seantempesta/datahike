@@ -40,8 +40,8 @@
          (<!? (d/create-database tiered))
          (let [conn (<!? (d/connect tiered {:sync? false}))]
            (<!? (d/transact! conn [{:db/ident :name :db/valueType :db.type/string
-                                   :db/cardinality :db.cardinality/one}
-                                  {:name "Alice"}]))
+                                    :db/cardinality :db.cardinality/one}
+                                   {:name "Alice"}]))
            (<!? (d/release conn)))
 
          ;; COLD read #1 — plain :file store over the same backend
@@ -66,5 +66,9 @@
            (<!? (d/release conn)))
 
          (<!? (d/delete-database tiered))
-         (catch :default e (is false (str "unexpected throw: " (.-message e)))))
+         (catch :default e
+           (is false (str "unexpected throw: " (.-message e)
+                          "\ndata: " (pr-str (ex-data e))
+                          "\ncause: " (pr-str (ex-cause e))
+                          "\n" (.-stack e)))))
        (done)))))
