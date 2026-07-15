@@ -5,6 +5,7 @@
             [konserve.store :as ks]
             [datahike.config :as dc]
             [datahike.connections :refer [*connections*]]
+            [datahike.gc-guard :as guard]
             [datahike.store :refer [store-identity add-cache-and-handlers]]
             [datahike.writing :refer [stored->db db->stored stored-db?
                                       commit! create-commit-id get-and-clear-pending-kvs!
@@ -176,42 +177,52 @@
    (let [opts (select-keys opts [:sync?])]
      (async+sync (:sync? opts) *default-sync-translation*
                  (go-try-
-                  (let [store (:store @conn)
-                        commit-source? (uuid? from)
-                        commit-graph? (get (:config @conn) :commit-graph? true)
-                        _ (when (and commit-source? (false? commit-graph?))
-                            (log/raise "This store was created with :commit-graph? false, so branching from a commit-id is unavailable."
-                                       {:type :commit-graph-disabled
-                                        :from from
-                                        :commit-graph? false}))
-                        _ (when-not (or (keyword? from) commit-source?)
-                            (log/raise "From must be a branch keyword or commit UUID."
-                                       {:type :invalid-branch-source :from from}))
-                        existing-branches (<?- (k/get store :branches nil opts))
-                        _ (when (and existing-branches (existing-branches new-branch))
-                            (log/raise "Branch already exists." {:type :branch-already-exists
-                                                                 :new-branch new-branch}))
-                        stored-db (<?- (k/get store from nil opts))]
-                    (when-not (stored-db? stored-db)
-                      (log/raise (if commit-source?
-                                   "Commit record does not exist."
-                                   "Branch does not exist.")
-                                 {:type (if commit-source? :commit-not-found :branch-does-not-exist)
-                                  :from from
-                                  :commit-graph? commit-graph?}))
-                  ;; Branch secondary indices from the SAME selected root as
-                  ;; the primary database. Only an exact attached head may
-                  ;; reuse the connection's live index instances.
-                    (let [sec-keys (:secondary-index-keys stored-db)
-                          branched-sec-keys
-                          #?(:clj
-                             (when (or (seq sec-keys) (seq (:secondary-indices @conn)))
-                               (branch-secondary-indices conn stored-db from new-branch store))
-                             :cljs nil)
-                          updated-db (cond-> (assoc-in stored-db [:config :branch] new-branch)
-                                       (seq branched-sec-keys) (assoc :secondary-index-keys branched-sec-keys))]
-                      (<?- (k/assoc store new-branch updated-db opts))
-                      (<?- (k/update store :branches #(conj (set %) new-branch) opts)))))))))
+                  ;; GC GUARD: a secondary index's -sec-flush writes konserve keys, and
+                  ;; the new branch's head record is written before `:branches` names it
+                  ;; — until then NOTHING points at either, so a concurrent collector
+                  ;; would sweep them (GC's whitelist comes from `:branches`).
+                  (let [gc-sid   (:id (:store (:config @conn)))
+                        gc-token (guard/writing! gc-sid)]
+                    (try
+                      (let [store (:store @conn)
+                            commit-source? (uuid? from)
+                            commit-graph? (get (:config @conn) :commit-graph? true)
+                            _ (when (and commit-source? (false? commit-graph?))
+                                (log/raise "This store was created with :commit-graph? false, so branching from a commit-id is unavailable."
+                                           {:type :commit-graph-disabled
+                                            :from from
+                                            :commit-graph? false}))
+                            _ (when-not (or (keyword? from) commit-source?)
+                                (log/raise "From must be a branch keyword or commit UUID."
+                                           {:type :invalid-branch-source :from from}))
+                            existing-branches (<?- (k/get store :branches nil opts))
+                            _ (when (and existing-branches (existing-branches new-branch))
+                                (log/raise "Branch already exists." {:type :branch-already-exists
+                                                                     :new-branch new-branch}))
+                            stored-db (<?- (k/get store from nil opts))]
+                        (when-not (stored-db? stored-db)
+                          (log/raise (if commit-source?
+                                       "Commit record does not exist."
+                                       "Branch does not exist.")
+                                     {:type (if commit-source? :commit-not-found :branch-does-not-exist)
+                                      :from from
+                                      :commit-graph? commit-graph?}))
+                        ;; Branch secondary indices from the SAME selected root as
+                        ;; the primary database. Only an exact attached head may
+                        ;; reuse the connection's live index instances.
+                        (let [sec-keys (:secondary-index-keys stored-db)
+                              branched-sec-keys
+                              #?(:clj
+                                 (when (or (seq sec-keys) (seq (:secondary-indices @conn)))
+                                   (branch-secondary-indices conn stored-db from new-branch store))
+                                 :cljs nil)
+                              updated-db (cond-> (assoc-in stored-db [:config :branch] new-branch)
+                                           (seq branched-sec-keys) (assoc :secondary-index-keys branched-sec-keys))]
+                          (<?- (k/assoc store new-branch updated-db opts))
+                          ;; :branches is the GC discovery pointer and is published last.
+                          (<?- (k/update store :branches #(conj (set %) new-branch) opts))))
+                      (finally
+                        (guard/done! gc-sid gc-token)))))))))
 
 (defn delete-branch!
   "Removes this branch from set of known branches. The branch will still be
@@ -275,92 +286,96 @@
          sync? (:sync? opts)]
      (async+sync sync? *default-sync-translation*
                  (go-try-
-                  (let [store (:store db)
-                        current-stored (<?- (k/get store branch nil opts))
-                        current-commit (get-in current-stored [:meta :datahike/commit-id])
-                        resolved-parents (branch-heads-as-commits store parents)
-                        _ (when (and guard? (not= expected-current-commit current-commit))
-                            (log/raise "Branch head changed before force-branch!."
-                                       {:type :stale-branch-head
-                                        :branch branch
-                                        :expected-current-commit expected-current-commit
-                                        :current-commit current-commit}))
-                        ;; Flush first, then compute the audit-grade cid
-                        ;; from the post-flush stored form (true merkle
-                        ;; root). Same pattern as datahike.writing/commit!.
-                        db-with-parents (-> db
-                                            (assoc-in [:config :branch] branch)
-                                            (assoc-in [:meta :datahike/parents] resolved-parents))
-                        [schema-meta-kv-to-write pre-cid-store*]
-                        (db->stored db-with-parents true)
-                        pre-cid-store
-                        #?(:clj
-                           (if-let [source-key-maps
-                                    (seq (:secondary-index-keys pre-cid-store*))]
-                             (assoc pre-cid-store* :secondary-index-keys
-                                    (force-secondary-key-maps
-                                     (into {} source-key-maps)
-                                     (:secondary-index-keys current-stored)
-                                     store branch))
-                             pre-cid-store*)
-                           :cljs pre-cid-store*)
-                        cid (create-commit-id db-with-parents pre-cid-store)
-                        db-to-store (assoc-in pre-cid-store
-                                              [:meta :datahike/commit-id] cid)
-                        pending-kvs (get-and-clear-pending-kvs! store)
-                        ;; Same opt-out as datahike.writing/commit!: no
-                        ;; commit-graph store → no separate cid record.
-                        commit-graph? (get (:config db) :commit-graph? true)]
-
-                  ;; Write all data, preserving the same nodes-before-head
-                  ;; ordering as the ordinary commit path.
-                    (if (multi-key-capable? store)
-                      (let [[meta-key meta-val] schema-meta-kv-to-write
-                            writes (cond-> (vec pending-kvs)
-                                     schema-meta-kv-to-write (conj [meta-key meta-val])
-                                     commit-graph?           (conj [cid db-to-store]))
-                            metas (into {} (map (fn [[key _]] [key {:immutable? true}])) writes)]
-                        (<?- (k/multi-assoc store writes metas opts)))
-                      (do
-                        (<?- (write-pending-kvs! store pending-kvs sync?))
-                        (when schema-meta-kv-to-write
-                          (<?- (k/assoc store
-                                        (first schema-meta-kv-to-write)
-                                        (second schema-meta-kv-to-write)
-                                        {:immutable? true}
-                                        opts)))
-                        (when commit-graph?
-                          (<?- (k/assoc store cid db-to-store {:immutable? true} opts)))))
-                    ;; The roster is a recoverable index over branch heads and
-                    ;; is updated before the head. Recheck inside the final
-                    ;; per-key update to catch a stale plan in this quiesced
-                    ;; operation. This is not a fence against an independent
-                    ;; writer using a different konserve operation; callers must
-                    ;; stop writers first. Prewritten immutable values are safe
-                    ;; orphans if the late check rejects.
-                    (<?- (k/update store :branches #(conj (set %) branch) opts))
-                    (<?- (k/update
-                          store branch
-                          (fn [stored]
-                            (let [stored-commit (get-in stored [:meta :datahike/commit-id])]
-                              (when (and guard?
-                                         (not= expected-current-commit stored-commit))
-                                (log/raise "Branch head changed during force-branch!."
+                  ;; GC GUARD: same values-then-pointer sequence as commit!, but this
+                  ;; runs on the CALLER's thread and needs no writer at all — which is
+                  ;; exactly why the guard lives in the store rather than in the writer.
+                  (let [gc-sid   (:id (:store (:config db)))
+                        gc-token (guard/writing! gc-sid)]
+                    (try
+                      (let [store (:store db)
+                            current-stored (<?- (k/get store branch nil opts))
+                            current-commit (get-in current-stored [:meta :datahike/commit-id])
+                            resolved-parents (branch-heads-as-commits store parents)
+                            _ (when (and guard? (not= expected-current-commit current-commit))
+                                (log/raise "Branch head changed before force-branch!."
                                            {:type :stale-branch-head
                                             :branch branch
                                             :expected-current-commit expected-current-commit
-                                            :current-commit stored-commit}))
-                              db-to-store))
-                          opts))
-                    (let [stored-head (<?- (k/get store branch nil opts))
-                          stored-commit (get-in stored-head [:meta :datahike/commit-id])]
-                      (when-not (= cid stored-commit)
-                        (log/raise "Forced branch head did not match on readback."
-                                   {:type :force-branch-readback-mismatch
-                                    :branch branch
-                                    :expected-commit cid
-                                    :stored-commit stored-commit})))
-                    nil))))))
+                                            :current-commit current-commit}))
+                            ;; Flush first, then compute the audit-grade cid from
+                            ;; the post-flush stored form (true merkle root).
+                            db-with-parents (-> db
+                                                (assoc-in [:config :branch] branch)
+                                                (assoc-in [:meta :datahike/parents] resolved-parents))
+                            [schema-meta-kv-to-write pre-cid-store*]
+                            (db->stored db-with-parents true)
+                            pre-cid-store
+                            #?(:clj
+                               (if-let [source-key-maps
+                                        (seq (:secondary-index-keys pre-cid-store*))]
+                                 (assoc pre-cid-store* :secondary-index-keys
+                                        (force-secondary-key-maps
+                                         (into {} source-key-maps)
+                                         (:secondary-index-keys current-stored)
+                                         store branch))
+                                 pre-cid-store*)
+                               :cljs pre-cid-store*)
+                            cid (create-commit-id db-with-parents pre-cid-store)
+                            db-to-store (assoc-in pre-cid-store
+                                                  [:meta :datahike/commit-id] cid)
+                            pending-kvs (get-and-clear-pending-kvs! store)
+                            ;; Same opt-out as datahike.writing/commit!: no
+                            ;; commit-graph store means no separate cid record.
+                            commit-graph? (get (:config db) :commit-graph? true)]
+                        ;; Write every immutable value before the mutable head.
+                        (if (multi-key-capable? store)
+                          (let [[meta-key meta-val] schema-meta-kv-to-write
+                                writes (cond-> (vec pending-kvs)
+                                         schema-meta-kv-to-write (conj [meta-key meta-val])
+                                         commit-graph?           (conj [cid db-to-store]))
+                                metas (into {} (map (fn [[key _]] [key {:immutable? true}])) writes)]
+                            (<?- (k/multi-assoc store writes metas opts)))
+                          (do
+                            (<?- (write-pending-kvs! store pending-kvs sync?))
+                            (when schema-meta-kv-to-write
+                              (<?- (k/assoc store
+                                            (first schema-meta-kv-to-write)
+                                            (second schema-meta-kv-to-write)
+                                            {:immutable? true}
+                                            opts)))
+                            (when commit-graph?
+                              (<?- (k/assoc store cid db-to-store {:immutable? true} opts)))))
+
+                        ;; Recheck inside the mutable head update. The GC guard
+                        ;; protects the values-to-head window; the expected head
+                        ;; rejects a stale plan in this quiesced operation.
+                        (<?- (k/update
+                              store branch
+                              (fn [stored]
+                                (let [stored-commit (get-in stored [:meta :datahike/commit-id])]
+                                  (when (and guard?
+                                             (not= expected-current-commit stored-commit))
+                                    (log/raise "Branch head changed during force-branch!."
+                                               {:type :stale-branch-head
+                                                :branch branch
+                                                :expected-current-commit expected-current-commit
+                                                :current-commit stored-commit}))
+                                  db-to-store))
+                              opts))
+
+                        ;; Publish the GC discovery pointer only after its head exists.
+                        (<?- (k/update store :branches #(conj (set %) branch) opts))
+                        (let [stored-head (<?- (k/get store branch nil opts))
+                              stored-commit (get-in stored-head [:meta :datahike/commit-id])]
+                          (when-not (= cid stored-commit)
+                            (log/raise "Forced branch head did not match on readback."
+                                       {:type :force-branch-readback-mismatch
+                                        :branch branch
+                                        :expected-commit cid
+                                        :stored-commit stored-commit})))
+                        nil)
+                      (finally
+                        (guard/done! gc-sid gc-token)))))))))
 
 (defn commit-id
   "Retrieve the commit-id for this db."

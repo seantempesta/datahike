@@ -1,7 +1,8 @@
 {:deps {org.clojure/clojure                         {:mvn/version "1.12.4"}
         org.replikativ/hasch                        {:mvn/version "0.4.100"
                                                      :exclusions [org.clojure/clojurescript]}
-        org.replikativ/konserve                     {:mvn/version "0.9.356"
+        org.replikativ/konserve                     {:git/url "https://github.com/seantempesta/konserve"
+                                                     :git/sha "fbdccc9ac3da74dca5b52f63dff2c7ae04f07057"
                                                      :exclusions [org.clojure/clojurescript
                                                                   org.clojars.mmb90/cljs-cache]}
                                                      
@@ -30,7 +31,7 @@
         com.github.pkpkpk/cljs-cache                {:mvn/version "1.0.21"}
         org.roaringbitmap/RoaringBitmap             {:mvn/version "1.3.0"}}
 
- :paths ["src" "target/classes" "resources"]
+ :paths ["src" "src-secondary" "target/classes" "resources"]
 
  :deps/prep-lib {:ensure "target/classes"
                  :alias :build
@@ -95,7 +96,8 @@
                                ring-cors/ring-cors           {:mvn/version "0.1.13"}
 
                                ;; secondary index integrations (for testing)
-                               org.replikativ/proximum       {:mvn/version "0.1.25"}
+                               org.replikativ/proximum       {:git/url "https://github.com/seantempesta/proximum"
+                                                              :git/sha "9846d3e79e1aee48474bc876d3d563d7137209c6"}
                                org.replikativ/scriptum       {:mvn/version "0.1.27"}
                                org.replikativ/stratum        {:mvn/version "0.3.69"}
 
