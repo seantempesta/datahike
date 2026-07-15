@@ -4,7 +4,8 @@
       :clj  [clojure.test :as t :refer [is deftest testing]])
    [datahike.api :as d]
    #?(:clj [datahike.db :as db])
-   #?(:clj [datahike.query :as dq])))
+   #?(:clj [datahike.query :as dq])
+   #?(:clj [datahike.writing :as writing])))
 
 (defn- with-temp-db
   "Create a temp in-memory db with schema, run f with the connection, then clean up."
@@ -113,6 +114,18 @@
            (d/release conn)
            (d/delete-database cfg)
            (dq/clear-query-cache!))))))
+
+#?(:clj
+   (deftest unknown-batch-member-disables-cache-propagation
+     (let [known {:db-after {:ref-ident-map nil}
+                  :tx-data [{:a :c/note}]}
+           unknown {:db-after {:ref-ident-map nil}
+                    :tx-data []}]
+       (is (= #{:c/note}
+              (writing/batch-cache-propagation-attributes [known])))
+       (is (nil?
+            (writing/batch-cache-propagation-attributes [known unknown]))
+           "one unknowable change must make the complete commit conservative"))))
 
 (deftest test-pull-only-attr-retract-invalidates-cache
   (testing "Core bug: retract on attr only in pull pattern must invalidate cache"

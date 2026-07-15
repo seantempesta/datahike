@@ -222,12 +222,9 @@
                                                  (some-> (:cache-context parent-db)
                                                          (assoc :datahike.cache/commit-id commit-id
                                                                 :datahike.cache/committed? true)))
-                                modified-attrs (reduce
-                                                (fn [attrs [report _]]
-                                                  (into attrs
-                                                        (w/modified-attributes
-                                                         commit-db (:tx-data report))))
-                                                #{} txs)
+                                modified-attrs
+                                (w/batch-cache-propagation-attributes
+                                 (mapv first txs))
                                 commit-time (- (get-time-ms) start-ts)]
                             (log/trace :datahike/commit-time {:duration-ms commit-time})
                             (q/propagate-query-cache parent-db commit-db modified-attrs)

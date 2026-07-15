@@ -480,7 +480,16 @@
                               (throw result))))
 
                         :last
-                        (let [shutdown-error
+                        (let [{:datahike.cache/keys [connection-id generation]}
+                              (:cache-context db)
+                              ;; Zero references closes cache ownership before
+                              ;; an unbounded writer drain. Accepted writes and
+                              ;; queries still finish, but cannot repopulate an
+                              ;; ownerless generation.
+                              _ (when (and connection-id generation)
+                                  (query/close-query-cache-generation!
+                                   connection-id generation))
+                              shutdown-error
                               (try
                             ;; shutdown closes admission synchronously; await its
                             ;; completion so every already-accepted write has
@@ -497,11 +506,6 @@
                                 (catch #?(:clj Throwable :cljs js/Error) e e))
                             ;; Secondary writers may be touched by queued writes,
                             ;; so close them only after the primary writer drains.
-                              {:datahike.cache/keys [connection-id generation]}
-                              (:cache-context db)
-                              _ (when (and connection-id generation)
-                                  (query/close-query-cache-generation!
-                                   connection-id generation))
                               secondary-errors (close-secondary-indices db)
                             ;; Release the underlying store only after the writer
                             ;; can no longer address it.
