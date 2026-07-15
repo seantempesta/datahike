@@ -304,7 +304,7 @@
                     end
                     (dbi/context-set-current-db-if-not-set context db)))
 
-(defrecord-updatable DB [schema eavt aevt avet temporal-eavt temporal-aevt temporal-avet max-eid max-tx op-count rschema hash config system-entities ident-ref-map ref-ident-map secondary-indices meta]
+(defrecord-updatable DB [schema eavt aevt avet temporal-eavt temporal-aevt temporal-avet max-eid max-tx op-count rschema hash config system-entities ident-ref-map ref-ident-map secondary-indices meta cache-context]
   #?@(:cljs
       [IHash (-hash [db] (.-hash db))
        IEquiv (-equiv [db other] (equiv-db db other))
@@ -381,6 +381,20 @@
                 (let [datoms-a (di/-slice (:eavt a) (datom e0 nil nil tx0) (datom emax nil nil txmax) :eavt)
                       datoms-b (di/-slice (:eavt b) (datom e0 nil nil tx0) (datom emax nil nil txmax) :eavt)]
                   (dd/diff-sorted datoms-a datoms-b dd/cmp-datoms-eavt-quick))))
+
+(defn committed-cache-identity
+  "Return `[connection-id generation commit-id]` for an attached committed DB."
+  [db]
+  (when (instance? DB db)
+    (let [{:datahike.cache/keys [connection-id generation commit-id committed?]}
+          (:cache-context db)]
+      (when (and committed? connection-id generation commit-id)
+        [connection-id generation commit-id]))))
+
+(defn clear-cache-context
+  "Detach speculative database values from committed query-cache identity."
+  [db]
+  (if (instance? DB db) (assoc db :cache-context nil) db))
 
 ;; FilteredDB
 

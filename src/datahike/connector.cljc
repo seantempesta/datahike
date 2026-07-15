@@ -6,6 +6,7 @@
                                           fail-connection-opening!
                                           *connections*]]
             [datahike.readers]
+            [datahike.query :as query]
             [datahike.store :as ds]
             [datahike.writing :as dsi]
             [datahike.config :as dc]
@@ -86,7 +87,12 @@
       (let [store  (:store @wrapped-atom)
             stored (k/get store (:branch (:config @wrapped-atom)) nil {:sync? true})]
         (log/trace :datahike/db-deref {:config (:config stored)})
-        (dsi/stored->db stored store))
+        (let [fresh-db (dsi/stored->db stored store)
+              commit-id (get-in fresh-db [:meta :datahike/commit-id])]
+          (assoc fresh-db :cache-context
+                 (some-> (:cache-context @wrapped-atom)
+                         (assoc :datahike.cache/commit-id commit-id
+                                :datahike.cache/committed? (some? commit-id))))))
       @wrapped-atom)))
 
 (defn conn-from-db
@@ -274,7 +280,7 @@
                      acquisition-key (connection-acquisition-key config)
                      physical-store-key (ds/physical-store-key store-config)
                      requested-completion (async/promise-chan)
-                     {:keys [state conn completion existing-key write-hooks]}
+                     {:keys [state conn completion existing-key write-hooks generation]}
                      (reserve-connection-opening! conn-id requested-completion
                                                   acquisition-key physical-store-key)]
                  (case state
@@ -352,7 +358,15 @@
                          _ (version-check stored-db)
                          _ (when-not (:allow-unsafe-config config)
                              (ensure-stored-config-consistency config (:config stored-db)))
-                         conn      (conn-from-db (dsi/stored->db (assoc stored-db :config config) store))
+                         committed-db (dsi/stored->db (assoc stored-db :config config) store)
+                         commit-id (get-in committed-db [:meta :datahike/commit-id])
+                         committed-db (assoc committed-db :cache-context
+                                             {:datahike.cache/connection-id conn-id
+                                              :datahike.cache/generation generation
+                                              :datahike.cache/commit-id commit-id
+                                              :datahike.cache/committed? (some? commit-id)})
+                         _         (query/open-query-cache-generation! conn-id generation)
+                         conn      (conn-from-db committed-db)
                          _         (vswap! resources assoc :conn conn)]
                      (swap! (:wrapped-atom conn) assoc :writer
                             (w/create-writer (:writer config) conn))
@@ -381,6 +395,7 @@
                          (async/put! completion conn)
                          conn)
                        (catch #?(:clj Throwable :cljs js/Error) e
+                         (query/close-query-cache-generation! conn-id generation)
                          (let [{opened-conn :conn opened-store :store} @resources
                                opened-db (some-> opened-conn :wrapped-atom deref)
                                writer (:writer opened-db)]
@@ -482,6 +497,11 @@
                                 (catch #?(:clj Throwable :cljs js/Error) e e))
                             ;; Secondary writers may be touched by queued writes,
                             ;; so close them only after the primary writer drains.
+                              {:datahike.cache/keys [connection-id generation]}
+                              (:cache-context db)
+                              _ (when (and connection-id generation)
+                                  (query/close-query-cache-generation!
+                                   connection-id generation))
                               secondary-errors (close-secondary-indices db)
                             ;; Release the underlying store only after the writer
                             ;; can no longer address it.

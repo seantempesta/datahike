@@ -12,7 +12,6 @@
             [datahike.store :as ds]
             [datahike.tools :as dt]
             [datahike.core :as core]
-            [datahike.query :as dq]
             [datahike.config :as dc]
             [datahike.schema-cache :as sc]
             [datahike.online-gc :as online-gc]
@@ -533,21 +532,22 @@
                     (finally
                       (guard/done! gc-store-id gc-token))))))))
 
+(defn modified-attributes
+  "Return the user and system attributes modified by transaction datoms."
+  [db tx-data]
+  (let [rim (:ref-ident-map db)]
+    (into #{}
+          (comp (map :a)
+                (filter some?)
+                (map (fn [a] (if (and rim (number? a)) (get rim a a) a))))
+          tx-data)))
+
 (defn complete-db-update [old tx-report]
   (let [{:keys [writer]} old
         {:keys [db-after tx-data]
          {:keys [db/txInstant]} :tx-meta} tx-report
         new-meta  (assoc (:meta db-after) :datahike/updated-at txInstant)
-        db        (assoc db-after :meta new-meta :writer writer)
-        ;; Propagate query result cache from old DB to new DB
-        ;; Extract modified attributes from tx-data for selective invalidation
-        rim (:ref-ident-map db)
-        modified-attrs (into #{}
-                             (comp (map :a)
-                                   (filter some?)
-                                   (map (fn [a] (if (and rim (number? a)) (get rim a a) a))))
-                             tx-data)
-        _ (dq/propagate-query-cache old db modified-attrs)
+        db        (assoc db-after :meta new-meta :writer writer :cache-context nil)
         tx-report (assoc tx-report :db-after db)]
     tx-report))
 

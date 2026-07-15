@@ -3,6 +3,7 @@
             [replikativ.logging :as log]
             [datahike.core]
             [datahike.writing :as w]
+            [datahike.query :as q]
             [datahike.gc :as gc]
             [datahike.tools :as dt :refer [throwable-promise get-time-ms]]
             [clojure.core.async :refer [chan close! promise-chan put! go go-loop <! >! poll! buffer timeout]]
@@ -205,7 +206,8 @@
               ;; empty channel of pending transactions
                       (log/trace :datahike/batch-commit {:batch-size (count txs)})
               ;; commit latest tx to disk
-                      (let [db (:db-after (first (peek txs)))
+                      (let [parent-db @connection
+                            db (:db-after (first (peek txs)))
                             ;; Check for merge parents (set by merge-writer!)
                             merge-parents (get-in db [:meta :datahike/merge-parents])
                             ;; Clear merge-parents from db meta before persisting
@@ -215,9 +217,20 @@
                         (try
                           (let [start-ts (get-time-ms)
                                 {{:keys [datahike/commit-id]} :meta
-                                 :as commit-db} (<?- (w/commit! db merge-parents false last-cid))
+                                 :as stored-commit-db} (<?- (w/commit! db merge-parents false last-cid))
+                                commit-db (assoc stored-commit-db :cache-context
+                                                 (some-> (:cache-context parent-db)
+                                                         (assoc :datahike.cache/commit-id commit-id
+                                                                :datahike.cache/committed? true)))
+                                modified-attrs (reduce
+                                                (fn [attrs [report _]]
+                                                  (into attrs
+                                                        (w/modified-attributes
+                                                         commit-db (:tx-data report))))
+                                                #{} txs)
                                 commit-time (- (get-time-ms) start-ts)]
                             (log/trace :datahike/commit-time {:duration-ms commit-time})
+                            (q/propagate-query-cache parent-db commit-db modified-attrs)
                             (reset! connection commit-db)
                     ;; notify all processes that transaction is complete
                             (doseq [[tx-report callback] txs]

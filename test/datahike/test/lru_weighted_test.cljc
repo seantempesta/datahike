@@ -57,6 +57,18 @@
     (is (= 3 (entry-count c)))
     (is (zero? (total-weight c)))))
 
+(deftest remove-where-preserves-weight-and-generation-bookkeeping
+  (let [before (-> (lru/weighted-lru 10 100 count)
+                   (assoc [:scope-a 1] [1 2 3])
+                   (assoc [:scope-b 1] [4 5])
+                   (assoc [:scope-a 2] [6]))
+        after (lru/weighted-remove-where before #(= :scope-a (first %)))
+        state (weighted-state after)]
+    (is (= {[:scope-b 1] [4 5]} (lru/weighted-entries after)))
+    (is (= 2 (lru/weighted-total-weight after)))
+    (is (= (set (keys (:key-value state))) (set (keys (:key-gen state)))))
+    (is (= (set (vals (:gen-key state))) (set (keys (:key-value state)))))))
+
 #?(:clj
    (deftest query-cache-bounded-by-weight-budget
      (let [orig-limit @#'q/*query-cache-weight-limit*
@@ -75,7 +87,7 @@
            (dotimes [t 30]
              (d/transact conn {:tx-data [{:nm (str "x" t)}]})
              (d/q '[:find ?n ?a :where [?e :nm ?n] [?e :age ?a]] @conn))
-           (let [st (.-state @q/query-result-cache)]
+           (let [st (.-state (:lru @q/query-result-cache))]
              (is (<= (:total-weight st) 200))
              (is (< (count (:key-value st)) 30)))
            (d/release conn))
@@ -131,7 +143,7 @@
            (d/transact conn [{:cache/huge huge}])
            (is (= #{[huge]}
                   (d/q '[:find ?v :where [_ :cache/huge ?v]] @conn)))
-           (is (zero? (-> @q/query-result-cache .-state :total-weight)))
+           (is (zero? (-> @q/query-result-cache :lru .-state :total-weight)))
            (d/release conn))
          (finally
            (d/delete-database cfg)

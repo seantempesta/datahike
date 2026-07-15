@@ -47,6 +47,25 @@
         (connections/fail-connection-opening! id-a completion-a)
         (connections/fail-connection-opening! id-b completion-b)))))
 
+(deftest opening-publication-preserves-one-connection-generation
+  (let [conn-id [(random-uuid) :db]
+        physical-key {:backend :memory :id (first conn-id)}
+        completion (async/promise-chan)
+        owner (connections/reserve-connection-opening!
+               conn-id completion {:branch :db} physical-key)
+        published-conn (atom :published)]
+    (try
+      (connections/complete-connection-opening!
+       conn-id completion published-conn)
+      (let [existing (connections/reserve-connection-opening!
+                      conn-id (async/promise-chan) {:branch :db} physical-key)]
+        (is (= :existing (:state existing)))
+        (is (= (:generation owner) (:generation existing)))
+        (is (= (:generation owner)
+               (get-in @connections/*connections* [conn-id :generation]))))
+      (finally
+        (connections/delete-connection! conn-id)))))
+
 (deftest release-awaits-an-accepted-write
   (let [cfg {:store {:backend :memory :id (random-uuid)}
              :keep-history? true

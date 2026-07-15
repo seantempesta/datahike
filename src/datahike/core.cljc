@@ -135,25 +135,18 @@
                                           :db-after  db
                                           :tx-data   []
                                           :tempids   {}
-                                          :tx-meta   tx-meta}) tx-data)
-           ;; Propagate query result cache with selective invalidation
-           rim (:ref-ident-map (:db-after report))
-           modified-attrs (into #{}
-                                (comp (map :a)
-                                      (clojure.core/filter some?)
-                                      (map (fn [a] (if (and rim (number? a)) (get rim a a) a))))
-                                (:tx-data report))
-           _ (dq/propagate-query-cache db (:db-after report) modified-attrs)]
-       report))))
+                                         :tx-meta   tx-meta}) tx-data)]
+       (update report :db-after assoc :cache-context nil)))))
 
 (defn load-entities-with [db entities tx-meta]
-  (dbt/transact-entities-directly
-   (db/map->TxReport {:db-before db
-                      :db-after  db
-                      :tx-data   []
-                      :tempids   {}
-                      :tx-meta   tx-meta})
-   entities))
+  (update (dbt/transact-entities-directly
+           (db/map->TxReport {:db-before db
+                              :db-after  db
+                              :tx-data   []
+                              :tempids   {}
+                              :tx-meta   tx-meta})
+           entities)
+          :db-after assoc :cache-context nil))
 
 (defn db-with
   "Applies transaction to an immutable db value, returning new immutable db value. Same as `(:db-after (with db tx-data))`."

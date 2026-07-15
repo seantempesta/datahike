@@ -3,6 +3,7 @@
    #?(:cljs [cljs.test :as t :refer-macros [is deftest testing]]
       :clj  [clojure.test :as t :refer [is deftest testing]])
    [datahike.api :as d]
+   #?(:clj [datahike.db :as db])
    #?(:clj [datahike.query :as dq])))
 
 (defn- with-temp-db
@@ -30,7 +31,48 @@
     :db/cardinality :db.cardinality/many}
    {:db/ident :c/note
     :db/valueType :db.type/string
-    :db/cardinality :db.cardinality/one}])
+   :db/cardinality :db.cardinality/one}])
+
+#?(:clj
+   (deftest committed-cache-identity-excludes-speculative-and-temporal-values
+     (with-temp-db label-schema
+       (fn [conn]
+         (d/transact conn [{:c/id "identity" :c/note "committed"}])
+         (let [committed @conn
+               speculative (:db-after (d/with committed [{:c/id "identity"
+                                                           :c/note "speculative"}]))]
+           (is (= 3 (count (db/committed-cache-identity committed))))
+           (is (nil? (db/committed-cache-identity speculative)))
+           (is (nil? (db/committed-cache-identity (d/as-of committed (:max-tx committed)))))
+           (is (nil? (db/committed-cache-identity (d/history committed)))))))))
+
+#?(:clj
+   (deftest final-release-atomically-fences-late-cache-put
+     (let [cfg {:store {:backend :memory :id (random-uuid)}
+                :schema-flexibility :write
+                :attribute-refs? false}
+           _ (d/create-database cfg)]
+       (try
+         (dq/clear-query-cache!)
+         (let [conn (d/connect cfg)]
+           (d/transact conn label-schema)
+           (d/transact conn [{:c/id "late" :c/note "value"}])
+           (let [committed @conn
+                 [_ generation-before _] (db/committed-cache-identity committed)]
+             (d/q '[:find ?n :where [_ :c/note ?n]] committed)
+             (is (pos? (:snapshot-count (dq/query-cache-metrics))))
+             (d/release conn)
+             (is (zero? (:snapshot-count (dq/query-cache-metrics))))
+             (#'dq/result-cache-put! committed ::late #{["stale"]} #{:c/note})
+             (is (zero? (:snapshot-count (dq/query-cache-metrics)))
+                 "a query finishing after release cannot resurrect its generation")
+             (let [reconnected (d/connect cfg)
+                   [_ generation-after _] (db/committed-cache-identity @reconnected)]
+               (is (not= generation-before generation-after))
+               (d/release reconnected))))
+         (finally
+           (d/delete-database cfg)
+           (dq/clear-query-cache!))))))
 
 (deftest test-pull-only-attr-retract-invalidates-cache
   (testing "Core bug: retract on attr only in pull pattern must invalidate cache"

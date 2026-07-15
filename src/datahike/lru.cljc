@@ -157,6 +157,25 @@
   ([limit weight-limit weigh]
    (->WeightedLRU (empty-weighted-state limit weight-limit weigh))))
 
+(defn weighted-entries
+  "Return the immutable key/value map retained by a weighted LRU."
+  [^WeightedLRU lru]
+  (:key-value (.-state lru)))
+
+(defn weighted-total-weight
+  "Return the currently retained structural weight."
+  [^WeightedLRU lru]
+  (:total-weight (.-state lru)))
+
+(defn weighted-remove-where
+  "Remove every entry whose key satisfies `pred`, preserving all LRU accounting."
+  [^WeightedLRU lru pred]
+  (->WeightedLRU
+   (reduce (fn [state k]
+             (if (pred k) (evict-key state k) state))
+           (.-state lru)
+           (keys (:key-value (.-state lru))))))
+
 (defcache LRUDatomCache [cache lru counts n-total-datoms tick datom-limit]
   CacheProtocol
   (lookup [_ item]

@@ -134,14 +134,7 @@
          tx-meta (if (:tx-meta arg-map) (:tx-meta arg-map) nil)]
      (with db tx-data tx-meta)))
   ([db tx-data tx-meta]
-   (if (dcore/is-filtered db)
-     (log/raise "Filtered DB cannot be modified" {:error :transaction/filtered})
-     (dbt/transact-tx-data (db/map->TxReport
-                            {:db-before db
-                             :db-after  db
-                             :tx-data   []
-                             :tempids   {}
-                             :tx-meta   tx-meta}) tx-data))))
+   (dcore/with db tx-data tx-meta)))
 
 (defn db-with [db tx-data]
   (:db-after (with db tx-data)))

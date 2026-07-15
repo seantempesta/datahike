@@ -66,6 +66,7 @@
                           (assoc connections conn-id
                                  {:opening? true
                                   :completion completion
+                                  :generation (random-uuid)
                                   :waiters 0
                                   :acquisition-key acquisition-key
                                   :physical-store-key physical-store-key
@@ -75,15 +76,18 @@
     (cond
       (nil? before-entry) {:state :owner
                            :completion completion
+                           :generation (:generation after-entry)
                            :write-hooks (:write-hooks after-entry)}
       (or (not= acquisition-key (:acquisition-key before-entry))
           (not= physical-store-key (:physical-store-key before-entry)))
       {:state :config-mismatch
        :existing-key (:acquisition-key before-entry)}
       (:opening? before-entry) {:state :opening
+                                :generation (:generation before-entry)
                                 :completion (:completion before-entry)}
       (and (:conn before-entry) (pos? (:count before-entry)))
-      {:state :existing :conn (:conn after-entry)}
+      {:state :existing :conn (:conn after-entry)
+       :generation (:generation after-entry)}
       :else {:state :releasing
              :completion (:release-completion before-entry)})))
 
@@ -98,6 +102,7 @@
                (assoc connections conn-id
                       {:conn conn
                        :count (inc (:waiters entry 0))
+                       :generation (:generation entry)
                        :acquisition-key (:acquisition-key entry)
                        :physical-store-key (:physical-store-key entry)
                        :write-hooks (:write-hooks entry)})

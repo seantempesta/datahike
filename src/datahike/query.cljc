@@ -7,11 +7,12 @@
    [clojure.walk :as walk]
    [datahike.datom :as datom]
    [datahike.db.interface :as dbi]
+   [datahike.db :as db]
    [datahike.db.utils :as dbu]
    [datahike.index.interface :as di]
    [datahike.array :refer [wrap-comparable]]
    [datahike.impl.entity :as de]
-   [datahike.lru]
+   [datahike.lru :as lru]
    [datahike.pull-api :as dpa]
    [datahike.query-stats :as dqs]
    [datahike.tools :as dt]
@@ -2375,11 +2376,14 @@
 ;; ---------------------------------------------------------------------------
 ;; Query result cache
 ;;
-;; Global LRU cache keyed by DB identity [hash max-tx max-eid].
-;; Portable (atom + persistent maps), no metadata, survives serialization.
+;; Global LRU cache keyed by exact committed identity
+;; [connection-id generation commit-id]. Speculative and temporal values do
+;; not cache. One atom owns both generation admission and LRU state so release
+;; cannot race a late cache put.
 ;; Inspectable: @datahike.query/query-result-cache
 ;;
-;; Structure: LRU { db-key -> { cache-key -> {:result r :attrs #{...}} } }
+;; Structure: {:generations {connection-id generation}
+;;             :lru LRU {db-key -> {cache-key -> entry}}}
 ;;
 ;; Propagation: on transaction, surviving entries (whose attr deps don't
 ;; overlap with modified-attrs) are copied from parent db-key to child db-key
@@ -2419,12 +2423,13 @@
   [bucket]
   (reduce-kv (fn [acc _ entry] (+ acc (:weight entry 0))) 0 bucket))
 
-(defonce ^{:doc "Global weighted LRU query result cache. Keys are [hash max-tx max-eid]
-   identifying a DB snapshot. Values are maps of {cache-key -> {:result r :attrs #{...}}}.
-   Bounded by *query-cache-size* snapshots and *query-cache-weight-limit* total weight.
-   Inspect with @datahike.query/query-result-cache."}
+(defn- empty-query-result-cache [size weight-limit]
+  {:lru (lru/weighted-lru size weight-limit bucket-weight)
+   :generations {}})
+
+(defonce ^{:doc "Global weighted query-result cache plus atomic connection-generation admission."}
   query-result-cache
-  (atom (datahike.lru/weighted-lru *query-cache-size* *query-cache-weight-limit* bucket-weight)))
+  (atom (empty-query-result-cache *query-cache-size* *query-cache-weight-limit*)))
 
 (defn set-query-cache-size!
   "Set the maximum number of DB snapshots retained in the query result cache.
@@ -2433,15 +2438,15 @@
   {:pre [(pos-int? n)]}
   #?(:clj (alter-var-root #'*query-cache-size* (constantly n))
      :cljs (set! *query-cache-size* n))
-  (reset! query-result-cache
-          (datahike.lru/weighted-lru n *query-cache-weight-limit* bucket-weight))
+  (swap! query-result-cache
+         assoc :lru (lru/weighted-lru n *query-cache-weight-limit* bucket-weight))
   n)
 
 (defn clear-query-cache!
   "Clear all entries from the query result cache."
   []
-  (reset! query-result-cache
-          (datahike.lru/weighted-lru *query-cache-size* *query-cache-weight-limit* bucket-weight)))
+  (swap! query-result-cache
+         assoc :lru (lru/weighted-lru *query-cache-size* *query-cache-weight-limit* bucket-weight)))
 
 (defn set-query-cache-weight-limit!
   "Set the maximum total shallow structural weight across all DB snapshots.
@@ -2450,14 +2455,44 @@
   {:pre [(nat-int? n)]}
   #?(:clj (alter-var-root #'*query-cache-weight-limit* (constantly n))
      :cljs (set! *query-cache-weight-limit* n))
-  (reset! query-result-cache
-          (datahike.lru/weighted-lru *query-cache-size* n bucket-weight))
+  (swap! query-result-cache
+         assoc :lru (lru/weighted-lru *query-cache-size* n bucket-weight))
   n)
 
+(defn open-query-cache-generation!
+  "Admit committed values from the current open generation of a connection."
+  [connection-id generation]
+  (swap! query-result-cache assoc-in [:generations connection-id] generation)
+  generation)
+
+(defn close-query-cache-generation!
+  "Fence cache puts and evict all snapshots for one exact connection generation."
+  [connection-id generation]
+  (swap! query-result-cache
+         (fn [{:keys [lru generations] :as state}]
+           (if (= generation (get generations connection-id))
+             (assoc state
+                    :generations (dissoc generations connection-id)
+                    :lru (lru/weighted-remove-where
+                          lru
+                          (fn [[cached-id cached-generation _]]
+                            (and (= connection-id cached-id)
+                                 (= generation cached-generation)))))
+             state)))
+  nil)
+
+(defn query-cache-metrics
+  "Return bounded cache occupancy without exposing cached query results."
+  []
+  (let [{:keys [lru generations]} @query-result-cache]
+    {:snapshot-count (count (lru/weighted-entries lru))
+     :total-weight (lru/weighted-total-weight lru)
+     :open-generation-count (count generations)}))
+
 (defn- db-cache-key
-  "Compute the cache identity key for a DB snapshot."
-  [db]
-  [(:hash db) (:max-tx db) (:max-eid db)])
+  "Return exact committed identity, or nil for speculative and wrapped values."
+  [database]
+  (db/committed-cache-identity database))
 
 (defn- extract-query-attr-deps
   "Extract the set of attributes referenced in where-clauses.
@@ -2559,16 +2594,16 @@
 (defn- result-cache-get
   "Look up a cached query result for the given DB."
   [db cache-key]
-  (let [dk (db-cache-key db)]
-    (when-let [snapshot-cache (get @query-result-cache dk)]
+  (when-let [dk (db-cache-key db)]
+    (when-let [snapshot-cache (get-in @query-result-cache [:lru dk])]
       (when-let [entry (get snapshot-cache cache-key)]
         ;; Touch LRU atomically — re-assoc current value so LRU updates generation.
         ;; Use swap! which retries on CAS conflict, reading fresh state each retry.
         (swap! query-result-cache
-               (fn [lru]
+               (fn [{:keys [lru] :as state}]
                  (if-let [current (get lru dk)]
-                   (assoc lru dk current)
-                   lru)))
+                   (assoc state :lru (assoc lru dk current))
+                   state)))
         entry))))
 
 (defn- result-cache-put!
@@ -2576,32 +2611,36 @@
   [db cache-key result attr-deps]
   (when-let [weight (and (pos? *query-cache-weight-limit*)
                          (result-weight result))]
-    (let [dk (db-cache-key db)]
+    (when-let [[connection-id generation :as dk] (db-cache-key db)]
       (swap! query-result-cache
-             (fn [lru]
-               (let [existing (or (get lru dk) {})]
-                 (assoc lru dk (assoc existing cache-key
-                                      {:result result :attrs attr-deps
-                                       :weight weight}))))))))
+             (fn [{:keys [lru generations] :as state}]
+               (if (= generation (get generations connection-id))
+                 (let [existing (or (get lru dk) {})]
+                   (assoc state :lru
+                          (assoc lru dk (assoc existing cache-key
+                                               {:result result :attrs attr-deps
+                                                :weight weight}))))
+                 state))))))
 
 (defn propagate-query-cache
   "Propagate query result cache from parent DB to child DB after a transaction.
    Entries whose attribute deps overlap with modified-attrs are evicted.
    Uses dissoc for structural sharing — child cache shares most of parent's
    persistent map when few entries are invalidated.
-   Parent cache is NOT removed — parent DB may still be queried (e.g. d/with).
-   Called from datahike.writing/complete-db-update and datahike.core/with."
+   Parent cache is not removed because already-issued committed values remain
+   immutable and queryable. Called once after durable writer publication."
   [parent-db child-db modified-attrs]
   (let [parent-key (db-cache-key parent-db)
         child-key  (db-cache-key child-db)]
-    (when-not (= parent-key child-key)
+    (when (and parent-key child-key (not= parent-key child-key)
+               (= (subvec parent-key 0 2) (subvec child-key 0 2)))
       ;; Only propagate if we have user-visible modified attrs for selective invalidation.
       ;; If modified-attrs is empty or only has system attrs (e.g. purge ops where
       ;; tx-data doesn't list affected user attrs), skip propagation entirely —
       ;; the DB changed but we can't determine which queries are safe to keep.
       (let [user-attrs (disj modified-attrs :db/txInstant)]
         (when (seq user-attrs)
-          (let [parent-entries (get @query-result-cache parent-key)]
+          (let [parent-entries (get-in @query-result-cache [:lru parent-key])]
             (when (seq parent-entries)
               (let [child-entries (reduce-kv
                                    (fn [m k {:keys [attrs]}]
@@ -2612,7 +2651,12 @@
                                    parent-entries
                                    parent-entries)]
                 (when (seq child-entries)
-                  (swap! query-result-cache assoc child-key child-entries))))))))))
+                  (swap! query-result-cache
+                         (fn [{:keys [lru generations] :as state}]
+                           (let [[connection-id generation] child-key]
+                             (if (= generation (get generations connection-id))
+                               (assoc state :lru (assoc lru child-key child-entries))
+                               state)))))))))))))
 
 (defn memoized-parse-query [q]
   (if-some [cached (get @query-cache q nil)]
