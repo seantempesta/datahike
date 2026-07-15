@@ -4,7 +4,10 @@
       :clj  [clojure.test :as t :refer [is deftest testing]])
    [datahike.api :as d]
    #?(:clj [datahike.db :as db])
+   #?(:clj [datahike.connections :as connections])
+   #?(:clj [datahike.lru :as lru])
    #?(:clj [datahike.query :as dq])
+   #?(:clj [datahike.store :as store])
    #?(:clj [datahike.writing :as writing])))
 
 (defn- with-temp-db
@@ -35,6 +38,84 @@
    :db/cardinality :db.cardinality/one}])
 
 #?(:clj
+   (defn- query-cache-keys []
+     (set (keys (lru/weighted-entries (:lru @dq/query-result-cache))))))
+
+#?(:clj
+   (deftest committed-identity-ignores-forced-legacy-collision-across-stores
+     (let [cfg-a {:store {:backend :memory :id (random-uuid)}
+                  :schema-flexibility :write :attribute-refs? false}
+           cfg-b {:store {:backend :memory :id (random-uuid)}
+                  :schema-flexibility :write :attribute-refs? false}]
+       (try
+         (dq/clear-query-cache!)
+         (d/create-database cfg-a)
+         (d/create-database cfg-b)
+         (let [conn-a (d/connect cfg-a)
+               conn-b (d/connect cfg-b)]
+           (try
+             (d/transact conn-a (conj label-schema {:c/id "a" :c/note "store-a"}))
+             (d/transact conn-b (conj label-schema {:c/id "b" :c/note "store-b"}))
+             (let [db-a (assoc @conn-a :hash ::forced :max-tx 7 :max-eid 9)
+                   db-b (assoc @conn-b :hash ::forced :max-tx 7 :max-eid 9)
+                   identity-a (db/committed-cache-identity db-a)
+                   identity-b (db/committed-cache-identity db-b)
+                   query '[:find ?n . :where [_ :c/note ?n]]]
+               (is (= (mapv #(get db-a %) [:hash :max-tx :max-eid])
+                      (mapv #(get db-b %) [:hash :max-tx :max-eid])))
+               (is (not= identity-a identity-b))
+               (is (= ["store-a" "store-b" "store-a" "store-b"]
+                      [(d/q query db-a) (d/q query db-b)
+                       (d/q query db-a) (d/q query db-b)]))
+               (is (= #{identity-a identity-b} (query-cache-keys)))
+               (d/release conn-a)
+               (is (= #{identity-b} (query-cache-keys)))
+               (is (= "store-b" (d/q query db-b))))
+             (finally
+               (try (d/release conn-a) (catch Exception _))
+               (d/release conn-b))))
+         (finally
+           (d/delete-database cfg-a)
+           (d/delete-database cfg-b)
+           (dq/clear-query-cache!))))))
+
+#?(:clj
+   (deftest sibling-branches-at-one-commit-have-independent-cache-scopes
+     (let [cfg {:store {:backend :memory :id (random-uuid)}
+                :schema-flexibility :write :attribute-refs? false}]
+       (try
+         (dq/clear-query-cache!)
+         (d/create-database cfg)
+         (let [main (d/connect cfg)]
+           (d/transact main (conj label-schema {:c/id "branch" :c/note "base"}))
+           (let [head (d/commit-id @main)]
+             (d/branch! main head :left)
+             (d/branch! main head :right)
+             (d/release main)
+             (let [left (d/connect (assoc cfg :branch :left))
+                   right (d/connect (assoc cfg :branch :right))]
+               (try
+                 (let [left-id (db/committed-cache-identity @left)
+                       right-id (db/committed-cache-identity @right)
+                       query '[:find ?n . :where [_ :c/note ?n]]]
+                   (is (= (last left-id) (last right-id)))
+                   (is (not= (first left-id) (first right-id)))
+                   (is (not= (second left-id) (second right-id)))
+                   (is (= ["base" "base"] [(d/q query @left) (d/q query @right)]))
+                   (is (= #{left-id right-id} (query-cache-keys)))
+                   (d/transact left [{:c/id "branch" :c/note "left-new"}])
+                   (is (= ["left-new" "base"] [(d/q query @left) (d/q query @right)]))
+                   (d/release left)
+                   (is (= #{right-id} (query-cache-keys)))
+                   (is (= "base" (d/q query @right))))
+                 (finally
+                   (try (d/release left) (catch Exception _))
+                   (d/release right))))))
+         (finally
+           (d/delete-database cfg)
+           (dq/clear-query-cache!))))))
+
+#?(:clj
    (deftest committed-cache-identity-excludes-speculative-and-temporal-values
      (with-temp-db label-schema
        (fn [conn]
@@ -59,7 +140,8 @@
            (d/transact conn label-schema)
            (d/transact conn [{:c/id "late" :c/note "value"}])
            (let [committed @conn
-                 [_ generation-before _] (db/committed-cache-identity committed)]
+                 [connection-id generation-before _]
+                 (db/committed-cache-identity committed)]
              (d/q '[:find ?n :where [_ :c/note ?n]] committed)
              (is (pos? (:snapshot-count (dq/query-cache-metrics))))
              (d/release conn)
@@ -70,8 +152,43 @@
              (let [reconnected (d/connect cfg)
                    [_ generation-after _] (db/committed-cache-identity @reconnected)]
                (is (not= generation-before generation-after))
+               (d/q '[:find ?n :where [_ :c/note ?n]] @reconnected)
+               (let [before-stale-close (dq/query-cache-metrics)]
+                 (dq/close-query-cache-generation!
+                  connection-id generation-before)
+                 (is (= before-stale-close (dq/query-cache-metrics))
+                     "a delayed old-generation close cannot erase a reconnect"))
                (d/release reconnected))))
          (finally
+           (d/delete-database cfg)
+           (dq/clear-query-cache!))))))
+
+#?(:clj
+   (deftest config-mismatch-does-not-open-or-alter-cache-generation
+     (let [cfg {:store {:backend :memory :id (random-uuid)}
+                :keep-history? true
+                :schema-flexibility :write
+                :attribute-refs? false}
+           _ (d/create-database cfg)
+           conn (d/connect cfg)]
+       (try
+         (d/transact conn (conj label-schema {:c/id "mismatch" :c/note "stable"}))
+         (d/q '[:find ?n :where [_ :c/note ?n]] @conn)
+         (let [conn-id (store/connection-id (:config @conn))
+               entry-before (get @connections/*connections* conn-id)
+               metrics-before (dq/query-cache-metrics)
+               keys-before (query-cache-keys)]
+           (is (= :config-does-not-match-existing-connections
+                  (try
+                    (d/connect (assoc cfg :keep-history? false))
+                    (catch Exception e (:type (ex-data e))))))
+           (is (= entry-before (get @connections/*connections* conn-id)))
+           (is (= metrics-before (dq/query-cache-metrics)))
+           (is (= keys-before (query-cache-keys)))
+           (is (= #{["stable"]}
+                  (d/q '[:find ?n :where [_ :c/note ?n]] @conn))))
+         (finally
+           (d/release conn)
            (d/delete-database cfg)
            (dq/clear-query-cache!))))))
 
