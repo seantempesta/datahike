@@ -15,6 +15,7 @@
    [datahike.lru :as lru]
    [datahike.pull-api :as dpa]
    [datahike.query-stats :as dqs]
+   [datahike.query.single-flight :as single-flight]
    [datahike.tools :as dt]
    [datalog.parser :refer [parse]]
    [datalog.parser.impl :as dpi]
@@ -2425,7 +2426,13 @@
 
 (defn- empty-query-result-cache [size weight-limit]
   {:lru (lru/weighted-lru size weight-limit bucket-weight)
-   :generations {}})
+   :generations {}
+   :epoch 0})
+
+(defn- replace-query-result-lru [state size weight-limit]
+  (-> state
+      (update :epoch inc)
+      (assoc :lru (lru/weighted-lru size weight-limit bucket-weight))))
 
 (defonce ^{:doc "Global weighted query-result cache plus atomic connection-generation admission."}
   query-result-cache
@@ -2439,14 +2446,16 @@
   #?(:clj (alter-var-root #'*query-cache-size* (constantly n))
      :cljs (set! *query-cache-size* n))
   (swap! query-result-cache
-         assoc :lru (lru/weighted-lru n *query-cache-weight-limit* bucket-weight))
+         replace-query-result-lru n *query-cache-weight-limit*)
+  (single-flight/clear!)
   n)
 
 (defn clear-query-cache!
   "Clear all entries from the query result cache."
   []
   (swap! query-result-cache
-         assoc :lru (lru/weighted-lru *query-cache-size* *query-cache-weight-limit* bucket-weight)))
+         replace-query-result-lru *query-cache-size* *query-cache-weight-limit*)
+  (single-flight/clear!))
 
 (defn set-query-cache-weight-limit!
   "Set the maximum total shallow structural weight across all DB snapshots.
@@ -2456,7 +2465,8 @@
   #?(:clj (alter-var-root #'*query-cache-weight-limit* (constantly n))
      :cljs (set! *query-cache-weight-limit* n))
   (swap! query-result-cache
-         assoc :lru (lru/weighted-lru *query-cache-size* n bucket-weight))
+         replace-query-result-lru *query-cache-size* n)
+  (single-flight/clear!)
   n)
 
 (defn open-query-cache-generation!
@@ -2479,6 +2489,7 @@
                             (and (= connection-id cached-id)
                                  (= generation cached-generation)))))
              state)))
+  (single-flight/close-scope! connection-id generation)
   nil)
 
 (defn query-cache-metrics
@@ -2487,7 +2498,8 @@
   (let [{:keys [lru generations]} @query-result-cache]
     {:snapshot-count (count (lru/weighted-entries lru))
      :total-weight (lru/weighted-total-weight lru)
-     :open-generation-count (count generations)}))
+     :open-generation-count (count generations)
+     :single-flight (single-flight/metrics)}))
 
 (defn- db-cache-key
   "Return exact committed identity, or nil for speculative and wrapped values."
@@ -2608,19 +2620,23 @@
 
 (defn- result-cache-put!
   "Store a query result in the cache for the given DB."
-  [db cache-key result attr-deps]
+  [db cache-key result attr-deps expected-epoch]
   (when-let [weight (and (pos? *query-cache-weight-limit*)
                          (result-weight result))]
     (when-let [[connection-id generation :as dk] (db-cache-key db)]
-      (swap! query-result-cache
-             (fn [{:keys [lru generations] :as state}]
-               (if (= generation (get generations connection-id))
-                 (let [existing (or (get lru dk) {})]
-                   (assoc state :lru
-                          (assoc lru dk (assoc existing cache-key
-                                               {:result result :attrs attr-deps
-                                                :weight weight}))))
-                 state))))))
+      (let [stored? (volatile! false)]
+        (swap! query-result-cache
+               (fn [{:keys [lru generations epoch] :as state}]
+                 (if (and (= expected-epoch epoch)
+                          (= generation (get generations connection-id)))
+                   (let [existing (or (get lru dk) {})]
+                     (vreset! stored? true)
+                     (assoc state :lru
+                            (assoc lru dk (assoc existing cache-key
+                                                 {:result result :attrs attr-deps
+                                                  :weight weight}))))
+                   state)))
+        @stored?))))
 
 (defn propagate-query-cache
   "Propagate query result cache from parent DB to child DB after a transaction.
@@ -4095,36 +4111,49 @@
 
 (defn raw-q [{:keys [query args stats? count-fns? offset limit order-by
                      max-work max-results max-result-weight] :as query-map}]
-  (let [uncached (fn []
-                   #?(:clj (or (when-not (or max-work max-results max-result-weight)
-                                 (try-secondary-index-aggregate-fast query-map))
-                               (raw-q* query-map))
-                      :cljs (raw-q* query-map)))]
+  (let [uncached (fn [shared-cancel]
+                   (let [effective-query-map
+                         (if shared-cancel
+                           (assoc query-map :cancel shared-cancel)
+                           query-map)]
+                     #?(:clj (or (when-not (or max-work max-results max-result-weight)
+                                   (try-secondary-index-aggregate-fast effective-query-map))
+                                 (raw-q* effective-query-map))
+                        :cljs (raw-q* effective-query-map))))]
     (if (or (not *query-result-cache?*)
             stats?
             count-fns?                         ;; counting needs re-execution; a cache hit wouldn't re-run the fn
             max-work max-results max-result-weight
             #?(:clj *profile?* :cljs false))
-      (uncached)
+      (uncached nil)
       ;; Try result cache
       (let [db (first args)
-            cacheable? (and (dbu/db? db) (instance? DB db))]
-        (if-not cacheable?
-          (uncached)
+            db-key (db-cache-key db)]
+        (if-not db-key
+          (uncached nil)
           (let [non-db-args (vec (rest args))
+                cache-epoch (:epoch @query-result-cache)
                 ;; scale-sensitive-key: BigDecimal args/consts of equal value but
                 ;; different scale (1.50M vs 1.500M) are `=` with equal hash in
                 ;; Clojure, so they'd share a result-cache entry and return the
                 ;; first-cached scale. Keep them distinct.
                 cache-key (scale-sensitive-key
                            [query non-db-args offset limit order-by *disable-planner*])
-                entry (result-cache-get db cache-key)]
-            (if entry
-              (:result entry)
-              (let [result (uncached)
-                    attr-deps (query-attribute-dependencies query)]
-                (result-cache-put! db cache-key result attr-deps)
-                result))))))))
+                cached (result-cache-get db cache-key)]
+            ;; Completed hits never enter the in-flight path and therefore do
+            ;; not allocate a promise, waiter identity, flight key, or delayed
+            ;; dependency analysis. The coordinator rechecks on a miss to close
+            ;; the race with a concurrent owner publishing after this read.
+            (if cached
+              (:result cached)
+              (let [attr-deps (delay (query-attribute-dependencies query))]
+                (single-flight/execute!
+                 [db-key cache-key]
+                 #(when-let [entry (result-cache-get db cache-key)]
+                    {:value (:result entry)})
+                 uncached
+                 #(result-cache-put! db cache-key % @attr-deps
+                                     cache-epoch))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Register legacy functions for CLJS execute.cljc (breaks circular dep)

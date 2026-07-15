@@ -12,6 +12,8 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Features
 
+- **Identical-query single-flight on JVM** — simultaneous cold misses for one exact committed database/query key now share one owner computation while different keys remain parallel. Completed hits bypass coordination; failures are shared and retryable; same-owner recursion and bounded overflow preserve synchronous semantics; exact connection release fails and removes only that generation's waiters. ClojureScript retains direct synchronous execution. Cache metrics include active flights, waiters, saved computations, timing, overflow, cancellation, and cache outcomes. *Experimental.* ([#TODO])
+
 - **Committed database cache identity and scoped query-cache lifetime** — attached head values now carry exact `[connection-id generation commit-id]` identity. Speculative `with` values and temporal/filtered wrappers do not enter the shared result cache; final connection release atomically fences late inserts and evicts that generation. Successful batched commits propagate unaffected entries once from the durable parent to the final committed child. Cache occupancy is available through `datahike.query/query-cache-metrics`. *Experimental.* ([#TODO])
 
 - **Public query dependency projection (`query-attribute-dependencies`)** — exposes the query result cache's pure conservative attribute analysis through `datahike.api`. Literal where/pull attributes return a set; variables, rules, wildcard/input-bound pulls, malformed forms, and unknown clauses return `:all`. The projection executes no query and retains no database value. *Experimental.* ([#TODO])

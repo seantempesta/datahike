@@ -146,7 +146,8 @@
              (is (pos? (:snapshot-count (dq/query-cache-metrics))))
              (d/release conn)
              (is (zero? (:snapshot-count (dq/query-cache-metrics))))
-             (#'dq/result-cache-put! committed ::late #{["stale"]} #{:c/note})
+             (#'dq/result-cache-put! committed ::late #{["stale"]} #{:c/note}
+                                     (:epoch @dq/query-result-cache))
              (is (zero? (:snapshot-count (dq/query-cache-metrics)))
                  "a query finishing after release cannot resurrect its generation")
              (let [reconnected (d/connect cfg)
@@ -162,6 +163,20 @@
          (finally
            (d/delete-database cfg)
            (dq/clear-query-cache!))))))
+
+#?(:clj
+   (deftest explicit-clear-atomically-fences-an-already-admitted-cache-put
+     (with-temp-db
+       (conj label-schema {:c/id "clear" :c/note "value"})
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (let [database @conn
+               admitted-epoch (:epoch @dq/query-result-cache)]
+           (dq/clear-query-cache!)
+           (is (false?
+                (#'dq/result-cache-put! database ::late #{["stale"]}
+                                        #{:c/note} admitted-epoch)))
+           (is (zero? (:snapshot-count (dq/query-cache-metrics)))))))))
 
 #?(:clj
    (deftest config-mismatch-does-not-open-or-alter-cache-generation
@@ -191,6 +206,33 @@
            (d/release conn)
            (d/delete-database cfg)
            (dq/clear-query-cache!))))))
+
+#?(:clj
+   (deftest identical-concurrent-datahike-queries-compute-once
+     (with-temp-db
+       (conj label-schema {:c/id "single-flight" :c/note "value"})
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (let [database @conn
+               start (java.util.concurrent.CountDownLatch. 1)
+               calls (atom 0)
+               pred (fn [_]
+                      (swap! calls inc)
+                      (Thread/sleep 75)
+                      true)
+               run #(d/q '[:find ?n
+                            :in $ ?pred
+                            :where [_ :c/note ?n]
+                                   [(?pred ?n)]]
+                          database pred)
+               workers (doall
+                        (for [_ (range 16)]
+                          (future (.await start) (run))))]
+           (.countDown start)
+           (is (= (vec (repeat 16 #{["value"]})) (mapv deref workers)))
+           (is (= 1 @calls))
+           (is (zero? (get-in (dq/query-cache-metrics)
+                              [:single-flight :active-flights]))))))))
 
 #?(:clj
    (deftest batched-writer-invalidates-the-union-of-request-attributes
