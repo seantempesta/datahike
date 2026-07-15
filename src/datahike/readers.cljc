@@ -24,9 +24,9 @@
          (let [store (:store @conn)]
            (when-let [raw-db (k/get store commit-id nil {:sync? true})]
              (dw/stored->db raw-db store)))
-         (log/raise (ex-info "Could not find active connection. Did you connect already?"
-                             {:type :no-connection-for-db
-                              :raw-db raw-db}))))
+         (log/raise "Could not find active connection. Did you connect already?"
+                    {:type :no-connection-for-db
+                     :raw-db raw-db})))
     (init-db (map (fn [[e a v tx]] (datom e a v tx)) datoms) schema)))
 
 (defn history-from-reader [{:keys [origin]}]

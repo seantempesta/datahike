@@ -62,10 +62,12 @@
 (deftest test-rule-body-or-join-attr-refs
   (testing "rule body containing (or-join ...) with data patterns resolves
             attribute keywords for both engines on HistoricalDB"
-    (let [cfg (fresh-cfg)]
+    (let [cfg (fresh-cfg)
+          conn* (atom nil)]
       (try
         (d/create-database cfg)
-        (let [conn (d/connect cfg)]
+        (let [conn (d/connect cfg)
+              _ (reset! conn* conn)]
           (d/transact conn
                       [{:db/ident :version/id
                         :db/cardinality :db.cardinality/one
@@ -109,7 +111,9 @@
                 "planner must match legacy under attribute-refs+history")
             (is (instance? java.util.Date (ffirst planner))
                 "planner returns a real instant, not nil/empty")))
-        (finally (d/delete-database cfg))))))
+        (finally
+          (when-let [conn @conn*] (d/release conn))
+          (d/delete-database cfg))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Bug 2 — pushed-down predicate dropped in entity-group temporal fallback
@@ -133,10 +137,12 @@
 (deftest test-temporal-entity-group-pushdown-pred
   (testing "range predicate pushed onto entity-group scan-op is applied
             on HistoricalDB"
-    (let [cfg (fresh-cfg)]
+    (let [cfg (fresh-cfg)
+          conn* (atom nil)]
       (try
         (d/create-database cfg)
-        (let [conn (d/connect cfg)]
+        (let [conn (d/connect cfg)
+              _ (reset! conn* conn)]
           (d/transact conn
                       [{:db/ident :event/marker
                         :db/cardinality :db.cardinality/one
@@ -187,7 +193,9 @@
                   must be re-applied in the temporal fallback path")
             (is (= #{["e2"] ["e3"]} (set planner))
                 "planner result must drop e1 (whose ?inst < ?from-inst)")))
-        (finally (d/delete-database cfg))))))
+        (finally
+          (when-let [conn @conn*] (d/release conn))
+          (d/delete-database cfg))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Bug 2b — same shape as Bug 2 but for the STANDALONE pattern-scan path
@@ -212,10 +220,12 @@
 (deftest test-temporal-standalone-pattern-scan-pushdown-pred
   (testing "range predicate pushed onto a STANDALONE pattern-scan is
             applied on HistoricalDB"
-    (let [cfg (fresh-cfg)]
+    (let [cfg (fresh-cfg)
+          conn* (atom nil)]
       (try
         (d/create-database cfg)
-        (let [conn (d/connect cfg)]
+        (let [conn (d/connect cfg)
+              _ (reset! conn* conn)]
           (d/transact conn
                       [{:db/ident :event/marker
                         :db/cardinality :db.cardinality/one
@@ -260,7 +270,9 @@
                   temporal fallback path")
             (is (not (some #(= e1-inst (first %)) planner))
                 "planner result must drop the e1 tx (whose ?inst < ?from-inst)")))
-        (finally (d/delete-database cfg))))))
+        (finally
+          (when-let [conn @conn*] (d/release conn))
+          (d/delete-database cfg))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Bug 3 — LOptionalScan reordered before its entity-var binders
@@ -294,10 +306,12 @@
 (deftest test-optional-scan-after-binder
   (testing "LOptionalScan (get-else with default) is ordered after its
             entity-var binder so its e-var isn't nil at execute time"
-    (let [cfg (fresh-cfg)]
+    (let [cfg (fresh-cfg)
+          conn* (atom nil)]
       (try
         (d/create-database cfg)
-        (let [conn (d/connect cfg)]
+        (let [conn (d/connect cfg)
+              _ (reset! conn* conn)]
           (d/transact conn
                       [{:db/ident :concept/id
                         :db/cardinality :db.cardinality/one
@@ -342,7 +356,9 @@
                 "planner row must have non-nil values — a pre-fix run
                   produces a tuple of all-nils because the optional scan
                   ran with ?r still free")))
-        (finally (d/delete-database cfg))))))
+        (finally
+          (when-let [conn @conn*] (d/release conn))
+          (d/delete-database cfg))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Note 179 §4 Gap 1 — zero-cost overlay invariant
@@ -391,12 +407,16 @@
           vt-cfg {:store {:backend :memory :id (UUID/randomUUID)}
                   :writer {:backend :self}
                   :schema-flexibility :write
-                  :keep-history? true}]
+                  :keep-history? true}
+          baseline* (atom nil)
+          vt* (atom nil)]
       (try
         (d/create-database baseline-cfg)
         (d/create-database vt-cfg)
         (let [baseline (d/connect baseline-cfg)
               vt (d/connect vt-cfg)
+              _ (reset! baseline* baseline)
+              _ (reset! vt* vt)
               schema [{:db/ident :user/name
                        :db/valueType :db.type/string
                        :db/cardinality :db.cardinality/one
@@ -453,6 +473,8 @@
               (is (= baseline-result vt-result)
                   "vt-DB answers the non-vt query identically"))))
         (finally
+          (when-let [baseline @baseline*] (d/release baseline))
+          (when-let [vt @vt*] (d/release vt))
           (d/delete-database baseline-cfg)
           (d/delete-database vt-cfg))))))
 
@@ -470,10 +492,12 @@
 
 (deftest test-get-else-on-history-is-single-valued
   (testing "get-else over d/history yields one value per entity, matching legacy"
-    (let [cfg (fresh-cfg)]
+    (let [cfg (fresh-cfg)
+          conn* (atom nil)]
       (try
         (d/create-database cfg)
-        (let [conn (d/connect cfg)]
+        (let [conn (d/connect cfg)
+              _ (reset! conn* conn)]
           (d/transact conn [{:db/ident :name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
                             {:db/ident :age  :db/valueType :db.type/long   :db/cardinality :db.cardinality/one}
                             {:db/ident :tag  :db/valueType :db.type/string :db/cardinality :db.cardinality/many}])
@@ -493,10 +517,10 @@
                       (str label ": planner must match legacy get-else on history"))
                   ;; each entity appears at most once (single-valued get-else)
                   (is (= (count planner) (count (into #{} (map first) planner)))
-                      (str label ": at most one row per entity"))))))
-          (d/release (d/connect cfg)))
-        (finally
-          (d/delete-database cfg))))))
+                      (str label ": at most one row per entity")))))))
+          (finally
+            (when-let [conn @conn*] (d/release conn))
+            (d/delete-database cfg))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Bug — date as-of card-one merge skipped the older visible value
@@ -544,10 +568,12 @@
           q '[:find ?e ?n ?a
               :where
               [?e :name ?n]
-              [?e :age ?a]]]
+              [?e :age ?a]]
+          conn* (atom nil)]
       (try
         (d/create-database cfg)
         (let [conn (d/connect cfg)
+              _ (reset! conn* conn)
               tx1 (d/transact conn [{:name "Alice" :age 20}
                                     {:name "Bob" :age 30}
                                     {:name "Charlie" :age 40}])
@@ -569,7 +595,7 @@
                      ["at second tx" at-tx2 after-update]]]
               (let [result (run-both q (d/as-of (d/db conn) as-of-date))]
                 (is (= (:legacy result) (:planner result)))
-                (is (= expected (:planner result)) label))))
-          (d/release conn))
+                (is (= expected (:planner result)) label)))))
         (finally
+          (when-let [conn @conn*] (d/release conn))
           (d/delete-database cfg))))))

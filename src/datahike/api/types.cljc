@@ -98,9 +98,9 @@
    [:selector [:vector :any]]
    [:eid {:optional true} SEId]
    [:eids {:optional true} [:sequential SEId]]
-   [:max-work {:optional true} :pos-int]
-   [:max-results {:optional true} :pos-int]
-   [:max-result-weight {:optional true} :pos-int]])
+   [:max-work {:optional true} pos-int?]
+   [:max-results {:optional true} pos-int?]
+   [:max-result-weight {:optional true} pos-int?]])
 
 (def SQueryArgs
   "Query arguments map."
@@ -109,9 +109,9 @@
    [:args {:optional true} [:sequential :any]]
    [:limit {:optional true} :int]
    [:offset {:optional true} :int]
-   [:max-work {:optional true} :pos-int]
-   [:max-results {:optional true} :pos-int]
-   [:max-result-weight {:optional true} :pos-int]])
+   [:max-work {:optional true} pos-int?]
+   [:max-results {:optional true} pos-int?]
+   [:max-result-weight {:optional true} pos-int?]])
 
 (def SWithArgs
   "Arguments for 'with' operation."

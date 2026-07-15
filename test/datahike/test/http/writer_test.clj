@@ -7,25 +7,27 @@
 
 (deftest test-http-writer
   (testing "Testing distributed datahike.http.writer implementation."
-    (let [port  31283
+    (let [port 31283
+          cfg {:store              {:backend :file
+                                    :path "/tmp/distributed_writer"
+                                    :id #uuid "17100000-0000-0000-0000-000000000001"}
+               :keep-history?      true
+               :schema-flexibility :read
+               :writer             {:backend :datahike-server
+                                    :url (str "http://localhost:" port)
+                                    :token "securerandompassword"}}
+          conn* (atom nil)
           server (start-server {:port     port
                                 :join?    false
                                 :dev-mode false
                                 :token    "securerandompassword"})]
       (try
-        (let [cfg    {:store              {:backend :file
-                                           :path  "/tmp/distributed_writer"
-                                           :id #uuid "17100000-0000-0000-0000-000000000001"}
-                      :keep-history?      true
-                      :schema-flexibility :read
-                      :writer             {:backend :datahike-server
-                                           :url     (str "http://localhost:" port)
-                                           :token   "securerandompassword"}}
-              conn   (do
-                       (when (d/database-exists? cfg)
-                         (d/delete-database cfg))
-                       (d/create-database cfg)
-                       (d/connect cfg))]
+        (let [conn (do
+                     (when (d/database-exists? cfg)
+                       (d/delete-database cfg))
+                     (d/create-database cfg)
+                     (d/connect cfg))
+              _ (reset! conn* conn)]
 
           (d/transact conn [{:name "Alice"
                              :age  25}])
@@ -49,8 +51,14 @@
                       @conn
                       18)))
 
+          (d/release conn)
+          (reset! conn* nil)
           (d/delete-database cfg))
         (finally
+          (when-let [conn @conn*]
+            (d/release conn)
+            (when (d/database-exists? cfg)
+              (d/delete-database cfg)))
           (stop-server server))))))
 
 (deftest test-http-writer-failure-without-server
@@ -81,6 +89,10 @@
         ;; make sure the database exists before testing transact
       (do (d/delete-database server-cfg)
           (d/create-database server-cfg))
-      (is (thrown? Exception
-                   (d/transact (d/connect cfg)
-                               [{:name "Should fail."}]))))))
+      (let [conn (d/connect cfg)]
+        (try
+          (is (thrown? Exception
+                       (d/transact conn [{:name "Should fail."}])))
+          (finally
+            (d/release conn)
+            (d/delete-database server-cfg)))))))
