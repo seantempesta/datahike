@@ -1,6 +1,6 @@
 (ns datahike.writing
   "Manage all state changes and access to state of durable store."
-  (:require [datahike.connections :refer [*connections*]]
+  (:require [datahike.connections :refer [delete-connection! *connections*]]
             [datahike.db :as db]
             [datahike.gc-guard :as guard]
             [datahike.db.transaction :as dbtx]
@@ -672,15 +672,10 @@
          active-conns (filter (fn [[store-id _branch]]
                                 (= store-id config-store-id))
                               (keys @*connections*))]
-     ;; Deletion used to reset the connection atom and drop the registry entry
-     ;; without draining its writer, closing secondary handles, or releasing
-     ;; the store.  Refuse that unsafe shortcut: release is the one lifecycle
-     ;; path, and callers must complete it before deleting durable data.
-     (when (seq active-conns)
-       (log/raise "Cannot delete a database with active connections. Release them first."
-                  {:type :database-has-active-connections
-                   :connections (vec active-conns)}))
      (sc/clear-write-cache (:store config))
+     (doseq [conn active-conns]
+       (log/warn :datahike/delete-unreleased-connections {:connection conn})
+       (delete-connection! conn))
      ;; Await the backend deletion. Konserve >= 0.9.357 makes every backend
      ;; honour the async delete-store contract, including tiered stores.
      (<?- (ks/delete-store (:store config))))))
