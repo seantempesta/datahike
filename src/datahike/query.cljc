@@ -71,7 +71,7 @@
    Bind to false for benchmarking raw query execution."
   true)
 
-(declare -collect -resolve-clause resolve-clause raw-q)
+(declare -collect -resolve-clause resolve-clause raw-q memoized-parse-query)
 
 ;; Records
 
@@ -2502,8 +2502,8 @@
               ;; Unknown: rule call, get-else, etc. — cannot determine attr deps
               :all))
 
-          ;; Unknown shape — skip
-          :else (recur rest-clauses attrs))))))
+          ;; Unknown shape — cache/caller must conservatively assume all attrs.
+          :else :all)))))
 
 (defn- extract-find-pull-attr-deps
   "Extract the set of attributes referenced in pull patterns within :find.
@@ -2515,7 +2515,10 @@
        (if (= attrs :all)
          (reduced :all)
          (if (instance? Pull el)
-           (let [pattern (:pattern el)]
+           (let [raw-pattern (:pattern el)
+                 pattern (if (instance? Constant raw-pattern)
+                           (:value raw-pattern)
+                           raw-pattern)]
              (if-not (sequential? pattern)
                 ;; Pattern is a variable bound via :in — cannot determine attrs
                (reduced :all)
@@ -2534,6 +2537,24 @@
     (= a :all) :all
     (= b :all) :all
     :else (into a b)))
+
+(defn query-attribute-dependencies
+  "Conservatively project the attributes that can affect a query result.
+
+   Accepts the same query representation as `q` (vector/list, map, quoted
+   form, or EDN string) without query inputs or a database value. Returns a
+   set of concrete attributes, or `:all` when a variable, rule, pull pattern,
+   malformed form, or unknown clause prevents a sound narrower projection.
+   This function is pure: it neither executes the query nor retains data."
+  [query-input]
+  (try
+    (let [query (:query (normalize-q-input query-input []))]
+      (merge-attr-deps
+       (extract-query-attr-deps (:where query))
+       (extract-find-pull-attr-deps
+        (:qfind (memoized-parse-query query)))))
+    (catch #?(:clj Throwable :cljs :default) _
+      :all)))
 
 (defn- result-cache-get
   "Look up a cached query result for the given DB."
@@ -4057,10 +4078,7 @@
             (if entry
               (:result entry)
               (let [result (uncached)
-                    where-deps (extract-query-attr-deps (:where query))
-                    find-deps  (extract-find-pull-attr-deps
-                                (:qfind (memoized-parse-query query)))
-                    attr-deps  (merge-attr-deps where-deps find-deps)]
+                    attr-deps (query-attribute-dependencies query)]
                 (result-cache-put! db cache-key result attr-deps)
                 result))))))))
 

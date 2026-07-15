@@ -313,6 +313,19 @@
                            :limit 10})"}]
      :impl datahike.query/q}
 
+    query-attribute-dependencies
+    {:args [:=> [:cat [:or [:vector :any] :map :string]]
+            [:or [:= :all] [:set :any]]]
+     :ret [:or [:= :all] [:set :any]]
+     :categories [:query :diagnostics]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? true
+     :doc "Conservatively returns the attributes that can affect a query result, or :all when no sound narrower projection is possible. Does not execute the query or retain a database value."
+     :examples [{:desc "Project literal query dependencies"
+                 :code "(query-attribute-dependencies '[:find ?e :where [?e :person/name]])"}]
+     :impl datahike.query/query-attribute-dependencies}
+
     query-stats
     {:args [:function
             [:=> [:cat :datahike/SQueryArgs] :map]

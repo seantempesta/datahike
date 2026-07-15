@@ -39,6 +39,43 @@
              [3 3 "Ivan"]
              [3 2 "Petr"]}))))
 
+(deftest query-attribute-dependencies-are-public-and-conservative
+  (testing "literal and source-qualified data patterns"
+    (is (= #{:person/name :person/age}
+           (d/query-attribute-dependencies
+            '[:find ?e :in $ $archive
+              :where [?e :person/name]
+                     [$archive ?e :person/age ?age]]))))
+  (testing "nested boolean clauses retain concrete dependencies"
+    (is (= #{:person/name :person/email :person/disabled?}
+           (d/query-attribute-dependencies
+            '[:find ?e
+              :where [?e :person/name]
+                     (or [?e :person/email]
+                         (and [?e :person/disabled?]
+                              [?e :person/email]))]))))
+  (testing "find pulls contribute attributes"
+    (is (= #{:person/id :person/name :person/friend}
+           (d/query-attribute-dependencies
+            '[:find (pull ?e [:person/id :person/name
+                              {:person/friend [:person/id]}])
+              :where [?e :person/id]]))))
+  (testing "unsafe or unknown shapes widen"
+    (is (= :all
+           (d/query-attribute-dependencies
+            '[:find ?e :where [?e ?attribute ?value]])))
+    (is (= :all
+           (d/query-attribute-dependencies
+            '[:find (pull ?e [*]) :where [?e :person/id]])))
+    (is (= :all
+           (d/query-attribute-dependencies
+            '[:find (pull ?e ?pattern) :in $ ?pattern
+              :where [?e :person/id]])))
+    (is (= :all
+           (d/query-attribute-dependencies
+            '[:find ?e :in $ % :where (ancestor ?e ?parent)])))
+    (is (= :all (d/query-attribute-dependencies "not-edn")))))
+
 (deftest test-mixed-age-types
   (let [db (-> (db/empty-db)
                (d/db-with [{:db/id 1, :name  "Ivan", :age   15}
