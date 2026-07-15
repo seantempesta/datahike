@@ -293,6 +293,29 @@
 (defmethod branch-from-key-map :default [key-map _ _ _] key-map)
 
 ;; ---------------------------------------------------------------------------
+;; Static guarded force from key maps
+
+(defmulti check-force-from-key-map
+  "Preflight guarded replacement of an existing native secondary branch."
+  (fn [source-key-map current-key-map store branch]
+    (:type source-key-map)))
+
+(defmethod check-force-from-key-map :default [_ _ _ _] nil)
+
+(defmulti force-from-key-map
+  "Replace an existing native secondary branch with one selected root.
+
+   `current-key-map` is the destination state observed with the primary head
+   and supplies the implementation-specific stale guard. Implementations must
+   return the source root attached to the existing native destination without
+   creating another secondary commit."
+  (fn [source-key-map current-key-map store branch]
+    (:type source-key-map)))
+
+(defmethod force-from-key-map :default [source-key-map _ _ _]
+  source-key-map)
+
+;; ---------------------------------------------------------------------------
 ;; Registry: index-type keyword → factory function
 
 (defonce ^:private index-types (atom {}))

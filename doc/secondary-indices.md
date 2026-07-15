@@ -269,6 +269,32 @@ Each index type uses its native CoW mechanism:
 
 Index state is persisted in commits via the `IVersionedSecondaryIndex` protocol. On reconnect, indices are restored from their durable storage — no AEVT backfill needed for versioned indices.
 
+### Guarded force and Proximum generations
+
+`datahike.versioning/force-branch!` replaces an existing Proximum destination
+with the exact secondary root selected by the source database. The destination
+key map supplies the stale-head guard. If the process loses the response after
+Proximum publishes but before Datahike publishes its head, retrying the same
+guard adopts that already-published generation. The adapter does not call
+Proximum `sync!` after force, because doing so would create a different root.
+
+The adapter also migrates the historical bridge shape where Datahike recorded
+branch `"db"` while Proximum used native branch `:main`. It resolves the native
+branch from the immutable commit when the declared branch does not exist, and
+upgrades a generation-less legacy source with one explicit sync before branch
+or force. No unrelated vector write is required.
+
+This integration requires the Proximum guarded-force changes at commit
+`fb6572c` (based on Proximum 0.1.25) or a release containing that commit. Before
+publishing Datahike, replace the test-only local override with an immutable
+released Proximum coordinate and record that exact version in `deps.edn`.
+
+Generation publication is correctness-first and not free: Proximum currently
+hashes the full mmap on each vector-index sync, so sync cost is O(mmap bytes),
+and filesystems without reflink also copy O(mmap bytes). Measure representative
+sync latency and retained generation bytes before selecting a history/GC
+cutoff for a large index.
+
 ## Purge propagation
 
 `:db/purge` / `:db.purge/entity` / `:db.purge/attribute` / `:db.history.purge/before` route a retraction event (`-transact` with `:added? false`) to every secondary index covering an affected attribute, the same way `:db/retract` does. After purge:

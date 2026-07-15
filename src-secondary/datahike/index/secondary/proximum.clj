@@ -50,6 +50,58 @@
     (sequential? v)                (float-array v)
     :else                          nil))
 
+(defn- await-owner!
+  "Await a Proximum owner channel and surface asynchronous failures."
+  [channel]
+  (let [result (async/<!! channel)]
+    (if (instance? Throwable result)
+      (throw result)
+      result)))
+
+(defn- owner->key-map
+  "Describe one already-durable Proximum owner without syncing it."
+  [owner config]
+  (let [commit-id (pproto/current-commit owner)]
+    {:type :proximum
+     :branch (name (pproto/current-branch owner))
+     :commit-id commit-id
+     :merkle-root commit-id
+     :mmap-dir (effective-mmap-dir config)
+     :store-config (:store-config config)}))
+
+(defn- generation-addressed-owner?
+  "True when an owner's immutable commit carries mmap generation evidence."
+  [owner]
+  (when-let [commit-id (pproto/current-commit owner)]
+    (let [snapshot (k/get (pproto/raw-storage owner) commit-id nil {:sync? true})]
+      (and (:mmap-generation snapshot)
+           (:mmap-generation-bytes snapshot)
+           (:mmap-generation-sha256 snapshot)))))
+
+(defn- native-destination-branch
+  "Resolve a destination attachment, including the legacy `db`/`main` lie."
+  [store current-key-map]
+  (let [declared (some-> (:branch current-key-map) keyword)
+        declared-head (when declared (k/get store declared nil {:sync? true}))]
+    (if declared-head
+      declared
+      (let [snapshot (k/get store (:commit-id current-key-map) nil {:sync? true})
+            historical-branch (:branch snapshot)]
+        (when-not (and snapshot (keyword? historical-branch)
+                       (k/get store historical-branch nil {:sync? true}))
+          (throw (ex-info "Proximum destination key map has no native attachment."
+                          {:type :secondary-force/destination-attachment-mismatch
+                           :current-key-map current-key-map})))
+        historical-branch))))
+
+(defn- load-key-map-owner
+  "Load the exact key-map commit attached to its real native branch."
+  [key-map mmap-dir]
+  (let [store (pwr/connect-store-sync (:store-config key-map))
+        branch (native-destination-branch store key-map)]
+    (pwr/load-commit (:store-config key-map) (:commit-id key-map)
+                     {:branch branch :mmap-dir mmap-dir})))
+
 (defn- make-proximum-index
   "Create an ISecondaryIndex backed by Proximum.
    Entity IDs are used as external keys in the Proximum index.
@@ -96,7 +148,7 @@
         ;; Proximum close! is asynchronous.  A Datahike connection release is
         ;; synchronous from the caller's perspective, so do not return while
         ;; the mmap index can still hold file descriptors or locks.
-        (async/<!! (pproto/close! @!idx)))
+        (await-owner! (pproto/close! @!idx)))
 
       sec/ISecondaryIndex
       (-search [_ query-spec entity-filter]
@@ -139,7 +191,7 @@
       (-indexed-attrs [_] attrs)
 
       sec/IVersionedSecondaryIndex
-      (-sec-flush [_ _store branch]
+      (-sec-flush [_ _store _branch]
         ;; Proximum manages its own konserve store internally. The
         ;; protocol method `proximum.protocols/sync!` returns a chan
         ;; that yields a NEW immutable index value carrying the post-
@@ -182,22 +234,21 @@
         ;; follow-on commit would persist an empty edges-addr-pss — losing the
         ;; whole HNSW edge graph on reopen. Resetting !idx makes the address-map
         ;; accumulate across commits.
-        (let [synced (async/<!! (pproto/sync! @!idx))
-              cid    (phi/commit-id synced)]
+        (let [current @!idx
+              ;; A restored or previously flushed owner already names an exact
+              ;; durable generation. Re-export it; syncing would create a new
+              ;; root and mutate the source during a guarded Datahike force.
+              synced (if (generation-addressed-owner? current)
+                       current
+                       (await-owner! (pproto/sync! current)))]
           (reset! !idx synced)
-          {:type :proximum
-           :branch (name branch)
-           :commit-id cid
-           :merkle-root cid
-           :mmap-dir (effective-mmap-dir config)
-           :store-config (:store-config config)}))
+          (owner->key-map synced config)))
 
       (-sec-restore [_ _store key-map]
         ;; Restore from proximum's own store using commit ID
-        (let [restored (pwr/load-commit (:store-config key-map) (:commit-id key-map)
-                                        {:branch (keyword (:branch key-map))
-                                         :mmap-dir (or (:mmap-dir key-map)
-                                                       (effective-mmap-dir config))})]
+        (let [restored (load-key-map-owner
+                        key-map (or (:mmap-dir key-map)
+                                    (effective-mmap-dir config)))]
           (make-proximum-index restored config)))
 
       (-sec-branch [_ _store _from-branch new-branch]
@@ -297,10 +348,9 @@
       (-sec-restore [_ _store key-map]
         ;; The real restore: load the committed HNSW from proximum's own
         ;; durable store. Identical to the live index's `-sec-restore`.
-        (let [restored (pwr/load-commit (:store-config key-map) (:commit-id key-map)
-                                        {:branch (keyword (:branch key-map))
-                                         :mmap-dir (or (:mmap-dir key-map)
-                                                       (effective-mmap-dir config))})]
+        (let [restored (load-key-map-owner
+                        key-map (or (:mmap-dir key-map)
+                                    (effective-mmap-dir config)))]
           (make-proximum-index restored config)))
       (-sec-branch [_ _store _from _new] (bug! "-sec-branch"))
       (-sec-mark [_] #{}))))
@@ -335,16 +385,87 @@
 ;; GC: proximum uses its own store, not datahike's konserve
 (defmethod sec/mark-from-key-map :proximum [_ _] #{})
 
+(defmethod sec/check-force-from-key-map :proximum
+  [source-key-map current-key-map _store branch]
+  (when-not (= :proximum (:type current-key-map))
+    (throw (ex-info "Existing Proximum destination state is required."
+                    {:type :secondary-force/destination-not-found
+                     :index-type :proximum
+                     :branch branch})))
+  (when-not (and (uuid? (:commit-id source-key-map))
+                 (= (:commit-id source-key-map) (:merkle-root source-key-map))
+                 (uuid? (:commit-id current-key-map))
+                 (= (:commit-id current-key-map) (:merkle-root current-key-map))
+                 (string? (:branch source-key-map))
+                 (string? (:branch current-key-map)))
+    (throw (ex-info "Proximum force requires committed source and destination key maps."
+                    {:type :secondary-force/invalid-key-map
+                     :branch branch
+                     :source-key-map source-key-map
+                     :current-key-map current-key-map})))
+  (when-not (and (= (:store-config source-key-map)
+                    (:store-config current-key-map))
+                 (= (effective-mmap-dir source-key-map)
+                    (effective-mmap-dir current-key-map)))
+    (throw (ex-info "Proximum source and destination belong to different storage."
+                    {:type :secondary-force/storage-mismatch
+                     :branch branch
+                     :source-store-config (:store-config source-key-map)
+                     :current-store-config (:store-config current-key-map)
+                     :source-mmap-dir (effective-mmap-dir source-key-map)
+                     :current-mmap-dir (effective-mmap-dir current-key-map)})))
+  (let [store (pwr/connect-store-sync (:store-config source-key-map))
+        source-snapshot (k/get store (:commit-id source-key-map) nil {:sync? true})
+        current-snapshot (k/get store (:commit-id current-key-map) nil {:sync? true})
+        destination (native-destination-branch store current-key-map)
+        destination-head (k/get store destination nil {:sync? true})
+        destination-commit (:commit-id destination-head)]
+    (when-not (and source-snapshot current-snapshot)
+      (throw (ex-info "Proximum force key maps do not resolve to native commits."
+                      {:type :secondary-force/destination-attachment-mismatch
+                       :branch branch
+                       :source-commit (:commit-id source-key-map)
+                       :current-commit (:commit-id current-key-map)})))
+    (when-not (or (= (:commit-id current-key-map) destination-commit)
+                  (= (:commit-id source-key-map) destination-commit))
+      (throw (ex-info "Proximum destination branch moved before guarded force."
+                      {:type :force-branch/stale-destination
+                       :branch branch
+                       :native-branch destination
+                       :expected-current-commit (:commit-id current-key-map)
+                       :source-commit (:commit-id source-key-map)
+                       :current-commit destination-commit}))))
+  nil)
+
+(defmethod sec/force-from-key-map :proximum
+  [source-key-map current-key-map _store _branch]
+  (let [source-owner
+        (load-key-map-owner source-key-map
+                            (effective-mmap-dir source-key-map))
+        destination (native-destination-branch (pproto/raw-storage source-owner)
+                                               current-key-map)
+        forced-owner (volatile! nil)]
+    (try
+      (let [forced (pver/force-branch!
+                    source-owner
+                    destination
+                    (:commit-id current-key-map))]
+        (vreset! forced-owner forced)
+        (assoc (owner->key-map forced source-key-map)
+               :store-config (:store-config source-key-map)))
+      (finally
+        (when-let [owner @forced-owner]
+          (await-owner! (pproto/close! owner)))
+        (await-owner! (pproto/close! source-owner))))))
+
 ;; Branch: load from stored commit, branch via proximum native
 (defmethod sec/branch-from-key-map :proximum [key-map _store _from-branch new-branch]
-  (let [idx (pwr/load-commit (:store-config key-map) (:commit-id key-map)
-                             {:branch (keyword (:branch key-map))
-                              :mmap-dir (effective-mmap-dir key-map)})
+  (let [idx (load-key-map-owner key-map (effective-mmap-dir key-map))
         fork-owner (volatile! nil)]
     (try
       (let [branched (pver/branch! idx (keyword new-branch))
             _ (vreset! fork-owner branched)
-            synced (async/<!! (pproto/sync! branched))
+            synced (await-owner! (pproto/sync! branched))
             _ (vreset! fork-owner synced)
             new-commit-id (phi/commit-id synced)]
         (assoc key-map
@@ -355,5 +476,5 @@
         ;; sync! returns the new resource owner. Close exactly that value (or
         ;; the pre-sync fork when sync failed), plus the independent source.
         (when-let [owner @fork-owner]
-          (async/<!! (pproto/close! owner)))
-        (async/<!! (pproto/close! idx))))))
+          (await-owner! (pproto/close! owner)))
+        (await-owner! (pproto/close! idx))))))
