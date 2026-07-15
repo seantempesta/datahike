@@ -4,6 +4,7 @@
             [datahike.core]
             [datahike.writing :as w]
             [datahike.query :as q]
+            [datahike.committed-report :as committed-report]
             [datahike.gc :as gc]
             [datahike.tools :as dt :refer [throwable-promise get-time-ms]]
             [clojure.core.async :refer [chan close! promise-chan put! go go-loop <! >! poll! buffer timeout]]
@@ -234,6 +235,7 @@
                               (let [tx-report (-> tx-report
                                                   (assoc-in [:tx-meta :db/commitId] commit-id)
                                                   (assoc :db-after commit-db))]
+                                (committed-report/offer-committed! commit-db tx-report)
                                 (>! callback tx-report))))
                           (catch #?(:clj Throwable :cljs js/Error) e
                             ;; Close the queues BEFORE delivering the failed
