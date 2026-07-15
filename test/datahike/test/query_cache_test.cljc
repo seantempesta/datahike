@@ -74,6 +74,46 @@
            (d/delete-database cfg)
            (dq/clear-query-cache!))))))
 
+#?(:clj
+   (deftest batched-writer-invalidates-the-union-of-request-attributes
+     (let [cfg {:store {:backend :memory :id (random-uuid)}
+                :writer {:backend :self :commit-wait-time 500}
+                :schema-flexibility :write
+                :attribute-refs? false}
+           _ (d/create-database cfg)
+           conn (d/connect cfg)]
+       (try
+         (d/transact conn (conj label-schema
+                                {:c/id "batch" :c/note "before"
+                                 :c/labels ["before"]}))
+         (let [parent @conn]
+           (is (= #{["before"]}
+                  (d/q '[:find ?v :where [_ :c/note ?v]] parent)))
+           (is (= #{["before"]}
+                  (d/q '[:find ?v :where [_ :c/labels ?v]] parent)))
+           ;; The previous commit's configured pause keeps the commit consumer
+           ;; asleep while both independent requests reach its queue.
+           (let [note-result (future
+                               (d/transact conn [{:c/id "batch"
+                                                  :c/note "after"}]))
+                 label-result (future
+                                (d/transact conn [{:c/id "batch"
+                                                   :c/labels ["after"]}]))
+                 note-report @note-result
+                 label-report @label-result]
+             (is (= (get-in note-report [:tx-meta :db/commitId])
+                    (get-in label-report [:tx-meta :db/commitId]))
+                 "the proof must exercise one physical writer batch")
+             (let [committed @conn]
+               (is (= #{["after"]}
+                      (d/q '[:find ?v :where [_ :c/note ?v]] committed)))
+               (is (= #{["before"] ["after"]}
+                      (d/q '[:find ?v :where [_ :c/labels ?v]] committed))))))
+         (finally
+           (d/release conn)
+           (d/delete-database cfg)
+           (dq/clear-query-cache!))))))
+
 (deftest test-pull-only-attr-retract-invalidates-cache
   (testing "Core bug: retract on attr only in pull pattern must invalidate cache"
     (with-temp-db label-schema
