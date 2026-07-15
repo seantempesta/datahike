@@ -382,14 +382,28 @@
                       datoms-b (di/-slice (:eavt b) (datom e0 nil nil tx0) (datom emax nil nil txmax) :eavt)]
                   (dd/diff-sorted datoms-a datoms-b dd/cmp-datoms-eavt-quick))))
 
-(defn committed-cache-identity
-  "Return `[connection-id generation commit-id]` for an attached committed DB."
+(defn committed-value-identity
+  "Return the exact plain-data identity of an attached committed raw DB.
+
+   Speculative and wrapped database values return nil. The identity is
+   process-local ownership data and is not part of database equality or
+   durable storage."
   [db]
   (when (instance? DB db)
     (let [{:datahike.cache/keys [connection-id generation commit-id committed?]}
           (:cache-context db)]
       (when (and committed? connection-id generation commit-id)
-        [connection-id generation commit-id]))))
+        {:datahike.value/connection-id connection-id
+         :datahike.value/generation generation
+         :datahike.value/commit-id commit-id}))))
+
+(defn committed-cache-identity
+  "Return the internal vector cache key for an attached committed raw DB."
+  [db]
+  (when-let [identity (committed-value-identity db)]
+    [(:datahike.value/connection-id identity)
+     (:datahike.value/generation identity)
+     (:datahike.value/commit-id identity)]))
 
 (defn clear-cache-context
   "Detach speculative database values from committed query-cache identity."

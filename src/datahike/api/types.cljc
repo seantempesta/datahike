@@ -48,6 +48,13 @@
   [:fn {:error/message "must be a Datahike connection"}
    connection?])
 
+(def SCommittedValueIdentity
+  "Exact process-local identity of one attached committed database value."
+  [:map {:closed true}
+   [:datahike.value/connection-id :any]
+   [:datahike.value/generation :uuid]
+   [:datahike.value/commit-id :uuid]])
+
 (def SEId
   "Entity identifier.
 
@@ -165,6 +172,7 @@
    {:datahike/SDB SDB
     :datahike/SConfig SConfig
     :datahike/SConnection SConnection
+    :datahike/SCommittedValueIdentity SCommittedValueIdentity
     :datahike/SEId SEId
     :datahike/SDatom SDatom
     :datahike/SDatoms SDatoms
