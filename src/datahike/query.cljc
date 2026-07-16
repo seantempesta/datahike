@@ -4159,14 +4159,32 @@
                                  :vars   sub-find}))
                             components extended-find)
                            wide-vars (vec (mapcat :vars sub-results))
-                           merged    (cartesian-merge sub-results wide-vars)
-                           filtered  (apply-post-filters merged wide-vars post-filters
-                                                         (:consts context-in))
-                           ;; Project wide tuples back to the user's find-var order.
-                           wide->find-idxs (let [idx (into {} (map-indexed (fn [i v] [v i])) wide-vars)]
-                                             (mapv idx find-var-syms))
-                           projected (into #{} (map (fn [t] (mapv #(nth t %) wide->find-idxs))) filtered)]
-                       (apply-result-transforms projected order-spec offset limit qreturnmaps)))))]
+                           missing-find-vars
+                           (remove (set wide-vars) find-var-syms)]
+                       (if (seq missing-find-vars)
+                         ;; A projected value supplied only by :in (scalar,
+                         ;; tuple, collection, or relation) is not owned by any
+                         ;; where component. The split cannot reconstruct it
+                         ;; from component tuples; the existing relation engine
+                         ;; already preserves these bindings exactly.
+                         (execute-legacy context-in query qfind find-elements
+                                         all-vars result-arity order-spec offset
+                                         limit stats? qreturnmaps)
+                         (let [merged (cartesian-merge sub-results wide-vars)
+                               filtered (apply-post-filters merged wide-vars post-filters
+                                                            (:consts context-in))
+                               ;; Project wide tuples back to the user's find-var order.
+                               wide->find-idxs
+                               (let [idx (into {} (map-indexed (fn [i v] [v i]))
+                                               wide-vars)]
+                                 (mapv idx find-var-syms))
+                               projected
+                               (into #{}
+                                     (map (fn [t]
+                                            (mapv #(nth t %) wide->find-idxs)))
+                                     filtered)]
+                           (apply-result-transforms projected order-spec offset
+                                                    limit qreturnmaps)))))))]
         split-result
 
         (if (and use-planner?

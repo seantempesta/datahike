@@ -600,6 +600,15 @@
                       [$2 ?e :id ?a2] [(> ?a2 1)]]
                     db1 db2))
 
+    (testing "disconnected sources preserve projected input bindings"
+      (assert-multi '[:find ?a1 ?a2 ?ordinary
+                      :in $1 ?ordinary $2
+                      :where [$1 ?e1 :id ?a1]
+                             [$2 ?e2 :id ?a2]
+                             [(< ?a1 2)]
+                             [(< ?a2 2)]]
+                    db1 6 db2))
+
     (testing "multi-source with OR"
       (assert-multi '[:find ?n
                       :in $1 $2
