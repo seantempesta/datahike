@@ -64,6 +64,28 @@
     ;; Assume it's a raw store
     conn-or-db))
 
+(defn- attached-cache-context
+  "Derive committed cache ownership for a value loaded through an attached
+   connection or committed DB. Raw stores and detached values return nil."
+  [conn-or-db commit-id]
+  (let [source
+        (cond
+          #?(:clj (instance? clojure.lang.IDeref conn-or-db)
+             :cljs (satisfies? IDeref conn-or-db))
+          @conn-or-db
+
+          (db? conn-or-db)
+          conn-or-db
+
+          :else nil)
+        {:datahike.cache/keys [connection-id generation committed?]}
+        (:cache-context source)]
+    (when (and committed? connection-id generation)
+      {:datahike.cache/connection-id connection-id
+       :datahike.cache/generation generation
+       :datahike.cache/commit-id commit-id
+       :datahike.cache/committed? true})))
+
 #?(:clj
    (defn- branch-secondary-indices
      "Branch the secondary state selected by `stored-db`.
@@ -391,7 +413,11 @@
 
 (defn commit-as-db
   "Loads the database stored at this commit id.
-   First argument can be a connection, db value, or raw konserve store."
+   First argument can be a connection, db value, or raw konserve store.
+
+   Loading through an attached connection or committed DB preserves that
+   connection generation's committed cache identity. Loading through a raw
+   store or detached DB remains detached."
   ([conn-or-store cid] (commit-as-db conn-or-store cid {:sync? true}))
   ([conn-or-store cid opts]
    (commit-id-check cid)
@@ -400,7 +426,11 @@
      (async+sync (:sync? opts) *default-sync-translation*
                  (go-try-
                   (when-let [raw-db (<?- (k/get store cid nil opts))]
-                    (stored->db raw-db store)))))))
+                    (let [cache-context
+                          (attached-cache-context conn-or-store cid)]
+                      (cond-> (stored->db raw-db store)
+                        cache-context
+                        (assoc :cache-context cache-context)))))))))
 
 (defn branch-as-db
   "Loads the database stored at this branch.

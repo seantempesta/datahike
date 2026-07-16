@@ -60,6 +60,50 @@
       (d/release conn))))
 
 #?(:clj
+   (deftest commit-as-db-preserves-only-attached-generation-identity
+     (let [cfg {:store {:backend :memory :id (random-uuid)}
+                :keep-history? true
+                :schema-flexibility :read}
+           _ (d/create-database cfg)
+           conn (d/connect cfg)]
+       (try
+         (d/transact conn [{:db/id 1 :value :first}])
+         (let [first-commit (commit-id @conn)
+               store (:store @conn)]
+           (d/transact conn [{:db/id 1 :value :second}])
+           (let [head-identity (d/committed-value-identity @conn)
+                 attached (commit-as-db conn first-commit)
+                 attached-via-db (commit-as-db @conn first-commit)
+                 detached (commit-as-db store first-commit)
+                 query '[:find ?value . :where [1 :value ?value]]
+                 owner (d/q-with-evidence query attached)
+                 hit (d/q-with-evidence query attached-via-db)]
+             (doseq [db-value [attached attached-via-db]]
+               (is (= (select-keys head-identity
+                                   [:datahike.value/connection-id
+                                    :datahike.value/generation])
+                      (select-keys (d/committed-value-identity db-value)
+                                   [:datahike.value/connection-id
+                                    :datahike.value/generation])))
+               (is (= first-commit
+                      (:datahike.value/commit-id
+                       (d/committed-value-identity db-value))))
+               (is (= :first (d/q query db-value))))
+             (is (= :first (:datahike.query/result owner)
+                    (:datahike.query/result hit)))
+             (is (= :datahike.cache.outcome/miss-owner
+                    (get-in owner [:datahike.query/cache-evidence
+                                   :datahike.cache/outcome])))
+             (is (= :datahike.cache.outcome/hit
+                    (get-in hit [:datahike.query/cache-evidence
+                                 :datahike.cache/outcome])))
+             (is (nil? (d/committed-value-identity detached))
+                 "a raw store does not acquire connection ownership")))
+         (finally
+           (d/release conn)
+           (d/delete-database cfg))))))
+
+#?(:clj
    (deftest branch-preflights-commit-records
      (let [cfg {:store {:backend :memory :id (random-uuid)}
                 :keep-history? true
