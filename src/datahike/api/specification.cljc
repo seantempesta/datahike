@@ -111,12 +111,23 @@
 ;; =============================================================================
 
 (def host-api-specification
-  "JVM-host-only operations returning opaque process-local values.
+  "JVM-host-only operations for process-local authority integration.
 
    These descriptions are consumed only by the Clojure API. They are not part
    of generated JavaScript, Java, native, Python, pod, CLI, HTTP, or capability
    surfaces."
-  '{acquire-q!
+  '{shallow-weight-within
+    {:args [:=> [:cat :any [:int {:min 0}]]
+            [:maybe [:int {:min 0}]]]
+     :ret [:maybe [:int {:min 0}]]
+     :categories [:resource :host]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? true
+     :doc "Returns exact shallow weight within a bound, or nil without realizing uncertifiable values."
+     :impl datahike.resource/shallow-weight-within}
+
+    acquire-q!
     {:args [:function
             [:=> [:cat :datahike/SQueryArgs] :any]
             [:=> [:cat [:or [:vector :any] :map :string] [:* :any]] :any]]

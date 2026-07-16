@@ -2,10 +2,40 @@
   (:require
    #?(:cljs [cljs.test :as t :refer-macros [is are deftest testing]]
       :clj  [clojure.test :as t :refer [is are deftest testing]])
+   #?(:clj [datahike.api :as d])
    [datahike.api.specification :refer [api-specification
+                                       host-api-specification
                                        malli-schema->argslist]]
    [datahike.api.types :as types]
    [malli.core :as m]))
+
+#?(:clj
+   (deftest shallow-weight-is-an-exact-host-only-api
+     (let [operation (get host-api-specification 'shallow-weight-within)
+           realized (atom 0)
+           uncounted (lazy-seq (swap! realized inc) [1 2 3])]
+       (testing "the API metadata excludes generated and remote surfaces"
+         (is (= :experimental (:stability operation)))
+         (is (= [:resource :host] (:categories operation)))
+         (is (false? (:supports-remote? operation)))
+         (is (:referentially-transparent? operation))
+         (is (= '([arg0 arg1]) (:arglists (meta #'d/shallow-weight-within))))
+         (is (= (:doc operation) (:doc (meta #'d/shallow-weight-within))))
+         (is (not (contains? api-specification 'shallow-weight-within)))
+         (is (nil? (get-in (d/capabilities)
+                           [:datahike.capability/operations
+                            :datahike.operation/shallow-weight-within]))))
+       (testing "ordinary eager values have exact structural weight"
+         (is (= 0 (d/shallow-weight-within nil 0)))
+         (is (= 1 (d/shallow-weight-within :value 1)))
+         (is (= 4 (d/shallow-weight-within "abc" 4)))
+         (is (= 5 (d/shallow-weight-within [nil :value "ab"] 5)))
+         (is (= 5 (d/shallow-weight-within {:value [1 2]} 5))))
+       (testing "the bound rejects without traversing uncounted values"
+         (is (nil? (d/shallow-weight-within {:value [1 2]} 4)))
+         (is (nil? (d/shallow-weight-within :value 0)))
+         (is (nil? (d/shallow-weight-within uncounted 100)))
+         (is (zero? @realized))))))
 
 (deftest pull-options-have-distinct-exact-shapes
   (is (m/validate types/SPullOptions {:selector [:name] :eid 1}))

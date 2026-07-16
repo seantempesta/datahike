@@ -46,6 +46,7 @@
             [datahike.core :as dcore]
             [datahike.pull-api :as dp]
             [datahike.query :as dq]
+            [datahike.resource]
             [datahike.schema :as ds]
             [datahike.tools :as dt]
             [datahike.db :as db #?@(:cljs [:refer [HistoricalDB AsOfDB SinceDB FilteredDB]])]
