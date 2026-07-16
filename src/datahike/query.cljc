@@ -4181,7 +4181,10 @@
   ([{:keys [query args stats? count-fns? offset limit order-by
             request-id max-work max-results max-result-weight] :as query-map}
     cache-evidence]
-  (let [uncached (fn [shared-cancel]
+  (let [resource-options {:max-work max-work
+                          :max-results max-results
+                          :max-result-weight max-result-weight}
+        uncached (fn [shared-cancel]
                    (let [effective-query-map
                          (if shared-cancel
                            (assoc query-map :cancel shared-cancel)
@@ -4193,7 +4196,6 @@
     (if (or (not *query-result-cache?*)
             stats?
             count-fns?                         ;; counting needs re-execution; a cache hit wouldn't re-run the fn
-            max-work max-results max-result-weight
             #?(:clj *profile?* :cljs false))
       (do (when cache-evidence
             (vreset! cache-evidence
@@ -4227,23 +4229,45 @@
             ;; dependency analysis. The coordinator rechecks on a miss to close
             ;; the race with a concurrent owner publishing after this read.
             (if cached
-              (do (when cache-evidence
+              (do (resource/certify-cached-result! (:result cached)
+                                                   resource-options)
+                  (when cache-evidence
                     (vreset! cache-evidence
                              {:datahike.cache/outcome
                               :datahike.cache.outcome/hit
                               :datahike.cache/stored? true
                               :datahike.cache/saved-computation? false}))
                   (:result cached))
-              (let [attr-deps (delay (query-attribute-dependencies query))]
-                (single-flight/execute!
-                 [db-key cache-key]
-                 request-id
-                 #(when-let [entry (result-cache-get db cache-key)]
-                    {:value (:result entry)})
-                 uncached
-                 #(result-cache-put! db cache-key % @attr-deps
-                                     cache-epoch)
-                 #(when cache-evidence (vreset! cache-evidence %))))))))))))
+              (let [attr-deps (delay (query-attribute-dependencies query))
+                    computation-evidence (volatile! nil)
+                    compute (fn [shared-cancel]
+                              (let [sink (volatile! nil)]
+                                (binding [resource/*evidence-sink* sink]
+                                  (try
+                                    (uncached shared-cancel)
+                                    (finally
+                                      (vreset! computation-evidence @sink))))))]
+                (let [result
+                      (single-flight/execute!
+                       [db-key cache-key max-work max-results max-result-weight]
+                       request-id
+                       #(when-let [entry (result-cache-get db cache-key)]
+                          (resource/certify-cached-result! (:result entry)
+                                                           resource-options)
+                          {:value (:result entry)})
+                       compute
+                       #(result-cache-put! db cache-key % @attr-deps
+                                           cache-epoch)
+                       #(when cache-evidence (vreset! cache-evidence %))
+                       #(when-let [evidence @computation-evidence]
+                          {:datahike.query/resource-evidence evidence})
+                       #(when-let [evidence
+                                   (:datahike.query/resource-evidence %)]
+                          (when resource/*evidence-sink*
+                            (vreset! resource/*evidence-sink* evidence))))]
+                  (when (and resource/*evidence-sink* @computation-evidence)
+                    (vreset! resource/*evidence-sink* @computation-evidence))
+                  result))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Register legacy functions for CLJS execute.cljc (breaks circular dep)

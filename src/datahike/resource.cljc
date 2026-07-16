@@ -167,6 +167,23 @@
                         max-result-weight)))
   result)
 
+(defn certify-cached-result!
+  "Certifies a completed result for one caller and publishes zero-work evidence."
+  [result {:keys [max-work max-results max-result-weight] :as options}]
+  (let [budget (make-budget (assoc options :evidence? true))
+        result-count (when max-results (result-count result))
+        result-weight (when max-result-weight
+                        (shallow-weight-within result max-result-weight))]
+    (when (and max-results (> result-count max-results))
+      (budget-exceeded! :query-results result-count max-results))
+    (when (and max-result-weight (nil? result-weight))
+      (budget-exceeded! :result-weight (inc max-result-weight)
+                        max-result-weight))
+    (when result-count (vreset! (:results budget) result-count))
+    (when result-weight (vreset! (:result-weight budget) result-weight))
+    (publish-evidence! budget)
+    result))
+
 (defn work-signal
   "Returns an IDeref that charges work and delegates cancellation."
   [cancel budget]

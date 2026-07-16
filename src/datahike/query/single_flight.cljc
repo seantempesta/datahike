@@ -99,6 +99,10 @@
   ([flight-key cache-read compute cache-success! evidence!]
    (execute! flight-key nil cache-read compute cache-success! evidence!))
   ([flight-key request-id cache-read compute cache-success! evidence!]
+   (execute! flight-key request-id cache-read compute cache-success! evidence!
+             nil nil))
+  ([flight-key request-id cache-read compute cache-success! evidence!
+    completion-data joined!]
    #?(:cljs
       (if-some [cached (cache-read)]
         (do (when evidence! (evidence! {:datahike.cache/outcome
@@ -143,8 +147,10 @@
                 value))
 
             :waiter
-            (let [{:keys [status value throwable stored?]} @completion]
+            (let [{:keys [status value throwable stored?] :as completed}
+                  @completion]
               (add! :wait-nanos (- (System/nanoTime) wait-start))
+              (when joined! (joined! completed))
               (when evidence! (evidence! {:datahike.cache/outcome
                                           :datahike.cache.outcome/miss-joined
                                           :datahike.cache/stored? (boolean stored?)
@@ -159,9 +165,12 @@
                                                 :datahike.cache.outcome/hit-after-acquire
                                                 :datahike.cache/stored? true
                                                 :datahike.cache/saved-computation? false}))
-                    (complete! flight-key entry {:status :ok
-                                                 :value (:value cached)
-                                                 :stored? true})
+                    (complete! flight-key entry
+                               (merge {:status :ok
+                                       :value (:value cached)
+                                       :stored? true}
+                                      (when completion-data
+                                        (completion-data))))
                     (:value cached))
                 (let [started (System/nanoTime)
                       value (compute (:cancel entry))
@@ -176,8 +185,11 @@
                                               :datahike.cache.outcome/miss-owner
                                               :datahike.cache/stored? (boolean cached?)
                                               :datahike.cache/saved-computation? false}))
-                  (complete! flight-key entry {:status :ok :value value
-                                               :stored? (boolean cached?)})
+                  (complete! flight-key entry
+                             (merge {:status :ok :value value
+                                     :stored? (boolean cached?)}
+                                    (when completion-data
+                                      (completion-data))))
                   value))
               (catch Throwable throwable
                 (increment! :failures)

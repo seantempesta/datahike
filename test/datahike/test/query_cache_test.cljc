@@ -263,6 +263,107 @@
                        (vals (:datahike.query/cache-evidence owner)))))))))
 
 #?(:clj
+   (deftest bounded-queries-share-completed-semantic-results
+     (with-temp-db
+       (conj label-schema {:c/id "bounded-cache" :c/note "value"})
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (let [database @conn
+               calls (atom 0)
+               predicate (fn [_] (swap! calls inc) true)
+               query '[:find ?n
+                       :in $ ?pred
+                       :where [_ :c/note ?n]
+                              [(?pred ?n)]]
+               input {:query query
+                      :args [database predicate]
+                      :max-work 1000
+                      :max-results 10
+                      :max-result-weight 1000}
+               bounded-owner (dq/q-with-evidence input)
+               unbounded-hit (dq/q-with-evidence query database predicate)
+               bounded-hit (dq/q-with-evidence input)]
+           (is (= 1 @calls))
+           (is (= #{["value"]}
+                  (:datahike.query/result bounded-owner)
+                  (:datahike.query/result unbounded-hit)
+                  (:datahike.query/result bounded-hit)))
+           (is (= :datahike.cache.outcome/miss-owner
+                  (get-in bounded-owner [:datahike.query/cache-evidence
+                                         :datahike.cache/outcome])))
+           (is (= [:datahike.cache.outcome/hit
+                   :datahike.cache.outcome/hit]
+                  (mapv #(get-in % [:datahike.query/cache-evidence
+                                    :datahike.cache/outcome])
+                        [unbounded-hit bounded-hit])))
+           (is (= 0 (get-in bounded-hit
+                            [:datahike.query/resource-evidence
+                             :datahike.resource/work])))
+           (is (= {:datahike.resource/max-work 1000
+                   :datahike.resource/max-results 10
+                   :datahike.resource/max-result-weight 1000}
+                  (get-in bounded-hit
+                          [:datahike.query/resource-evidence
+                           :datahike.resource/limits]))))))))
+
+#?(:clj
+   (deftest completed-result-is-certified-per-bounded-caller
+     (with-temp-db
+       (conj label-schema {:c/id "bounded-certify" :c/note "value"})
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (let [query '[:find ?n :where [_ :c/note ?n]]
+               result (dq/q-with-evidence query @conn)]
+           (is (= #{["value"]} (:datahike.query/result result)))
+           (is (thrown-with-msg?
+                clojure.lang.ExceptionInfo
+                #"query-results budget exceeded"
+                (dq/q-with-evidence {:query query
+                                     :args [@conn]
+                                     :max-results 0})))
+           (is (= :datahike.cache.outcome/hit
+                  (get-in (dq/q-with-evidence {:query query
+                                               :args [@conn]
+                                               :max-results 1})
+                          [:datahike.query/cache-evidence
+                           :datahike.cache/outcome]))))))))
+
+#?(:clj
+   (deftest different-cold-work-limits-do-not-share-failure
+     (with-temp-db
+       (conj label-schema {:c/id "bounded-flight" :c/note "value"})
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (let [start (java.util.concurrent.CountDownLatch. 1)
+               predicate (fn [_] (Thread/sleep 50) true)
+               query '[:find ?n
+                       :in $ ?pred
+                       :where [_ :c/note ?n]
+                              [(?pred ?n)]]
+               run (fn [max-work]
+                     (.await start)
+                     (try
+                       (dq/q-with-evidence {:query query
+                                            :args [@conn predicate]
+                                            :request-id (str (random-uuid))
+                                            :max-work max-work})
+                       (catch clojure.lang.ExceptionInfo error error)))
+               strict (future (run 1))
+               generous (future (run 1000))]
+           (.countDown start)
+           (let [strict-result @strict
+                 generous-result @generous]
+             (is (:datahike/budget-exceeded (ex-data strict-result)))
+             (is (= #{["value"]}
+                    (:datahike.query/result generous-result)))
+             (is (= :datahike.cache.outcome/hit
+                    (get-in (dq/q-with-evidence {:query query
+                                                 :args [@conn predicate]
+                                                 :max-work 1})
+                            [:datahike.query/cache-evidence
+                             :datahike.cache/outcome])))))))))
+
+#?(:clj
    (deftest concurrent-evidence-distinguishes-owner-and-joined-callers
      (with-temp-db
        (conj label-schema {:c/id "joined-evidence" :c/note "value"})
@@ -286,7 +387,10 @@
                                :where [_ :c/note ?n]
                                       [(?predicate ?n)]]
                       :args [database predicate]
-                      :request-id (str (random-uuid))}))))]
+                      :request-id (str (random-uuid))
+                      :max-work 1000
+                      :max-results 10
+                      :max-result-weight 1000}))))]
            (.countDown start)
            (let [results (mapv deref workers)
                  outcomes (frequencies
