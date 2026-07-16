@@ -6,9 +6,26 @@
               commit-id commit-as-db]]
             [datahike.constants :as const]
             [datahike.db.utils :refer [db?]]
+            [datahike.writing :as writing]
             [datahike.api :as d]
             [konserve.core :as k]
             [superv.async :refer [<?? S]]))
+
+#?(:clj
+   (deftest release-materialized-db-is-owned-and-idempotent
+     (let [closed (atom 0)
+           closeable (reify java.io.Closeable
+                       (close [_] (swap! closed inc)))
+           materialized {:datahike.db/materialized-secondary-indices? true
+                         :datahike.db/released? (atom false)
+                         :secondary-indices {:test/index closeable}}
+           ordinary {:secondary-indices {:test/index closeable}}]
+       (is (= [] (writing/release-db ordinary)))
+       (is (= 0 @closed))
+       (is (= [] (writing/release-db materialized)))
+       (is (= 1 @closed))
+       (is (= [] (writing/release-db materialized)))
+       (is (= 1 @closed)))))
 
 (deftest datahike-versioning-test
   (testing "Testing versioning functionality."

@@ -7,7 +7,7 @@
             [datahike.connections :refer [*connections*]]
             [datahike.gc-guard :as guard]
             [datahike.store :refer [store-identity add-cache-and-handlers]]
-            [datahike.writing :refer [stored->db db->stored stored-db?
+            [datahike.writing :refer [stored->db db->stored stored-db? release-db
                                       commit! create-commit-id get-and-clear-pending-kvs!
                                       write-pending-kvs! branch-heads-as-commits]]
             [datahike.writer]
@@ -422,15 +422,24 @@
   ([conn-or-store cid opts]
    (commit-id-check cid)
    (let [store (extract-store conn-or-store)
-         opts (select-keys opts [:sync?])]
+         opts (select-keys opts [:sync? :secondary-indices?])]
      (async+sync (:sync? opts) *default-sync-translation*
                  (go-try-
                   (when-let [raw-db (<?- (k/get store cid nil opts))]
                     (let [cache-context
                           (attached-cache-context conn-or-store cid)]
-                      (cond-> (stored->db raw-db store)
+                      (cond-> (stored->db raw-db store opts)
                         cache-context
                         (assoc :cache-context cache-context)))))))))
+
+(defn release-materialized-db
+  "Release native resources owned by a database returned from commit-as-db.
+   Ordinary connection database values and primary-only materializations are
+   no-ops. The caller must ensure no read is still using the value."
+  [db]
+  (db-check db)
+  #?(:clj (release-db db)
+     :cljs []))
 
 (defn branch-as-db
   "Loads the database stored at this branch.

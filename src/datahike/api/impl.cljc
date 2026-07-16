@@ -365,9 +365,15 @@
 (defn parent-commit-ids [db]
   (dv/parent-commit-ids db))
 
-(defn commit-as-db [conn-or-store cid]
-  #?(:clj  (dv/commit-as-db conn-or-store cid {:sync? true})
-     :cljs (dv/commit-as-db conn-or-store cid {:sync? false})))
+(defn commit-as-db
+  ([conn-or-store cid]
+   (commit-as-db conn-or-store cid {}))
+  ([conn-or-store cid opts]
+   #?(:clj  (dv/commit-as-db conn-or-store cid (assoc opts :sync? true))
+      :cljs (dv/commit-as-db conn-or-store cid (assoc opts :sync? false)))))
+
+(defn release-materialized-db [db]
+  (dv/release-materialized-db db))
 
 (defn branch-as-db [conn-or-store branch]
   #?(:clj  (dv/branch-as-db conn-or-store branch {:sync? true})

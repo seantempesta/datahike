@@ -282,6 +282,17 @@
       (let [historical-cid (dv/commit-id @conn)]
         (d/transact conn {:tx-data [{:emp/name "Bob" :emp/salary 110000}]
                           :tx-meta {:db.valid/from #inst "2024-07-01"}})
+        (testing "historical primary reads can omit native secondary owners"
+          (let [primary-only (dv/commit-as-db conn historical-cid
+                                               {:sync? true
+                                                :secondary-indices? false})
+                with-secondary (dv/commit-as-db conn historical-cid
+                                                 {:sync? true})]
+            (is (empty? (:secondary-indices primary-only)))
+            (is (nil? (:datahike.db/released? primary-only)))
+            (is (seq (:secondary-indices with-secondary)))
+            (is (= [] (dv/release-materialized-db with-secondary)))
+            (is (= [] (dv/release-materialized-db with-secondary)))))
         (testing "head has advanced in both primary and secondary state"
           (is (= #{110000}
                  (set (d/q '[:find [?salary ...]

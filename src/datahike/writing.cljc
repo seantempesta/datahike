@@ -224,8 +224,13 @@
      :cljs {}))
 
 (defn stored->db
-  "Constructs in-memory db instance from stored map value."
-  [stored-db store]
+  "Constructs an in-memory db value from a stored map.
+
+   `:secondary-indices?` defaults to true. Callers that only use primary
+   indexes may set it false and avoid opening native secondary resources."
+  ([stored-db store] (stored->db stored-db store {}))
+  ([stored-db store {:keys [secondary-indices?]
+                     :or {secondary-indices? true}}]
   (let [{:keys [eavt-key aevt-key avet-key
                 temporal-eavt-key temporal-aevt-key temporal-avet-key
                 eavt-root aevt-root avet-root
@@ -241,8 +246,9 @@
                           schema-meta))
         effective-schema (or (:schema schema-meta) schema)
         effective-ident-ref-map (or (:ident-ref-map schema-meta) ident-ref-map)
-        sec-indices (restore-secondary-indices effective-schema effective-ident-ref-map
-                                               secondary-index-keys store)
+        sec-indices (when secondary-indices?
+                      (restore-secondary-indices effective-schema effective-ident-ref-map
+                                                 secondary-index-keys store))
         empty       (db/empty-db nil config store)
         ;; Bind each index to THIS connection's storage (as a copy). Stored
         ;; values are storage-detached (db->stored) and deserializing
@@ -283,8 +289,34 @@
             :ref-ident-map ref-ident-map
             :store store)
      (when (seq sec-indices)
-       {:secondary-indices sec-indices})
-     schema-meta)))
+       {:secondary-indices sec-indices
+        :datahike.db/materialized-secondary-indices? true
+        :datahike.db/released? (atom false)})
+     schema-meta))))
+
+#?(:clj
+   (defn release-db
+     "Closes secondary resources owned by a materialized database value.
+
+      Values returned without secondary indices and ordinary connection DB
+      values own nothing and are left unchanged. The caller must invoke this
+      after all reads using the value have finished. Repeated release is a
+      no-op. Returns a vector of cleanup failures."
+     [db]
+     (if (and (:datahike.db/materialized-secondary-indices? db)
+              (compare-and-set! (:datahike.db/released? db) false true))
+       (into []
+             (keep (fn [[ident idx]]
+                     (when (instance? java.io.Closeable idx)
+                       (try
+                         (.close ^java.io.Closeable idx)
+                         nil
+                         (catch Throwable e
+                           (log/warn :datahike/materialized-secondary-index-close-failed
+                                     {:ident ident :error (.getMessage e)})
+                           e)))))
+             (:secondary-indices db))
+       [])))
 
 (defn branch-heads-as-commits
   "Resolve keyword parents (branch names) to their head commit-ids.

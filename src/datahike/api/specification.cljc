@@ -852,16 +852,32 @@
      :impl datahike.api.impl/parent-commit-ids}
 
     commit-as-db
-    {:args [:=> [:cat :any :uuid] [:maybe :datahike/SDB]]
+    {:args [:function
+            [:=> [:cat :any :uuid] [:maybe :datahike/SDB]]
+            [:=> [:cat :any :uuid [:map {:closed true}
+                                       [:secondary-indices? {:optional true} :boolean]]]
+             [:maybe :datahike/SDB]]]
      :ret [:maybe :datahike/SDB]
      :categories [:versioning :query]
      :stability :stable
      :supports-remote? true
      :referentially-transparent? false
-     :doc "Load the database at a specific commit. First argument can be a connection, db value, or raw store."
+     :doc "Load the database at a specific commit. First argument can be a connection, db value, or raw store. Set :secondary-indices? false for primary-only reads."
      :examples [{:desc "Load db at commit"
                  :code "(commit-as-db conn #uuid \"...\")"}]
      :impl datahike.api.impl/commit-as-db}
+
+    release-materialized-db
+    {:args [:=> [:cat :datahike/SDB] [:sequential :any]]
+     :ret [:sequential :any]
+     :categories [:versioning :query]
+     :stability :stable
+     :supports-remote? false
+     :referentially-transparent? false
+     :doc "Close native secondary resources owned by a database returned from commit-as-db. Primary-only and connection database values are no-ops."
+     :examples [{:desc "Release a materialized historical database"
+                 :code "(release-materialized-db historical-db)"}]
+     :impl datahike.api.impl/release-materialized-db}
 
     branch-as-db
     {:args [:=> [:cat :any :keyword] [:maybe :datahike/SDB]]
