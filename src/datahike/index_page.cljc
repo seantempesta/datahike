@@ -42,6 +42,16 @@
 (defn- index-comparator [db index]
   (dd/index-type->cmp-quick index (not (temporal-index? db))))
 
+(defn- restore-temporal-index-order
+  "Restores native order after an as-of or since reconstruction."
+  [db comparator direction candidates]
+  (if (dbi/context-time-pred (dbi/-search-context db))
+    (sort (if (= :forward direction)
+            comparator
+            (fn [left right] (comparator right left)))
+          candidates)
+    candidates))
+
 (defn- with-added [datom added?]
   (dd/datom (:e datom) (:a datom) (:v datom) (dd/datom-tx datom) added?))
 
@@ -121,6 +131,12 @@
                       dbi/seek-datoms
                       dbi/rseek-datoms)
                     db index seek-components)
+        ;; Time-filtered temporal reads reconstruct cardinality-one state by
+        ;; entity/attribute. That grouping is eager and does not retain AVET
+        ;; (or another requested index's) order. Restore dependency-native
+        ;; comparator order before a foreign datom can terminate this prefix.
+        candidates (restore-temporal-index-order db comparator direction
+                                                  candidates)
         candidates (take-while #(within-prefix? index prefix %) candidates)
         candidates
         (if resolved-cursor

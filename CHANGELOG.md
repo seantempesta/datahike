@@ -39,6 +39,13 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Notable fixes
 
+- **Time-filtered `index-page` restores native index order** — `AsOfDB` and
+  `SinceDB` reconstruct cardinality-one state by entity/attribute, which can
+  discard AVET/AEVT/EAVT order when unrelated bootstrap datoms are present. A
+  reverse prefix page could therefore stop at an unrelated datom and omit
+  valid rows. Paging now restores the native temporal comparator order before
+  prefix and cursor processing, including history polarity. ([#TODO])
+
 - **`pull-many` preserves every input position** — one native pull now returns
   an ordered vector with nil for each well-formed missing numeric ID, lookup
   ref, or ident. Missing inputs no longer abort or disappear, wildcard pulls

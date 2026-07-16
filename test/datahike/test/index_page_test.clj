@@ -91,6 +91,46 @@
         (is (some #(and (= "after" (nth % 2)) (true? (nth % 4)))
                   history-forward))))))
 
+(deftest as-of-avet-pages-compose-after-a-cardinality-one-replacement
+  (let [configuration {:store {:backend :memory :id (random-uuid)}
+                       :schema-flexibility :write
+                       :keep-history? true
+                       ;; Bootstrap datoms outside the later AVET prefix expose
+                       ;; temporal reconstruction order; four is the smallest
+                       ;; stable fixture that interrupts the old reverse page.
+                       :initial-tx
+                       (mapv (fn [n]
+                               {:db/ident (keyword "bootstrap" (str "a" n))
+                                :db/valueType :db.type/string
+                                :db/cardinality :db.cardinality/one})
+                             (range 4))}]
+    (d/create-database configuration)
+    (let [connection (d/connect configuration)]
+      (try
+        (d/transact connection
+                    [{:db/ident :rank/id
+                      :db/valueType :db.type/string
+                      :db/cardinality :db.cardinality/one
+                      :db/unique :db.unique/identity}
+                     {:db/ident :rank/value
+                      :db/valueType :db.type/long
+                      :db/cardinality :db.cardinality/one
+                      :db/index true}
+                     {:rank/id "alice" :rank/value 1}
+                     {:rank/id "bob" :rank/value 2}])
+        (let [cut (:max-tx @connection)]
+          (d/transact connection
+                      [[:db/add [:rank/id "alice"] :rank/value 9]])
+          (let [as-of (d/as-of @connection cut)
+                forward {:index :avet :components [:rank/value]
+                         :direction :forward :limit 1}
+                reverse (assoc forward :direction :reverse)]
+            (is (= [1 2] (mapv :v (all-pages as-of forward))))
+            (is (= [2 1] (mapv :v (all-pages as-of reverse))))))
+        (finally
+          (d/release connection)
+          (d/delete-database configuration))))))
+
 (deftest polarity-is-part-of-an-exact-history-cursor
   (with-database
     (fn [connection]
