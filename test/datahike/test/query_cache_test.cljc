@@ -4,6 +4,7 @@
       :clj  [clojure.test :as t :refer [is deftest testing]])
    [datahike.api :as d]
    #?(:clj [datahike.db :as db])
+   #?(:clj [datahike.db.utils :as dbu])
    #?(:clj [datahike.connections :as connections])
    #?(:clj [datahike.lru :as lru])
    #?(:clj [datahike.query :as dq])
@@ -1169,3 +1170,157 @@
                  (is (= "1.5" (run legacy? "1.5")) tag)
                  (is (= "1.50" (run legacy? "1.50")) tag)
                  (is (= "1.500" (run legacy? "1.500")) tag)))))))))
+
+#?(:clj
+   (deftest parsed-query-source-bindings-name-only-top-level-source-arguments
+     (is (= [] (d/query-source-bindings
+                '[:find ?value :in ?value :where [(identity ?value)]])))
+     (is (= [{:datahike.query.source/symbol '$
+              :datahike.query.source/argument-position 0}]
+            (d/query-source-bindings
+             '[:find ?value :where [_ :c/note ?value]])))
+     (is (= [{:datahike.query.source/symbol '$a
+              :datahike.query.source/argument-position 0}
+             {:datahike.query.source/symbol '$b
+              :datahike.query.source/argument-position 2}
+             {:datahike.query.source/symbol '$c
+              :datahike.query.source/argument-position 3}]
+            (d/query-source-bindings
+             '[:find ?value
+               :in $a ?ordinary $b $c
+               :where [$a _ :c/note ?value]])))
+     (is (= [{:datahike.query.source/symbol '$a
+              :datahike.query.source/argument-position 0}]
+            (d/query-source-bindings
+             '[:find ?ordinary
+               :in $a [?ordinary ...]
+               :where [(identity ?ordinary)]])))))
+
+#?(:clj
+   (deftest three-source-query-cache-has-one-composite-ordinary-key-and-all-member-lifetime
+     (with-temp-db
+       (conj label-schema {:c/id "a" :c/note "A"})
+       (fn [a]
+         (with-temp-db
+           (conj label-schema {:c/id "b" :c/note "B"})
+           (fn [b]
+             (with-temp-db
+               (conj label-schema {:c/id "c" :c/note "C"})
+               (fn [c]
+                 (dq/clear-query-cache!)
+                 (let [query '[:find ?a ?b ?c
+                               :in $a $b $c
+                               :where
+                               [$a _ :c/note ?a]
+                               [$b _ :c/note ?b]
+                               [$c _ :c/note ?c]]
+                       first-result (dq/q-with-evidence query @a @b @c)
+                       second-result (dq/q-with-evidence query @a @b @c)
+                       cache-keys (query-cache-keys)
+                       cache-entries
+                       (lru/weighted-entries (:lru @dq/query-result-cache))
+                       [_ connection-b generation-b]
+                       (let [[connection generation _]
+                             (db/committed-cache-identity @b)]
+                         [nil connection generation])]
+                   (is (= #{["A" "B" "C"]}
+                          (:datahike.query/result first-result)))
+                   (is (= :datahike.cache.outcome/miss-owner
+                          (get-in first-result
+                                  [:datahike.query/cache-evidence
+                                   :datahike.cache/outcome])))
+                   (is (= :datahike.cache.outcome/hit
+                          (get-in second-result
+                                  [:datahike.query/cache-evidence
+                                   :datahike.cache/outcome])))
+                   (is (= 1 (count cache-keys)))
+                   (is (not-any? dbu/db?
+                                 (tree-seq coll? seq cache-entries)))
+                   (d/close-query-cache-generation! connection-b generation-b)
+                   (is (zero? (:snapshot-count (dq/query-cache-metrics)))))))))))))
+
+#?(:clj
+   (deftest composite-source-cache-propagates-one-advanced-source-conservatively
+     (with-temp-db
+       (conj label-schema {:c/id "left" :c/note "L"})
+       (fn [left]
+         (with-temp-db
+           (conj label-schema {:c/id "right" :c/note "R"})
+           (fn [right]
+             (dq/clear-query-cache!)
+             (let [query '[:find ?left ?right
+                           :in $left $right
+                           :where
+                           [$left _ :c/note ?left]
+                           [$right _ :c/note ?right]]
+                   initial (dq/q-with-evidence query @left @right)
+                   unrelated (d/transact right
+                                         [{:c/id "right"
+                                           :c/labels ["unrelated"]}])
+                   inherited (dq/q-with-evidence
+                              query @left (:db-after unrelated))
+                   changed (d/transact right
+                                       [{:c/id "right" :c/note "R2"}])
+                   recomputed (dq/q-with-evidence
+                               query @left (:db-after changed))]
+               (is (= #{["L" "R"]} (:datahike.query/result initial)))
+               (is (= :datahike.cache.outcome/hit
+                      (get-in inherited [:datahike.query/cache-evidence
+                                         :datahike.cache/outcome])))
+               (is (= #{["L" "R2"]} (:datahike.query/result recomputed)))
+               (is (= :datahike.cache.outcome/miss-owner
+                      (get-in recomputed [:datahike.query/cache-evidence
+                                          :datahike.cache/outcome]))))))))))
+
+#?(:clj
+   (deftest duplicate-source-members-share-one-metric-and-nonprimary-close-detaches-flight
+     (with-temp-db
+       (conj label-schema {:c/id "left" :c/note "L"})
+       (fn [left]
+         (with-temp-db
+           (conj label-schema {:c/id "right" :c/note "R"})
+           (fn [right]
+             (dq/clear-query-cache!)
+             (let [duplicate-query '[:find ?a ?b
+                                     :in $a $b
+                                     :where
+                                     [$a _ :c/note ?a]
+                                     [$b _ :c/note ?b]]
+                   duplicate (d/acquire-q!
+                              {:query duplicate-query
+                               :args [@left @left]
+                               :request-id "duplicate-source"})
+                   left-key (db/committed-cache-identity @left)
+                   metrics (dq/query-cache-metrics)]
+               (is (= :run (d/q-call-state duplicate)))
+               (is (= 1 (count (get-in metrics
+                                       [:single-flight :active-by-database]))))
+               (is (= 1 (get-in metrics
+                                [:single-flight :active-by-database
+                                 left-key :flights])))
+               (is (:datahike.query.cancel/detached?
+                    (d/cancel-query! "duplicate-source")))
+               (is (zero? (get-in (dq/query-cache-metrics)
+                                  [:single-flight :active-flights]))))
+             (let [query '[:find ?left ?right
+                           :in $left $right
+                           :where
+                           [$left _ :c/note ?left]
+                           [$right _ :c/note ?right]]
+                   owner (d/acquire-q! {:query query :args [@left @right]
+                                        :request-id "composite-owner"})
+                   waiter (d/acquire-q! {:query query :args [@left @right]
+                                         :request-id "composite-waiter"})
+                   owner-result (promise)
+                   waiter-result (promise)
+                   [connection-id generation _]
+                   (db/committed-cache-identity @right)]
+               (d/on-q-complete! owner #(deliver owner-result %))
+               (d/on-q-complete! waiter #(deliver waiter-result %))
+               (d/close-query-cache-generation! connection-id generation)
+               (is (= :datahike/query-cache-scope-closed
+                      (:type (ex-data (:throwable @owner-result)))))
+               (is (= :datahike/query-cache-scope-closed
+                      (:type (ex-data (:throwable @waiter-result)))))
+               (is (zero? (get-in (dq/query-cache-metrics)
+                                  [:single-flight :active-flights]))))))))))

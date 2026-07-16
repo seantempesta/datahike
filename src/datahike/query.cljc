@@ -2521,6 +2521,39 @@
   (swap! query-result-cache assoc-in [:generations connection-id] generation)
   generation)
 
+(def ^:private composite-source-key-tag
+  :datahike.query.cache/sources-by-binding)
+
+(defn- source-database-keys
+  "Normalize a legacy one-source key or tagged composite to exact DB keys."
+  [source-key]
+  (if (= composite-source-key-tag (first source-key))
+    (into #{} (map #(nth % 2)) (second source-key))
+    #{source-key}))
+
+(defn- replace-source-database-key
+  [source-key parent-key child-key]
+  (if (= composite-source-key-tag (first source-key))
+    [composite-source-key-tag
+     (mapv (fn [[symbol position database-key]]
+             [symbol position
+              (if (= parent-key database-key) child-key database-key)])
+           (second source-key))]
+    (if (= parent-key source-key) child-key source-key)))
+
+(defn- source-key-contains-generation?
+  [source-key connection-id generation]
+  (some (fn [[cached-id cached-generation]]
+          (and (= connection-id cached-id)
+               (= generation cached-generation)))
+        (source-database-keys source-key)))
+
+(defn- source-key-generations-current?
+  [source-key generations]
+  (every? (fn [[connection-id generation]]
+            (= generation (get generations connection-id)))
+          (map #(subvec % 0 2) (source-database-keys source-key))))
+
 (defn close-query-cache-generation!
   "Fence cache puts and evict all snapshots for one exact connection generation."
   [connection-id generation]
@@ -2532,9 +2565,8 @@
                      next-lru
                      (lru/weighted-remove-where
                       lru
-                      (fn [[cached-id cached-generation _]]
-                        (and (= connection-id cached-id)
-                             (= generation cached-generation))))]
+                      #(source-key-contains-generation?
+                        % connection-id generation))]
                  (vreset! release {:current? true
                                    :snapshots (- before
                                                  (count (lru/weighted-entries
@@ -2689,39 +2721,47 @@
       :all)))
 
 (defn- result-cache-get
-  "Look up a cached query result for the given DB."
-  [db cache-key]
-  (when-let [dk (db-cache-key db)]
-    (when-let [snapshot-cache (get-in @query-result-cache [:lru dk])]
-      (when-let [entry (get snapshot-cache cache-key)]
-        ;; Touch LRU atomically — re-assoc current value so LRU updates generation.
-        ;; Use swap! which retries on CAS conflict, reading fresh state each retry.
-        (swap! query-result-cache
-               (fn [{:keys [lru] :as state}]
-                 (if-let [current (get lru dk)]
-                   (assoc state :lru (assoc lru dk current))
-                   state)))
-        entry))))
+  "Look up a cached query result for an exact composite source identity."
+  [source-key cache-key]
+  (let [source-key (if (dbu/db? source-key)
+                     (db-cache-key source-key)
+                     source-key)]
+    (when source-key
+      (when-let [snapshot-cache (get-in @query-result-cache [:lru source-key])]
+        (when-let [entry (get snapshot-cache cache-key)]
+          ;; Touch LRU atomically — re-assoc current value so LRU updates generation.
+          ;; Use swap! which retries on CAS conflict, reading fresh state each retry.
+          (swap! query-result-cache
+                 (fn [{:keys [lru] :as state}]
+                   (if-let [current (get lru source-key)]
+                     (assoc state :lru (assoc lru source-key current))
+                     state)))
+          entry)))))
 
 (defn- result-cache-put!
-  "Store a query result in the cache for the given DB."
-  [db cache-key result attr-deps expected-epoch]
-  (when-let [weight (and (pos? *query-cache-weight-limit*)
-                         (result-weight result))]
-    (when-let [[connection-id generation :as dk] (db-cache-key db)]
-      (let [stored? (volatile! false)]
-        (swap! query-result-cache
-               (fn [{:keys [lru generations epoch] :as state}]
-                 (if (and (= expected-epoch epoch)
-                          (= generation (get generations connection-id)))
-                   (let [existing (or (get lru dk) {})]
-                     (vreset! stored? true)
-                     (assoc state :lru
-                            (assoc lru dk (assoc existing cache-key
-                                                 {:result result :attrs attr-deps
-                                                  :weight weight}))))
-                   state)))
-        @stored?))))
+  "Store a query result when every source generation remains admitted."
+  [source-key cache-key result attr-deps expected-epoch]
+  (let [source-key (if (dbu/db? source-key)
+                     (db-cache-key source-key)
+                     source-key)]
+    (when-let [weight (and (pos? *query-cache-weight-limit*)
+                           (result-weight result))]
+      (when source-key
+        (let [stored? (volatile! false)]
+          (swap! query-result-cache
+                 (fn [{:keys [lru generations epoch] :as state}]
+                   (if (and (= expected-epoch epoch)
+                            (source-key-generations-current?
+                             source-key generations))
+                     (let [existing (or (get lru source-key) {})]
+                       (vreset! stored? true)
+                       (assoc state :lru
+                              (assoc lru source-key
+                                     (assoc existing cache-key
+                                            {:result result :attrs attr-deps
+                                             :weight weight}))))
+                     state)))
+          @stored?)))))
 
 (defn propagate-query-cache
   "Propagate query result cache from parent DB to child DB after a transaction.
@@ -2741,23 +2781,38 @@
       ;; the DB changed but we can't determine which queries are safe to keep.
       (let [user-attrs (disj modified-attrs :db/txInstant)]
         (when (seq user-attrs)
-          (let [parent-entries (get-in @query-result-cache [:lru parent-key])]
-            (when (seq parent-entries)
-              (let [child-entries (reduce-kv
-                                   (fn [m k {:keys [attrs]}]
-                                     (if (or (= attrs :all)
-                                             (some user-attrs attrs))
-                                       (dissoc m k)
-                                       m))
-                                   parent-entries
-                                   parent-entries)]
-                (when (seq child-entries)
-                  (swap! query-result-cache
-                         (fn [{:keys [lru generations] :as state}]
-                           (let [[connection-id generation] child-key]
-                             (if (= generation (get generations connection-id))
-                               (assoc state :lru (assoc lru child-key child-entries))
-                               state)))))))))))))
+          (swap! query-result-cache
+                 (fn [{:keys [lru generations] :as state}]
+                   (if-not (= (second child-key)
+                              (get generations (first child-key)))
+                     state
+                     (let [propagations
+                           (keep
+                            (fn [[source-key entries]]
+                              (when (contains? (source-database-keys source-key)
+                                               parent-key)
+                                (let [next-source-key
+                                      (replace-source-database-key
+                                       source-key parent-key child-key)
+                                      surviving
+                                      (into {}
+                                            (remove
+                                             (fn [[_ {:keys [attrs]}]]
+                                               (or (= attrs :all)
+                                                   (some user-attrs attrs))))
+                                            entries)]
+                                  (when (seq surviving)
+                                    [next-source-key surviving]))))
+                            (lru/weighted-entries lru))
+                           next-lru
+                           (reduce
+                            (fn [result [source-key inherited]]
+                              (let [existing (get result source-key)]
+                                (assoc result source-key
+                                       (merge inherited existing))))
+                            lru
+                            propagations)]
+                       (assoc state :lru next-lru))))))))))
 
 (defn memoized-parse-query [q]
   (if-some [cached (get @query-cache q nil)]
@@ -2765,6 +2820,47 @@
     (let [qp (parse q)]
       (vswap! query-cache assoc q qp)
       qp)))
+
+(defn query-source-bindings
+  "Return the ordered top-level argument positions declared as query sources."
+  [query-input]
+  (let [query (:query (normalize-q-input query-input []))
+        qin (:qin (memoized-parse-query query))]
+    (into []
+          (keep-indexed
+           (fn [position binding]
+             (when (and (instance? BindScalar binding)
+                        (instance? SrcVar (:variable binding)))
+               {:datahike.query.source/symbol
+                (get-in binding [:variable :symbol])
+                :datahike.query.source/argument-position position})))
+          qin)))
+
+(defn- query-cache-sources
+  [query args]
+  (let [sources (query-source-bindings query)
+        members
+        (mapv
+         (fn [{:datahike.query.source/keys [symbol argument-position]}]
+           [symbol argument-position
+            (some-> (nth args argument-position nil) db-cache-key)])
+         sources)]
+    (when (and (seq members) (every? #(some? (nth % 2)) members))
+      (if (= 1 (count members))
+        (nth (first members) 2)
+        [composite-source-key-tag members]))))
+
+(defn- query-cache-arguments
+  [query args]
+  (let [source-positions
+        (into #{}
+              (map :datahike.query.source/argument-position)
+              (query-source-bindings query))]
+    (into []
+          (keep-indexed (fn [position value]
+                          (when-not (contains? source-positions position)
+                            value)))
+          args)))
 
 (defn convert-to-return-maps [{:keys [mapping-type mapping-keys]} resultset]
   (let [mapping-keys (map #(get % :mapping-key) mapping-keys)
@@ -4241,9 +4337,8 @@
                     (uncached nil))
              :cljs (uncached nil)))
       ;; Try result cache
-      (let [db (first args)
-            db-key (db-cache-key db)]
-        (if-not db-key
+      (let [source-key (query-cache-sources query args)]
+        (if-not source-key
           (do (when cache-evidence
                 (vreset! cache-evidence
                          {:datahike.cache/outcome
@@ -4256,7 +4351,7 @@
                             (uncached nil)))
                         (uncached nil))
                  :cljs (uncached nil)))
-          (let [non-db-args (vec (rest args))
+          (let [non-db-args (query-cache-arguments query args)
                 cache-epoch (:epoch @query-result-cache)
                 ;; scale-sensitive-key: BigDecimal args/consts of equal value but
                 ;; different scale (1.50M vs 1.500M) are `=` with equal hash in
@@ -4264,7 +4359,7 @@
                 ;; first-cached scale. Keep them distinct.
                 cache-key (scale-sensitive-key
                            [query non-db-args offset limit order-by *disable-planner*])
-                cached (result-cache-get db cache-key)]
+                cached (result-cache-get source-key cache-key)]
             ;; Completed hits never enter the in-flight path and therefore do
             ;; not allocate a promise, request identity, flight key, or delayed
             ;; dependency analysis. The coordinator rechecks on a miss to close
@@ -4295,19 +4390,19 @@
                                       (when outer-evidence-sink
                                         (vreset! outer-evidence-sink @sink)))))))]
                 (let [arguments
-                      [[db-key cache-key max-work max-results
+                      [[source-key cache-key max-work max-results
                         max-result-weight]
                        request-id
                        #(binding [resource/*evidence-sink* outer-evidence-sink]
-                          (when-let [entry (result-cache-get db cache-key)]
+                          (when-let [entry (result-cache-get source-key cache-key)]
                             (resource/certify-cached-result!
                              (:result entry) resource-options)
                             (when dependency-evidence
                               (vreset! dependency-evidence (:attrs entry)))
                             {:value (:result entry)}))
                        compute
-                       #(result-cache-put! db cache-key % @attribute-dependencies
-                                           cache-epoch)
+                       #(result-cache-put! source-key cache-key %
+                                           @attribute-dependencies cache-epoch)
                        #(when cache-evidence (vreset! cache-evidence %))
                        #(cond-> {:datahike.query/attribute-dependencies
                                  (or (when dependency-evidence

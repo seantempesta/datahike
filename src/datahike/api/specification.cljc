@@ -140,6 +140,16 @@
      :doc "Acquires an opaque host query call without running its computation."
      :impl datahike.query/acquire-q!}
 
+    query-source-bindings
+    {:args [:=> [:cat [:or [:vector :any] :map :string]] [:vector :map]]
+     :ret [:vector :map]
+     :categories [:query :host]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? true
+     :doc "Returns parsed source symbols and top-level argument positions."
+     :impl datahike.query/query-source-bindings}
+
     q-call-state
     {:args [:=> [:cat :any] [:enum :completed :run :waiting :rejected]]
      :ret [:enum :completed :run :waiting :rejected]

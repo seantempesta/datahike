@@ -4,6 +4,15 @@
   "Maximum distinct cold computations coordinated in one process."
   1024)
 
+(def ^:private composite-source-key-tag
+  :datahike.query.cache/sources-by-binding)
+
+(defn- source-database-keys
+  [source-key]
+  (if (= composite-source-key-tag (first source-key))
+    (into #{} (map #(nth % 2)) (second source-key))
+    #{source-key}))
+
 ;; One atom makes flight admission and waiter reverse lookup one atomic fact.
 (defonce ^:private coordinator (atom {:flights {} :waiters {}}))
 (def ^:private counter-names
@@ -504,9 +513,11 @@
   "Remove and fail every in-flight computation for one exact cache scope."
   [connection-id generation]
   (remove-flights!
-   (fn [[[[cached-id cached-generation _] _] _]]
-     (and (= connection-id cached-id)
-          (= generation cached-generation)))
+   (fn [[[source-key _] _]]
+     (some (fn [[cached-id cached-generation]]
+             (and (= connection-id cached-id)
+                  (= generation cached-generation)))
+           (source-database-keys source-key)))
    (ex-info "Query cache scope closed."
             {:type :datahike/query-cache-scope-closed})))
 
@@ -534,12 +545,16 @@
             :saved-computations (:waiter-hits totals)
             :active-by-database
             (reduce-kv
-             (fn [result [database-key _]
+             (fn [result [source-key _]
                   {:keys [waiters owner-request-id]}]
-               (-> result
-                   (update-in [database-key :flights] (fnil inc 0))
-                   (update-in [database-key :callers] (fnil + 0)
-                              (count waiters))
-                   (update-in [database-key :waiters] (fnil + 0)
-                              (count (dissoc waiters owner-request-id)))))
+               (reduce
+                (fn [result database-key]
+                  (-> result
+                      (update-in [database-key :flights] (fnil inc 0))
+                      (update-in [database-key :callers] (fnil + 0)
+                                 (count waiters))
+                      (update-in [database-key :waiters] (fnil + 0)
+                                 (count (dissoc waiters owner-request-id)))))
+                result
+                (source-database-keys source-key)))
              {} current)})))
