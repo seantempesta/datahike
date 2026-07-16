@@ -1,7 +1,8 @@
 (ns datahike.test.committed-report-test
   (:require [clojure.test :refer [deftest is use-fixtures]]
             [datahike.api :as d]
-            [datahike.committed-report :as reports]))
+            [datahike.committed-report :as reports])
+  (:import [java.util.concurrent CountDownLatch]))
 
 (use-fixtures :each
   (fn [test-fn]
@@ -15,7 +16,7 @@
     (is (= :accepted (reports/offer! source generation {:sequence 1})))
     (is (= :accepted (reports/offer! source generation {:sequence 2})))
     (is (= :overflow (reports/offer! source generation {:sequence 3})))
-    (is (identical? source (reports/poll-ready!)))
+    (is (identical? source (reports/take-ready!)))
     (is (= :closed (reports/offer! source generation {:sequence 4})))
     (is (= {:sequence 1} (reports/poll! source)))
     (is (= {:sequence 2} (reports/poll! source)))
@@ -49,11 +50,99 @@
     (is (identical? source (reports/poll-ready!)))
     (is (= {:sequence 3} (reports/poll! source)))))
 
+(deftest blocking-readiness-drains-many-reports-from-one-handoff
+  (let [generation (random-uuid)
+        source (reports/open! :many generation 128)
+        expected (mapv #(hash-map :sequence %) (range 100))]
+    (doseq [report expected]
+      (is (= :accepted (reports/offer! source generation report))))
+    (is (= 1 (:datahike.committed-report.readiness/queued
+              (reports/readiness-evidence))))
+    (is (identical? source (reports/take-ready!)))
+    (is (= expected (mapv (fn [_] (reports/poll! source)) expected)))
+    (is (nil? (reports/poll! source)))
+    (is (zero? (:datahike.committed-report.readiness/queued
+                (reports/readiness-evidence))))))
+
+(deftest final-drain-and-offer-preserve-the-one-handoff-law
+  (let [generation (random-uuid)
+        source (reports/open! :race generation 4)]
+    (reports/offer! source generation {:sequence 1})
+    (is (identical? source (reports/take-ready!)))
+    (let [drained (CountDownLatch. 1)
+          drain-result (future
+                         (let [report (reports/poll! source)]
+                           (.countDown drained)
+                           report))]
+      (.await drained)
+      (is (= :accepted (reports/offer! source generation {:sequence 2})))
+      (is (= {:sequence 1} @drain-result))
+      (is (identical? source (reports/take-ready!)))
+      (is (= {:sequence 2} (reports/poll! source))))
+    (reports/offer! source generation {:sequence 3})
+    (is (identical? source (reports/take-ready!)))
+    (let [offered (CountDownLatch. 1)
+          offer-result (future
+                         (let [outcome
+                               (reports/offer! source generation {:sequence 4})]
+                           (.countDown offered)
+                           outcome))]
+      (.await offered)
+      (is (= :accepted @offer-result))
+      (is (= {:sequence 3} (reports/poll! source)))
+      (is (nil? (reports/poll-ready!)))
+      (is (= {:sequence 4} (reports/poll! source))))))
+
+(deftest blocking-readiness-is-interruptible-without-losing-the-next-source
+  (let [started (CountDownLatch. 1)
+        waiter-thread (promise)
+        result (future
+                 (deliver waiter-thread (Thread/currentThread))
+                 (.countDown started)
+                 (try
+                   (reports/take-ready!)
+                   (catch InterruptedException _ :interrupted)))]
+    (.await started)
+    (.interrupt ^Thread @waiter-thread)
+    (is (= :interrupted @result))
+    (let [generation (random-uuid)
+          source (reports/open! :after-interrupt generation 1)]
+      (is (= :accepted
+             (reports/offer! source generation {:sequence :after-interrupt})))
+      (is (identical? source (reports/take-ready!)))
+      (is (= {:sequence :after-interrupt} (reports/poll! source))))))
+
+(deftest blocking-readiness-skips-a-source-closed-after-dequeue
+  (let [generation (random-uuid)
+        old-source (reports/open! :close-race generation 1)
+        started (CountDownLatch. 1)
+        reopened (atom nil)
+        taken (promise)]
+    (reports/offer! old-source generation {:sequence :old})
+    (locking old-source
+      (future
+        (.countDown started)
+        (deliver taken (reports/take-ready!)))
+      (.await started)
+      (is (loop [remaining 1000000]
+            (cond
+              (zero? (:datahike.committed-report.readiness/queued
+                      (reports/readiness-evidence))) true
+              (zero? remaining) false
+              :else (do (Thread/yield) (recur (dec remaining))))))
+      (reports/close! old-source false)
+      (let [source (reports/open! :close-race generation 1)]
+        (reset! reopened source)
+        (reports/offer! source generation {:sequence :new})))
+    (let [source @reopened]
+      (is (identical? source @taken))
+      (is (= {:sequence :new} (reports/poll! source))))))
+
 (deftest gapped-source-closes-and-reopens-without-stale-readiness
   (let [generation (random-uuid)
         source (reports/open! :connection generation 1)]
     (is (= :accepted (reports/offer! source generation {:sequence 1})))
-    (is (identical? source (reports/poll-ready!)))
+    (is (identical? source (reports/take-ready!)))
     (is (= :overflow (reports/offer! source generation {:sequence 2})))
     (is (= :datahike.committed-report.status/gapped
            (:datahike.committed-report/status (reports/evidence source))))
@@ -76,6 +165,7 @@
     (is (= :datahike.committed-report.status/closed
            (:datahike.committed-report/status
             (reports/close! old-source false))))
+    (is (nil? (reports/poll-ready!)))
     (let [new-source (reports/open! :connection new-generation 2)]
       (reports/close! old-source false)
       (is (= :accepted

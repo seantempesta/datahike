@@ -1,11 +1,14 @@
-(ns ^:no-doc datahike.committed-report)
+(ns ^:no-doc datahike.committed-report
+  #?(:clj (:import [java.util.concurrent ArrayBlockingQueue])))
 
 (def ^:private empty-queue #?(:clj clojure.lang.PersistentQueue/EMPTY
                               :cljs cljs.core/PersistentQueue.EMPTY))
 
 (defonce ^:private sources (atom {}))
 (def ^:private maximum-active-sources 4096)
-(defonce ^:private ready-sources (atom empty-queue))
+(defonce ^:private ready-sources
+  #?(:clj (ArrayBlockingQueue. maximum-active-sources)
+     :cljs (atom empty-queue)))
 
 (defn- with-source-lock [source f]
   #?(:clj (locking source (f))
@@ -22,16 +25,38 @@
    :datahike.committed-report/abandoned (:abandoned state)})
 
 (defn- enqueue-ready! [source]
-  (swap! ready-sources
-         (fn [ready]
-           ;; One entry per active source makes this bound structural: a source
-           ;; becomes ready again only after its prior entry has been removed.
-           (conj ready source))))
+  ;; One entry per active source makes this bound structural: a source becomes
+  ;; ready again only after its prior entry has been removed.
+  #?(:clj
+     (when-not (.offer ^ArrayBlockingQueue ready-sources source)
+       (throw (ex-info "Committed-report readiness capacity exhausted."
+                       {:type :datahike.committed-report/readiness-capacity
+                        :maximum maximum-active-sources})))
+     :cljs
+     (swap! ready-sources conj source)))
 
 (defn- remove-ready! [source]
-  (swap! ready-sources
-         (fn [ready]
-           (into empty-queue (remove #(identical? source %)) ready))))
+  #?(:clj
+     (let [iterator (.iterator ^ArrayBlockingQueue ready-sources)]
+       (loop []
+         (when (.hasNext iterator)
+           (if (identical? source (.next iterator))
+             (.remove iterator)
+             (recur)))))
+     :cljs
+     (swap! ready-sources
+            (fn [ready]
+              (into empty-queue (remove #(identical? source %)) ready)))))
+
+(defn- registered-ready-source [source]
+  (with-source-lock
+    source
+    (fn []
+      (let [state @(:state source)]
+        (when (and (:readiness-queued? state)
+                   (identical? source (get @sources (:scope source))))
+          (swap! (:state source) assoc :readiness-queued? false)
+          source)))))
 
 (defn- scope-of [db]
   (let [{:datahike.cache/keys [connection-id generation]}
@@ -150,24 +175,36 @@
 (defn poll-ready!
   "Take one source whose accepted reports or gap are ready to inspect."
   []
-  (let [source (volatile! nil)]
-    (swap! ready-sources
-           (fn [ready]
-             (if (seq ready)
-               (do (vreset! source (peek ready))
-                   (pop ready))
-               ready)))
-    (when-let [ready-source @source]
-      (with-source-lock
-        ready-source
-        (fn []
-          (swap! (:state ready-source) assoc :readiness-queued? false)))
-      ready-source)))
+  (loop []
+    (when-let [source
+               #?(:clj (.poll ^ArrayBlockingQueue ready-sources)
+                  :cljs
+                  (let [source (volatile! nil)]
+                    (swap! ready-sources
+                           (fn [ready]
+                             (if (seq ready)
+                               (do (vreset! source (peek ready))
+                                   (pop ready))
+                               ready)))
+                    @source))]
+      (or (registered-ready-source source)
+          (recur)))))
+
+#?(:clj
+   (defn take-ready!
+     "Block until one registered source has accepted reports or a gap."
+     []
+     (loop []
+       (let [source (.take ^ArrayBlockingQueue ready-sources)]
+         (or (registered-ready-source source)
+             (recur))))))
 
 (defn readiness-evidence
   "Return bounded process-wide committed-report readiness evidence."
   []
-  {:datahike.committed-report.readiness/queued (count @ready-sources)
+  {:datahike.committed-report.readiness/queued
+   #?(:clj (.size ^ArrayBlockingQueue ready-sources)
+      :cljs (count @ready-sources))
    :datahike.committed-report.readiness/capacity maximum-active-sources
    :datahike.committed-report.readiness/active-sources (count @sources)})
 
@@ -224,5 +261,6 @@
   (let [current (vals (swap! sources (constantly {})))]
     (doseq [source current]
       (close! source false))
-    (reset! ready-sources empty-queue)
+    #?(:clj (.clear ^ArrayBlockingQueue ready-sources)
+       :cljs (reset! ready-sources empty-queue))
     nil))
