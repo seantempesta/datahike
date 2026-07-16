@@ -423,6 +423,7 @@
             :datahike.query.cancel/found? false
             :datahike.query.cancel/detached? false
             :datahike.query.cancel/last-waiter? false
+            :datahike.query.cancel/unstarted-owner? false
             :datahike.query.cancel/cooperative-signal-set? false}
      :clj
      (loop []
@@ -435,6 +436,7 @@
             :datahike.query.cancel/found? false
             :datahike.query.cancel/detached? false
             :datahike.query.cancel/last-waiter? false
+            :datahike.query.cancel/unstarted-owner? false
             :datahike.query.cancel/cooperative-signal-set? false}
            (let [remaining (dissoc (:waiters entry) request-id)
                  last? (empty? remaining)
@@ -459,11 +461,16 @@
                    (ex-info "Query waiter canceled."
                             {:type :datahike/query-canceled
                              :datahike.query/request-id request-id})})
-                 {:datahike.query.cancel/request-id request-id
-                  :datahike.query.cancel/found? true
-                  :datahike.query.cancel/detached? true
-                  :datahike.query.cancel/last-waiter? last?
-                  :datahike.query.cancel/cooperative-signal-set? last?})
+                 (cond->
+                  {:datahike.query.cancel/request-id request-id
+                   :datahike.query.cancel/found? true
+                   :datahike.query.cancel/detached? true
+                   :datahike.query.cancel/last-waiter? last?
+                   :datahike.query.cancel/unstarted-owner? unstarted-owner?
+                   :datahike.query.cancel/cooperative-signal-set? last?}
+                   unstarted-owner?
+                   (assoc :datahike.query.cancel/owner-request-id
+                          (:owner-request-id entry))))
                (recur))))))))
 
 (defn cancel-waiter!

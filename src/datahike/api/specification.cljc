@@ -451,7 +451,7 @@
      :supports-remote? false
      :referentially-transparent? false
      :capability-operation :datahike.operation/cancel-query
-     :doc "Detaches and wakes one active query caller by request identity."
+     :doc "Detaches and wakes one active query caller by request identity. Final cancellation of an unstarted owner names its request identity so a host can remove the queued job."
      :impl datahike.query/cancel-query!}
 
     query-cache-evidence

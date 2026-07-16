@@ -511,6 +511,35 @@
                          (d/query-cache-evidence))))))))))
 
 #?(:clj
+   (deftest final-host-cancel-names-the-unstarted-owner-job
+     (with-temp-db
+       [{:db/ident :host.cancel/value
+         :db/valueType :db.type/long
+         :db/cardinality :db.cardinality/one}
+        {:host.cancel/value 8}]
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (let [query '[:find ?value :where [_ :host.cancel/value ?value]]
+               owner-id "host-cancel-owner"
+               waiter-id "host-cancel-waiter"
+               owner (d/acquire-q! {:query query :args [@conn]
+                                    :request-id owner-id})
+               waiter (d/acquire-q! {:query query :args [@conn]
+                                     :request-id waiter-id})]
+           (is (= :run (d/q-call-state owner)))
+           (is (= :waiting (d/q-call-state waiter)))
+           (is (false? (:datahike.query.cancel/unstarted-owner?
+                        (d/cancel-query! owner-id))))
+           (let [cancelled (d/cancel-query! waiter-id)]
+             (is (:datahike.query.cancel/unstarted-owner? cancelled))
+             (is (= owner-id
+                    (:datahike.query.cancel/owner-request-id cancelled))))
+           (is (thrown-with-msg? clojure.lang.ExceptionInfo #"canceled"
+                                 (d/run-q! owner)))
+           (is (zero? (:datahike.single-flight/active-flights
+                       (d/query-cache-evidence)))))))))
+
+#?(:clj
    (deftest host-query-call-shares-failure-and-retries
      (with-temp-db
        [{:db/ident :host.failure/value

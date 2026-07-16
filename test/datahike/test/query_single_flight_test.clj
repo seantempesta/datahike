@@ -285,6 +285,39 @@
     (is (zero? (:active-flights (single-flight/metrics))))
     (is (zero? (:active-callers (single-flight/metrics))))))
 
+(deftest final-waiter-cancel-identifies-the-unstarted-owner-job
+  (single-flight/clear!)
+  (let [key [[:db :generation :commit] :detached-owner]
+        owner-id "detached-owner"
+        waiter-id "final-waiter"
+        calls (atom 0)
+        owner
+        (single-flight/acquire-execution!
+         key owner-id (constantly nil)
+         (fn [_] (swap! calls inc))
+         (fn [_] false) nil nil nil false)
+        waiter
+        (single-flight/acquire-execution!
+         key waiter-id (constantly nil)
+         (fn [_] (swap! calls inc))
+         (fn [_] false) nil nil nil false)]
+    (is (= :run (single-flight/call-state owner)))
+    (is (= :waiting (single-flight/call-state waiter)))
+    (let [owner-cancel (single-flight/cancel! owner-id)]
+      (is (false? (:datahike.query.cancel/last-waiter? owner-cancel)))
+      (is (false? (:datahike.query.cancel/unstarted-owner? owner-cancel)))
+      (is (not (contains? owner-cancel
+                          :datahike.query.cancel/owner-request-id))))
+    (let [waiter-cancel (single-flight/cancel! waiter-id)]
+      (is (:datahike.query.cancel/last-waiter? waiter-cancel))
+      (is (:datahike.query.cancel/unstarted-owner? waiter-cancel))
+      (is (= owner-id
+             (:datahike.query.cancel/owner-request-id waiter-cancel))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"canceled"
+                          (single-flight/run-call! owner)))
+    (is (zero? @calls))
+    (is (zero? (:active-flights (single-flight/metrics))))))
+
 (deftest running-owner-cancel-retains-physical-ownership-until-finish
   (single-flight/clear!)
   (let [key [[:db :generation :commit] :running-cancel]
@@ -306,6 +339,9 @@
     (is (.await entered 10 TimeUnit/SECONDS))
     (let [cancelled (single-flight/cancel! request-id)]
       (is (:datahike.query.cancel/last-waiter? cancelled))
+      (is (false? (:datahike.query.cancel/unstarted-owner? cancelled)))
+      (is (not (contains? cancelled
+                          :datahike.query.cancel/owner-request-id)))
       (is (:datahike.query.cancel/cooperative-signal-set? cancelled)))
     (is (= :datahike/query-canceled
            (:type (ex-data (:throwable @completion)))))
