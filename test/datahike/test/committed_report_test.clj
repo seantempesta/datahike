@@ -64,6 +64,106 @@
     (is (zero? (:datahike.committed-report.readiness/queued
                 (reports/readiness-evidence))))))
 
+(deftest bounded-batches-yield-a-hot-source-to-the-global-tail
+  (let [a-generation (random-uuid)
+        b-generation (random-uuid)
+        a (reports/open! :a a-generation 4)
+        b (reports/open! :b b-generation 1)]
+    (doseq [sequence (range 3)]
+      (is (= :accepted
+             (reports/offer! a a-generation {:source :a
+                                              :sequence sequence}))))
+    (is (= :accepted
+           (reports/offer! b b-generation {:source :b :sequence 0})))
+    (is (identical? a (reports/take-ready!)))
+    (is (= {:datahike.committed-report/status
+            :datahike.committed-report.status/open
+            :datahike.committed-report/reports [{:source :a :sequence 0}]
+            :datahike.committed-report/more? true}
+           (reports/poll-batch! a 1)))
+    (is (= :requeued (reports/requeue-ready! a)))
+    (is (identical? b (reports/take-ready!)))
+    (is (= [{:source :b :sequence 0}]
+           (:datahike.committed-report/reports
+            (reports/poll-batch! b 1))))
+    (is (identical? a (reports/take-ready!)))
+    (is (= [{:source :a :sequence 1} {:source :a :sequence 2}]
+           (:datahike.committed-report/reports
+            (reports/poll-batch! a 2))))
+    (is (= :not-ready (reports/requeue-ready! a)))
+    (is (nil? (reports/poll-ready!)))))
+
+(deftest rejected-admission-requeues-without-consuming-reports
+  (let [generation (random-uuid)
+        source (reports/open! :rejected generation 2)
+        report {:sequence :preserved}]
+    (reports/offer! source generation report)
+    (is (identical? source (reports/take-ready!)))
+    (is (= :requeued (reports/requeue-ready! source)))
+    (is (= :already-queued (reports/requeue-ready! source)))
+    (is (= 1 (:datahike.committed-report.readiness/queued
+              (reports/readiness-evidence))))
+    (is (identical? source (reports/take-ready!)))
+    (is (= [report]
+           (:datahike.committed-report/reports
+            (reports/poll-batch! source 2))))))
+
+(deftest batch-bound-gap-and-shutdown-preserve-readiness-laws
+  (let [generation (random-uuid)
+        source (reports/open! :bounded generation 3)]
+    (doseq [sequence (range 3)]
+      (reports/offer! source generation {:sequence sequence}))
+    (is (= :overflow
+           (reports/offer! source generation {:sequence :overflow})))
+    (is (identical? source (reports/take-ready!)))
+    (let [first-batch (reports/poll-batch! source 2)]
+      (is (= [{:sequence 0} {:sequence 1}]
+             (:datahike.committed-report/reports first-batch)))
+      (is (:datahike.committed-report/more? first-batch))
+      (is (= :datahike.committed-report.status/gapped
+             (:datahike.committed-report/status first-batch))))
+    (is (= :requeued (reports/requeue-ready! source)))
+    (is (identical? source (reports/take-ready!)))
+    (let [last-batch (reports/poll-batch! source 2)]
+      (is (= [{:sequence 2}]
+             (:datahike.committed-report/reports last-batch)))
+      (is (:datahike.committed-report/more? last-batch)))
+    (is (= :requeued (reports/requeue-ready! source))
+        "a gap remains ready until its owner replaces the source")
+    (reports/clear!)
+    (is (zero? (reports/active-source-count)))
+    (is (zero? (:datahike.committed-report.readiness/queued
+                (reports/readiness-evidence))))))
+
+(deftest requeue-is-identity-fenced-across-close-and-reopen
+  (let [generation (random-uuid)
+        old-source (reports/open! :aba generation 1)]
+    (reports/offer! old-source generation {:sequence :old})
+    (is (identical? old-source (reports/take-ready!)))
+    (reports/close! old-source false)
+    (let [new-source (reports/open! :aba generation 1)]
+      (reports/offer! new-source generation {:sequence :new})
+      (is (= :stale (reports/requeue-ready! old-source)))
+      (is (= 1 (:datahike.committed-report.readiness/queued
+                (reports/readiness-evidence))))
+      (is (identical? new-source (reports/take-ready!)))
+      (is (= [{:sequence :new}]
+             (:datahike.committed-report/reports
+              (reports/poll-batch! new-source 1)))))))
+
+(deftest batch-limit-is-validated-before-source-state-changes
+  (let [generation (random-uuid)
+        source (reports/open! :invalid-batch generation 1)]
+    (reports/offer! source generation {:sequence 1})
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"batch limit must be positive"
+                          (reports/poll-batch! source 0)))
+    (is (= [{:sequence 1}]
+           (:datahike.committed-report/reports
+            (reports/poll-batch! source 1))))
+    (is (zero? (:datahike.committed-report.readiness/queued
+                (reports/readiness-evidence))))))
+
 (deftest final-drain-and-offer-preserve-the-one-handoff-law
   (let [generation (random-uuid)
         source (reports/open! :race generation 4)]

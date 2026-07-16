@@ -172,6 +172,90 @@
           (remove-ready! source))))
     @report))
 
+(defn poll-batch!
+  "Take at most `limit` accepted reports from a source without blocking.
+
+  This operation never requeues the source. The source owner calls
+  `requeue-ready!` after its bounded delivery job completes, or before
+  delivery when admission is rejected without polling a batch."
+  [source limit]
+  (when-not (pos-int? limit)
+    (throw (ex-info "Committed-report batch limit must be positive."
+                    {:type :datahike.committed-report/invalid-batch-limit
+                     :limit limit})))
+  (let [result (volatile! nil)
+        remove-readiness? (volatile! false)]
+    (with-source-lock
+      source
+      (fn []
+        (swap! (:state source)
+               (fn [{:keys [status queue queued readiness-queued?] :as state}]
+                 (let [[remaining reports]
+                       (loop [remaining limit
+                              queue queue
+                              reports []]
+                         (if (and (pos? remaining) (seq queue))
+                           (recur (dec remaining)
+                                  (pop queue)
+                                  (conj reports (peek queue)))
+                           [queue reports]))
+                       delivered (count reports)
+                       queued-after (- queued delivered)
+                       more? (or (pos? queued-after) (= :gapped status))
+                       ready-after? (and (not= :closed status) more?)
+                       state-after (cond-> (-> state
+                                                (assoc :queue remaining
+                                                       :queued queued-after
+                                                       :ready? ready-after?)
+                                                (update :delivered + delivered))
+                                     (not ready-after?)
+                                     (assoc :readiness-queued? false))]
+                   (when (and readiness-queued? (not ready-after?))
+                     (vreset! remove-readiness? true))
+                   (vreset! result
+                            {:datahike.committed-report/status
+                             (keyword "datahike.committed-report.status"
+                                      (name status))
+                             :datahike.committed-report/reports reports
+                             :datahike.committed-report/more? more?})
+                   state-after)))
+        (when @remove-readiness?
+          (remove-ready! source))))
+    @result))
+
+(defn requeue-ready!
+  "Put one still-registered ready source at the readiness queue tail.
+
+  Requeue is identity-fenced and idempotent. It does not inspect or consume
+  reports."
+  [source]
+  (let [outcome (volatile! :stale)]
+    (with-source-lock
+      source
+      (fn []
+        (let [{:keys [status ready? readiness-queued?]} @(:state source)]
+          (cond
+            (not (identical? source (get @sources (:scope source))))
+            (vreset! outcome :stale)
+
+            (= :closed status)
+            (vreset! outcome :closed)
+
+            (not (or ready? (= :gapped status)))
+            (vreset! outcome :not-ready)
+
+            readiness-queued?
+            (vreset! outcome :already-queued)
+
+            :else
+            (do
+              (swap! (:state source) assoc
+                     :ready? true
+                     :readiness-queued? true)
+              (enqueue-ready! source)
+              (vreset! outcome :requeued))))))
+    @outcome))
+
 (defn poll-ready!
   "Take one source whose accepted reports or gap are ready to inspect."
   []
