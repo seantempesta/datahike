@@ -67,8 +67,8 @@
                    (future
                      (.await start)
                      (try (run (fn [_] (swap! calls inc)
-                                    (Thread/sleep 75)
-                                    (throw (ex-info "shared" {}))))
+                                 (Thread/sleep 75)
+                                 (throw (ex-info "shared" {}))))
                           (catch Exception _ :failed)))))]
     (.countDown start)
     (is (= (vec (repeat 8 :failed)) (mapv deref workers)))
@@ -119,8 +119,8 @@
                       (single-flight/execute!
                        [[:db :g :c] :owner] (constantly nil)
                        (fn [_] (.countDown entered)
-                            (.await release 10 TimeUnit/SECONDS)
-                            :owner)
+                         (.await release 10 TimeUnit/SECONDS)
+                         :owner)
                        (fn [_])))]
           (is (.await entered 10 TimeUnit/SECONDS))
           (is (= :overflow
@@ -230,3 +230,107 @@
                    (single-flight/cancel! waiter-id))))
       (is (zero? (:active-flights (single-flight/metrics)))
           "completion removes the flight after all callers detach"))))
+
+(deftest acquired-owner-binds-the-run-thread-and-hands-off-once
+  (single-flight/clear!)
+  (let [key [[:db :generation :commit] :transferred]
+        calls (atom 0)
+        completion (promise)
+        run (fn run []
+              (single-flight/execute!
+               key nil (constantly nil)
+               (fn [_]
+                 (if (= 1 (swap! calls inc))
+                   (run)
+                   :inner))
+               (fn [_] false) nil nil nil))
+        call
+        (single-flight/acquire-execution!
+         key "transferred-owner" (constantly nil)
+         (fn [_]
+           (if (= 1 (swap! calls inc))
+             (run)
+             :inner))
+         (fn [_] false) nil nil nil false)]
+    (is (= :run (single-flight/call-state call)))
+    (is (true? (single-flight/on-call-complete! call #(deliver completion %))))
+    (is (false? (single-flight/on-call-complete! call (fn [_] nil)))
+        "one call retains at most one nonblocking handoff")
+    (is (= :inner @(future (single-flight/run-call! call))))
+    (is (= {:status :ok :value :inner} @completion))
+    (is (= 2 @calls)
+        "the nested same-key call bypasses on the actual run thread")
+    (is (zero? (:active-flights (single-flight/metrics))))))
+
+(deftest unstarted-owner-cancel-removes-the-flight-before-run
+  (single-flight/clear!)
+  (let [key [[:db :generation :commit] :unstarted]
+        request-id "unstarted-owner"
+        calls (atom 0)
+        completion (promise)
+        call
+        (single-flight/acquire-execution!
+         key request-id (constantly nil)
+         (fn [_] (swap! calls inc) :must-not-run)
+         (fn [_] false) nil nil nil false)]
+    (single-flight/on-call-complete! call #(deliver completion %))
+    (let [cancelled (single-flight/cancel! request-id)]
+      (is (:datahike.query.cancel/detached? cancelled))
+      (is (:datahike.query.cancel/last-waiter? cancelled)))
+    (is (= :datahike/query-canceled
+           (:type (ex-data (:throwable @completion)))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"canceled"
+                          (single-flight/run-call! call)))
+    (is (zero? @calls))
+    (is (zero? (:active-flights (single-flight/metrics))))
+    (is (zero? (:active-callers (single-flight/metrics))))))
+
+(deftest running-owner-cancel-retains-physical-ownership-until-finish
+  (single-flight/clear!)
+  (let [key [[:db :generation :commit] :running-cancel]
+        request-id "running-owner"
+        entered (CountDownLatch. 1)
+        release (CountDownLatch. 1)
+        completion (promise)
+        call
+        (single-flight/acquire-execution!
+         key request-id (constantly nil)
+         (fn [cancel]
+           (.countDown entered)
+           (.await release 10 TimeUnit/SECONDS)
+           (is (true? @cancel))
+           :late-value)
+         (fn [_] false) nil nil nil false)
+        running (future (single-flight/run-call! call))]
+    (single-flight/on-call-complete! call #(deliver completion %))
+    (is (.await entered 10 TimeUnit/SECONDS))
+    (let [cancelled (single-flight/cancel! request-id)]
+      (is (:datahike.query.cancel/last-waiter? cancelled))
+      (is (:datahike.query.cancel/cooperative-signal-set? cancelled)))
+    (is (= :datahike/query-canceled
+           (:type (ex-data (:throwable @completion)))))
+    (is (= 1 (:active-flights (single-flight/metrics)))
+        "running physical work retains the exact entry")
+    (.countDown release)
+    (is (= :late-value @running)
+        "synchronous owner semantics remain unchanged after detachment")
+    (is (zero? (:active-flights (single-flight/metrics))))))
+
+(deftest host-overflow-rejects-without-direct-computation
+  (single-flight/clear!)
+  (binding [single-flight/*max-active-flights* 1]
+    (let [owner (single-flight/acquire! [[:db :g :c] :held] "held")
+          calls (atom 0)
+          rejected
+          (single-flight/acquire-execution!
+           [[:db :g :c] :rejected] "rejected" (constantly nil)
+           (fn [_] (swap! calls inc)) (fn [_] false) nil nil nil true)
+          completion (promise)]
+      (is (= :rejected (single-flight/call-state rejected)))
+      (single-flight/on-call-complete! rejected #(deliver completion %))
+      (is (= :datahike/query-coordinator-full
+             (:type (ex-data (:throwable @completion)))))
+      (is (zero? @calls))
+      (single-flight/complete! [[:db :g :c] :held] (:entry owner)
+                               {:status :ok :value :done})
+      (is (zero? (:active-flights (single-flight/metrics)))))))

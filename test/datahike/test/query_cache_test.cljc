@@ -429,6 +429,163 @@
                               results))))))))))
 
 #?(:clj
+   (deftest host-query-calls-complete-thirty-two-callers
+     (with-temp-db
+       [{:db/ident :host/value
+         :db/valueType :db.type/long
+         :db/cardinality :db.cardinality/one}
+        {:host/value 42}]
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (let [predicate-calls (atom 0)
+               predicate (fn [_] (swap! predicate-calls inc) true)
+               query '[:find ?value
+                       :in $ ?predicate
+                       :where [_ :host/value ?value]
+                       [(?predicate ?value)]]
+               calls
+               (mapv
+                (fn [index]
+                  (d/acquire-q!
+                   {:query query
+                    :args [@conn predicate]
+                    :request-id (str "host-call-" index)}))
+                (range 32))
+               states (mapv d/q-call-state calls)
+               completions (vec (repeatedly 32 promise))]
+           (is (= 1 (count (filter #{:run} states))))
+           (is (= 31 (count (filter #{:waiting} states))))
+           (doseq [[call completion] (map vector calls completions)]
+             (is (true? (d/on-q-complete! call #(deliver completion %)))))
+           (let [owner (first (filter #(= :run (d/q-call-state %)) calls))]
+             (is (= #{[42]} (:datahike.query/result (d/run-q! owner)))))
+           (let [responses (mapv deref completions)
+                 outcomes
+                 (mapv #(get-in % [:value :datahike.query/cache-evidence
+                                   :datahike.cache/outcome])
+                       responses)]
+             (is (every? #(= :ok (:status %)) responses))
+             (is (= 1 (count (filter #{:datahike.cache.outcome/miss-owner}
+                                     outcomes))))
+             (is (= 31 (count (filter #{:datahike.cache.outcome/miss-joined}
+                                      outcomes)))))
+           (is (= 1 @predicate-calls))
+           (is (zero? (:datahike.single-flight/active-flights
+                       (d/query-cache-evidence))))
+           (is (zero? (:datahike.single-flight/active-callers
+                       (d/query-cache-evidence)))))))))
+
+#?(:clj
+   (deftest host-query-call-release-reopen-fences-stale-owner
+     (with-temp-db
+       [{:db/ident :host.release/value
+         :db/valueType :db.type/long
+         :db/cardinality :db.cardinality/one}
+        {:host.release/value 7}]
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (let [database @conn
+               {:datahike.value/keys [connection-id generation]}
+               (d/committed-value-identity database)
+               query '[:find ?value :where [_ :host.release/value ?value]]
+               old (d/acquire-q!
+                    {:query query :args [database]
+                     :request-id "host-release-old"})
+               old-completion (promise)]
+           (is (= :run (d/q-call-state old)))
+           (d/on-q-complete! old #(deliver old-completion %))
+           (d/close-query-cache-generation! connection-id generation)
+           (is (= :datahike/query-cache-scope-closed
+                  (:type (ex-data (:throwable @old-completion)))))
+           (dq/open-query-cache-generation! connection-id generation)
+           (let [successor
+                 (d/acquire-q!
+                  {:query query :args [database]
+                   :request-id "host-release-successor"})]
+             (is (= :run (d/q-call-state successor)))
+             (is (thrown-with-msg? clojure.lang.ExceptionInfo #"scope closed"
+                                   (d/run-q! old)))
+             (is (= #{[7]}
+                    (:datahike.query/result (d/run-q! successor))))
+             (is (zero? (:datahike.single-flight/active-flights
+                         (d/query-cache-evidence))))))))))
+
+#?(:clj
+   (deftest host-query-call-shares-failure-and-retries
+     (with-temp-db
+       [{:db/ident :host.failure/value
+         :db/valueType :db.type/long
+         :db/cardinality :db.cardinality/one}
+        {:host.failure/value 9}]
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (let [fail? (atom true)
+               predicate
+               (fn [_]
+                 (if (compare-and-set! fail? true false)
+                   (throw (ex-info "shared host failure" {}))
+                   true))
+               query '[:find ?value
+                       :in $ ?predicate
+                       :where [_ :host.failure/value ?value]
+                       [(?predicate ?value)]]
+               owner
+               (d/acquire-q!
+                {:query query :args [@conn predicate]
+                 :request-id "host-failure-owner"
+                 :max-work 100})
+               waiter
+               (d/acquire-q!
+                {:query query :args [@conn predicate]
+                 :request-id "host-failure-waiter"
+                 :max-work 100})
+               owner-result (promise)
+               waiter-result (promise)]
+           (d/on-q-complete! owner #(deliver owner-result %))
+           (d/on-q-complete! waiter #(deliver waiter-result %))
+           (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                 #"shared host failure"
+                                 (d/run-q! owner)))
+           (is (= "shared host failure"
+                  (.getMessage (:throwable @owner-result))))
+           (is (= "shared host failure"
+                  (.getMessage (:throwable @waiter-result))))
+           (let [retry
+                 (d/acquire-q!
+                  {:query query :args [@conn predicate]
+                   :request-id "host-failure-retry"
+                   :max-work 100})
+                 response (d/run-q! retry)]
+             (is (= #{[9]} (:datahike.query/result response)))
+             (is (pos? (get-in response [:datahike.query/resource-evidence
+                                         :datahike.resource/work])))
+             (is (= {:datahike.resource/max-work 100}
+                    (get-in response [:datahike.query/resource-evidence
+                                      :datahike.resource/limits]))))
+           (is (zero? (:datahike.single-flight/active-flights
+                       (d/query-cache-evidence)))))))))
+
+#?(:clj
+   (deftest host-direct-query-preserves-resource-evidence
+     (with-temp-db
+       [{:db/ident :host.direct/value
+         :db/valueType :db.type/long
+         :db/cardinality :db.cardinality/one}
+        {:host.direct/value 11}]
+       (fn [conn]
+         (let [call (binding [dq/*query-result-cache?* false]
+                      (d/acquire-q!
+                       {:query '[:find ?value
+                                 :where [_ :host.direct/value ?value]]
+                        :args [@conn]
+                        :request-id "host-direct"}))
+               response (d/run-q! call)]
+           (is (= :run (d/q-call-state call)))
+           (is (= #{[11]} (:datahike.query/result response)))
+           (is (pos? (get-in response [:datahike.query/resource-evidence
+                                       :datahike.resource/work]))))))))
+
+#?(:clj
    (deftest batched-writer-invalidates-the-union-of-request-attributes
      (let [cfg {:store {:backend :memory :id (random-uuid)}
                 :writer {:backend :self :commit-wait-time 500}

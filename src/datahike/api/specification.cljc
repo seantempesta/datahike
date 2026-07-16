@@ -110,6 +110,55 @@
 ;; API Specification
 ;; =============================================================================
 
+(def host-api-specification
+  "JVM-host-only operations returning opaque process-local values.
+
+   These descriptions are consumed only by the Clojure API. They are not part
+   of generated JavaScript, Java, native, Python, pod, CLI, HTTP, or capability
+   surfaces."
+  '{acquire-q!
+    {:args [:function
+            [:=> [:cat :datahike/SQueryArgs] :any]
+            [:=> [:cat [:or [:vector :any] :map :string] [:* :any]] :any]]
+     :ret :any
+     :categories [:query :host]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? false
+     :returns-host-value? true
+     :doc "Acquires an opaque host query call without running its computation."
+     :impl datahike.query/acquire-q!}
+
+    q-call-state
+    {:args [:=> [:cat :any] [:enum :completed :run :waiting :rejected]]
+     :ret [:enum :completed :run :waiting :rejected]
+     :categories [:query :host]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? false
+     :doc "Returns bounded ordinary state for an opaque host query call."
+     :impl datahike.query/q-call-state}
+
+    on-q-complete!
+    {:args [:=> [:cat :any :ifn] :boolean]
+     :ret :boolean
+     :categories [:query :host]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? false
+     :doc "Registers one nonblocking terminal handoff for a host query call."
+     :impl datahike.query/on-q-complete!}
+
+    run-q!
+    {:args [:=> [:cat :any] :datahike/SQueryEvidence]
+     :ret :datahike/SQueryEvidence
+     :categories [:query :host]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? false
+     :doc "Runs an acquired host query owner exactly once on this thread."
+     :impl datahike.query/run-q!}})
+
 (def api-specification
   "Complete API specification for Datahike.
 
@@ -870,7 +919,7 @@
     {:args [:function
             [:=> [:cat :any :uuid] [:maybe :datahike/SDB]]
             [:=> [:cat :any :uuid [:map {:closed true}
-                                       [:secondary-indices? {:optional true} :boolean]]]
+                                   [:secondary-indices? {:optional true} :boolean]]]
              [:maybe :datahike/SDB]]]
      :ret [:maybe :datahike/SDB]
      :categories [:versioning :query]

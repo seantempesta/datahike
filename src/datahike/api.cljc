@@ -33,7 +33,9 @@
   #?(:cljs (:require-macros [datahike.api :refer [emit-api]]))
   (:require [datahike.connector :as dc]
             [datahike.config :as config]
-            [datahike.api.specification :refer [api-specification malli-schema->argslist]]
+            [datahike.api.specification :refer [api-specification
+                                                host-api-specification
+                                                malli-schema->argslist]]
             [datahike.api.impl]
             #?(:cljs [datahike.api.async])
             [datahike.writer :as dw]
@@ -70,7 +72,7 @@
                                :doc      doc})
                        [& args#]
                        (datahike.api.async/chan->promise
-                         (apply ~impl args#)))
+                        (apply ~impl args#)))
                     ;; CLJ — or CLJS sync fn — alias straight to the
                     ;; impl. Callers use the result as a value.
                     `(def ~(with-meta n
@@ -78,6 +80,9 @@
                               :doc      doc})
                        ~impl))))
           ()
-          (into (sorted-map) api-specification)))))
+          (into (sorted-map)
+                (if cljs?
+                  api-specification
+                  (concat api-specification host-api-specification)))))))
 
 (emit-api)
