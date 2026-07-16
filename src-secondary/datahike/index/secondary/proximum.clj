@@ -159,8 +159,8 @@
               cur @!idx
               results (if entity-filter
                         (prox/search-filtered cur qv k
-                                              (fn [ext-id _meta]
-                                                (es/entity-bitset-contains? entity-filter (long ext-id))))
+                                              (set (es/entity-bitset-seq
+                                                    entity-filter)))
                         (prox/search cur qv k))]
           (es/entity-bitset-from-longs (map :id results))))
 
@@ -180,8 +180,8 @@
               cur @!idx
               results (if entity-filter
                         (prox/search-filtered cur qv effective-k
-                                              (fn [ext-id _meta]
-                                                (es/entity-bitset-contains? entity-filter (long ext-id))))
+                                              (set (es/entity-bitset-seq
+                                                    entity-filter)))
                         (prox/search cur qv effective-k))]
           ;; Return as seq of {:entity-id :distance} for the caller to project
           (mapv (fn [{:keys [id distance]}]
