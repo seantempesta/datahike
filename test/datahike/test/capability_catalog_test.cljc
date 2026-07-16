@@ -18,6 +18,7 @@
   (let [catalog (specification/capability-catalog)
         operations (:datahike.capability/operations catalog)
         query (get operations :datahike.operation/query)
+        schema (get operations :datahike.operation/schema)
         evidence (get operations :datahike.operation/query-with-evidence)]
     (is (= 1 (:datahike.capability/version catalog)))
     (is (plain-data? catalog))
@@ -25,6 +26,8 @@
            (:datahike.capability.operation/api-name query)))
     (is (:datahike.capability.operation/cacheable? query))
     (is (:datahike.capability.operation/cancellable? query))
+    (is (= :datahike.api/schema
+           (:datahike.capability.operation/api-name schema)))
     (is (= #{:max-work :max-results :max-result-weight}
            (:datahike.capability.operation/resource-options evidence)))
     (is (every? namespace (mapcat keys (vals operations))))

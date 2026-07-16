@@ -4,6 +4,12 @@
                               :cljs cljs.core/PersistentQueue.EMPTY))
 
 (defonce ^:private sources (atom {}))
+(def ^:private maximum-active-sources 4096)
+(defonce ^:private ready-sources (atom empty-queue))
+
+(defn- with-source-lock [source f]
+  #?(:clj (locking source (f))
+     :cljs (f)))
 
 (defn- public-evidence [state]
   {:datahike.committed-report/status
@@ -14,6 +20,18 @@
    :datahike.committed-report/overflowed (:overflowed state)
    :datahike.committed-report/stale-rejected (:stale-rejected state)
    :datahike.committed-report/abandoned (:abandoned state)})
+
+(defn- enqueue-ready! [source]
+  (swap! ready-sources
+         (fn [ready]
+           ;; One entry per active source makes this bound structural: a source
+           ;; becomes ready again only after its prior entry has been removed.
+           (conj ready source))))
+
+(defn- remove-ready! [source]
+  (swap! ready-sources
+         (fn [ready]
+           (into empty-queue (remove #(identical? source %)) ready))))
 
 (defn- scope-of [db]
   (let [{:datahike.cache/keys [connection-id generation]}
@@ -34,6 +52,8 @@
                    :state (atom {:status :open
                                  :queue empty-queue
                                  :queued 0
+                                 :ready? false
+                                 :readiness-queued? false
                                  :offered 0
                                  :delivered 0
                                  :overflowed 0
@@ -41,39 +61,55 @@
                                  :abandoned 0})}]
     (get (swap! sources
                 (fn [current]
-                  (if (contains? current scope)
-                    current
-                    (assoc current scope candidate))))
+                  (cond
+                    (contains? current scope) current
+                    (< (count current) maximum-active-sources)
+                    (assoc current scope candidate)
+                    :else
+                    (throw (ex-info "Too many active committed-report sources."
+                                    {:type :datahike.committed-report/source-limit
+                                     :maximum maximum-active-sources})))))
          scope)))
 
 (defn offer!
   "Offer one committed report without blocking or invoking downstream work."
   [source generation report]
   (let [[_ expected-generation] (:scope source)
-        outcome (volatile! :rejected)]
-    (swap! (:state source)
-           (fn [{:keys [status queued] :as state}]
-             (cond
-               (not= expected-generation generation)
-               (do (vreset! outcome :stale)
-                   (update state :stale-rejected inc))
+        outcome (volatile! :rejected)
+        became-ready? (volatile! false)]
+    (with-source-lock
+      source
+      (fn []
+        (swap! (:state source)
+               (fn [{:keys [status queued ready?] :as state}]
+                 (cond
+                   (not= expected-generation generation)
+                   (do (vreset! outcome :stale)
+                       (update state :stale-rejected inc))
 
-               (not= :open status)
-               (do (vreset! outcome :closed)
-                   (update state :stale-rejected inc))
+                   (not= :open status)
+                   (do (vreset! outcome :closed)
+                       (update state :stale-rejected inc))
 
-               (< queued (:capacity source))
-               (do (vreset! outcome :accepted)
-                   (-> state
-                       (update :queue conj report)
-                       (update :queued inc)
-                       (update :offered inc)))
+                   (< queued (:capacity source))
+                   (do (vreset! outcome :accepted)
+                       (when-not ready? (vreset! became-ready? true))
+                       (cond-> (-> state
+                                   (assoc :ready? true)
+                                   (update :queue conj report)
+                                   (update :queued inc)
+                                   (update :offered inc))
+                         (not ready?) (assoc :readiness-queued? true)))
 
-               :else
-               (do (vreset! outcome :overflow)
-                   (-> state
-                       (assoc :status :gapped)
-                       (update :overflowed inc))))))
+                   :else
+                   (do (vreset! outcome :overflow)
+                       (when-not ready? (vreset! became-ready? true))
+                       (cond-> (-> state
+                                   (assoc :status :gapped :ready? true)
+                                   (update :overflowed inc))
+                         (not ready?) (assoc :readiness-queued? true))))))
+        (when @became-ready?
+          (enqueue-ready! source))))
     @outcome))
 
 (defn offer-committed!
@@ -86,32 +122,76 @@
 (defn poll!
   "Take the next accepted report from a source without blocking."
   [source]
-  (let [report (volatile! nil)]
-    (swap! (:state source)
-           (fn [{:keys [queue queued] :as state}]
-             (if (pos? queued)
-               (do (vreset! report (peek queue))
-                   (-> state
-                       (assoc :queue (pop queue))
-                       (update :queued dec)
-                       (update :delivered inc)))
-               state)))
+  (let [report (volatile! nil)
+        remove-readiness? (volatile! false)]
+    (with-source-lock
+      source
+      (fn []
+        (swap! (:state source)
+               (fn [{:keys [queue queued] :as state}]
+                 (if (pos? queued)
+                   (do (vreset! report (peek queue))
+                       (when (= 1 queued)
+                         (vreset! remove-readiness?
+                                  (:readiness-queued? state)))
+                       (cond-> (-> state
+                                   (assoc :queue (pop queue))
+                                   (update :queued dec)
+                                   (update :delivered inc))
+                         (= 1 queued)
+                         (assoc :ready? false :readiness-queued? false)))
+                   state)))
+        (when (and @report
+                   (not (:ready? @(:state source)))
+                   @remove-readiness?)
+          (remove-ready! source))))
     @report))
+
+(defn poll-ready!
+  "Take one source whose accepted reports or gap are ready to inspect."
+  []
+  (let [source (volatile! nil)]
+    (swap! ready-sources
+           (fn [ready]
+             (if (seq ready)
+               (do (vreset! source (peek ready))
+                   (pop ready))
+               ready)))
+    (when-let [ready-source @source]
+      (with-source-lock
+        ready-source
+        (fn []
+          (swap! (:state ready-source) assoc :readiness-queued? false)))
+      ready-source)))
+
+(defn readiness-evidence
+  "Return bounded process-wide committed-report readiness evidence."
+  []
+  {:datahike.committed-report.readiness/queued (count @ready-sources)
+   :datahike.committed-report.readiness/capacity maximum-active-sources
+   :datahike.committed-report.readiness/active-sources (count @sources)})
 
 (defn close!
   "Fence one exact source and either retain or abandon its accepted reports."
   [source drain?]
   (let [scope (:scope source)]
-    (swap! sources
-           (fn [current]
-             (if (identical? source (get current scope))
-               (dissoc current scope)
-               current)))
-    (swap! (:state source)
-           (fn [{:keys [queued] :as state}]
-             (cond-> (assoc state :status :closed)
-               (not drain?) (-> (assoc :queue empty-queue :queued 0)
-                                (update :abandoned + queued)))))
+    (with-source-lock
+      source
+      (fn []
+        (swap! sources
+               (fn [current]
+                 (if (identical? source (get current scope))
+                   (dissoc current scope)
+                   current)))
+        (remove-ready! source)
+        (swap! (:state source)
+               (fn [{:keys [queued] :as state}]
+                 (cond-> (assoc state
+                                :status :closed
+                                :ready? false
+                                :readiness-queued? false)
+                   (not drain?) (-> (assoc :queue empty-queue :queued 0)
+                                    (update :abandoned + queued)))))))
     (public-evidence @(:state source))))
 
 (defn close-scope!
@@ -144,4 +224,5 @@
   (let [current (vals (swap! sources (constantly {})))]
     (doseq [source current]
       (close! source false))
+    (reset! ready-sources empty-queue)
     nil))

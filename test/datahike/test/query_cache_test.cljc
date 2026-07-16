@@ -35,7 +35,7 @@
     :db/cardinality :db.cardinality/many}
    {:db/ident :c/note
     :db/valueType :db.type/string
-   :db/cardinality :db.cardinality/one}])
+    :db/cardinality :db.cardinality/one}])
 
 #?(:clj
    (defn- query-cache-keys []
@@ -122,7 +122,7 @@
          (d/transact conn [{:c/id "identity" :c/note "committed"}])
          (let [committed @conn
                speculative (:db-after (d/with committed [{:c/id "identity"
-                                                           :c/note "speculative"}]))]
+                                                          :c/note "speculative"}]))]
            (is (= 3 (count (db/committed-cache-identity committed))))
            (is (nil? (db/committed-cache-identity speculative)))
            (is (nil? (db/committed-cache-identity (d/as-of committed (:max-tx committed)))))
@@ -221,10 +221,10 @@
                       (Thread/sleep 75)
                       true)
                run #(d/q '[:find ?n
-                            :in $ ?pred
-                            :where [_ :c/note ?n]
-                                   [(?pred ?n)]]
-                          database pred)
+                           :in $ ?pred
+                           :where [_ :c/note ?n]
+                           [(?pred ?n)]]
+                         database pred)
                workers (doall
                         (for [_ (range 16)]
                           (future (.await start) (run))))]
@@ -253,6 +253,24 @@
            (is (= :datahike.cache.outcome/hit
                   (get-in hit [:datahike.query/cache-evidence
                                :datahike.cache/outcome])))
+           (is (= #{:c/note}
+                  (:datahike.query/attribute-dependencies owner)
+                  (:datahike.query/attribute-dependencies hit)))
+           (is (= #{:c/note}
+                  (:datahike.query/attribute-dependencies
+                   (with-redefs [dq/query-attribute-dependencies
+                                 (fn [_]
+                                   (throw (ex-info "unexpected recomputation"
+                                                   {})))]
+                     (dq/q-with-evidence query database)))))
+           (is (= #{:c/note}
+                  (:datahike.query/attribute-dependencies
+                   (binding [dq/*query-result-cache?* false]
+                     (dq/q-with-evidence query database)))))
+           (is (= :all
+                  (:datahike.query/attribute-dependencies
+                   (dq/q-with-evidence
+                    '[:find ?attribute :where [_ ?attribute _]] database))))
            (is (pos? (get-in owner [:datahike.query/resource-evidence
                                     :datahike.resource/work])))
            (is (= 0 (get-in hit [:datahike.query/resource-evidence
@@ -274,7 +292,7 @@
                query '[:find ?n
                        :in $ ?pred
                        :where [_ :c/note ?n]
-                              [(?pred ?n)]]
+                       [(?pred ?n)]]
                input {:query query
                       :args [database predicate]
                       :max-work 1000
@@ -339,7 +357,7 @@
                query '[:find ?n
                        :in $ ?pred
                        :where [_ :c/note ?n]
-                              [(?pred ?n)]]
+                       [(?pred ?n)]]
                run (fn [max-work]
                      (.await start)
                      (try
@@ -385,7 +403,7 @@
                      {:query '[:find ?n
                                :in $ ?predicate
                                :where [_ :c/note ?n]
-                                      [(?predicate ?n)]]
+                               [(?predicate ?n)]]
                       :args [database predicate]
                       :request-id (str (random-uuid))
                       :max-work 1000
@@ -400,6 +418,8 @@
              (is (= 1 @calls))
              (is (= 1 (:datahike.cache.outcome/miss-owner outcomes)))
              (is (= 7 (:datahike.cache.outcome/miss-joined outcomes)))
+             (is (= #{#{:c/note}}
+                    (set (map :datahike.query/attribute-dependencies results))))
              (is (= #{["value"]}
                     (:datahike.query/result (first results))))
              (is (= #{:datahike.resource.scope/local-computation

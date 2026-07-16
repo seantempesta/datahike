@@ -73,7 +73,8 @@
    Bind to false for benchmarking raw query execution."
   true)
 
-(declare -collect -resolve-clause resolve-clause raw-q memoized-parse-query)
+(declare -collect -resolve-clause resolve-clause raw-q memoized-parse-query
+         query-attribute-dependencies)
 
 ;; Records
 
@@ -123,14 +124,21 @@
 (defn q-with-evidence
   "Executes a query and returns its result with bounded cache/resource evidence."
   [query & inputs]
-  (let [cache-evidence (volatile! {:datahike.cache/outcome
+  (let [query-map (normalize-q-input query inputs)
+        attribute-dependencies
+        (delay (query-attribute-dependencies (:query query-map)))
+        dependency-evidence (volatile! nil)
+        cache-evidence (volatile! {:datahike.cache/outcome
                                    :datahike.cache.outcome/uncacheable
                                    :datahike.cache/stored? false
                                    :datahike.cache/saved-computation? false})
         resource-evidence (volatile! (resource/budget-evidence nil))]
     (binding [resource/*evidence-sink* resource-evidence]
-      (let [result (raw-q (normalize-q-input query inputs) cache-evidence)]
+      (let [result (raw-q query-map cache-evidence attribute-dependencies
+                          dependency-evidence)]
         {:datahike.query/result result
+         :datahike.query/attribute-dependencies
+         (or @dependency-evidence @attribute-dependencies)
          :datahike.query/cache-evidence @cache-evidence
          :datahike.query/resource-evidence
          (assoc @resource-evidence
@@ -4178,96 +4186,116 @@
 
 (defn raw-q
   ([query-map] (raw-q query-map nil))
+  ([query-map cache-evidence] (raw-q query-map cache-evidence nil))
+  ([query-map cache-evidence attribute-dependencies]
+   (raw-q query-map cache-evidence attribute-dependencies nil))
   ([{:keys [query args stats? count-fns? offset limit order-by
             request-id max-work max-results max-result-weight] :as query-map}
-    cache-evidence]
-  (let [resource-options {:max-work max-work
-                          :max-results max-results
-                          :max-result-weight max-result-weight}
-        uncached (fn [shared-cancel]
-                   (let [effective-query-map
-                         (if shared-cancel
-                           (assoc query-map :cancel shared-cancel)
-                           query-map)]
-                     #?(:clj (or (when-not (or max-work max-results max-result-weight)
-                                   (try-secondary-index-aggregate-fast effective-query-map))
-                                 (raw-q* effective-query-map))
-                        :cljs (raw-q* effective-query-map))))]
-    (if (or (not *query-result-cache?*)
-            stats?
-            count-fns?                         ;; counting needs re-execution; a cache hit wouldn't re-run the fn
-            #?(:clj *profile?* :cljs false))
-      (do (when cache-evidence
-            (vreset! cache-evidence
-                     {:datahike.cache/outcome
-                      :datahike.cache.outcome/uncacheable
-                      :datahike.cache/stored? false
-                      :datahike.cache/saved-computation? false}))
-          (uncached nil))
+    cache-evidence attribute-dependencies dependency-evidence]
+   (let [resource-options {:max-work max-work
+                           :max-results max-results
+                           :max-result-weight max-result-weight}
+         attribute-dependencies
+         (or attribute-dependencies
+             (delay (query-attribute-dependencies query)))
+         uncached (fn [shared-cancel]
+                    (let [effective-query-map
+                          (if shared-cancel
+                            (assoc query-map :cancel shared-cancel)
+                            query-map)]
+                      #?(:clj (or (when-not (or max-work max-results max-result-weight)
+                                    (try-secondary-index-aggregate-fast effective-query-map))
+                                  (raw-q* effective-query-map))
+                         :cljs (raw-q* effective-query-map))))]
+     (if (or (not *query-result-cache?*)
+             stats?
+             count-fns?                         ;; counting needs re-execution; a cache hit wouldn't re-run the fn
+             #?(:clj *profile?* :cljs false))
+       (do (when cache-evidence
+             (vreset! cache-evidence
+                      {:datahike.cache/outcome
+                       :datahike.cache.outcome/uncacheable
+                       :datahike.cache/stored? false
+                       :datahike.cache/saved-computation? false}))
+           (uncached nil))
       ;; Try result cache
-      (let [db (first args)
-            db-key (db-cache-key db)]
-        (if-not db-key
-          (do (when cache-evidence
-                (vreset! cache-evidence
-                         {:datahike.cache/outcome
-                          :datahike.cache.outcome/uncacheable
-                          :datahike.cache/stored? false
-                          :datahike.cache/saved-computation? false}))
-              (uncached nil))
-          (let [non-db-args (vec (rest args))
-                cache-epoch (:epoch @query-result-cache)
+       (let [db (first args)
+             db-key (db-cache-key db)]
+         (if-not db-key
+           (do (when cache-evidence
+                 (vreset! cache-evidence
+                          {:datahike.cache/outcome
+                           :datahike.cache.outcome/uncacheable
+                           :datahike.cache/stored? false
+                           :datahike.cache/saved-computation? false}))
+               (uncached nil))
+           (let [non-db-args (vec (rest args))
+                 cache-epoch (:epoch @query-result-cache)
                 ;; scale-sensitive-key: BigDecimal args/consts of equal value but
                 ;; different scale (1.50M vs 1.500M) are `=` with equal hash in
                 ;; Clojure, so they'd share a result-cache entry and return the
                 ;; first-cached scale. Keep them distinct.
-                cache-key (scale-sensitive-key
-                           [query non-db-args offset limit order-by *disable-planner*])
-                cached (result-cache-get db cache-key)]
+                 cache-key (scale-sensitive-key
+                            [query non-db-args offset limit order-by *disable-planner*])
+                 cached (result-cache-get db cache-key)]
             ;; Completed hits never enter the in-flight path and therefore do
             ;; not allocate a promise, request identity, flight key, or delayed
             ;; dependency analysis. The coordinator rechecks on a miss to close
             ;; the race with a concurrent owner publishing after this read.
-            (if cached
-              (do (resource/certify-cached-result! (:result cached)
-                                                   resource-options)
-                  (when cache-evidence
-                    (vreset! cache-evidence
-                             {:datahike.cache/outcome
-                              :datahike.cache.outcome/hit
-                              :datahike.cache/stored? true
-                              :datahike.cache/saved-computation? false}))
-                  (:result cached))
-              (let [attr-deps (delay (query-attribute-dependencies query))
-                    computation-evidence (volatile! nil)
-                    compute (fn [shared-cancel]
-                              (let [sink (volatile! nil)]
-                                (binding [resource/*evidence-sink* sink]
-                                  (try
-                                    (uncached shared-cancel)
-                                    (finally
-                                      (vreset! computation-evidence @sink))))))]
-                (let [result
-                      (single-flight/execute!
-                       [db-key cache-key max-work max-results max-result-weight]
-                       request-id
-                       #(when-let [entry (result-cache-get db cache-key)]
-                          (resource/certify-cached-result! (:result entry)
-                                                           resource-options)
-                          {:value (:result entry)})
-                       compute
-                       #(result-cache-put! db cache-key % @attr-deps
-                                           cache-epoch)
-                       #(when cache-evidence (vreset! cache-evidence %))
-                       #(when-let [evidence @computation-evidence]
-                          {:datahike.query/resource-evidence evidence})
-                       #(when-let [evidence
-                                   (:datahike.query/resource-evidence %)]
-                          (when resource/*evidence-sink*
-                            (vreset! resource/*evidence-sink* evidence))))]
-                  (when (and resource/*evidence-sink* @computation-evidence)
-                    (vreset! resource/*evidence-sink* @computation-evidence))
-                  result))))))))))
+             (if cached
+               (do (resource/certify-cached-result! (:result cached)
+                                                    resource-options)
+                   (when dependency-evidence
+                     (vreset! dependency-evidence (:attrs cached)))
+                   (when cache-evidence
+                     (vreset! cache-evidence
+                              {:datahike.cache/outcome
+                               :datahike.cache.outcome/hit
+                               :datahike.cache/stored? true
+                               :datahike.cache/saved-computation? false}))
+                   (:result cached))
+               (let [computation-evidence (volatile! nil)
+                     compute (fn [shared-cancel]
+                               (let [sink (volatile! nil)]
+                                 (binding [resource/*evidence-sink* sink]
+                                   (try
+                                     (uncached shared-cancel)
+                                     (finally
+                                       (vreset! computation-evidence @sink))))))]
+                 (let [result
+                       (single-flight/execute!
+                        [db-key cache-key max-work max-results max-result-weight]
+                        request-id
+                        #(when-let [entry (result-cache-get db cache-key)]
+                           (resource/certify-cached-result! (:result entry)
+                                                            resource-options)
+                           (when dependency-evidence
+                             (vreset! dependency-evidence (:attrs entry)))
+                           {:value (:result entry)})
+                        compute
+                        #(result-cache-put! db cache-key % @attribute-dependencies
+                                            cache-epoch)
+                        #(when cache-evidence (vreset! cache-evidence %))
+                        #(cond-> {:datahike.query/attribute-dependencies
+                                  (or (when dependency-evidence
+                                        @dependency-evidence)
+                                      @attribute-dependencies)}
+                           @computation-evidence
+                           (assoc :datahike.query/resource-evidence
+                                  @computation-evidence))
+                        (fn [completed]
+                          (when-let [evidence
+                                     (:datahike.query/resource-evidence
+                                      completed)]
+                            (when resource/*evidence-sink*
+                              (vreset! resource/*evidence-sink* evidence)))
+                          (when dependency-evidence
+                            (vreset! dependency-evidence
+                                     (:datahike.query/attribute-dependencies
+                                      completed)))))]
+                   (when (and resource/*evidence-sink* @computation-evidence)
+                     (vreset! resource/*evidence-sink* @computation-evidence))
+                   result))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Register legacy functions for CLJS execute.cljc (breaks circular dep)

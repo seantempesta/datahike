@@ -934,6 +934,7 @@
      :stability :stable
      :supports-remote? true
      :referentially-transparent? true
+     :capability-operation :datahike.operation/schema
      :doc "Returns current schema definition."
      :examples [{:desc "Get schema"
                  :code "(schema @conn)"}]

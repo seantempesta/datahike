@@ -15,6 +15,7 @@
     (is (= :accepted (reports/offer! source generation {:sequence 1})))
     (is (= :accepted (reports/offer! source generation {:sequence 2})))
     (is (= :overflow (reports/offer! source generation {:sequence 3})))
+    (is (identical? source (reports/poll-ready!)))
     (is (= :closed (reports/offer! source generation {:sequence 4})))
     (is (= {:sequence 1} (reports/poll! source)))
     (is (= {:sequence 2} (reports/poll! source)))
@@ -28,6 +29,41 @@
             :datahike.committed-report/stale-rejected 1
             :datahike.committed-report/abandoned 0}
            (reports/evidence source)))))
+
+(deftest readiness-handoff-is-transition-driven-and-bounded
+  (let [generation (random-uuid)
+        source (reports/open! :connection generation 3)]
+    (is (= {:datahike.committed-report.readiness/queued 0
+            :datahike.committed-report.readiness/capacity 4096
+            :datahike.committed-report.readiness/active-sources 1}
+           (reports/readiness-evidence)))
+    (is (= :accepted (reports/offer! source generation {:sequence 1})))
+    (is (= :accepted (reports/offer! source generation {:sequence 2})))
+    (is (= 1 (:datahike.committed-report.readiness/queued
+              (reports/readiness-evidence))))
+    (is (identical? source (reports/poll-ready!)))
+    (is (nil? (reports/poll-ready!)))
+    (is (= [{:sequence 1} {:sequence 2}]
+           [(reports/poll! source) (reports/poll! source)]))
+    (is (= :accepted (reports/offer! source generation {:sequence 3})))
+    (is (identical? source (reports/poll-ready!)))
+    (is (= {:sequence 3} (reports/poll! source)))))
+
+(deftest gapped-source-closes-and-reopens-without-stale-readiness
+  (let [generation (random-uuid)
+        source (reports/open! :connection generation 1)]
+    (is (= :accepted (reports/offer! source generation {:sequence 1})))
+    (is (identical? source (reports/poll-ready!)))
+    (is (= :overflow (reports/offer! source generation {:sequence 2})))
+    (is (= :datahike.committed-report.status/gapped
+           (:datahike.committed-report/status (reports/evidence source))))
+    (is (= {:sequence 1} (reports/poll! source)))
+    (reports/close! source false)
+    (let [reopened (reports/open! :connection generation 1)]
+      (is (not (identical? source reopened)))
+      (is (= :accepted (reports/offer! reopened generation {:sequence 3})))
+      (is (identical? reopened (reports/poll-ready!)))
+      (is (= {:sequence 3} (reports/poll! reopened))))))
 
 (deftest generation-fence-and-compare-remove-prevent-aba
   (let [old-generation (random-uuid)
@@ -132,6 +168,10 @@
       (reports/open! connection-id generation 2)
       (d/transact connection [{:db/id 1 :value :accepted}])
       (is (= 1 (reports/active-source-count)))
+      (is (= 1 (:datahike.committed-report.readiness/queued
+                (reports/readiness-evidence))))
       (d/release connection)
       (is (zero? (reports/active-source-count)))
+      (is (zero? (:datahike.committed-report.readiness/queued
+                  (reports/readiness-evidence))))
       (d/delete-database configuration))))
