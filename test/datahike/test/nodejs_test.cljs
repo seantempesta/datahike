@@ -86,6 +86,7 @@
                                   :db/cardinality :db.cardinality/one}
                                  {:cache/id "one" :cache/value "before"}]))
         (let [committed @conn
+              earlier-t (:max-tx committed)
               [connection-id generation-before _]
               (db/committed-cache-identity committed)
               speculative (:db-after
@@ -102,6 +103,27 @@
                                      :cache/value "after"}]))
           (is (= #{["after"]}
                  (d/q '[:find ?v :where [_ :cache/value ?v]] @conn)))
+          (let [temporal (d/as-of @conn earlier-t)
+                predicate-calls (atom 0)
+                predicate (fn [_] (swap! predicate-calls inc) true)
+                query '[:find ?value
+                        :in $ ?predicate
+                        :where [_ :cache/value ?value]
+                        [(?predicate ?value)]]
+                owner (dq/q-with-evidence query temporal predicate)
+                hit (dq/q-with-evidence query temporal predicate)]
+            (is (= #{["before"]}
+                   (:datahike.query/result owner)
+                   (:datahike.query/result hit)))
+            (is (= 1 @predicate-calls))
+            (is (= :datahike.cache.outcome/miss-owner
+                   (get-in owner [:datahike.query/cache-evidence
+                                  :datahike.cache/outcome])))
+            (is (= :datahike.cache.outcome/hit
+                   (get-in hit [:datahike.query/cache-evidence
+                                :datahike.cache/outcome])))
+            (is (zero? (get-in hit [:datahike.query/resource-evidence
+                                    :datahike.resource/work]))))
           (await (d/release conn))
           (is (zero? (:snapshot-count (dq/query-cache-metrics))))
           (let [reconnected (await (d/connect cfg))

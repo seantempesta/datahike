@@ -2577,9 +2577,19 @@
           (dissoc single-flight :active-by-database))))
 
 (defn- db-cache-key
-  "Return exact committed identity, or nil for speculative and wrapped values."
+  "Return exact committed identity for one cache-eligible database value."
   [database]
-  (db/committed-cache-identity database))
+  (if (instance? AsOfDB database)
+    (let [origin (dbi/-origin database)
+          time-point (dbi/-time-point database)
+          origin-key (when (instance? DB origin)
+                       (db/committed-cache-identity origin))]
+      (when (and origin-key
+                 (integer? time-point)
+                 (<= const/tx0 time-point)
+                 (< time-point (dbi/-max-tx origin)))
+        (conj origin-key (long time-point))))
+    (db/committed-cache-identity database)))
 
 (defn- extract-query-attr-deps
   "Extract the set of attributes referenced in where-clauses.

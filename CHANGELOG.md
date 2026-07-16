@@ -20,6 +20,15 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 - **Committed database cache identity and scoped query-cache lifetime** — attached head values now carry exact `[connection-id generation commit-id]` identity. Speculative `with` values and temporal/filtered wrappers do not enter the shared result cache; final connection release atomically fences late inserts and evicts that generation. Successful batched commits propagate unaffected entries once from the durable parent to the final committed child. Cache occupancy is available through `datahike.query/query-cache-metrics`. *Experimental.* ([#TODO])
 
+- **Exact earlier `AsOfDB` query sharing** — direct numeric as-of queries over
+  an attached committed value now reuse completed results and join identical
+  in-flight JVM computation under `[connection-id generation commit-id t]`.
+  Different transaction cuts, containing commits, connection generations,
+  queries, arguments, or cold resource limits remain isolated. Date, head or
+  future as-of values and other temporal/filtered compositions remain direct.
+  Final release, reconnect, explicit clear, cancellation, and failure retain
+  the existing generation-fenced behavior. *Experimental.* ([#TODO])
+
 - **Public query dependency projection (`query-attribute-dependencies`)** — exposes the query result cache's pure conservative attribute analysis through `datahike.api`. Literal where/pull attributes return a set; variables, rules, wildcard/input-bound pulls, malformed forms, and unknown clauses return `:all`. The projection executes no query and retains no database value. *Experimental.* ([#TODO])
 
 - **diff-buf write-buffering (per-store, opt-in)** — persistent-sorted-set's diff-buf buffers a commit's content-only child diffs inside the rewritten ancestor instead of rewriting the whole root→leaf spine, cutting small-commit object writes from ~`depth+1` PUTs per index to ~1 — the biggest win on request-priced object stores. Enable at database creation with `:index-config {:diff-buf-size 256}` (default `0` = off; the on-disk format is unchanged when off). The setting is create-time-fixed and adopted from the store at connect, so reconnects don't need to re-specify it (an explicitly conflicting value raises). Composes with `:crypto-hash?`: a branch's content address folds its buffered diffs, so the merkle audit (`datahike.audit/verify-chain :deep?`) detects slot tampering like any other content; note the hash is representation-dependent — identical logical content hashes differently under different `:diff-buf-size` settings. On-disk format requires persistent-sorted-set ≥ 0.4.126 (older readers refuse slot-bearing stores via the existing version guard); **correctness requires ≥ 0.4.137**, which is what this PR pins — 0.4.136 made a commit's settle atomically published against a pipelining writer's structural-sharing copies (NodeState), and 0.4.137 made diff-buf projection land on a copy so tree versions sharing a durable anchor through the node cache can't clobber each other's reads. See [Reducing write amplification](doc/write-amplification.md). *Experimental.* ([#867])

@@ -12,18 +12,21 @@
 
 (defn- with-temp-db
   "Create a temp in-memory db with schema, run f with the connection, then clean up."
-  [schema-txs f]
-  (let [cfg {:store {:backend :memory :id (random-uuid)}
-             :schema-flexibility :write
-             :attribute-refs? false}
-        _ (d/create-database cfg)
-        conn (d/connect cfg)]
-    (try
-      (d/transact conn schema-txs)
-      (f conn)
-      (finally
-        (d/release conn)
-        (d/delete-database cfg)))))
+  ([schema-txs f]
+   (with-temp-db {} schema-txs f))
+  ([config schema-txs f]
+   (let [cfg (merge {:store {:backend :memory :id (random-uuid)}
+                     :schema-flexibility :write
+                     :attribute-refs? false}
+                    config)
+         _ (d/create-database cfg)
+         conn (d/connect cfg)]
+     (try
+       (d/transact conn schema-txs)
+       (f conn)
+       (finally
+         (d/release conn)
+         (d/delete-database cfg))))))
 
 (def ^:private label-schema
   [{:db/ident :c/id
@@ -127,6 +130,380 @@
            (is (nil? (db/committed-cache-identity speculative)))
            (is (nil? (db/committed-cache-identity (d/as-of committed (:max-tx committed)))))
            (is (nil? (db/committed-cache-identity (d/history committed)))))))))
+
+#?(:clj
+   (deftest direct-earlier-numeric-as-of-has-private-query-cache-identity
+     (with-temp-db
+       {:keep-history? true}
+       (conj label-schema {:c/id "temporal-identity" :c/note "before"})
+       (fn [conn]
+         (let [earlier-t (:max-tx @conn)
+               _ (d/transact conn [{:c/id "temporal-identity" :c/note "after"}])
+               head @conn
+               raw-key (db/committed-cache-identity head)
+               temporal (d/as-of head earlier-t)
+               speculative (:db-after
+                            (d/with head [{:c/id "temporal-identity"
+                                           :c/note "local"}]))
+               detached (db/clear-cache-context head)]
+           (is (= (conj raw-key earlier-t) (#'dq/db-cache-key temporal)))
+           (is (nil? (db/committed-cache-identity temporal))
+               "the public committed identity remains raw-only")
+           (is (nil? (#'dq/db-cache-key
+                      (d/as-of head (java.util.Date.)))))
+           (is (nil? (#'dq/db-cache-key (d/as-of head (:max-tx head)))))
+           (is (nil? (#'dq/db-cache-key (d/as-of head (inc (:max-tx head))))))
+           (is (nil? (#'dq/db-cache-key (d/history temporal))))
+           (is (nil? (#'dq/db-cache-key (d/history head))))
+           (is (nil? (#'dq/db-cache-key (d/since head earlier-t))))
+           (is (nil? (#'dq/db-cache-key (d/filter temporal (constantly true)))))
+           (is (nil? (#'dq/db-cache-key (d/as-of speculative earlier-t))))
+           (is (nil? (#'dq/db-cache-key (d/as-of detached earlier-t)))))))))
+
+#?(:clj
+   (deftest temporal-host-query-calls-share-thirty-two-callers-and-completed-hit
+     (with-temp-db
+       {:keep-history? true}
+       (conj label-schema {:c/id "temporal-host" :c/note "before"})
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (let [earlier-t (:max-tx @conn)
+               _ (d/transact conn [{:c/id "temporal-host" :c/note "after"}])
+               temporal (d/as-of @conn earlier-t)
+               predicate-calls (atom 0)
+               predicate (fn [_] (swap! predicate-calls inc) true)
+               query '[:find ?value
+                       :in $ ?predicate
+                       :where [_ :c/note ?value]
+                       [(?predicate ?value)]]
+               calls
+               (mapv
+                (fn [index]
+                  (d/acquire-q!
+                   {:query query
+                    :args [temporal predicate]
+                    :request-id (str "temporal-host-" index)}))
+                (range 32))
+               states (mapv d/q-call-state calls)
+               completions (vec (repeatedly 32 promise))]
+           (is (= 1 (count (filter #{:run} states))))
+           (is (= 31 (count (filter #{:waiting} states))))
+           (doseq [[call completion] (map vector calls completions)]
+             (is (true? (d/on-q-complete! call #(deliver completion %)))))
+           (let [owner (first (filter #(= :run (d/q-call-state %)) calls))]
+             (is (= #{["before"]}
+                    (:datahike.query/result (d/run-q! owner)))))
+           (let [responses (mapv deref completions)
+                 outcomes (frequencies
+                           (map #(get-in % [:value
+                                            :datahike.query/cache-evidence
+                                            :datahike.cache/outcome])
+                                responses))]
+             (is (every? #(= :ok (:status %)) responses))
+             (is (= 1 (:datahike.cache.outcome/miss-owner outcomes)))
+             (is (= 31 (:datahike.cache.outcome/miss-joined outcomes))))
+           (is (= 1 @predicate-calls))
+           (let [hit (dq/q-with-evidence query temporal predicate)]
+             (is (= #{["before"]} (:datahike.query/result hit)))
+             (is (= :datahike.cache.outcome/hit
+                    (get-in hit [:datahike.query/cache-evidence
+                                 :datahike.cache/outcome])))
+             (is (zero? (get-in hit [:datahike.query/resource-evidence
+                                     :datahike.resource/work]))))
+           (is (= 1 @predicate-calls))
+           (is (zero? (:datahike.single-flight/active-flights
+                       (d/query-cache-evidence))))
+           (is (zero? (:datahike.single-flight/active-callers
+                       (d/query-cache-evidence)))))))))
+
+#?(:clj
+   (deftest temporal-host-query-calls-share-two-callers
+     (with-temp-db
+       {:keep-history? true}
+       (conj label-schema {:c/id "temporal-pair" :c/note "before"})
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (let [earlier-t (:max-tx @conn)
+               _ (d/transact conn [{:c/id "temporal-pair" :c/note "after"}])
+               temporal (d/as-of @conn earlier-t)
+               predicate-calls (atom 0)
+               predicate (fn [_] (swap! predicate-calls inc) true)
+               query '[:find ?value
+                       :in $ ?predicate
+                       :where [_ :c/note ?value]
+                       [(?predicate ?value)]]
+               owner (d/acquire-q! {:query query :args [temporal predicate]
+                                    :request-id "temporal-pair-owner"})
+               waiter (d/acquire-q! {:query query :args [temporal predicate]
+                                     :request-id "temporal-pair-waiter"})
+               waiter-completion (promise)]
+           (is (= :run (d/q-call-state owner)))
+           (is (= :waiting (d/q-call-state waiter)))
+           (d/on-q-complete! waiter #(deliver waiter-completion %))
+           (is (= #{["before"]}
+                  (:datahike.query/result (d/run-q! owner))))
+           (is (= :datahike.cache.outcome/miss-joined
+                  (get-in @waiter-completion
+                          [:value :datahike.query/cache-evidence
+                           :datahike.cache/outcome])))
+           (is (= 1 @predicate-calls))
+           (is (zero? (:datahike.single-flight/active-flights
+                       (d/query-cache-evidence)))))))))
+
+#?(:clj
+   (deftest temporal-query-flight-identity-isolates-every-semantic-input
+     (with-temp-db
+       {:keep-history? true}
+       (conj label-schema {:c/id "temporal-isolation" :c/note "zero"})
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (let [t0 (:max-tx @conn)
+               _ (d/transact conn [{:c/id "temporal-isolation" :c/note "one"}])
+               commit-a (d/commit-id @conn)
+               t1 (:max-tx @conn)
+               _ (d/transact conn [{:c/id "temporal-isolation" :c/note "two"}])
+               head @conn
+               commit-db (d/commit-as-db conn commit-a)
+               t0-at-a (d/as-of commit-db t0)
+               t0-at-b (d/as-of head t0)
+               t1-at-b (d/as-of head t1)
+               by-value '[:find ?value
+                          :in $ ?expected
+                          :where [_ :c/note ?value]
+                          [(= ?value ?expected)]]
+               specifications
+               [{:query '[:find ?value :where [_ :c/note ?value]]
+                 :args [t0-at-a] :request-id "temporal-commit-a"}
+                {:query '[:find ?value :where [_ :c/note ?value]]
+                 :args [t0-at-b] :request-id "temporal-commit-b"}
+                {:query '[:find ?value :where [_ :c/note ?value]]
+                 :args [t1-at-b] :request-id "temporal-t-one"}
+                {:query '[:find ?id :where [?entity :c/id ?id]]
+                 :args [t0-at-b] :request-id "temporal-query"}
+                {:query by-value :args [t0-at-b "zero"]
+                 :request-id "temporal-arg-zero"}
+                {:query by-value :args [t0-at-b "missing"]
+                 :request-id "temporal-arg-missing"}
+                {:query '[:find ?value :where [_ :c/note ?value]]
+                 :args [t0-at-b] :request-id "temporal-work-strict"
+                 :max-work 10}
+                {:query '[:find ?value :where [_ :c/note ?value]]
+                 :args [t0-at-b] :request-id "temporal-work-generous"
+                 :max-work 100}]
+               calls (mapv d/acquire-q! specifications)]
+           (try
+             (is (every? #{:run} (map d/q-call-state calls))
+                 "different t, commit, query, args, and limits own distinct flights")
+             (is (not= (#'dq/db-cache-key t0-at-a)
+                       (#'dq/db-cache-key t0-at-b)))
+             (is (not= (#'dq/db-cache-key t0-at-b)
+                       (#'dq/db-cache-key t1-at-b)))
+             (finally
+               (doseq [{:keys [request-id]} specifications]
+                 (d/cancel-query! request-id))
+               (d/release-materialized-db commit-db)))
+           (is (zero? (:datahike.single-flight/active-flights
+                       (d/query-cache-evidence))))
+           (is (zero? (:datahike.single-flight/active-callers
+                       (d/query-cache-evidence)))))))))
+
+#?(:clj
+   (deftest temporal-query-cancellation-and-clear-leave-no-flight
+     (with-temp-db
+       {:keep-history? true}
+       (conj label-schema {:c/id "temporal-cancel" :c/note "before"})
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (let [earlier-t (:max-tx @conn)
+               _ (d/transact conn [{:c/id "temporal-cancel" :c/note "after"}])
+               temporal (d/as-of @conn earlier-t)
+               query '[:find ?value :where [_ :c/note ?value]]
+               owner-id "temporal-cancel-owner"
+               waiter-id "temporal-cancel-waiter"
+               owner (d/acquire-q! {:query query :args [temporal]
+                                    :request-id owner-id})
+               waiter (d/acquire-q! {:query query :args [temporal]
+                                     :request-id waiter-id})]
+           (is (= :run (d/q-call-state owner)))
+           (is (= :waiting (d/q-call-state waiter)))
+           (is (false? (:datahike.query.cancel/unstarted-owner?
+                        (d/cancel-query! owner-id))))
+           (let [cancelled (d/cancel-query! waiter-id)]
+             (is (:datahike.query.cancel/unstarted-owner? cancelled))
+             (is (= owner-id
+                    (:datahike.query.cancel/owner-request-id cancelled))))
+           (is (thrown-with-msg? clojure.lang.ExceptionInfo #"canceled"
+                                 (d/run-q! owner)))
+           (let [clear-owner (d/acquire-q!
+                              {:query query :args [temporal]
+                               :request-id "temporal-clear-owner"})
+                 clear-waiter (d/acquire-q!
+                               {:query query :args [temporal]
+                                :request-id "temporal-clear-waiter"})
+                 owner-completion (promise)
+                 waiter-completion (promise)]
+             (d/on-q-complete! clear-owner #(deliver owner-completion %))
+             (d/on-q-complete! clear-waiter #(deliver waiter-completion %))
+             (dq/clear-query-cache!)
+             (is (= :datahike/query-coordinator-cleared
+                    (:type (ex-data (:throwable @owner-completion)))))
+             (is (= :datahike/query-coordinator-cleared
+                    (:type (ex-data (:throwable @waiter-completion)))))
+             (is (thrown-with-msg? clojure.lang.ExceptionInfo #"cleared"
+                                   (d/run-q! clear-owner))))
+           (is (zero? (:snapshot-count (dq/query-cache-metrics))))
+           (is (zero? (:datahike.single-flight/active-flights
+                       (d/query-cache-evidence))))
+           (is (zero? (:datahike.single-flight/active-callers
+                       (d/query-cache-evidence)))))))))
+
+#?(:clj
+   (deftest temporal-query-shares-failure-retries-and-bypasses-reentrancy
+     (with-temp-db
+       {:keep-history? true}
+       (conj label-schema {:c/id "temporal-failure" :c/note "before"})
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (let [earlier-t (:max-tx @conn)
+               _ (d/transact conn [{:c/id "temporal-failure" :c/note "after"}])
+               temporal (d/as-of @conn earlier-t)
+               fail? (atom true)
+               predicate (fn [_]
+                           (if (compare-and-set! fail? true false)
+                             (throw (ex-info "shared temporal failure" {}))
+                             true))
+               query '[:find ?value
+                       :in $ ?predicate
+                       :where [_ :c/note ?value]
+                       [(?predicate ?value)]]
+               owner (d/acquire-q! {:query query :args [temporal predicate]
+                                    :request-id "temporal-failure-owner"})
+               waiter (d/acquire-q! {:query query :args [temporal predicate]
+                                     :request-id "temporal-failure-waiter"})
+               owner-completion (promise)
+               waiter-completion (promise)]
+           (d/on-q-complete! owner #(deliver owner-completion %))
+           (d/on-q-complete! waiter #(deliver waiter-completion %))
+           (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                                 #"shared temporal failure"
+                                 (d/run-q! owner)))
+           (is (= "shared temporal failure"
+                  (.getMessage (:throwable @owner-completion))))
+           (is (= "shared temporal failure"
+                  (.getMessage (:throwable @waiter-completion))))
+           (let [retry (d/acquire-q!
+                        {:query query :args [temporal predicate]
+                         :request-id "temporal-failure-retry"})]
+             (is (= :run (d/q-call-state retry)))
+             (is (= #{["before"]}
+                    (:datahike.query/result (d/run-q! retry)))))
+           (dq/clear-query-cache!)
+           (let [entered? (atom false)
+                 reentrant-predicate (atom nil)
+                 reentrant-query '[:find ?value
+                                   :in $ ?predicate
+                                   :where [_ :c/note ?value]
+                                   [(?predicate ?value)]]]
+             (reset! reentrant-predicate
+                     (fn [_]
+                       (when (compare-and-set! entered? false true)
+                         (d/q reentrant-query temporal @reentrant-predicate))
+                       true))
+             (is (= #{["before"]}
+                    (d/q reentrant-query temporal @reentrant-predicate)))
+             (is (true? @entered?)))
+           (is (zero? (:datahike.single-flight/active-flights
+                       (d/query-cache-evidence))))
+           (is (zero? (:datahike.single-flight/active-callers
+                       (d/query-cache-evidence)))))))))
+
+#?(:clj
+   (deftest temporal-completed-result-is-certified-per-caller
+     (with-temp-db
+       {:keep-history? true}
+       (conj label-schema {:c/id "temporal-budget" :c/note "before"})
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (let [earlier-t (:max-tx @conn)
+               _ (d/transact conn [{:c/id "temporal-budget" :c/note "after"}])
+               temporal (d/as-of @conn earlier-t)
+               query '[:find ?value :where [_ :c/note ?value]]
+               owner (dq/q-with-evidence query temporal)]
+           (is (= #{["before"]} (:datahike.query/result owner)))
+           (is (thrown-with-msg?
+                clojure.lang.ExceptionInfo
+                #"query-results budget exceeded"
+                (dq/q-with-evidence {:query query
+                                     :args [temporal]
+                                     :max-results 0})))
+           (let [hit (dq/q-with-evidence {:query query
+                                          :args [temporal]
+                                          :max-work 1
+                                          :max-results 1
+                                          :max-result-weight 10})]
+             (is (= :datahike.cache.outcome/hit
+                    (get-in hit [:datahike.query/cache-evidence
+                                 :datahike.cache/outcome])))
+             (is (zero? (get-in hit [:datahike.query/resource-evidence
+                                     :datahike.resource/work])))))))))
+
+#?(:clj
+   (deftest temporal-generation-release-and-reconnect-fence-results-and-flights
+     (let [cfg {:store {:backend :memory :id (random-uuid)}
+                :keep-history? true
+                :schema-flexibility :write
+                :attribute-refs? false}
+           _ (d/create-database cfg)]
+       (try
+         (dq/clear-query-cache!)
+         (let [conn (d/connect cfg)]
+           (d/transact conn (conj label-schema
+                                  {:c/id "temporal-generation"
+                                   :c/note "before"}))
+           (let [earlier-t (:max-tx @conn)
+                 _ (d/transact conn [{:c/id "temporal-generation"
+                                      :c/note "after"}])
+                 database @conn
+                 [connection-id generation-before _]
+                 (db/committed-cache-identity database)
+                 temporal (d/as-of database earlier-t)
+                 query '[:find ?value :where [_ :c/note ?value]]
+                 owner (d/acquire-q! {:query query :args [temporal]
+                                      :request-id "temporal-release-owner"})
+                 waiter (d/acquire-q! {:query query :args [temporal]
+                                       :request-id "temporal-release-waiter"})
+                 owner-completion (promise)
+                 waiter-completion (promise)]
+             (d/on-q-complete! owner #(deliver owner-completion %))
+             (d/on-q-complete! waiter #(deliver waiter-completion %))
+             (d/release conn)
+             (is (= :datahike/query-cache-scope-closed
+                    (:type (ex-data (:throwable @owner-completion)))))
+             (is (= :datahike/query-cache-scope-closed
+                    (:type (ex-data (:throwable @waiter-completion)))))
+             (is (thrown-with-msg? clojure.lang.ExceptionInfo #"scope closed"
+                                   (d/run-q! owner)))
+             (is (zero? (:snapshot-count (dq/query-cache-metrics))))
+             (is (zero? (:datahike.single-flight/active-flights
+                         (d/query-cache-evidence))))
+             (let [reconnected (d/connect cfg)
+                   [_ generation-after _]
+                   (db/committed-cache-identity @reconnected)
+                   reopened (d/as-of @reconnected earlier-t)
+                   response (dq/q-with-evidence query reopened)]
+               (is (= connection-id
+                      (first (db/committed-cache-identity @reconnected))))
+               (is (not= generation-before generation-after))
+               (is (= #{["before"]} (:datahike.query/result response)))
+               (is (= :datahike.cache.outcome/miss-owner
+                      (get-in response [:datahike.query/cache-evidence
+                                        :datahike.cache/outcome])))
+               (is (pos? (:snapshot-count (dq/query-cache-metrics))))
+               (d/release reconnected)
+               (is (zero? (:snapshot-count (dq/query-cache-metrics)))))))
+         (finally
+           (d/delete-database cfg)
+           (dq/clear-query-cache!))))))
 
 #?(:clj
    (deftest final-release-atomically-fences-late-cache-put
