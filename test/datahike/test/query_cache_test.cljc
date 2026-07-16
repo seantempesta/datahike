@@ -1173,8 +1173,12 @@
 
 #?(:clj
    (deftest parsed-query-source-bindings-name-only-top-level-source-arguments
+     (is (= 1 (d/query-input-count
+               '[:find ?value :in ?value :where [(identity ?value)]])))
      (is (= [] (d/query-source-bindings
                 '[:find ?value :in ?value :where [(identity ?value)]])))
+     (is (= 1 (d/query-input-count
+               '[:find ?value :where [_ :c/note ?value]])))
      (is (= [{:datahike.query.source/symbol '$
               :datahike.query.source/argument-position 0}]
             (d/query-source-bindings
@@ -1189,6 +1193,10 @@
              '[:find ?value
                :in $a ?ordinary $b $c
                :where [$a _ :c/note ?value]])))
+     (is (= 4 (d/query-input-count
+               '[:find ?value
+                 :in $a ?ordinary $b $c
+                 :where [$a _ :c/note ?value]])))
      (is (= [{:datahike.query.source/symbol '$a
               :datahike.query.source/argument-position 0}]
             (d/query-source-bindings

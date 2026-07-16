@@ -2836,6 +2836,12 @@
                 :datahike.query.source/argument-position position})))
           qin)))
 
+(defn query-input-count
+  "Return the number of top-level arguments declared by a normalized query."
+  [query-input]
+  (let [query (:query (normalize-q-input query-input []))]
+    (count (:qin (memoized-parse-query query)))))
+
 (defn- query-cache-sources
   [query args]
   (let [sources (query-source-bindings query)

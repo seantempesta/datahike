@@ -150,6 +150,16 @@
      :doc "Returns parsed source symbols and top-level argument positions."
      :impl datahike.query/query-source-bindings}
 
+    query-input-count
+    {:args [:=> [:cat [:or [:vector :any] :map :string]] :int]
+     :ret :int
+     :categories [:query :host]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? true
+     :doc "Returns the number of parsed top-level query inputs after normalization."
+     :impl datahike.query/query-input-count}
+
     q-call-state
     {:args [:=> [:cat :any] [:enum :completed :run :waiting :rejected]]
      :ret [:enum :completed :run :waiting :rejected]
