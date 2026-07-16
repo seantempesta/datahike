@@ -50,6 +50,11 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Notable fixes
 
+- **Schema updates retain every invalid difference** — comparing a schema
+  entity no longer forgets an incompatible earlier change when a later map
+  entry is unchanged or explicitly mutable. Incompatible updates are rejected
+  without advancing the database head. ([#TODO])
+
 - **Time-filtered `index-page` restores native index order** — `AsOfDB` and
   `SinceDB` reconstruct cardinality-one state by entity/attribute, which can
   discard AVET/AEVT/EAVT order when unrelated bootstrap datoms are present. A

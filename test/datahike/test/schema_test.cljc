@@ -6,7 +6,8 @@
    [datahike.db.interface :as dbi]
    [datahike.db.transaction :as dbt]
    [datahike.datom :as da]
-   [datahike.constants :as const])
+   [datahike.constants :as const]
+   [datahike.schema :as ds])
   (:import [java.lang System]
            [java.util UUID]))
 
@@ -422,3 +423,42 @@
                               (d/transact conn {:tx-data [(assoc personal-id-schema :db/cardinality :db.cardinality/many)]}))
             "It shouldn't be allowed to update :db/cardinality to :db.cardinality/many")))
     (d/release conn)))
+
+(deftest incompatible-schema-update-survives-later-entries
+  (let [old-schema #:db{:ident :name
+                        :valueType :db.type/string
+                        :cardinality :db.cardinality/one}
+        invalid-update [:db/valueType
+                        [:db.type/string :db.type/long]]
+        updates [(array-map :db/valueType :db.type/long
+                            :db/ident :name
+                            :db/cardinality :db.cardinality/one
+                            :db/doc "allowed")
+                 (array-map :db/ident :name
+                            :db/valueType :db.type/long
+                            :db/cardinality :db.cardinality/one
+                            :db/doc "allowed")
+                 (array-map :db/ident :name
+                            :db/cardinality :db.cardinality/one
+                            :db/doc "allowed"
+                            :db/valueType :db.type/long)]
+        cfg {:store {:backend :memory
+                     :id #uuid "5c100000-0000-0000-0000-000000000009"}
+             :initial-tx [name-schema]}
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)]
+    (testing "pure comparison preserves an incompatible change at every position"
+      (doseq [update updates]
+        (is (= (into {} [invalid-update])
+               (ds/find-invalid-schema-updates update old-schema)))))
+    (testing "transaction rejection preserves the schema and database coordinate"
+      (let [before @conn]
+        (is (thrown-with-msg? Throwable
+                              #"Update not supported for these schema attributes"
+                              (d/transact conn [(first updates)])))
+        (is (= (:max-tx before) (:max-tx @conn)))
+        (is (= :db.type/string
+               (get-in (dbi/-schema @conn) [:name :db/valueType])))))
+    (d/release conn)
+    (d/delete-database cfg)))

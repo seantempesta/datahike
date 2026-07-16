@@ -258,32 +258,36 @@
   (reduce-kv
    (fn [m attr-def new-value]
      (let [old-value (get-in attr-schema [attr-def])]
-       (when (not= old-value new-value)
+       (if (= old-value new-value)
+         m
          (case attr-def
            :db/cardinality
            ;; Prohibit update from :db.cardinality/one to :db.cardinality/many, if there is a :db/unique constraint.
-           (when (and (= new-value :db.cardinality/many)
-                      (#{:db.unique/value :db.unique/identity} (:db/unique attr-schema)))
-             (assoc m attr-def [old-value new-value]))
+           (if (and (= new-value :db.cardinality/many)
+                    (#{:db.unique/value :db.unique/identity} (:db/unique attr-schema)))
+             (assoc m attr-def [old-value new-value])
+             m)
 
            :db/unique
-           (when (or (not (:db/unique attr-schema))
-                     (not= :db.cardinality/one (:db/cardinality attr-schema)))
-             (assoc m attr-def [old-value new-value]))
+           (if (or (not (:db/unique attr-schema))
+                   (not= :db.cardinality/one (:db/cardinality attr-schema)))
+             (assoc m attr-def [old-value new-value])
+             m)
 
            ;; Always allow these attributes to be updated.
-           :db/doc nil
-           :db/noHistory nil
-           :db/isComponent nil
+           :db/doc m
+           :db/noHistory m
+           :db/isComponent m
 
            ;; Secondary index: monotonic status transitions only
            ;; :building → :ready → :disabled (no going back)
            :db.secondary/status
            (let [valid-transitions {:building #{:ready :disabled}
                                     :ready    #{:disabled}}]
-             (when-not (contains? (get valid-transitions old-value) new-value)
+             (if (contains? (get valid-transitions old-value) new-value)
+               m
                (assoc m attr-def [old-value new-value])))
-           :db.secondary/building-since-tx nil
+           :db.secondary/building-since-tx m
 
            (assoc m attr-def [old-value new-value])))))
    {}
