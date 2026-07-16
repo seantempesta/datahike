@@ -121,6 +121,18 @@
    [:max-results {:optional true} pos-int?]
    [:max-result-weight {:optional true} pos-int?]])
 
+(def SQueryAttributeDependencies
+  "Concrete query attributes or the conservative all-attributes marker."
+  [:or [:= :all] [:set :keyword]])
+
+(def SQueryEvidence
+  "A query result with cache, resource, and attribute evidence."
+  [:map
+   [:datahike.query/result :any]
+   [:datahike.query/attribute-dependencies SQueryAttributeDependencies]
+   [:datahike.query/cache-evidence :map]
+   [:datahike.query/resource-evidence :map]])
+
 (def SWithArgs
   "Arguments for 'with' operation."
   [:map
@@ -132,6 +144,24 @@
   [:map
    [:index [:enum :eavt :aevt :avet]]
    [:components {:optional true} [:maybe [:sequential :any]]]])
+
+(def SIndexPageArgs
+  "One bounded eager native-index page request."
+  [:map {:closed true}
+   [:index [:enum :eavt :aevt :avet]]
+   [:components [:vector {:min 0 :max 4} :any]]
+   [:direction [:enum :forward :reverse]]
+   [:limit [:int {:min 1 :max 200}]]
+   [:cursor {:optional true} [:tuple :any :any :any pos-int? :boolean]]
+   [:max-result-weight {:optional true} pos-int?]])
+
+(def SIndexPageResult
+  "One eager native-index page and its optional continuation cursor."
+  [:map {:closed true}
+   [:datahike.index-page/datoms [:vector SDatom]]
+   [:datahike.index-page/complete? :boolean]
+   [:datahike.index-page/cursor
+    {:optional true} [:tuple :any :any :any pos-int? :boolean]]])
 
 (def SIndexRangeArgs
   "Index range query arguments."
@@ -182,8 +212,12 @@
     :datahike/STransactions STransactions
     :datahike/SPullOptions SPullOptions
     :datahike/SQueryArgs SQueryArgs
+    :datahike/SQueryAttributeDependencies SQueryAttributeDependencies
+    :datahike/SQueryEvidence SQueryEvidence
     :datahike/SWithArgs SWithArgs
     :datahike/SIndexLookupArgs SIndexLookupArgs
+    :datahike/SIndexPageArgs SIndexPageArgs
+    :datahike/SIndexPageResult SIndexPageResult
     :datahike/SIndexRangeArgs SIndexRangeArgs
     :datahike/SSchema SSchema
     :datahike/SMetrics SMetrics

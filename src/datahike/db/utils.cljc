@@ -202,11 +202,16 @@
        v)
      (or (entid-some db t) default-tx))))                   ;; t
 
-(defn components->pattern [db index [c0 c1 c2 c3] default-e default-tx]
-  (case index
-    :eavt (resolve-datom db c0 c1 c2 c3 default-e default-tx)
-    :aevt (resolve-datom db c1 c0 c2 c3 default-e default-tx)
-    :avet (resolve-datom db c2 c0 c1 c3 default-e default-tx)))
+(defn components->pattern [db index [c0 c1 c2 c3 added?] default-e default-tx]
+  (let [resolved
+        (case index
+          :eavt (resolve-datom db c0 c1 c2 c3 default-e default-tx)
+          :aevt (resolve-datom db c1 c0 c2 c3 default-e default-tx)
+          :avet (resolve-datom db c2 c0 c1 c3 default-e default-tx))]
+    (if (some? added?)
+      (datom (:e resolved) (:a resolved) (:v resolved)
+             (datom-tx resolved) added?)
+      resolved)))
 
 (defn merge-datoms [index-type a b]
   (if index-type

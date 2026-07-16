@@ -16,6 +16,7 @@
             [datahike.db.interface :as dbi]
             [datahike.db.transaction :as dbt]
             [datahike.impl.entity :as de]
+            [datahike.index-page :as index-page]
             [datahike.versioning :as dv]
             [datahike.bitemporal.predicate :as bp.pred]
             [replikativ.logging :as log]
@@ -121,6 +122,8 @@
   (if (nil? components)
     (dbi/rseek-datoms db index [])
     (dbi/rseek-datoms db index components)))
+
+(def index-page index-page/index-page)
 
 (defmethod seek-datoms ::index
   [db index & components]

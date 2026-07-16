@@ -3,7 +3,22 @@
    #?(:cljs [cljs.test :as t :refer-macros [is are deftest testing]]
       :clj  [clojure.test :as t :refer [is are deftest testing]])
    [datahike.api.specification :refer [malli-schema->argslist]]
-   [datahike.api.types :as types]))
+   [datahike.api.types :as types]
+   [malli.core :as m]))
+
+(deftest query-evidence-and-index-page-have-exact-public-shapes
+  (is (m/validate types/SQueryAttributeDependencies #{:unqualified :a/name}))
+  (is (m/validate types/SQueryAttributeDependencies :all))
+  (is (m/validate types/SIndexPageArgs
+                  {:index :avet
+                   :components [:a/name "A"]
+                   :direction :forward
+                   :limit 20
+                   :cursor [1 :a/name "A" 536870913 true]
+                   :max-result-weight 1000}))
+  (is (not (m/validate types/SIndexPageArgs
+                       {:index :avet :components []
+                        :direction :forward :limit 201}))))
 
 (deftest malli-to-argslist-translation
   (testing "Testing core cases of malli to argslist translator."

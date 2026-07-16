@@ -379,9 +379,10 @@
 
     q-with-evidence
     {:args [:function
-            [:=> [:cat :datahike/SQueryArgs] :map]
-            [:=> [:cat [:or [:vector :any] :map :string] [:* :any]] :map]]
-     :ret :map
+            [:=> [:cat :datahike/SQueryArgs] :datahike/SQueryEvidence]
+            [:=> [:cat [:or [:vector :any] :map :string] [:* :any]]
+             :datahike/SQueryEvidence]]
+     :ret :datahike/SQueryEvidence
      :categories [:query :diagnostics]
      :stability :experimental
      :supports-remote? true
@@ -583,6 +584,20 @@
      :examples [{:desc "Latest room messages, newest first"
                  :code "(take 20 (rseek-datoms db {:index :avet :components [:message/room room-eid]}))"}]
      :impl datahike.api.impl/rseek-datoms}
+
+    index-page
+    {:args [:=> [:cat :datahike/SDB :datahike/SIndexPageArgs]
+            :datahike/SIndexPageResult]
+     :ret :datahike/SIndexPageResult
+     :categories [:query :index :advanced]
+     :stability :experimental
+     :supports-remote? true
+     :referentially-transparent? true
+     :capability-operation :datahike.operation/index-page
+     :resource-options #{:max-result-weight}
+     :returns-lazy? false
+     :doc "Returns one eager bounded page in native Datahike index order."
+     :impl datahike.api.impl/index-page}
 
     index-range
     {:args [:=> [:cat :datahike/SDB :datahike/SIndexRangeArgs] :datahike/SDatoms]

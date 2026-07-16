@@ -19,6 +19,7 @@
         operations (:datahike.capability/operations catalog)
         query (get operations :datahike.operation/query)
         schema (get operations :datahike.operation/schema)
+        index-page (get operations :datahike.operation/index-page)
         evidence (get operations :datahike.operation/query-with-evidence)]
     (is (= 1 (:datahike.capability/version catalog)))
     (is (plain-data? catalog))
@@ -28,6 +29,11 @@
     (is (:datahike.capability.operation/cancellable? query))
     (is (= :datahike.api/schema
            (:datahike.capability.operation/api-name schema)))
+    (is (= :datahike.api/index-page
+           (:datahike.capability.operation/api-name index-page)))
+    (is (= #{:max-result-weight}
+           (:datahike.capability.operation/resource-options index-page)))
+    (is (false? (:datahike.capability.operation/returns-lazy? index-page)))
     (is (= #{:max-work :max-results :max-result-weight}
            (:datahike.capability.operation/resource-options evidence)))
     (is (every? namespace (mapcat keys (vals operations))))
