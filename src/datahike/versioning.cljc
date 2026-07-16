@@ -7,7 +7,8 @@
             [datahike.connections :refer [*connections*]]
             [datahike.gc-guard :as guard]
             [datahike.store :refer [store-identity add-cache-and-handlers]]
-            [datahike.writing :refer [stored->db db->stored stored-db? release-db
+            [datahike.writing :refer [stored->db db->stored stored-db?
+                                      #?@(:clj [release-db])
                                       commit! create-commit-id get-and-clear-pending-kvs!
                                       write-pending-kvs! branch-heads-as-commits]]
             [datahike.writer]
