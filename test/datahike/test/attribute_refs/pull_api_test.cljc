@@ -61,6 +61,15 @@
          (d/pull-many test-db '[:name]
                       (mapv (partial + ref-e0) [1 5 7 9])))))
 
+(deftest ordered-pull-many-with-attribute-refs
+  (is (= [{:name "Petr"} nil {:name "Elizabeth"} nil]
+         (d/pull-many test-db '[:name]
+                      [[:name "Petr"]
+                       [:name "Missing"]
+                       (+ ref-e0 5)
+                       (+ ref-e0 9999)])))
+  (is (nil? (d/pull test-db '[*] (+ ref-e0 9999)))))
+
 (deftest test-pull-reverse-attr-spec
   (is (= {:name "David" :_child [{:db/id (+ ref-e0 1)}]}
          (d/pull test-db '[:name :_child] (+ ref-e0 2))))

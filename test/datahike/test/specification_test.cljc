@@ -2,9 +2,26 @@
   (:require
    #?(:cljs [cljs.test :as t :refer-macros [is are deftest testing]]
       :clj  [clojure.test :as t :refer [is are deftest testing]])
-   [datahike.api.specification :refer [malli-schema->argslist]]
+   [datahike.api.specification :refer [api-specification
+                                       malli-schema->argslist]]
    [datahike.api.types :as types]
    [malli.core :as m]))
+
+(deftest pull-options-have-distinct-exact-shapes
+  (is (m/validate types/SPullOptions {:selector [:name] :eid 1}))
+  (is (not (m/validate types/SPullOptions {:selector [:name] :eids [1]})))
+  (is (not (m/validate types/SPullOptions
+                       {:selector [:name] :eid 1 :extra true})))
+  (is (m/validate types/SPullManyOptions
+                  {:selector [:name] :eids [1 [:person/id "petr"]]}))
+  (is (not (m/validate types/SPullManyOptions
+                       {:selector [:name] :eid 1})))
+  (is (not (m/validate types/SPullManyOptions
+                       {:selector [:name] :eids 1})))
+  (let [spec (get api-specification 'pull-many)]
+    (is (= [:vector [:maybe :map]] (:ret spec)))
+    (is (= '([arg0 arg1] [arg0 arg1 arg2])
+           (malli-schema->argslist (:args spec))))))
 
 (deftest query-evidence-and-index-page-have-exact-public-shapes
   (is (m/validate types/SQueryAttributeDependencies #{:unqualified :a/name}))

@@ -537,15 +537,18 @@
 
     pull-many
     {:args [:function
-            [:=> [:cat :datahike/SDB :datahike/SPullOptions] [:sequential :map]]
-            [:=> [:cat :datahike/SDB [:vector :any] :datahike/SEId] [:sequential :map]]]
-     :ret [:sequential :map]
+            [:=> [:cat :datahike/SDB :datahike/SPullManyOptions]
+             [:vector [:maybe :map]]]
+            [:=> [:cat :datahike/SDB [:vector :any]
+                  [:sequential :datahike/SEId]]
+             [:vector [:maybe :map]]]]
+     :ret [:vector [:maybe :map]]
      :categories [:query :pull]
      :stability :stable
      :supports-remote? true
      :referentially-transparent? true
      :capability-operation :datahike.operation/pull-many
-     :doc "Same as pull, but accepts sequence of ids and returns sequence of maps."
+     :doc "Pulls one ordered map-or-nil result for each entity ref."
      :examples [{:desc "Pull multiple entities"
                  :code "(pull-many db [:db/id :name] [1 2 3])"}]
      :impl datahike.pull-api/pull-many}

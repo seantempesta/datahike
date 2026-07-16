@@ -17,16 +17,19 @@
 
 (defn- initial-frame
   "Creates an empty pattern frame according to pattern information."
-  [pattern eids multi?]
-  {:state     :pattern
-   :pattern   pattern
-   :wildcard? (:wildcard? pattern)
-   :specs     (-> pattern :attrs seq)
-   :results   (transient [])
-   :kvps      (transient {})
-   :eids      eids
-   :multi?    multi?
-   :recursion {:depth {} :seen #{}}})
+  ([pattern eids multi?]
+   (initial-frame pattern eids multi? false))
+  ([pattern eids multi? pull-many?]
+   {:state      :pattern
+    :pattern    pattern
+    :wildcard?  (:wildcard? pattern)
+    :specs      (-> pattern :attrs seq)
+    :results    (transient [])
+    :kvps       (transient {})
+    :eids       eids
+    :multi?     multi?
+    :pull-many? pull-many?
+    :recursion  {:depth {} :seen #{}}}))
 
 (defn subpattern-frame
   "Returns frame specific for given attribute"
@@ -36,14 +39,17 @@
 (defn reset-frame
   "Recalculate frame attributes from frame pattern and transfer end results to frame-specific result section"
   [frame eids kvps]
-  (let [pattern (:pattern frame)]
+  (let [pattern (:pattern frame)
+        keep-result? (or (:pull-many? frame) (seq kvps))]
+    (when (and (:pull-many? frame) (nil? kvps))
+      (resource/charge-result-node!))
     (assoc frame
            :eids      eids
            :specs     (seq (:attrs pattern))
            :wildcard? (:wildcard? pattern)
            :kvps      (transient {})
            :results   (cond-> (:results frame)
-                        (seq kvps) (conj! kvps)))))
+                        keep-result? (conj! kvps)))))
 
 (defn push-recursion
   "Push newly processed entity and increase recursion depth."
@@ -290,21 +296,25 @@
 (defn pull-pattern-frame
   [db [frame & frames]]
   (if-let [eids (seq (:eids frame))]
-    (if (:wildcard? frame)
-      (pull-wildcard db
-                     (assoc frame
-                            :specs []
-                            :eid (first eids)
-                            :wildcard? false)
-                     frames)
-      (if-let [specs (seq (:specs frame))]
-        (let [spec       (first specs)
-              new-frames (conj frames (assoc frame :specs (rest specs)))]
-          (pull-attr db spec (first eids) new-frames))
-        (->> frame :kvps persistent! not-empty
-             (reset-frame frame (rest eids))
-             (conj frames)
-             (recur db))))
+    (if (nil? (first eids))
+      (->> (reset-frame frame (rest eids) nil)
+           (conj frames)
+           (recur db))
+      (if (:wildcard? frame)
+        (pull-wildcard db
+                       (assoc frame
+                              :specs []
+                              :eid (first eids)
+                              :wildcard? false)
+                       frames)
+        (if-let [specs (seq (:specs frame))]
+          (let [spec       (first specs)
+                new-frames (conj frames (assoc frame :specs (rest specs)))]
+            (pull-attr db spec (first eids) new-frames))
+          (->> frame :kvps persistent! not-empty
+               (reset-frame frame (rest eids))
+               (conj frames)
+               (recur db)))))
     (conj frames (assoc frame :state :done))))
 
 (defn pull-pattern
@@ -325,16 +335,25 @@
                          (recur db))
                     result))))
 
+(defn- resolve-pull-eid
+  "Returns an existing pull entity ID or nil for a missing entity ref."
+  [db entity-ref]
+  (resource/charge-work!)
+  (when-let [eid (dbu/entid db entity-ref)]
+    (when (or (not (number? entity-ref))
+              (first (dbi/datoms db :eavt [eid])))
+      eid)))
+
 (defn pull-spec
   ([db pattern eids multi?]
    (pull-spec db pattern eids multi? nil))
   ([db pattern eids multi? options]
-   (let [eids (into [] (map #(dbu/entid-strict db %)) eids)
-         budget (resource/make-budget options)]
+   (let [budget (resource/make-budget options)]
      (binding [resource/*budget* (or budget resource/*budget*)]
-       (resource/certify-result!
-        (pull-pattern db (list (initial-frame pattern eids multi?)))
-        (dissoc options :max-results))))))
+       (let [eids (into [] (map #(resolve-pull-eid db %)) eids)]
+         (resource/certify-result!
+          (pull-pattern db (list (initial-frame pattern eids multi? multi?)))
+          (dissoc options :max-results)))))))
 
 (defn pull
   ([db {:keys [selector eid max-work max-results max-result-weight]}]
@@ -348,6 +367,10 @@
    (pull-spec db (dpp/parse-pull selector) [eid] false)))
 
 (defn pull-many
+  "Pulls one input-aligned eager result for each entity ref.
+
+   Well-formed missing refs return nil in their original positions. Malformed
+   refs and lookup attributes without uniqueness remain errors."
   ([db {:keys [selector eids max-work max-results max-result-weight]}]
    {:pre [(dbu/db? db)]}
    (pull-spec db (dpp/parse-pull selector) eids true

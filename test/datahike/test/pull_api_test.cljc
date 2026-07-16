@@ -5,6 +5,7 @@
    [datahike.api :as d]
    [datahike.db :as db]
    [datahike.datom :as dd]
+   #?(:cljs [datahike.js :as js-api])
    [datahike.pull-api :as p]
    [datahike.constants :refer [tx0]]
    [datahike.test.core-test]
@@ -65,10 +66,99 @@
 
 (def test-db (db/init-db test-datoms test-schema))
 
+(def ordered-test-db
+  (db/init-db
+   (concat test-datoms
+           [(dd/datom 1 :person/id "petr" tx0)
+            (dd/datom 5 :person/id "elizabeth" tx0)
+            (dd/datom 1 :db/ident :person/petr tx0)])
+   (assoc test-schema :person/id {:db/unique :db.unique/identity})))
+
 (defn- budget-exceeded?
   [error budget-name]
   (and (true? (:datahike/budget-exceeded (ex-data error)))
        (= budget-name (:datahike.budget/name (ex-data error)))))
+
+(defn- error-code
+  [f]
+  (try
+    (f)
+    nil
+    (catch #?(:clj Exception :cljs :default) error
+      (:error (ex-data error)))))
+
+(deftest ordered-pull-many-preserves-input-positions
+  (testing "empty and repeated inputs preserve exact vector shape"
+    (is (= [] (d/pull-many ordered-test-db '[:name] [])))
+    (is (= [{:name "Petr"} nil {:name "Elizabeth"} nil
+            {:name "Petr"} nil]
+           (d/pull-many ordered-test-db '[:name]
+                        [1 999 [:person/id "elizabeth"]
+                         [:person/id "missing"] 1 :person/missing])))
+    (is (= [nil nil nil]
+           (d/pull-many ordered-test-db
+                        {:selector '[:name]
+                         :eids [999 [:person/id "missing"] :person/missing]}))))
+  (testing "single pull and wildcard pull use the same absence rule"
+    (is (nil? (d/pull ordered-test-db '[:name] 999)))
+    (is (nil? (d/pull ordered-test-db '[:name]
+                      [:person/id "missing"])))
+    (is (nil? (d/pull ordered-test-db '[:name] :person/missing)))
+    (is (nil? (d/pull ordered-test-db '[*] 999)))
+    (is (nil? (d/pull ordered-test-db
+                      '[(default :name "fabricated")] 999))))
+  (testing "malformed and non-unique refs remain structured errors"
+    (is (= :lookup-ref/syntax
+           (error-code #(d/pull-many ordered-test-db '[:name]
+                                     [[:person/id "petr" :extra]]))))
+    (is (= :lookup-ref/unique
+           (error-code #(d/pull-many ordered-test-db '[:name]
+                                     [[:name "Petr"]]))))
+    (is (= :entity-id/syntax
+           (error-code #(d/pull-many ordered-test-db '[:name] ["Petr"]))))))
+
+(deftest pull-many-parses-once-and-shares-one-budget
+  (doseq [n [1 32 1000]]
+    (let [parse dpp/parse-pull
+          calls (atom 0)]
+      (with-redefs [dpp/parse-pull (fn [selector]
+                                    (swap! calls inc)
+                                    (parse selector))]
+        (is (= n (count (d/pull-many ordered-test-db '[:name]
+                                     (repeat n 1)))))
+        (is (= 1 @calls)))))
+  (testing "nil result slots consume the shared result and work budgets"
+    (is (= :query-results
+           (:datahike.budget/name
+            (ex-data
+             (try
+               (d/pull-many ordered-test-db
+                            {:selector '[:name] :eids [998 999]
+                             :max-results 1})
+               nil
+               (catch #?(:clj Exception :cljs :default) error error))))))
+    (is (= :query-work
+           (:datahike.budget/name
+            (ex-data
+             (try
+               (d/pull-many ordered-test-db
+                            {:selector '[:name] :eids [998 999]
+                             :max-work 1})
+               nil
+               (catch #?(:clj Exception :cljs :default) error error))))))
+    (is (= [nil nil]
+           (d/pull-many ordered-test-db
+                        {:selector '[:name] :eids [998 999]
+                         :max-work 4 :max-results 2})))))
+
+#?(:cljs
+   (deftest javascript-pull-many-preserves-null-slots
+     (let [result (js-api/pull_many ordered-test-db "[:name]"
+                                    #js [1 999 5])]
+       (is (= 3 (alength result)))
+       (is (= "Petr" (aget (aget result 0) ":name")))
+       (is (nil? (aget result 1)))
+       (is (= "Elizabeth" (aget (aget result 2) ":name"))))))
 
 (deftest global-pull-budget
   (testing "wildcard component expansion stops at the synchronous work budget"

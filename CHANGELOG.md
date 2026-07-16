@@ -39,6 +39,13 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Notable fixes
 
+- **`pull-many` preserves every input position** — one native pull now returns
+  an ordered vector with nil for each well-formed missing numeric ID, lookup
+  ref, or ident. Missing inputs no longer abort or disappear, wildcard pulls
+  cannot fabricate `:db/id` for an absent numeric entity, and malformed or
+  non-unique lookup refs remain structured errors. `pull` now follows the same
+  missing-ref rule. ([#TODO])
+
 - **Transaction reports contain changes, not redundant assertions** — reasserting an existing cardinality-one or cardinality-many fact no longer rewrites its current transaction id, mutates index hashes/op-counts, or publishes a false-positive datom to listeners. Retracting an absent fact is likewise omitted. Transaction functions such as `:db.ensure/attrs` still see the complete attempted transaction while it is being evaluated; only the committed `:tx-data` report is reduced to effective changes.
 - **NOT-JOIN post-filter enabled on ClojureScript** — `post-filter-not-joins` was made cross-platform upstream but this fork's direct-path caller still carried a `:cljs nil` gate, so single-group NOT-JOIN queries on the planner's direct HashSet path returned UNfiltered results on cljs (caught by the newly-ported `query-not-test` in the node runner). The gate is removed. (2026-07-11 upstream sync)
 - **`rel-dedup-into!` cljs projection is loud and vector-safe** — a head-var missing from the relation's `:attrs` indexed the tuple with `nil` and `(aget tuple nil)` silently projected `undefined` (the CLJ int-array coercion NPEs loudly); relations built by legacy fns carry persistent-vector tuples that `aget` also misread. The cljs branch now throws on a missing head-var and splits array/vector access like the CLJ branch. (2026-07-11 upstream sync)

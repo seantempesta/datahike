@@ -100,11 +100,19 @@
   [:sequential :any])
 
 (def SPullOptions
-  "Pull pattern options map."
-  [:map
+  "Options for pulling one entity."
+  [:map {:closed true}
    [:selector [:vector :any]]
-   [:eid {:optional true} SEId]
-   [:eids {:optional true} [:sequential SEId]]
+   [:eid SEId]
+   [:max-work {:optional true} pos-int?]
+   [:max-results {:optional true} pos-int?]
+   [:max-result-weight {:optional true} pos-int?]])
+
+(def SPullManyOptions
+  "Options for pulling an ordered sequence of entities."
+  [:map {:closed true}
+   [:selector [:vector :any]]
+   [:eids [:sequential SEId]]
    [:max-work {:optional true} pos-int?]
    [:max-results {:optional true} pos-int?]
    [:max-result-weight {:optional true} pos-int?]])
@@ -211,6 +219,7 @@
     :datahike/STransactionReport STransactionReport
     :datahike/STransactions STransactions
     :datahike/SPullOptions SPullOptions
+    :datahike/SPullManyOptions SPullManyOptions
     :datahike/SQueryArgs SQueryArgs
     :datahike/SQueryAttributeDependencies SQueryAttributeDependencies
     :datahike/SQueryEvidence SQueryEvidence
@@ -240,6 +249,7 @@
    :SSchema "Map<Object, Object>"
    :SMetrics "Map<String, Object>"
    :SPullOptions "Map<String, Object>"
+   :SPullManyOptions "Map<String, Object>"
    :SQueryArgs "Map<String, Object>"
    :SIndexLookupArgs "Map<String, Object>"
    :SIndexRangeArgs "Map<String, Object>"
@@ -272,6 +282,7 @@
    :SSchema "Record<string, any>"
    :SMetrics "Metrics"
    :SPullOptions "PullOptions"
+   :SPullManyOptions "PullManyOptions"
    :SQueryArgs "QueryArgs"
    :SIndexLookupArgs "IndexLookupArgs"
    :SIndexRangeArgs "IndexRangeArgs"

@@ -20,8 +20,12 @@ class DatahikeGenerated {
     protected static final IFn branchAsyncFn = Clojure.var("datahike.api", "branch!");
     protected static final IFn branchAsDbFn = Clojure.var("datahike.api", "branch-as-db");
     protected static final IFn branchesFn = Clojure.var("datahike.api", "branches");
+    protected static final IFn cancelQueryAsyncFn = Clojure.var("datahike.api", "cancel-query!");
+    protected static final IFn capabilitiesFn = Clojure.var("datahike.api", "capabilities");
+    protected static final IFn closeQueryCacheGenerationAsyncFn = Clojure.var("datahike.api", "close-query-cache-generation!");
     protected static final IFn commitAsDbFn = Clojure.var("datahike.api", "commit-as-db");
     protected static final IFn commitIdFn = Clojure.var("datahike.api", "commit-id");
+    protected static final IFn committedValueIdentityFn = Clojure.var("datahike.api", "committed-value-identity");
     protected static final IFn connectFn = Clojure.var("datahike.api", "connect");
     protected static final IFn createDatabaseFn = Clojure.var("datahike.api", "create-database");
     protected static final IFn databaseExistsFn = Clojure.var("datahike.api", "database-exists?");
@@ -38,6 +42,7 @@ class DatahikeGenerated {
     protected static final IFn forkDatabaseFn = Clojure.var("datahike.api", "fork-database");
     protected static final IFn gcStorageFn = Clojure.var("datahike.api", "gc-storage");
     protected static final IFn historyFn = Clojure.var("datahike.api", "history");
+    protected static final IFn indexPageFn = Clojure.var("datahike.api", "index-page");
     protected static final IFn indexRangeFn = Clojure.var("datahike.api", "index-range");
     protected static final IFn isFilteredFn = Clojure.var("datahike.api", "is-filtered");
     protected static final IFn listenFn = Clojure.var("datahike.api", "listen");
@@ -49,8 +54,12 @@ class DatahikeGenerated {
     protected static final IFn pullFn = Clojure.var("datahike.api", "pull");
     protected static final IFn pullManyFn = Clojure.var("datahike.api", "pull-many");
     protected static final IFn qFn = Clojure.var("datahike.api", "q");
+    protected static final IFn qWithEvidenceFn = Clojure.var("datahike.api", "q-with-evidence");
+    protected static final IFn queryAttributeDependenciesFn = Clojure.var("datahike.api", "query-attribute-dependencies");
+    protected static final IFn queryCacheEvidenceFn = Clojure.var("datahike.api", "query-cache-evidence");
     protected static final IFn queryStatsFn = Clojure.var("datahike.api", "query-stats");
     protected static final IFn releaseFn = Clojure.var("datahike.api", "release");
+    protected static final IFn releaseMaterializedDbFn = Clojure.var("datahike.api", "release-materialized-db");
     protected static final IFn reverseSchemaFn = Clojure.var("datahike.api", "reverse-schema");
     protected static final IFn rseekDatomsFn = Clojure.var("datahike.api", "rseek-datoms");
     protected static final IFn schemaFn = Clojure.var("datahike.api", "schema");
@@ -132,7 +141,28 @@ class DatahikeGenerated {
     }
 
     /**
-     * Load the database at a specific commit. First argument can be a connection, db value, or raw store.
+     * Detaches and wakes one active query caller by request identity. Final cancellation of an unstarted owner names its request identity so a host can remove the queued job.
+     */
+    public static Map<?,?> cancelQueryAsync(String arg0) {
+        return (Map<?,?>) cancelQueryAsyncFn.invoke(arg0);
+    }
+
+    /**
+     * Returns Datahike's bounded transport-free capability catalog.
+     */
+    public static Map<?,?> capabilities() {
+        return (Map<?,?>) capabilitiesFn.invoke();
+    }
+
+    /**
+     * Fences and evicts one exact query-cache connection generation.
+     */
+    public static Map<?,?> closeQueryCacheGenerationAsync(Object arg0, Object arg1) {
+        return (Map<?,?>) closeQueryCacheGenerationAsyncFn.invoke(arg0, arg1);
+    }
+
+    /**
+     * Load the database at a specific commit. First argument can be a connection, db value, or raw store. Set :secondary-indices? false for primary-only reads.
      *
      * <h3>Examples:</h3>
      * <pre>{@code
@@ -142,6 +172,19 @@ class DatahikeGenerated {
      */
     public static Object commitAsDb(Object arg0, Object arg1) {
         return (Object) commitAsDbFn.invoke(arg0, arg1);
+    }
+
+    /**
+     * Load the database at a specific commit. First argument can be a connection, db value, or raw store. Set :secondary-indices? false for primary-only reads.
+     *
+     * <h3>Examples:</h3>
+     * <pre>{@code
+     * // Load db at commit
+     * (commit-as-db conn #uuid "...")
+     * }</pre>
+     */
+    public static Object commitAsDb(Object arg0, Object arg1, Map<?,?> arg2) {
+        return (Object) commitAsDbFn.invoke(arg0, arg1, Util.normalizeCollections(arg2));
     }
 
     /**
@@ -155,6 +198,13 @@ class DatahikeGenerated {
      */
     public static Object commitId(Object arg0) {
         return (Object) commitIdFn.invoke(arg0);
+    }
+
+    /**
+     * Returns exact process-local identity for a committed raw database value, or nil for unsupported values.
+     */
+    public static Object committedValueIdentity(Object arg0) {
+        return (Object) committedValueIdentityFn.invoke(arg0);
     }
 
     /**
@@ -515,6 +565,13 @@ class DatahikeGenerated {
     }
 
     /**
+     * Returns one eager bounded page in native Datahike index order.
+     */
+    public static Object indexPage(Object arg0, Object arg1) {
+        return (Object) indexPageFn.invoke(arg0, arg1);
+    }
+
+    /**
      * Returns part of :avet index between start and end values.
      *
      * <h3>Examples:</h3>
@@ -698,7 +755,7 @@ class DatahikeGenerated {
     }
 
     /**
-     * Same as pull, but accepts sequence of ids and returns sequence of maps.
+     * Pulls one ordered map-or-nil result for each entity ref.
      *
      * <h3>Examples:</h3>
      * <pre>{@code
@@ -706,12 +763,12 @@ class DatahikeGenerated {
      * (pull-many db [:db/id :name] [1 2 3])
      * }</pre>
      */
-    public static Iterable<?> pullMany(Object arg0, Object arg1) {
-        return (Iterable<?>) pullManyFn.invoke(arg0, arg1);
+    public static List<?> pullMany(Object arg0, Object arg1) {
+        return (List<?>) pullManyFn.invoke(arg0, arg1);
     }
 
     /**
-     * Same as pull, but accepts sequence of ids and returns sequence of maps.
+     * Pulls one ordered map-or-nil result for each entity ref.
      *
      * <h3>Examples:</h3>
      * <pre>{@code
@@ -719,8 +776,8 @@ class DatahikeGenerated {
      * (pull-many db [:db/id :name] [1 2 3])
      * }</pre>
      */
-    public static Iterable<?> pullMany(Object arg0, List<?> arg1, Object arg2) {
-        return (Iterable<?>) pullManyFn.invoke(arg0, Util.normalizeCollections(arg1), arg2);
+    public static List<?> pullMany(Object arg0, List<?> arg1, Iterable<?> arg2) {
+        return (List<?>) pullManyFn.invoke(arg0, Util.normalizeCollections(arg1), arg2);
     }
 
     /**
@@ -751,6 +808,40 @@ class DatahikeGenerated {
      */
     public static Object q(Object arg0, Object arg1) {
         return (Object) qFn.invoke(arg0, arg1);
+    }
+
+    /**
+     * Executes a Datalog query and returns its value with bounded cache and resource evidence.
+     */
+    public static Object qWithEvidence(Object arg0) {
+        return (Object) qWithEvidenceFn.invoke(arg0);
+    }
+
+    /**
+     * Executes a Datalog query and returns its value with bounded cache and resource evidence.
+     */
+    public static Object qWithEvidence(Object arg0, Object arg1) {
+        return (Object) qWithEvidenceFn.invoke(arg0, arg1);
+    }
+
+    /**
+     * Conservatively returns the attributes that can affect a query result, or :all when no sound narrower projection is possible. Does not execute the query or retain a database value.
+     *
+     * <h3>Examples:</h3>
+     * <pre>{@code
+     * // Project literal query dependencies
+     * (query-attribute-dependencies '[:find ?e :where [?e :person/name]])
+     * }</pre>
+     */
+    public static Object queryAttributeDependencies(Object arg0) {
+        return (Object) queryAttributeDependenciesFn.invoke(arg0);
+    }
+
+    /**
+     * Returns bounded aggregate completed-cache and single-flight evidence.
+     */
+    public static Map<?,?> queryCacheEvidence() {
+        return (Map<?,?>) queryCacheEvidenceFn.invoke();
     }
 
     /**
@@ -790,6 +881,19 @@ class DatahikeGenerated {
      */
     public static void release(Object arg0) {
         releaseFn.invoke(arg0);
+    }
+
+    /**
+     * Close native secondary resources owned by a database returned from commit-as-db. Primary-only and connection database values are no-ops.
+     *
+     * <h3>Examples:</h3>
+     * <pre>{@code
+     * // Release a materialized historical database
+     * (release-materialized-db historical-db)
+     * }</pre>
+     */
+    public static Iterable<?> releaseMaterializedDb(Object arg0) {
+        return (Iterable<?>) releaseMaterializedDbFn.invoke(arg0);
     }
 
     /**

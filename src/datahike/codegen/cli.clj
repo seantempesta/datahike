@@ -115,6 +115,7 @@
    :datahike/STransactionReport "transaction report map"
    :datahike/SQueryArgs "query arguments map"
    :datahike/SPullOptions "pull pattern options"
+   :datahike/SPullManyOptions "ordered pull-many options"
    :datahike/SDatoms "sequence of datoms"
    :datahike/SSchema "database schema map"
    :datahike/SMetrics "database metrics map"
