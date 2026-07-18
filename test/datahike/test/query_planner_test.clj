@@ -547,6 +547,37 @@
     (assert-engines-agree @test-db
                           '[:find ?e ?a ?v :where [?e ?a ?v] [?e :name "Ivan"]])))
 
+(deftest test-input-bound-uninstalled-attribute-does-not-crash-planner
+  (let [cfg {:store {:backend :memory
+                     :id (java.util.UUID/randomUUID)}
+             :attribute-refs? true
+             :schema-flexibility :write}
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)
+        _ (d/transact conn
+                      [{:db/ident :present/id
+                        :db/valueType :db.type/string
+                        :db/cardinality :db.cardinality/one
+                        :db/unique :db.unique/identity}
+                       {:present/id "one"}])
+        db (d/db conn)
+        query '[:find ?e ?tx ?identity-attr
+                :in $ [?identity-attr ...]
+                :where
+                [?e ?identity-attr _]
+                [?e _ _ ?tx]]
+        inputs [[:present/id :missing/id]]]
+    (try
+      (assert-engines-agree db query inputs)
+      ;; Attribute-position input variables are not keyword-to-ref resolution
+      ;; sites. Both engines therefore return the empty relation; the compiled
+      ;; executor must not pass the unresolved nil attribute to the EAVT probe.
+      (is (empty? (apply d/q query db inputs)))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
+
 (deftest test-multi-source-queries
   (let [schema {:name {:db/unique :db.unique/identity}
                 :id   {:db/unique :db.unique/identity}

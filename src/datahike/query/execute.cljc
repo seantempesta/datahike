@@ -3027,11 +3027,30 @@
                                 vg? (aget merge-v-ground mi)
                                 vgv (aget merge-v-vals mi)
                                 card-many? (aget merge-card-many mi)
+                                merge-op (nth merge-ops mi)
+                                optional? (:optional? merge-op)
                                 has-v-var? (let [mv (get (:clause (nth merge-ops mi)) 2)]
                                              (and (symbol? mv) (analyze/free-var? mv)))
                                 has-tx-var? (let [mtx (get (:clause (nth merge-ops mi)) 3)]
                                               (and (some? mtx) (symbol? mtx) (analyze/free-var? mtx)))]
-                            (if card-many?
+                            (cond
+                              ;; In attribute-ref databases an uninstalled
+                              ;; keyword resolves to nil. A positive pattern on
+                              ;; that attribute is the empty relation; it must
+                              ;; never become an EAVT probe with a nil attr.
+                              (nil? ra)
+                              (cond
+                                anti?
+                                (process-merges scan-d eid (inc mi) tuple)
+
+                                optional?
+                                (process-merges scan-d eid (inc mi)
+                                                (cond-> tuple
+                                                  has-v-var?
+                                                  (conj (:default-value merge-op))
+                                                  has-tx-var? (conj 0))))
+
+                              card-many?
                           ;; Card-many: iterate ALL matching datoms
                               (let [from-d (datom eid ra (when vg? vgv) tx0)
                                     to-d (datom eid ra (when vg? vgv) txmax)
@@ -3049,12 +3068,12 @@
                                                         (cond-> tuple
                                                           has-v-var? (conj (.-v d))
                                                           has-tx-var? (conj (.-tx d)))))))))
+                              :else
                           ;; Card-one: single lookupGE
                               (let [^Datom d (pss-lookup-ge eavt-pss (datom eid ra vgv tx0))
                                     check-v? (aget merge-check-scan-v mi)
                                     check-tx? (aget merge-check-scan-tx mi)
                                     found? (and d (merge-datom-match? d eid ra vg? vgv check-v? check-tx? scan-d))
-                                    merge-op (nth merge-ops mi)
                                     optional? (:optional? merge-op)]
                                 (cond
                                   anti?
