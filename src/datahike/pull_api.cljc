@@ -15,6 +15,59 @@
 
 (def ^:private ^:const +default-limit+ 1000)
 
+(defn pull-spec-attribute-dependencies
+  "Returns canonical stored attributes from a parsed PullSpec.
+
+   Returns `:all` when
+   a wildcard or dynamic attribute prevents a sound narrower projection."
+  [spec]
+  (if (:wildcard? spec)
+    :all
+    (reduce-kv
+     (fn [attributes _display-key options]
+       (let [attribute (:attr options)
+             nested (when-let [subpattern (:subpattern options)]
+                      (pull-spec-attribute-dependencies subpattern))]
+         (cond
+           (not (keyword? attribute)) (reduced :all)
+           (= nested :all) (reduced :all)
+           :else (cond-> (conj attributes attribute)
+                   nested (into nested)))))
+     #{}
+     (:attrs spec))))
+
+(defn- entity-ref-attribute-dependencies
+  [entity-refs]
+  (reduce
+   (fn [attributes entity-ref]
+     (cond
+       (keyword? entity-ref) (conj attributes :db/ident)
+       (and (sequential? entity-ref)
+            (= 2 (count entity-ref))
+            (keyword? (first entity-ref)))
+       (conj attributes (first entity-ref))
+       :else attributes))
+   #{}
+   entity-refs))
+
+(defn pull-dependency-plan
+  "Returns a Datahike dependency plan.
+
+   Parses one pull selector and its
+   entity refs without retaining a database value."
+  [selector entity-refs]
+  (let [selector-attributes
+        (pull-spec-attribute-dependencies (dpp/parse-pull selector))
+        attributes
+        (if (= selector-attributes :all)
+          :all
+          (into selector-attributes
+                (entity-ref-attribute-dependencies entity-refs)))]
+    {:datahike.query.dependency/sources
+     [{:datahike.query.source/symbol '$
+       :datahike.query.source/argument-position 0
+       :datahike.query.source/attributes attributes}]}))
+
 (defn- initial-frame
   "Creates an empty pattern frame according to pattern information."
   ([pattern eids multi?]
@@ -380,3 +433,22 @@
   ([db selector eids]
    {:pre [(dbu/db? db)]}
    (pull-spec db (dpp/parse-pull selector) eids true)))
+
+(defn pull-with-evidence
+  "Pulls one entity and returns the value with its parsed dependency plan."
+  ([db {:keys [selector eid] :as options}]
+   {:datahike.pull/result (pull db options)
+    :datahike.read/dependency-plan (pull-dependency-plan selector [eid])})
+  ([db selector eid]
+   {:datahike.pull/result (pull db selector eid)
+    :datahike.read/dependency-plan (pull-dependency-plan selector [eid])}))
+
+(defn pull-many-with-evidence
+  "Pulls input-aligned entities and returns the values with one shared parsed
+   dependency plan."
+  ([db {:keys [selector eids] :as options}]
+   {:datahike.pull-many/result (pull-many db options)
+    :datahike.read/dependency-plan (pull-dependency-plan selector eids)})
+  ([db selector eids]
+   {:datahike.pull-many/result (pull-many db selector eids)
+    :datahike.read/dependency-plan (pull-dependency-plan selector eids)}))

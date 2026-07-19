@@ -154,6 +154,18 @@
    [:datahike.query/cache-evidence :map]
    [:datahike.query/resource-evidence :map]])
 
+(def SPullEvidence
+  "One pull result with its Datahike-owned dependency plan."
+  [:map
+   [:datahike.pull/result [:maybe :map]]
+   [:datahike.read/dependency-plan SReadDependencyPlan]])
+
+(def SPullManyEvidence
+  "Input-aligned pull results with their shared Datahike dependency plan."
+  [:map
+   [:datahike.pull-many/result [:vector [:maybe :map]]]
+   [:datahike.read/dependency-plan SReadDependencyPlan]])
+
 (def SWithArgs
   "Arguments for 'with' operation."
   [:map
@@ -236,6 +248,8 @@
     :datahike/SQueryArgs SQueryArgs
     :datahike/SQueryAttributeDependencies SQueryAttributeDependencies
     :datahike/SQueryEvidence SQueryEvidence
+    :datahike/SPullEvidence SPullEvidence
+    :datahike/SPullManyEvidence SPullManyEvidence
     :datahike/SWithArgs SWithArgs
     :datahike/SIndexLookupArgs SIndexLookupArgs
     :datahike/SIndexPageArgs SIndexPageArgs

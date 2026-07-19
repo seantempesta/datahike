@@ -87,6 +87,36 @@
     (catch #?(:clj Exception :cljs :default) error
       (:error (ex-data error)))))
 
+(deftest pull-dependency-evidence-uses-the-parsed-selector
+  (let [expected-plan
+        {:datahike.query.dependency/sources
+         [{:datahike.query.source/symbol '$
+           :datahike.query.source/argument-position 0
+           :datahike.query.source/attributes
+           #{:person/id :name :child :friend}}]}
+        selector '[:name {:child [:name {:_friend [:name]}]}]
+        single (d/pull-with-evidence ordered-test-db selector
+                                     [:person/id "petr"])
+        many (d/pull-many-with-evidence ordered-test-db selector
+                                        [1 [:person/id "elizabeth"]])]
+    (is (= {:name "Petr"
+            :child [{:name "David"} {:name "Thomas"}]}
+           (:datahike.pull/result single)))
+    (is (= expected-plan (:datahike.read/dependency-plan single)))
+    (is (= expected-plan (:datahike.read/dependency-plan many)))
+    (is (= [(d/pull ordered-test-db selector 1)
+            (d/pull ordered-test-db selector [:person/id "elizabeth"])]
+           (:datahike.pull-many/result many)))
+    (is (= :all
+           (get-in (d/pull-dependency-plan '[*] [1])
+                   [:datahike.query.dependency/sources 0
+                    :datahike.query.source/attributes]))))
+  (testing "keyword entity refs include the ident lookup dependency"
+    (is (= #{:db/ident :name}
+           (get-in (d/pull-dependency-plan '[:name] [:person/petr])
+                   [:datahike.query.dependency/sources 0
+                    :datahike.query.source/attributes])))))
+
 (deftest ordered-pull-many-preserves-input-positions
   (testing "empty and repeated inputs preserve exact vector shape"
     (is (= [] (d/pull-many ordered-test-db '[:name] [])))

@@ -580,6 +580,33 @@
                  :code "(pull db {:selector [:db/id :name] :eid 1})"}]
      :impl datahike.pull-api/pull}
 
+    pull-dependency-plan
+    {:args [:=> [:cat [:vector :any] [:sequential :datahike/SEId]]
+            :datahike/SReadDependencyPlan]
+     :ret :datahike/SReadDependencyPlan
+     :categories [:query :pull :diagnostics]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? true
+     :doc "Returns a parsed pull dependency plan including entity-ref lookup attributes without retaining a database value."
+     :impl datahike.pull-api/pull-dependency-plan}
+
+    pull-with-evidence
+    {:args [:function
+            [:=> [:cat :datahike/SDB :datahike/SPullOptions]
+             :datahike/SPullEvidence]
+            [:=> [:cat :datahike/SDB [:vector :any] :datahike/SEId]
+             :datahike/SPullEvidence]]
+     :ret :datahike/SPullEvidence
+     :categories [:query :pull :diagnostics]
+     :stability :experimental
+     :supports-remote? true
+     :referentially-transparent? true
+     :capability-operation :datahike.operation/pull-with-evidence
+     :resource-options #{:max-work :max-results :max-result-weight}
+     :doc "Pulls one entity and returns its eager value with a parsed dependency plan."
+     :impl datahike.pull-api/pull-with-evidence}
+
     pull-many
     {:args [:function
             [:=> [:cat :datahike/SDB :datahike/SPullManyOptions]
@@ -597,6 +624,23 @@
      :examples [{:desc "Pull multiple entities"
                  :code "(pull-many db [:db/id :name] [1 2 3])"}]
      :impl datahike.pull-api/pull-many}
+
+    pull-many-with-evidence
+    {:args [:function
+            [:=> [:cat :datahike/SDB :datahike/SPullManyOptions]
+             :datahike/SPullManyEvidence]
+            [:=> [:cat :datahike/SDB [:vector :any]
+                  [:sequential :datahike/SEId]]
+             :datahike/SPullManyEvidence]]
+     :ret :datahike/SPullManyEvidence
+     :categories [:query :pull :diagnostics]
+     :stability :experimental
+     :supports-remote? true
+     :referentially-transparent? true
+     :capability-operation :datahike.operation/pull-many-with-evidence
+     :resource-options #{:max-work :max-results :max-result-weight}
+     :doc "Pulls input-aligned entities and returns their values with one parsed dependency plan."
+     :impl datahike.pull-api/pull-many-with-evidence}
 
     entity
     {:args [:=> [:cat :datahike/SDB [:or :datahike/SEId :any]] :any]

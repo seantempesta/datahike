@@ -2806,23 +2806,6 @@
 
     :else (source-attr-deps inherited-source :all)))
 
-(defn- pull-spec-attr-deps
-  [spec]
-  (if (:wildcard? spec)
-    :all
-    (reduce-kv
-     (fn [attributes _display-key options]
-       (let [attribute (:attr options)
-             nested (when-let [subpattern (:subpattern options)]
-                      (pull-spec-attr-deps subpattern))]
-         (cond
-           (not (keyword? attribute)) (reduced :all)
-           (= nested :all) (reduced :all)
-           :else (cond-> (conj attributes attribute)
-                   nested (into nested)))))
-     #{}
-     (:attrs spec))))
-
 (defn- extract-find-pull-source-deps
   [find-clause bindings]
   (let [find-elements (dpip/find-elements find-clause)]
@@ -2833,7 +2816,8 @@
                pattern (dependency-argument-value (:pattern element) bindings)
                attributes
                (if (sequential? pattern)
-                 (pull-spec-attr-deps (dpp/parse-pull pattern))
+                 (dpa/pull-spec-attribute-dependencies
+                  (dpp/parse-pull pattern))
                  :all)]
            (merge-source-attr-deps dependencies
                                    (source-attr-deps source attributes)))
