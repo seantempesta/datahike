@@ -632,49 +632,62 @@
            (map dvec (d/index-range @db {:attrid :likes :start "egg" :end "pineapple"}))))
     (d/release db)))
 
+(defn- database-hash-after-reopen [cfg]
+  (let [conn (d/connect cfg)]
+    (try
+      (hash @conn)
+      (finally
+        (d/release conn)))))
+
 (deftest test-database-hash
   (testing "Hashing without history"
-    (let [cfg {:store {:backend :memory
-                       :id #uuid "ba5b1000-0000-0000-0000-000000000001"}
-               :keep-history? false
-               :schema-flexibility :read}
+    (let [cfg (utils/provide-unique-id
+               {:store {:backend :memory}
+                :keep-history? false
+                :schema-flexibility :read})
           conn (utils/setup-db cfg false)
           hash-0 0]
-      (testing "first hash equals zero"
-        (is (= hash-0 (hash @conn))))
-      (testing "hash remains 0 after reconnecting"
-        (is (= hash-0 (-> (d/connect cfg) deref hash))))
-      (testing "add entity to database"
-        (let [_ (d/transact conn [{:db/id 1 :name "Max Mustermann"}])
-              hash-1 (hash @conn)]
-          (is (= hash-1 (-> (d/connect cfg) deref hash)))
-          (testing "remove entity again"
-            (let [_ (d/transact conn [[:db/retractEntity 1]])
-                  hash-2 (hash @conn)]
-              (is (not= hash-2 hash-1))
-              (is (= hash-0 hash-2))))))
-      (d/release conn)))
+      (try
+        (testing "first hash equals zero"
+          (is (= hash-0 (hash @conn))))
+        (testing "hash remains 0 after reconnecting"
+          (is (= hash-0 (database-hash-after-reopen cfg))))
+        (testing "add entity to database"
+          (let [_ (d/transact conn [{:db/id 1 :name "Max Mustermann"}])
+                hash-1 (hash @conn)]
+            (is (= hash-1 (database-hash-after-reopen cfg)))
+            (testing "remove entity again"
+              (let [_ (d/transact conn [[:db/retractEntity 1]])
+                    hash-2 (hash @conn)]
+                (is (not= hash-2 hash-1))
+                (is (= hash-0 hash-2))))))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg)))))
   (testing "Hashing with history"
-    (let [cfg {:store {:backend :memory
-                       :id #uuid "ba5b1001-0000-0000-0000-000000000001"}
-               :keep-history? true
-               :schema-flexibility :read}
+    (let [cfg (utils/provide-unique-id
+               {:store {:backend :memory}
+                :keep-history? true
+                :schema-flexibility :read})
           conn (utils/setup-db cfg false)
           hash-0 (hash @conn)]
-      (testing "first hash equals zero"
-        (is (= hash-0 (hash @conn))))
-      (testing "hash remains 0 after reconnecting"
-        (is (= hash-0 (-> (d/connect cfg) deref hash))))
-      (testing "add entity to database"
-        (let [_ (d/transact conn [{:db/id 1 :name "Max Mustermann"}])
-              hash-1 (hash @conn)]
-          (is (= hash-1 (-> (d/connect cfg) deref hash)))
-          (testing "retract entity again"
-            (let [_ (d/transact conn [[:db/retractEntity 1]])
-                  hash-2 (hash @conn)]
-              (is (not= hash-1 hash-2))
-              (is (not= hash-0 hash-2))))))
-      (d/release conn))))
+      (try
+        (testing "first hash equals zero"
+          (is (= hash-0 (hash @conn))))
+        (testing "hash remains 0 after reconnecting"
+          (is (= hash-0 (database-hash-after-reopen cfg))))
+        (testing "add entity to database"
+          (let [_ (d/transact conn [{:db/id 1 :name "Max Mustermann"}])
+                hash-1 (hash @conn)]
+            (is (= hash-1 (database-hash-after-reopen cfg)))
+            (testing "retract entity again"
+              (let [_ (d/transact conn [[:db/retractEntity 1]])
+                    hash-2 (hash @conn)]
+                (is (not= hash-1 hash-2))
+                (is (not= hash-0 hash-2))))))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
 
 (deftest test-database-schema
   (letfn [(test-schema [cfg]
