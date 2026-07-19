@@ -85,7 +85,12 @@
   (let [conn (tu/setup-db (assoc-in cfg-template [:store :id] #uuid "09000000-0000-0000-0000-000000000003"))]
     (testing "purge entity from current index"
       (is (= #{{:name "Alice" :age 25} {:name "Bob" :age 35}} (find-entities @conn)))
-      (d/transact conn [[:db.purge/entity [:name "Alice"]]])
+      (let [report (d/transact conn [[:db.purge/entity [:name "Alice"]]])]
+        (is (= #{[:name "Alice" false]
+                 [:age 25 false]}
+               (into #{}
+                     (map (juxt :a :v :added))
+                     (remove #(= :db/txInstant (:a %)) (:tx-data report))))))
       (is (= #{{:name "Bob" :age 35}} (find-entities @conn)))
       (is (= #{{:name "Bob" :age 35}} (find-entities (d/history @conn)))))
     (testing "retract entity from current index and purge from history"

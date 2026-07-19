@@ -745,7 +745,15 @@
      (transact-report report (datom (.-e d) (.-a d) (.-v d) txid false)))))
 
 (defn- transact-purge-datom [report ^Datom d]
-  (update-in report [:db-after] with-temporal-datom d))
+  ;; Purge removes the matching fact from both current and temporal indexes.
+  ;; Preserve that committed change in :tx-data as an ordinary retraction at
+  ;; this transaction.  Committed-report consumers (including query-cache
+  ;; revision tracking and reactive interests) must not infer "unchanged"
+  ;; merely because purge's index surgery does not use transact-report.
+  (-> report
+      (update-in [:db-after] with-temporal-datom d)
+      (update ::effective-tx-data (fnil conj [])
+              (datom (.-e d) (.-a d) (.-v d) (current-tx report) false))))
 
 (defn- retract-components [db datoms]
   (into #{} (comp

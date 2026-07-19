@@ -343,12 +343,15 @@ public class DatahikeTest {
         Object conn = Datahike.connect(config);
         assertNotNull(conn);
 
-        // Transact and query to verify the database works
-        Datahike.transact(conn, vec(map(kwd(":name"), "Test")));
-        Object result = Datahike.q("[:find ?n :where [?e :name ?n]]", deref(conn));
-        assertNotNull(result);
-
-        Datahike.deleteDatabase(config);
+        try {
+            // Transact and query to verify the database works
+            Datahike.transact(conn, vec(map(kwd(":name"), "Test")));
+            Object result = Datahike.q("[:find ?n :where [?e :name ?n]]", deref(conn));
+            assertNotNull(result);
+        } finally {
+            Datahike.release(conn);
+            Datahike.deleteDatabase(config);
+        }
         assertFalse(Datahike.databaseExists(config));
     }
 

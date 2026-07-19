@@ -179,6 +179,7 @@
                   :url     (str "http://localhost:" port)
                   :token   "securerandompassword"
                   :format  :json}
+          raw-conn* (atom nil)
           _ (try (api/request-json-raw :post "delete-database" remote
                                        "[\"{:store {:backend :memory :id #uuid \\\"23196000-0000-0000-0000-000000000001\\\"}}\"]")
                  (catch Exception _))]  ; Ignore if database doesn't exist
@@ -187,6 +188,7 @@
                                              "[\"{:store {:backend :memory :id #uuid \\\"23196000-0000-0000-0000-000000000001\\\"} :schema-flexibility :read}\"]")
               raw-conn (api/request-json-raw :post "connect" remote
                                              (str "[" raw-cfg "]"))
+              _        (reset! raw-conn* raw-conn)
               _        (api/request-json-raw :post "transact" remote
                                              (str "[" raw-conn ", [{\"name\": \"Peter\", \"age\": 42}]]"))
               raw-db   (api/request-json-raw :post "db" remote
@@ -196,6 +198,10 @@
                                             raw-db "]"))
                  "[\"!set\",[[\"Peter\",42]]]")))
         (finally
+          (when-let [raw-conn @raw-conn*]
+            (try (api/request-json-raw :post "release" remote
+                                       (str "[" raw-conn "]"))
+                 (catch Exception _)))
           (try (api/request-json-raw :post "delete-database" remote
                                      "[\"{:store {:backend :memory :id #uuid \\\"23196000-0000-0000-0000-000000000001\\\"}}\"]")
                (catch Exception _))

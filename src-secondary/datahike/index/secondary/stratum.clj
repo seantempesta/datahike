@@ -23,6 +23,7 @@
    [datahike.index.secondary :as sec]
    [datahike.index.entity-set :as es]
    [datahike.db.interface :as dbi]
+   [datalog.parser.type]
    [stratum.api :as st]
    [stratum.dataset :as sd]
    [stratum.index :as sidx]
@@ -949,28 +950,40 @@
                                      sys-to-col sys-now))))))
       (persistent! rows))))
 
-(defn- snapshot-prev-open-attrs
-  "For each eid in `pending-adds`, find its currently-open row in the
-   dataset and capture the attribute values. Used to merge partial
-   updates into the new row so unchanged attributes carry over."
-  [current-cols ^long current-n ^java.util.HashMap pending-adds attr-col-keys]
-  (let [m (java.util.HashMap.)]
-    (when (and (pos? current-n) current-cols)
-      (let [eid-col (get current-cols :eid)
-            vto-col (get current-cols vt-to-col)]
-        (dotimes [i current-n]
-          (let [eid (long (materialize-col-value eid-col i))
-                vto (long (or (materialize-col-value vto-col i) vt-open-sentinel))]
-            (when (and (= vto vt-open-sentinel)
-                       (.containsKey pending-adds eid))
-              (let [prev (into {}
-                               (keep (fn [k]
-                                       (when-let [v (materialize-col-value
-                                                     (get current-cols k) i)]
-                                         [k v])))
-                               attr-col-keys)]
-                (.put m eid prev)))))))
-    m))
+(defn- snapshot-predecessor-attrs
+  "For each pending eid, capture attributes from the latest row whose valid
+   start does not follow the new row.  A predecessor may have a finite valid
+   end; contiguous and gapped partial updates must still carry its unchanged
+   attributes forward."
+  [current-cols current-n ^java.util.HashMap pending-adds attr-col-keys
+   new-vt-from]
+  (let [candidates
+        (if (and (pos? current-n) current-cols)
+          (let [eid-col (get current-cols :eid)
+                vf-col (get current-cols vt-from-col)]
+            (reduce
+             (fn [result i]
+               (let [eid (long (materialize-col-value eid-col i))
+                     vf (long (or (materialize-col-value vf-col i) vt-from-floor))
+                     [previous-vf] (get result eid)]
+                 (if (and (.containsKey pending-adds eid)
+                          (<= vf new-vt-from)
+                          (or (nil? previous-vf) (> vf (long previous-vf))))
+                   (assoc result eid
+                          [vf (into {}
+                                    (keep (fn [k]
+                                            (when-let [v (materialize-col-value
+                                                          (get current-cols k) i)]
+                                              [k v])))
+                                    attr-col-keys)])
+                   result)))
+             {}
+             (range current-n)))
+          {})
+        attrs (java.util.HashMap.)]
+    (doseq [[eid [_vf values]] candidates]
+      (.put attrs eid values))
+    attrs))
 
 (defn- build-new-rows
   "For each `[eid attr-map]` in `pending-adds`, build the row to append:
@@ -1025,10 +1038,11 @@
                             current-cols current-n col-keys
                             close-eids vt-from sys-now)
             new-rows      (when has-adds?
-                            (let [prev-open (snapshot-prev-open-attrs
-                                              current-cols current-n
-                                              pending-adds attr-col-keys)]
-                              (build-new-rows pending-adds prev-open
+                            (let [predecessors (snapshot-predecessor-attrs
+                                                current-cols current-n
+                                                pending-adds attr-col-keys
+                                                vt-from)]
+                              (build-new-rows pending-adds predecessors
                                               vt-from vt-to sys-now)))
             all-rows      (into existing-rows (or new-rows []))]
         (if (empty? all-rows)
