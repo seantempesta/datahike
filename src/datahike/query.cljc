@@ -2887,15 +2887,34 @@
     (catch #?(:clj Throwable :cljs :default) _
       :all)))
 
-(defn- dependency-plan-attributes
-  [plan]
-  (if (= plan :all)
-    :all
-    (reduce (fn [attributes source]
-              (merge-attr-deps attributes
-                               (:datahike.query.source/attributes source)))
-            #{}
-            (:datahike.query.dependency/sources plan))))
+(defn dependency-plan-attributes
+  "Interprets a Datahike read dependency plan.
+
+   With one argument, unions every source. With an argument position, returns
+   only that parsed database source's attributes. Missing or malformed source
+   evidence widens to `:all`."
+  ([plan]
+   (if (= plan :all)
+     :all
+     (reduce (fn [attributes source]
+               (merge-attr-deps
+                attributes (:datahike.query.source/attributes source)))
+             #{}
+             (:datahike.query.dependency/sources plan))))
+  ([plan argument-position]
+   (if (= plan :all)
+     :all
+     (let [sources
+           (filter #(= argument-position
+                       (:datahike.query.source/argument-position %))
+                   (:datahike.query.dependency/sources plan))]
+       (if (seq sources)
+         (reduce (fn [attributes source]
+                   (merge-attr-deps
+                    attributes (:datahike.query.source/attributes source)))
+                 #{}
+                 sources)
+         :all)))))
 
 (defn query-attribute-dependencies
   "Conservatively project the attributes that can affect a query result.

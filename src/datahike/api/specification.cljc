@@ -534,6 +534,20 @@
      :doc "Returns an execution-aware dependency plan partitioned by parsed database source. Parses inputs and supplied rules without executing or retaining a database value."
      :impl datahike.query/query-dependency-plan}
 
+    dependency-plan-attributes
+    {:args [:function
+            [:=> [:cat :datahike/SReadDependencyPlan]
+             :datahike/SQueryAttributeDependencies]
+            [:=> [:cat :datahike/SReadDependencyPlan [:int {:min 0}]]
+             :datahike/SQueryAttributeDependencies]]
+     :ret :datahike/SQueryAttributeDependencies
+     :categories [:query :diagnostics]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? true
+     :doc "Interprets one dependency plan as the union of all sources or as the attributes for one source argument position."
+     :impl datahike.query/dependency-plan-attributes}
+
     query-stats
     {:args [:function
             [:=> [:cat :datahike/SQueryArgs] :map]

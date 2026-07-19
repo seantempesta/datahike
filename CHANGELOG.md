@@ -65,7 +65,9 @@ When something is added, it's typically marked *Experimental*. When the API cont
   bodies, dynamic pull selectors, and partitions dependencies by parsed
   database source. Query cache entries retain that plan, so propagation checks
   only the source database that advanced and schema-changing transactions do
-  not inherit potentially stale results. ([#TODO])
+  not inherit potentially stale results. `dependency-plan-attributes` exposes
+  the same conservative source selection for committed-report consumers.
+  ([#TODO])
 
 - **Schema updates retain every invalid difference** — comparing a schema
   entity no longer forgets an incompatible earlier change when a later map

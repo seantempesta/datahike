@@ -144,7 +144,22 @@
               :in $ ?selector
               :where [?e :person/id]]
             ::people
-            [:person/id {:person/friend [:person/email]}])))))
+            [:person/id {:person/friend [:person/email]}]))))
+  (testing "one interpreter selects a source or unions the whole plan"
+    (let [plan (d/query-dependency-plan
+                '[:find ?name ?email
+                  :in $people $archive
+                  :where [$people ?e :person/name ?name]
+                         [$archive ?e :person/email ?email]]
+                ::people ::archive)]
+      (is (= #{:person/name :person/email}
+             (d/dependency-plan-attributes plan)))
+      (is (= #{:person/name}
+             (d/dependency-plan-attributes plan 0)))
+      (is (= #{:person/email}
+             (d/dependency-plan-attributes plan 1)))
+      (is (= :all (d/dependency-plan-attributes plan 2)))
+      (is (= :all (d/dependency-plan-attributes :all 0))))))
 
 (deftest test-mixed-age-types
   (let [db (-> (db/empty-db)
