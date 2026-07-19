@@ -13,127 +13,133 @@
    [datahike.constants :refer [tx0]]))
 
 (deftest test-transact-docs
-  (let [cfg {:store {:backend :memory
-                     :id #uuid "ba5b1000-0000-0000-0000-000000000001"}
-             :keep-history? false
-             :schema-flexibility :read}
-        conn (utils/setup-db cfg)
+  (let [cfg (utils/provide-unique-id
+             {:store {:backend :memory}
+              :keep-history? false
+              :schema-flexibility :read})
+        conn (utils/setup-db cfg false)
         dvec #(vector (:e %) (:a %) (:v %))]
-    ;; add a single datom to an existing entity (1)
-    (is (= [[1 :name "Ivan"]]
-           (map dvec (:tx-data (d/transact conn {:tx-data [[:db/add 1 :name "Ivan"]]})))))
+    (try
+      ;; add a single datom to an existing entity (1)
+      (is (= [[1 :name "Ivan"]]
+             (map dvec (:tx-data (d/transact conn {:tx-data [[:db/add 1 :name "Ivan"]]})))))
 
     ;; retract a single datom
-    (is (= [[1 :name "Ivan"]]
-           (map dvec (:tx-data (d/transact conn {:tx-data [[:db/retract 1 :name "Ivan"]]})))))
+      (is (= [[1 :name "Ivan"]]
+             (map dvec (:tx-data (d/transact conn {:tx-data [[:db/retract 1 :name "Ivan"]]})))))
 
     ;; retract single entity attribute
-    (is (= []
-           (map dvec (:tx-data (d/transact conn {:tx-data [[:db.fn/retractAttribute 1 :name]]})))))
+      (is (= []
+             (map dvec (:tx-data (d/transact conn {:tx-data [[:db.fn/retractAttribute 1 :name]]})))))
 
     ;; retract all entity attributes (effectively deletes entity)
-    (is (= []
-           (map dvec (:tx-data (d/transact conn {:tx-data [[:db.fn/retractEntity 1]]})))))
+      (is (= []
+             (map dvec (:tx-data (d/transact conn {:tx-data [[:db.fn/retractEntity 1]]})))))
 
     ;; create a new entity (`-1`, as any other negative value, is a tempid
     ;; that will be replaced with DataScript to a next unused eid)
-    (is (= '([2 :name "Ivan"])
-           (map dvec (:tx-data (d/transact conn {:tx-data [[:db/add -1 :name "Ivan"]]})))))
+      (is (= '([2 :name "Ivan"])
+             (map dvec (:tx-data (d/transact conn {:tx-data [[:db/add -1 :name "Ivan"]]})))))
 
     ;; check assigned id (here `*1` is a result returned from previous `transact` call)
-    (is (= {-1 3, :db/current-tx 536870918}
-           (:tempids (d/transact conn {:tx-data [[:db/add -1 :name "Ivan"]]}))))
+      (is (= {-1 3, :db/current-tx 536870918}
+             (:tempids (d/transact conn {:tx-data [[:db/add -1 :name "Ivan"]]}))))
 
     ;; check actual datoms inserted
-    (is (= '([4 :name "Ivan"])
-           (map dvec (:tx-data (d/transact conn {:tx-data [[:db/add -1 :name "Ivan"]]}))))) ; => [#datahike/Datom [296 :name "Ivan"]]
+      (is (= '([4 :name "Ivan"])
+             (map dvec (:tx-data (d/transact conn {:tx-data [[:db/add -1 :name "Ivan"]]}))))) ; => [#datahike/Datom [296 :name "Ivan"]]
 
     ;; tempid can also be a string
-    (is (= {"ivan" 5, :db/current-tx 536870920}
-           (:tempids (d/transact conn {:tx-data [[:db/add "ivan" :name "Ivan"]]}))))
+      (is (= {"ivan" 5, :db/current-tx 536870920}
+             (:tempids (d/transact conn {:tx-data [[:db/add "ivan" :name "Ivan"]]}))))
 
     ;; reference another entity (must exist)
-    (is (= '([6 :friend 296])
-           (map dvec (:tx-data (d/transact conn {:tx-data [[:db/add -1 :friend 296]]})))))
+      (is (= '([6 :friend 296])
+             (map dvec (:tx-data (d/transact conn {:tx-data [[:db/add -1 :friend 296]]})))))
 
     ;; create an entity and set multiple attributes (in a single transaction
     ;; equal tempids will be replaced with the same unused yet entid)
-    (is (= '([7 :name "Ivan"] [7 :likes "fries"] [7 :likes "pizza"] [7 :friend 296])
-           (map dvec (:tx-data (d/transact conn {:tx-data [[:db/add -1 :name "Ivan"]
-                                                           [:db/add -1 :likes "fries"]
-                                                           [:db/add -1 :likes "pizza"]
-                                                           [:db/add -1 :friend 296]]})))))
+      (is (= '([7 :name "Ivan"] [7 :likes "fries"] [7 :likes "pizza"] [7 :friend 296])
+             (map dvec (:tx-data (d/transact conn {:tx-data [[:db/add -1 :name "Ivan"]
+                                                             [:db/add -1 :likes "fries"]
+                                                             [:db/add -1 :likes "pizza"]
+                                                             [:db/add -1 :friend 296]]})))))
 
     ;; create an entity and set multiple attributes (alternative map form)
-    (is (= '([8 :name "Ivan"] [8 :likes ["fries" "pizza"]] [8 :friend 296])
-           (map dvec (:tx-data (d/transact conn {:tx-data [{:db/id  -1
-                                                            :name   "Ivan"
-                                                            :likes  ["fries" "pizza"]
-                                                            :friend 296}]})))))
+      (is (= '([8 :name "Ivan"] [8 :likes ["fries" "pizza"]] [8 :friend 296])
+             (map dvec (:tx-data (d/transact conn {:tx-data [{:db/id  -1
+                                                              :name   "Ivan"
+                                                              :likes  ["fries" "pizza"]
+                                                              :friend 296}]})))))
 
     ;; update an entity (alternative map form). Can’t retract attributes in
     ;; map form. For cardinality many attrs, value (fish in this example)
     ;; will be added to the list of existing values
-    (is (= '([296 :name "Oleg"] [296 :likes ["fish"]])
-           (map dvec (:tx-data (d/transact conn {:tx-data [{:db/id  296
-                                                            :name   "Oleg"
-                                                            :likes  ["fish"]}]})))))
+      (is (= '([296 :name "Oleg"] [296 :likes ["fish"]])
+             (map dvec (:tx-data (d/transact conn {:tx-data [{:db/id  296
+                                                              :name   "Oleg"
+                                                              :likes  ["fish"]}]})))))
 
     ;; ref attributes can be specified as nested map, that will create netsed entity as well
-    (is (= '([297 :name "Oleg"] [297 :friend {:db/id -2, :name "Sergey"}])
-           (map dvec (:tx-data (d/transact conn {:tx-data [{:db/id  -1
-                                                            :name   "Oleg"
-                                                            :friend {:db/id -2
-                                                                     :name "Sergey"}}]})))))
+      (is (= '([297 :name "Oleg"] [297 :friend {:db/id -2, :name "Sergey"}])
+             (map dvec (:tx-data (d/transact conn {:tx-data [{:db/id  -1
+                                                              :name   "Oleg"
+                                                              :friend {:db/id -2
+                                                                       :name "Sergey"}}]})))))
 
     ;; schema is needed for using a reverse attribute
-    (is (= '([298 :db/valueType :db.type/ref] [298 :db/cardinality :db.cardinality/one] [298 :db/ident :friend])
-           (map dvec (:tx-data (d/transact conn {:tx-data [{:db/valueType :db.type/ref
-                                                            :db/cardinality :db.cardinality/one
-                                                            :db/ident :friend}]})))))
+      (is (= '([298 :db/valueType :db.type/ref] [298 :db/cardinality :db.cardinality/one] [298 :db/ident :friend])
+             (map dvec (:tx-data (d/transact conn {:tx-data [{:db/valueType :db.type/ref
+                                                              :db/cardinality :db.cardinality/one
+                                                              :db/ident :friend}]})))))
 
     ;; reverse attribute name can be used if you want created entity to become
     ;; a value in another entity reference
-    (is (= '([299 :name "Oleg"] [296 :friend 299])
-           (map dvec (:tx-data (d/transact conn {:tx-data [{:db/id  -1
-                                                            :name   "Oleg"
-                                                            :_friend 296}]})))))
+      (is (= '([299 :name "Oleg"] [296 :friend 299])
+             (map dvec (:tx-data (d/transact conn {:tx-data [{:db/id  -1
+                                                              :name   "Oleg"
+                                                              :_friend 296}]})))))
 
     ;; equivalent to
-    (is (= '([300 :name "Oleg"] [296 :friend 300])
-           (map dvec (:tx-data (d/transact conn {:tx-data [{:db/id  -1, :name   "Oleg"}
-                                                           {:db/id 296, :friend -1}]})))))
+      (is (= '([300 :name "Oleg"] [296 :friend 300])
+             (map dvec (:tx-data (d/transact conn {:tx-data [{:db/id  -1, :name   "Oleg"}
+                                                             {:db/id 296, :friend -1}]})))))
 
     ;; deprecated api
-    (is (= '([301 :name "Oleg"] [301 :likes "pie"] [301 :likes "dates"] [301 :friend 297])
-           (map dvec (:tx-data (d/transact conn [[:db/add -1 :name "Oleg"]
-                                                 [:db/add -1 :likes "pie"]
-                                                 [:db/add -1 :likes "dates"]
-                                                 [:db/add -1 :friend 297]])))))
+      (is (= '([301 :name "Oleg"] [301 :likes "pie"] [301 :likes "dates"] [301 :friend 297])
+             (map dvec (:tx-data (d/transact conn [[:db/add -1 :name "Oleg"]
+                                                   [:db/add -1 :likes "pie"]
+                                                   [:db/add -1 :likes "dates"]
+                                                   [:db/add -1 :friend 297]])))))
 
     ;; lazy sequence
-    (is (= '([302 :name "Oleg"] [302 :likes "pie"] [302 :likes "dates"] [302 :friend 297])
-           (map dvec (:tx-data (d/transact conn (take 4 [[:db/add -1 :name "Oleg"]
-                                                         [:db/add -1 :likes "pie"]
-                                                         [:db/add -1 :likes "dates"]
-                                                         [:db/add -1 :friend 297]]))))))
+      (is (= '([302 :name "Oleg"] [302 :likes "pie"] [302 :likes "dates"] [302 :friend 297])
+             (map dvec (:tx-data (d/transact conn (take 4 [[:db/add -1 :name "Oleg"]
+                                                           [:db/add -1 :likes "pie"]
+                                                           [:db/add -1 :likes "dates"]
+                                                           [:db/add -1 :friend 297]]))))))
 
     ;; incorrect arguments
-    (is (thrown? clojure.lang.ExceptionInfo (d/transact conn nil)))
-    (is (thrown? clojure.lang.ExceptionInfo (d/transact conn :foo)))
-    (is (thrown? clojure.lang.ExceptionInfo (d/transact conn 1)))
-    (is (thrown? clojure.lang.ExceptionInfo (d/transact conn {:foo "bar"})))
-    (d/release conn)))
+      (is (thrown? clojure.lang.ExceptionInfo (d/transact conn nil)))
+      (is (thrown? clojure.lang.ExceptionInfo (d/transact conn :foo)))
+      (is (thrown? clojure.lang.ExceptionInfo (d/transact conn 1)))
+      (is (thrown? clojure.lang.ExceptionInfo (d/transact conn {:foo "bar"})))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
 
 (deftest test-transact!-docs
-  (let [cfg {:store {:backend :memory
-                     :id #uuid "ba5b1000-0000-0000-0000-000000000001"}
-             :keep-history? false
-             :schema-flexibility :read}
-        conn (utils/setup-db cfg)]
-    ;; add a single datom to an existing entity (1)
-    (is (d/transact! conn [[:db/add 1 :name "Ivan"]]))
-    (d/release conn)))
+  (let [cfg (utils/provide-unique-id
+             {:store {:backend :memory}
+              :keep-history? false
+              :schema-flexibility :read})
+        conn (utils/setup-db cfg false)]
+    (try
+      ;; add a single datom to an existing entity (1)
+      (is (d/transact! conn [[:db/add 1 :name "Ivan"]]))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
 
     ;; retract a single datom
 
@@ -169,17 +175,20 @@
     (d/release conn)))
 
 (deftest test-pull-many-docs
-  (let [cfg {:store {:backend :memory
-                     :id #uuid "ba5b1000-0000-0000-0000-000000000001"}
-             :initial-tx [[:db/add 1 :name "Ivan"]
-                          [:db/add 2 :name "Oleg"]]
-             :keep-history? false
-             :schema-flexibility :read}
-        conn (utils/setup-db cfg)]
-    (is (= (d/pull-many @conn [:db/id :name] [1 2])
-           [{:db/id 1, :name "Ivan"}
-            {:db/id 2, :name "Oleg"}]))
-    (d/release conn)))
+  (let [cfg (utils/provide-unique-id
+             {:store {:backend :memory}
+              :initial-tx [[:db/add 1 :name "Ivan"]
+                           [:db/add 2 :name "Oleg"]]
+              :keep-history? false
+              :schema-flexibility :read})
+        conn (utils/setup-db cfg false)]
+    (try
+      (is (= (d/pull-many @conn [:db/id :name] [1 2])
+             [{:db/id 1, :name "Ivan"}
+              {:db/id 2, :name "Oleg"}]))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
 
 (deftest test-q-docs
   (let [cfg {:store {:backend :memory

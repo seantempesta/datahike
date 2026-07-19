@@ -381,48 +381,53 @@
 
 (deftest test-update-schema
   (let [cfg {:store {:backend :memory
-                     :id #uuid "5c100000-0000-0000-0000-000000000008"}
+                     :id (random-uuid)}
              :initial-tx [name-schema personal-id-schema]}
         _ (d/delete-database cfg)
         _ (d/create-database cfg)
         conn (d/connect cfg)
         update-name-attr (fn [attr new-value] (d/transact conn {:tx-data [(assoc name-schema attr new-value)]}))]
-    (testing "Allow to update doc"
-      (is (update-name-attr :db/doc "Some doc") "It should be allowed to add :db/doc.")
-      (is (update-name-attr :db/doc "Some new doc") "It should be allowed to update :db/doc.")
-      (is (d/transact conn {:tx-data [[:db/retract :name :db/doc]]}) "It should be allowed to retract :db/doc."))
+    (try
+      (testing "Allow to update doc"
+        (is (update-name-attr :db/doc "Some doc") "It should be allowed to add :db/doc.")
+        (is (update-name-attr :db/doc "Some new doc") "It should be allowed to update :db/doc.")
+        (is (d/transact conn {:tx-data [[:db/retract :name :db/doc]]}) "It should be allowed to retract :db/doc."))
 
-    (testing "Allow to toggle noHistory"
-      (is (update-name-attr :db/noHistory true) "It should be allowed to enable :db/noHistory.")
-      (is (update-name-attr :db/noHistory false) "It should be allowed to disable :db/noHistory."))
+      (testing "Allow to toggle noHistory"
+        (is (update-name-attr :db/noHistory true) "It should be allowed to enable :db/noHistory.")
+        (is (update-name-attr :db/noHistory false) "It should be allowed to disable :db/noHistory."))
 
-    (testing "Allow to toggle isComponent"
-      (is (update-name-attr :db/isComponent true) "It should be allowed to enable :db/isComponent.")
-      (is (update-name-attr :db/isComponent false) "It should be allowed to disable :db/isComponent."))
+      (testing "Allow to toggle isComponent"
+        (is (update-name-attr :db/isComponent true) "It should be allowed to enable :db/isComponent.")
+        (is (update-name-attr :db/isComponent false) "It should be allowed to disable :db/isComponent."))
 
-    (testing "Allow to update :db/unique only if it already exists"
-      (is (thrown-with-msg? Throwable
-                            #"Update not supported for these schema attributes"
-                            (d/transact conn {:tx-data [(assoc name-schema :db/unique :db.unique/value)]}))
-          "It shouldn't be allowed to update :db/unique if it doesn't exist already.")
-      (is (d/transact conn {:tx-data [(assoc personal-id-schema :db/unique :db.unique/value)]})
-          "It should be allowed to update :db/unique if it exists already."))
-
-    (testing "Allow to update :db/cardinality "
-      (testing "if :db/unique is not set"
-        (is (update-name-attr :db/cardinality :db.cardinality/many)
-            "It should be allowed to update :db/cardinality to :db.cardinality/many.")
-        (is (update-name-attr :db/cardinality :db.cardinality/one)
-            "It should be allowed to update :db/cardinality to :db.cardinality/one."))
-
-      (testing "if :db/unique is set"
-        (is (d/transact conn {:tx-data [(assoc personal-id-schema :db/cardinality :db.cardinality/one)]})
-            "It should be allowed to update :db/cardinality to :db.cardinality/one.")
+      (testing "Reject unsupported :db/unique changes"
         (is (thrown-with-msg? Throwable
                               #"Update not supported for these schema attributes"
-                              (d/transact conn {:tx-data [(assoc personal-id-schema :db/cardinality :db.cardinality/many)]}))
-            "It shouldn't be allowed to update :db/cardinality to :db.cardinality/many")))
-    (d/release conn)))
+                              (d/transact conn {:tx-data [(assoc name-schema :db/unique :db.unique/value)]}))
+            "It shouldn't be allowed to update :db/unique if it doesn't exist already.")
+        (is (thrown-with-msg? Throwable
+                              #"Update not supported for these schema attributes"
+                              (d/transact conn {:tx-data [(assoc personal-id-schema :db/unique :db.unique/value)]}))
+            "A cardinality-many unique attribute cannot change uniqueness semantics."))
+
+      (testing "Allow to update :db/cardinality "
+        (testing "if :db/unique is not set"
+          (is (update-name-attr :db/cardinality :db.cardinality/many)
+              "It should be allowed to update :db/cardinality to :db.cardinality/many.")
+          (is (update-name-attr :db/cardinality :db.cardinality/one)
+              "It should be allowed to update :db/cardinality to :db.cardinality/one."))
+
+        (testing "if :db/unique is set"
+          (is (d/transact conn {:tx-data [(assoc personal-id-schema :db/cardinality :db.cardinality/one)]})
+              "It should be allowed to update :db/cardinality to :db.cardinality/one.")
+          (is (thrown-with-msg? Throwable
+                                #"Update not supported for these schema attributes"
+                                (d/transact conn {:tx-data [(assoc personal-id-schema :db/cardinality :db.cardinality/many)]}))
+              "It shouldn't be allowed to update :db/cardinality to :db.cardinality/many")))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
 
 (deftest incompatible-schema-update-survives-later-entries
   (let [old-schema #:db{:ident :name
