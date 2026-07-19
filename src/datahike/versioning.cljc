@@ -67,7 +67,13 @@
 
 (defn- attached-cache-context
   "Derive committed cache ownership for a value loaded through an attached
-   connection or committed DB. Raw stores and detached values return nil."
+   connection or committed DB. Raw stores and detached values return nil.
+
+   The attached source owns exact attribute revisions only for its own commit.
+   A different materialized commit keeps the same connection generation but
+   uses its own commit ID as the conservative revision: stored commits do not
+   retain the process-local attribute revision map, so cross-commit promotion
+   would otherwise compare two absent revisions as unchanged."
   [conn-or-db commit-id]
   (let [source
         (cond
@@ -79,13 +85,18 @@
           conn-or-db
 
           :else nil)
-        {:datahike.cache/keys [connection-id generation committed?]}
+        {:datahike.cache/keys [connection-id generation committed?]
+         source-commit-id :datahike.cache/commit-id
+         :as source-context}
         (:cache-context source)]
     (when (and committed? connection-id generation)
-      {:datahike.cache/connection-id connection-id
-       :datahike.cache/generation generation
-       :datahike.cache/commit-id commit-id
-       :datahike.cache/committed? true})))
+      (if (= source-commit-id commit-id)
+        source-context
+        {:datahike.cache/connection-id connection-id
+         :datahike.cache/generation generation
+         :datahike.cache/commit-id commit-id
+         :datahike.cache/committed? true
+         :datahike.cache/conservative-revision commit-id}))))
 
 #?(:clj
    (defn- branch-secondary-indices

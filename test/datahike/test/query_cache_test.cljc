@@ -309,6 +309,50 @@
                        (d/query-cache-evidence)))))))))
 
 #?(:clj
+   (deftest materialized-commit-does-not-promote-results-across-unknown-revisions
+     (with-temp-db
+       {:keep-history? true}
+       (conj label-schema {:c/id "first" :c/note "first"})
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (let [ordered-query {:find '[?id ?note]
+                              :where '[[?entity :c/id ?id]
+                                       [?entity :c/note ?note]]
+                              :order-by '[?note :desc]
+                              :limit 2}
+               count-query '[:find (count ?entity) .
+                             :where [?entity :c/note _]]
+               first-commit (d/commit-id @conn)
+               second-report
+               (d/transact conn [{:c/id "second" :c/note "second"}])
+               second-commit (d/commit-id (:db-after second-report))
+               _ (d/transact conn [{:c/id "third" :c/note "third"}])
+               first-db (d/commit-as-db conn first-commit)
+               second-db (d/commit-as-db conn second-commit)]
+           (try
+             (is (= [["first" "first"]]
+                    (d/q ordered-query first-db)))
+             (is (= 1 (d/q count-query first-db)))
+             (is (= [["second" "second"]
+                     ["first" "first"]]
+                    (d/q ordered-query second-db))
+                 "a limited ordered query includes entities added by the selected commit")
+             (is (= 2 (d/q count-query second-db))
+                 "an aggregate includes entities added by the selected commit")
+             (is (= :datahike.cache.outcome/hit
+                    (get-in (dq/q-with-evidence ordered-query second-db)
+                            [:datahike.query/cache-evidence
+                             :datahike.cache/outcome]))
+                 "the exact materialized snapshot still reuses its own result")
+             (is (= :datahike.cache.outcome/hit
+                    (get-in (dq/q-with-evidence count-query second-db)
+                            [:datahike.query/cache-evidence
+                             :datahike.cache/outcome])))
+             (finally
+               (d/release-materialized-db first-db)
+               (d/release-materialized-db second-db))))))))
+
+#?(:clj
    (deftest temporal-query-cancellation-and-clear-leave-no-flight
      (with-temp-db
        {:keep-history? true}
