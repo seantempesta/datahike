@@ -133,10 +133,23 @@
   "Concrete query attributes or the conservative all-attributes marker."
   [:or [:= :all] [:set :keyword]])
 
+(def SReadDependencyPlan
+  "Execution-aware read dependencies partitioned by parsed query source."
+  [:or
+   [:= :all]
+   [:map
+    [:datahike.query.dependency/sources
+     [:vector
+      [:map
+       [:datahike.query.source/symbol :symbol]
+       [:datahike.query.source/argument-position :nat-int]
+       [:datahike.query.source/attributes SQueryAttributeDependencies]]]]]])
+
 (def SQueryEvidence
   "A query result with cache, resource, and attribute evidence."
   [:map
    [:datahike.query/result :any]
+   [:datahike.read/dependency-plan SReadDependencyPlan]
    [:datahike.query/attribute-dependencies SQueryAttributeDependencies]
    [:datahike.query/cache-evidence :map]
    [:datahike.query/resource-evidence :map]])

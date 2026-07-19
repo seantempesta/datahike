@@ -52,9 +52,12 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 - **Query dependency projection follows parsed query and pull semantics** —
   database functions such as `missing?`, nested pull patterns, and reverse
-  pull attributes now contribute their canonical stored attributes. Query
-  cache inheritance and selective committed-report interests no longer miss
-  changes visible only through those valid forms. ([#TODO])
+  pull attributes now contribute their canonical stored attributes.
+  `query-dependency-plan` additionally resolves scalar inputs, supplied rule
+  bodies, dynamic pull selectors, and partitions dependencies by parsed
+  database source. Query cache entries retain that plan, so propagation checks
+  only the source database that advanced and schema-changing transactions do
+  not inherit potentially stale results. ([#TODO])
 
 - **Schema updates retain every invalid difference** — comparing a schema
   entity no longer forgets an incompatible earlier change when a later map

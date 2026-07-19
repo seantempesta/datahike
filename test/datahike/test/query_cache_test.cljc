@@ -634,10 +634,16 @@
            (is (= #{:c/note}
                   (:datahike.query/attribute-dependencies owner)
                   (:datahike.query/attribute-dependencies hit)))
+           (is (= {:datahike.query.dependency/sources
+                   [{:datahike.query.source/symbol '$
+                     :datahike.query.source/argument-position 0
+                     :datahike.query.source/attributes #{:c/note}}]}
+                  (:datahike.read/dependency-plan owner)
+                  (:datahike.read/dependency-plan hit)))
            (is (= #{:c/note}
                   (:datahike.query/attribute-dependencies
-                   (with-redefs [dq/query-attribute-dependencies
-                                 (fn [_]
+                   (with-redefs [dq/query-dependency-plan
+                                 (fn [& _]
                                    (throw (ex-info "unexpected recomputation"
                                                    {})))]
                      (dq/q-with-evidence query database)))))
@@ -657,6 +663,32 @@
                          (or (number? value) (boolean? value)
                              (keyword? value) (map? value)))
                        (vals (:datahike.query/cache-evidence owner)))))))))
+
+#?(:clj
+   (deftest input-bound-attribute-plan-drives-cache-inheritance
+     (with-temp-db
+       (conj label-schema {:c/id "input-plan" :c/note "value"})
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (let [query '[:find ?value
+                       :in $ ?attribute
+                       :where [_ ?attribute ?value]]
+               initial (dq/q-with-evidence query @conn :c/note)
+               unrelated (d/transact conn
+                                     [{:c/id "input-plan"
+                                       :c/labels ["other"]}])
+               inherited (dq/q-with-evidence
+                          query (:db-after unrelated) :c/note)]
+           (is (= #{["value"]} (:datahike.query/result initial)
+                  (:datahike.query/result inherited)))
+           (is (= #{:c/note}
+                  (:datahike.query.source/attributes
+                   (first (get-in initial
+                                  [:datahike.read/dependency-plan
+                                   :datahike.query.dependency/sources])))))
+           (is (= :datahike.cache.outcome/hit
+                  (get-in inherited [:datahike.query/cache-evidence
+                                     :datahike.cache/outcome]))))))))
 
 #?(:clj
    (deftest bounded-queries-share-completed-semantic-results
@@ -1142,6 +1174,26 @@
                                  :where [?c :c/id]]
                                (:db-after tx))))))))))
 
+#?(:clj
+   (deftest schema-changing-transactions-do-not-propagate-query-results
+     (with-temp-db
+       (conj label-schema {:c/id "schema-cache" :c/note "value"})
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (let [query '[:find ?value :where [_ :c/note ?value]]
+               initial (dq/q-with-evidence query @conn)
+               schema-change
+               (d/transact conn
+                           [{:db/ident :c/new-value
+                             :db/valueType :db.type/string
+                             :db/cardinality :db.cardinality/one}])
+               after (dq/q-with-evidence query (:db-after schema-change))]
+           (is (= #{["value"]} (:datahike.query/result initial)
+                  (:datahike.query/result after)))
+           (is (= :datahike.cache.outcome/miss-owner
+                  (get-in after [:datahike.query/cache-evidence
+                                 :datahike.cache/outcome]))))))))
+
 ;; CLJ only: ClojureScript has no BigDecimal (`bigdec`), and the
 ;; scale-insensitivity collision the fix guards against cannot arise on JS
 ;; numbers — so there is nothing to test under CLJS.
@@ -1276,6 +1328,42 @@
                       (get-in inherited [:datahike.query/cache-evidence
                                          :datahike.cache/outcome])))
                (is (= #{["L" "R2"]} (:datahike.query/result recomputed)))
+               (is (= :datahike.cache.outcome/miss-owner
+                      (get-in recomputed [:datahike.query/cache-evidence
+                                          :datahike.cache/outcome]))))))))))
+
+#?(:clj
+   (deftest composite-cache-propagation-checks-only-the-advanced-source-plan
+     (with-temp-db
+       (conj label-schema {:c/id "left" :c/note "L"})
+       (fn [left]
+         (with-temp-db
+           (conj label-schema
+                 {:c/id "right" :c/note "R" :c/labels ["x"]})
+           (fn [right]
+             (dq/clear-query-cache!)
+             (let [query '[:find ?left ?label
+                           :in $left $right
+                           :where
+                           [$left _ :c/note ?left]
+                           [$right _ :c/labels ?label]]
+                   initial (dq/q-with-evidence query @left @right)
+                   other-source-attribute
+                   (d/transact right [{:c/id "right" :c/note "R2"}])
+                   inherited
+                   (dq/q-with-evidence query @left
+                                       (:db-after other-source-attribute))
+                   selected-source-attribute
+                   (d/transact right [{:c/id "right" :c/labels ["y"]}])
+                   recomputed
+                   (dq/q-with-evidence query @left
+                                       (:db-after selected-source-attribute))]
+               (is (= #{["L" "x"]} (:datahike.query/result initial)))
+               (is (= :datahike.cache.outcome/hit
+                      (get-in inherited [:datahike.query/cache-evidence
+                                         :datahike.cache/outcome])))
+               (is (= #{["L" "x"] ["L" "y"]}
+                      (:datahike.query/result recomputed)))
                (is (= :datahike.cache.outcome/miss-owner
                       (get-in recomputed [:datahike.query/cache-evidence
                                           :datahike.cache/outcome]))))))))))

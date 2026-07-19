@@ -17,16 +17,17 @@
    [datahike.query-stats :as dqs]
    [datahike.query.single-flight :as single-flight]
    [datahike.tools :as dt]
-   [datalog.parser :refer [parse]]
+   [datalog.parser :as dp :refer [parse]]
    [datalog.parser.impl :as dpi]
    [datalog.parser.impl.proto :as dpip]
    [datalog.parser.pull :as dpp]
    #?(:cljs [datalog.parser.type :refer [Aggregate And BindColl BindIgnore BindScalar BindTuple Constant
-                                         FindColl FindRel FindScalar FindTuple Function Not Or Pattern
+                                         DefaultSrc FindColl FindRel FindScalar FindTuple Function Not Or Pattern
                                          PlainSymbol Predicate Pull RuleExpr RulesVar SrcVar Variable]])
    [datahike.constants :as const]
    [datahike.query.relation :as rel]
    [datahike.resource :as resource]
+   [datahike.schema :as schema]
    [datahike.query.plan :as plan]
    [datahike.query.analyze :as analyze]
    #?(:clj [datahike.query.logical :as logical])
@@ -48,7 +49,7 @@
                    [datahike.db DB AsOfDB SinceDB HistoricalDB]
                    [datahike.query.relation Relation]
                    [datalog.parser.type Aggregate And BindColl BindIgnore BindScalar BindTuple Constant
-                    FindColl FindRel FindScalar FindTuple Function Not Or Pattern
+                    DefaultSrc FindColl FindRel FindScalar FindTuple Function Not Or Pattern
                     PlainSymbol Predicate Pull RuleExpr RulesVar SrcVar Variable]
                    [java.lang.reflect Method]
                    [java.util Date Map HashSet HashSet])))
@@ -74,7 +75,8 @@
   true)
 
 (declare -collect -resolve-clause resolve-clause raw-q memoized-parse-query
-         query-attribute-dependencies)
+         query-attribute-dependencies query-dependency-plan
+         dependency-plan-attributes merge-attr-deps)
 
 ;; Records
 
@@ -134,20 +136,21 @@
          (await-q! call)))
      :cljs
      (let [query-map (normalize-q-input query inputs)
-           attribute-dependencies
-           (delay (query-attribute-dependencies (:query query-map)))
-           dependency-evidence (volatile! nil)
+           dependency-plan (delay (query-dependency-plan query-map))
+           cached-dependency-plan (volatile! nil)
            cache-evidence (volatile! {:datahike.cache/outcome
                                       :datahike.cache.outcome/uncacheable
                                       :datahike.cache/stored? false
                                       :datahike.cache/saved-computation? false})
            resource-evidence (volatile! (resource/budget-evidence nil))]
        (binding [resource/*evidence-sink* resource-evidence]
-         (let [result (raw-q query-map cache-evidence attribute-dependencies
-                             dependency-evidence)]
+         (let [result (raw-q query-map cache-evidence dependency-plan
+                             cached-dependency-plan)
+               plan (or @cached-dependency-plan @dependency-plan)]
            {:datahike.query/result result
+            :datahike.read/dependency-plan plan
             :datahike.query/attribute-dependencies
-            (or @dependency-evidence @attribute-dependencies)
+            (dependency-plan-attributes plan)
             :datahike.query/cache-evidence @cache-evidence
             :datahike.query/resource-evidence
             (assoc @resource-evidence
@@ -2541,6 +2544,34 @@
            (second source-key))]
     (if (= parent-key source-key) child-key source-key)))
 
+(defn- dependency-plan-source-attributes
+  [dependency-plan source-key database-key]
+  (if (= dependency-plan :all)
+    :all
+    (let [sources (:datahike.query.dependency/sources dependency-plan)
+          selected
+          (if (= composite-source-key-tag (first source-key))
+            (let [bindings (into #{}
+                                 (keep (fn [[symbol position member-key]]
+                                         (when (= database-key member-key)
+                                           [symbol position])))
+                                 (second source-key))]
+              (filter (fn [source]
+                        (contains?
+                         bindings
+                         [(:datahike.query.source/symbol source)
+                          (:datahike.query.source/argument-position source)]))
+                      sources))
+            sources)]
+      (if (seq selected)
+        (reduce (fn [attributes source]
+                  (merge-attr-deps
+                   attributes
+                   (:datahike.query.source/attributes source)))
+                #{}
+                selected)
+        :all))))
+
 (defn- source-key-contains-generation?
   [source-key connection-id generation]
   (some (fn [[cached-id cached-generation]]
@@ -2631,78 +2662,149 @@
     (= b :all) :all
     :else (into a b)))
 
-(defn- constant-attribute
-  [argument]
-  (when (and (instance? Constant argument)
-             (keyword? (:value argument)))
-    (:value argument)))
+(def ^:private dependency-unbound ::dependency-unbound)
+
+(defn- parsed-source-symbol
+  [source inherited-source]
+  (cond
+    (instance? SrcVar source) (:symbol source)
+    (instance? DefaultSrc source) inherited-source
+    :else inherited-source))
+
+(defn- dependency-argument-value
+  [argument bindings]
+  (cond
+    (instance? Constant argument) (:value argument)
+    (instance? Variable argument)
+    (get bindings (:symbol argument) dependency-unbound)
+    :else dependency-unbound))
+
+(defn- merge-source-attr-deps
+  [left right]
+  (merge-with merge-attr-deps left right))
+
+(defn- source-attr-deps
+  [source attributes]
+  {source attributes})
 
 (defn- database-function-attr-deps
-  [clause]
+  [clause bindings inherited-source]
   (let [fn-symbol (some-> clause :fn :symbol)
-        args (:args clause)]
+        args (:args clause)
+        source (or (some (fn [argument]
+                           (when (instance? SrcVar argument)
+                             (:symbol argument)))
+                         args)
+                   inherited-source)
+        attribute-at
+        (fn [position]
+          (let [value (dependency-argument-value (nth args position nil)
+                                                 bindings)]
+            (when (and (not= value dependency-unbound)
+                       (keyword? value))
+              value)))]
     (case fn-symbol
       missing?
-      (if-let [attribute (constant-attribute (nth args 2 nil))]
-        #{attribute}
-        :all)
+      (source-attr-deps source (if-let [attribute (attribute-at 2)]
+                                 #{attribute}
+                                 :all))
 
       get-else
-      (if-let [attribute (constant-attribute (nth args 2 nil))]
-        #{attribute}
-        :all)
+      (source-attr-deps source (if-let [attribute (attribute-at 2)]
+                                 #{attribute}
+                                 :all))
 
       get-some
-      (let [attributes (map constant-attribute (drop 2 args))]
-        (if (every? some? attributes)
-          (set attributes)
-          :all))
+      (let [attributes (mapv (fn [position] (attribute-at position))
+                             (range 2 (count args)))]
+        (source-attr-deps source
+                          (if (every? some? attributes)
+                            (set attributes)
+                            :all)))
 
-      #{})))
+      {})))
 
-(declare parsed-clause-attr-deps)
+(declare parsed-clause-source-deps)
 
-(defn- parsed-clauses-attr-deps
-  [clauses]
-  (reduce (fn [attributes clause]
-            (let [next-attributes (parsed-clause-attr-deps clause)]
-              (if (= next-attributes :all)
-                (reduced :all)
-                (into attributes next-attributes))))
-          #{}
+(defn- parsed-clauses-source-deps
+  [clauses environment inherited-source visited-rules]
+  (reduce (fn [dependencies clause]
+            (merge-source-attr-deps
+             dependencies
+             (parsed-clause-source-deps clause environment inherited-source
+                                        visited-rules)))
+          {}
           clauses))
 
-(defn- parsed-clause-attr-deps
-  "Fold the datalog-parser clause representation rather than maintaining a
-   second raw Datalog grammar."
-  [clause]
+(defn- resolved-rule-bindings
+  [branch call-arguments bindings]
+  (let [rule-vars (:vars branch)
+        variables (concat (or (:required rule-vars) [])
+                          (or (:free rule-vars) []))]
+    (into bindings
+          (keep (fn [[variable argument]]
+                  (let [value (dependency-argument-value argument bindings)]
+                    (when-not (= value dependency-unbound)
+                      [(:symbol variable) value]))))
+          (map vector variables call-arguments))))
+
+(defn- parsed-rule-source-deps
+  [clause {:keys [rules] :as environment} inherited-source visited-rules]
+  (let [rule-name (get-in clause [:name :symbol])
+        source (parsed-source-symbol (:source clause) inherited-source)
+        visit [rule-name source]]
+    (cond
+      (contains? visited-rules visit) {}
+      (nil? (get rules rule-name)) (source-attr-deps source :all)
+      :else
+      (reduce
+       (fn [dependencies branch]
+         (merge-source-attr-deps
+          dependencies
+          (parsed-clauses-source-deps
+           (:clauses branch)
+           (assoc environment
+                  :bindings
+                  (resolved-rule-bindings branch (:args clause)
+                                          (:bindings environment)))
+           source
+           (conj visited-rules visit))))
+       {}
+       (:branches (get rules rule-name))))))
+
+(defn- parsed-clause-source-deps
+  "Fold the typed datalog-parser clause representation with actual scalar and
+   rule inputs."
+  [clause {:keys [bindings] :as environment} inherited-source visited-rules]
   (cond
     (instance? Pattern clause)
-    (let [attribute (nth (:pattern clause) 1 nil)]
-      (cond
-        (instance? Variable attribute) :all
-        (instance? Constant attribute)
-        (if (keyword? (:value attribute)) #{(:value attribute)} :all)
-        :else :all))
+    (let [source (parsed-source-symbol (:source clause) inherited-source)
+          value (dependency-argument-value (nth (:pattern clause) 1 nil)
+                                           bindings)]
+      (source-attr-deps source (if (and (not= value dependency-unbound)
+                                        (keyword? value))
+                                 #{value}
+                                 :all)))
 
     (or (instance? Predicate clause)
         (instance? Function clause))
-    (database-function-attr-deps clause)
+    (database-function-attr-deps clause bindings inherited-source)
+
+    (instance? And clause)
+    (parsed-clauses-source-deps (:clauses clause) environment
+                                inherited-source visited-rules)
 
     (or (instance? Not clause)
-        (instance? Or clause)
-        (instance? And clause))
-    (parsed-clauses-attr-deps (:clauses clause))
+        (instance? Or clause))
+    (parsed-clauses-source-deps
+     (:clauses clause) environment
+     (parsed-source-symbol (:source clause) inherited-source)
+     visited-rules)
 
-    ;; Resolving supplied rule bodies requires query inputs. The input-free
-    ;; public projection must remain conservative.
-    (instance? RuleExpr clause) :all
+    (instance? RuleExpr clause)
+    (parsed-rule-source-deps clause environment inherited-source visited-rules)
 
-    :else :all))
-
-(defn- extract-query-attr-deps
-  [parsed-query]
-  (parsed-clauses-attr-deps (:qwhere parsed-query)))
+    :else (source-attr-deps inherited-source :all)))
 
 (defn- pull-spec-attr-deps
   [spec]
@@ -2721,31 +2823,95 @@
      #{}
      (:attrs spec))))
 
-(defn- extract-find-pull-attr-deps
-  "Extract the set of attributes referenced in pull patterns within :find.
-   Returns a set of keywords, or :all for wildcard pulls or unresolvable patterns."
-  [find-clause]
+(defn- extract-find-pull-source-deps
+  [find-clause bindings]
   (let [find-elements (dpip/find-elements find-clause)]
     (reduce
-     (fn [attrs el]
-       (if (= attrs :all)
-         (reduced :all)
-         (if (instance? Pull el)
-           (let [raw-pattern (:pattern el)
-                 pattern (if (instance? Constant raw-pattern)
-                           (:value raw-pattern)
-                           raw-pattern)]
-             (if-not (sequential? pattern)
-                ;; Pattern is a variable bound via :in — cannot determine attrs
-               (reduced :all)
-               (let [dependencies (pull-spec-attr-deps
-                                   (dpp/parse-pull pattern))]
-                 (if (= dependencies :all)
-                   (reduced :all)
-                   (into attrs dependencies)))))
-           attrs)))
-     #{}
+     (fn [dependencies element]
+       (if (instance? Pull element)
+         (let [source (parsed-source-symbol (:source element) '$)
+               pattern (dependency-argument-value (:pattern element) bindings)
+               attributes
+               (if (sequential? pattern)
+                 (pull-spec-attr-deps (dpp/parse-pull pattern))
+                 :all)]
+           (merge-source-attr-deps dependencies
+                                   (source-attr-deps source attributes)))
+         dependencies))
+     {}
      find-elements)))
+
+(defn- parsed-input-environment
+  [parsed-query args]
+  (reduce
+   (fn [environment [binding value]]
+     (cond
+       (and (instance? BindScalar binding)
+            (instance? Variable (:variable binding)))
+       (assoc-in environment [:bindings (get-in binding [:variable :symbol])]
+                 value)
+
+       (and (instance? BindScalar binding)
+            (instance? RulesVar (:variable binding)))
+       (assoc environment :rules
+              (into {}
+                    (map (fn [rule] [(get-in rule [:name :symbol]) rule]))
+                    (dp/parse-rules value)))
+
+       :else environment))
+   {:bindings {} :rules {}}
+   (map vector (:qin parsed-query) args)))
+
+(defn- parsed-source-bindings
+  [parsed-query]
+  (into []
+        (keep-indexed
+         (fn [position binding]
+           (when (and (instance? BindScalar binding)
+                      (instance? SrcVar (:variable binding)))
+             {:datahike.query.source/symbol
+              (get-in binding [:variable :symbol])
+              :datahike.query.source/argument-position position})))
+        (:qin parsed-query)))
+
+(defn query-dependency-plan
+  "Return an execution-aware dependency plan partitioned by parsed database
+   source. The function parses query and rule inputs but does not execute or
+   retain any database value."
+  [query-input & input-args]
+  (try
+    (let [{:keys [query args]} (normalize-q-input query-input input-args)
+          parsed-query (memoized-parse-query query)
+          environment (parsed-input-environment parsed-query args)
+          dependencies
+          (merge-source-attr-deps
+           (parsed-clauses-source-deps (:qwhere parsed-query) environment '$ #{})
+           (extract-find-pull-source-deps (:qfind parsed-query)
+                                          (:bindings environment)))
+          source-positions
+          (into {} (map (juxt :datahike.query.source/symbol
+                              :datahike.query.source/argument-position))
+                (parsed-source-bindings parsed-query))]
+      {:datahike.query.dependency/sources
+       (into []
+             (keep (fn [[source attributes]]
+                     (when-let [position (get source-positions source)]
+                       {:datahike.query.source/symbol source
+                        :datahike.query.source/argument-position position
+                        :datahike.query.source/attributes attributes})))
+             dependencies)})
+    (catch #?(:clj Throwable :cljs :default) _
+      :all)))
+
+(defn- dependency-plan-attributes
+  [plan]
+  (if (= plan :all)
+    :all
+    (reduce (fn [attributes source]
+              (merge-attr-deps attributes
+                               (:datahike.query.source/attributes source)))
+            #{}
+            (:datahike.query.dependency/sources plan))))
 
 (defn query-attribute-dependencies
   "Conservatively project the attributes that can affect a query result.
@@ -2756,14 +2922,7 @@
    malformed form, or unknown clause prevents a sound narrower projection.
    This function is pure: it neither executes the query nor retains data."
   [query-input]
-  (try
-    (let [query (:query (normalize-q-input query-input []))
-          parsed-query (memoized-parse-query query)]
-      (merge-attr-deps
-       (extract-query-attr-deps parsed-query)
-       (extract-find-pull-attr-deps (:qfind parsed-query))))
-    (catch #?(:clj Throwable :cljs :default) _
-      :all)))
+  (dependency-plan-attributes (query-dependency-plan query-input)))
 
 (defn- result-cache-get
   "Look up a cached query result for an exact composite source identity."
@@ -2785,7 +2944,7 @@
 
 (defn- result-cache-put!
   "Store a query result when every source generation remains admitted."
-  [source-key cache-key result attr-deps expected-epoch]
+  [source-key cache-key result dependency-plan expected-epoch]
   (let [source-key (if (dbu/db? source-key)
                      (db-cache-key source-key)
                      source-key)]
@@ -2803,7 +2962,8 @@
                        (assoc state :lru
                               (assoc lru source-key
                                      (assoc existing cache-key
-                                            {:result result :attrs attr-deps
+                                            {:result result
+                                             :dependency-plan dependency-plan
                                              :weight weight}))))
                      state)))
           @stored?)))))
@@ -2825,7 +2985,8 @@
       ;; tx-data doesn't list affected user attrs), skip propagation entirely —
       ;; the DB changed but we can't determine which queries are safe to keep.
       (let [user-attrs (disj modified-attrs :db/txInstant)]
-        (when (seq user-attrs)
+        (when (and (seq user-attrs)
+                   (not-any? schema/schema-attr? user-attrs))
           (swap! query-result-cache
                  (fn [{:keys [lru generations] :as state}]
                    (if-not (= (second child-key)
@@ -2842,9 +3003,14 @@
                                       surviving
                                       (into {}
                                             (remove
-                                             (fn [[_ {:keys [attrs]}]]
-                                               (or (= attrs :all)
-                                                   (some user-attrs attrs))))
+                                            (fn [[_ {:keys [dependency-plan]}]]
+                                               (let [attributes
+                                                     (dependency-plan-source-attributes
+                                                      dependency-plan source-key
+                                                      parent-key)]
+                                                 (or (= attributes :all)
+                                                     (some user-attrs
+                                                           attributes)))))
                                             entries)]
                                   (when (seq surviving)
                                     [next-source-key surviving]))))
@@ -2870,16 +3036,8 @@
   "Return the ordered top-level argument positions declared as query sources."
   [query-input]
   (let [query (:query (normalize-q-input query-input []))
-        qin (:qin (memoized-parse-query query))]
-    (into []
-          (keep-indexed
-           (fn [position binding]
-             (when (and (instance? BindScalar binding)
-                        (instance? SrcVar (:variable binding)))
-               {:datahike.query.source/symbol
-                (get-in binding [:variable :symbol])
-                :datahike.query.source/argument-position position})))
-          qin)))
+        parsed-query (memoized-parse-query query)]
+    (parsed-source-bindings parsed-query)))
 
 (defn query-input-count
   "Return the number of top-level arguments declared by a normalized query."
@@ -4371,15 +4529,15 @@
 (defn- raw-q-mode
   [{:keys [query args stats? count-fns? offset limit order-by
            request-id max-work max-results max-result-weight] :as query-map}
-   cache-evidence attribute-dependencies dependency-evidence
+   cache-evidence dependency-plan cached-dependency-plan
    deferred? reject-overflow?]
   (let [resource-options {:max-work max-work
                           :max-results max-results
                           :max-result-weight max-result-weight}
         outer-evidence-sink resource/*evidence-sink*
-        attribute-dependencies
-        (or attribute-dependencies
-            (delay (query-attribute-dependencies query)))
+        dependency-plan
+        (or dependency-plan
+            (delay (query-dependency-plan query-map)))
         uncached (fn [shared-cancel]
                    (let [effective-query-map
                          (if shared-cancel
@@ -4436,8 +4594,9 @@
             (if cached
               (do (resource/certify-cached-result! (:result cached)
                                                    resource-options)
-                  (when dependency-evidence
-                    (vreset! dependency-evidence (:attrs cached)))
+                  (when cached-dependency-plan
+                    (vreset! cached-dependency-plan
+                             (:dependency-plan cached)))
                   (when cache-evidence
                     (vreset! cache-evidence
                              {:datahike.cache/outcome
@@ -4466,17 +4625,18 @@
                           (when-let [entry (result-cache-get source-key cache-key)]
                             (resource/certify-cached-result!
                              (:result entry) resource-options)
-                            (when dependency-evidence
-                              (vreset! dependency-evidence (:attrs entry)))
+                            (when cached-dependency-plan
+                              (vreset! cached-dependency-plan
+                                       (:dependency-plan entry)))
                             {:value (:result entry)}))
                        compute
                        #(result-cache-put! source-key cache-key %
-                                           @attribute-dependencies cache-epoch)
+                                           @dependency-plan cache-epoch)
                        #(when cache-evidence (vreset! cache-evidence %))
-                       #(cond-> {:datahike.query/attribute-dependencies
-                                 (or (when dependency-evidence
-                                       @dependency-evidence)
-                                     @attribute-dependencies)}
+                       #(cond-> {:datahike.read/dependency-plan
+                                 (or (when cached-dependency-plan
+                                       @cached-dependency-plan)
+                                     @dependency-plan)}
                           @computation-evidence
                           (assoc :datahike.query/resource-evidence
                                  @computation-evidence))
@@ -4486,9 +4646,9 @@
                                      completed)]
                            (when outer-evidence-sink
                              (vreset! outer-evidence-sink evidence)))
-                         (when dependency-evidence
-                           (vreset! dependency-evidence
-                                    (:datahike.query/attribute-dependencies
+                         (when cached-dependency-plan
+                           (vreset! cached-dependency-plan
+                                    (:datahike.read/dependency-plan
                                      completed))))]
                       result
                       #?(:clj
@@ -4503,48 +4663,49 @@
 (defn raw-q
   ([query-map] (raw-q query-map nil))
   ([query-map cache-evidence] (raw-q query-map cache-evidence nil))
-  ([query-map cache-evidence attribute-dependencies]
-   (raw-q query-map cache-evidence attribute-dependencies nil))
-  ([query-map cache-evidence attribute-dependencies dependency-evidence]
-   (raw-q-mode query-map cache-evidence attribute-dependencies
-               dependency-evidence false false)))
+  ([query-map cache-evidence dependency-plan]
+   (raw-q query-map cache-evidence dependency-plan nil))
+  ([query-map cache-evidence dependency-plan cached-dependency-plan]
+   (raw-q-mode query-map cache-evidence dependency-plan
+               cached-dependency-plan false false)))
 
 #?(:clj
    (defn- acquire-raw-q!
-     [query-map cache-evidence attribute-dependencies dependency-evidence
+     [query-map cache-evidence dependency-plan cached-dependency-plan
       reject-overflow?]
-     (raw-q-mode query-map cache-evidence attribute-dependencies
-                 dependency-evidence true reject-overflow?)))
+     (raw-q-mode query-map cache-evidence dependency-plan
+                 cached-dependency-plan true reject-overflow?)))
 
 #?(:clj
    (deftype QueryCall [execution response]))
 
 #?(:clj
    (defn- query-call-response
-     [attribute-dependencies dependency-evidence cache-evidence
+     [dependency-plan cached-dependency-plan cache-evidence
       resource-evidence result]
-     {:datahike.query/result result
-      :datahike.query/attribute-dependencies
-      (or @dependency-evidence @attribute-dependencies)
-      :datahike.query/cache-evidence @cache-evidence
-      :datahike.query/resource-evidence
-      (assoc @resource-evidence
-             :datahike.resource/scope
-             (case (:datahike.cache/outcome @cache-evidence)
-               :datahike.cache.outcome/hit :datahike.resource.scope/none
-               :datahike.cache.outcome/hit-after-acquire
-               :datahike.resource.scope/none
-               :datahike.cache.outcome/miss-joined
-               :datahike.resource.scope/shared-computation
-               :datahike.resource.scope/local-computation))}))
+     (let [plan (or @cached-dependency-plan @dependency-plan)]
+       {:datahike.query/result result
+        :datahike.read/dependency-plan plan
+        :datahike.query/attribute-dependencies
+        (dependency-plan-attributes plan)
+        :datahike.query/cache-evidence @cache-evidence
+        :datahike.query/resource-evidence
+        (assoc @resource-evidence
+               :datahike.resource/scope
+               (case (:datahike.cache/outcome @cache-evidence)
+                 :datahike.cache.outcome/hit :datahike.resource.scope/none
+                 :datahike.cache.outcome/hit-after-acquire
+                 :datahike.resource.scope/none
+                 :datahike.cache.outcome/miss-joined
+                 :datahike.resource.scope/shared-computation
+                 :datahike.resource.scope/local-computation))})))
 
 #?(:clj
    (defn- acquire-q-call!
      [reject-overflow? query inputs]
      (let [query-map (normalize-q-input query inputs)
-           attribute-dependencies
-           (delay (query-attribute-dependencies (:query query-map)))
-           dependency-evidence (volatile! nil)
+           dependency-plan (delay (query-dependency-plan query-map))
+           cached-dependency-plan (volatile! nil)
            cache-evidence
            (volatile! {:datahike.cache/outcome
                        :datahike.cache.outcome/uncacheable
@@ -4553,11 +4714,11 @@
            resource-evidence (volatile! (resource/budget-evidence nil))
            execution
            (binding [resource/*evidence-sink* resource-evidence]
-             (acquire-raw-q! query-map cache-evidence attribute-dependencies
-                             dependency-evidence reject-overflow?))
+             (acquire-raw-q! query-map cache-evidence dependency-plan
+                             cached-dependency-plan reject-overflow?))
            response (fn [result]
                       (query-call-response
-                       attribute-dependencies dependency-evidence cache-evidence
+                       dependency-plan cached-dependency-plan cache-evidence
                        resource-evidence result))]
        (QueryCall. execution response))))
 

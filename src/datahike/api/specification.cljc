@@ -520,6 +520,20 @@
                  :code "(query-attribute-dependencies '[:find ?e :where [?e :person/name]])"}]
      :impl datahike.query/query-attribute-dependencies}
 
+    query-dependency-plan
+    {:args [:function
+            [:=> [:cat [:or [:vector :any] :map :string]]
+             :datahike/SReadDependencyPlan]
+            [:=> [:cat [:or [:vector :any] :map :string] [:* :any]]
+             :datahike/SReadDependencyPlan]]
+     :ret :datahike/SReadDependencyPlan
+     :categories [:query :diagnostics]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? true
+     :doc "Returns an execution-aware dependency plan partitioned by parsed database source. Parses inputs and supplied rules without executing or retaining a database value."
+     :impl datahike.query/query-dependency-plan}
+
     query-stats
     {:args [:function
             [:=> [:cat :datahike/SQueryArgs] :map]

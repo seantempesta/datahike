@@ -93,6 +93,59 @@
             '[:find ?e :in $ % :where (ancestor ?e ?parent)])))
     (is (= :all (d/query-attribute-dependencies "not-edn")))))
 
+(deftest query-dependency-plans-are-execution-aware-and-source-scoped
+  (testing "each parsed database source retains only its own attributes"
+    (is (= {:datahike.query.dependency/sources
+            [{:datahike.query.source/symbol '$people
+              :datahike.query.source/argument-position 0
+              :datahike.query.source/attributes #{:person/name}}
+             {:datahike.query.source/symbol '$archive
+              :datahike.query.source/argument-position 1
+              :datahike.query.source/attributes #{:person/email}}]}
+           (d/query-dependency-plan
+            '[:find ?name ?email
+              :in $people $archive
+              :where [$people ?e :person/name ?name]
+                     [$archive ?e :person/email ?email]]
+            ::people ::archive))))
+  (testing "scalar input bindings narrow an attribute variable"
+    (is (= {:datahike.query.dependency/sources
+            [{:datahike.query.source/symbol '$
+              :datahike.query.source/argument-position 0
+              :datahike.query.source/attributes #{:person/name}}]}
+           (d/query-dependency-plan
+            '[:find ?value
+              :in $ ?attribute
+              :where [_ ?attribute ?value]]
+            ::people :person/name))))
+  (testing "supplied rule bodies and their input-bound attributes are folded"
+    (is (= {:datahike.query.dependency/sources
+            [{:datahike.query.source/symbol '$
+              :datahike.query.source/argument-position 0
+              :datahike.query.source/attributes
+              #{:person/name :person/email}}]}
+           (d/query-dependency-plan
+            '[:find ?e
+              :in $ % ?attribute
+              :where (person-by ?e ?attribute)]
+            ::people
+            '[[(person-by ?e ?attribute)
+               [?e :person/name]
+               [?e ?attribute]]]
+            :person/email))))
+  (testing "an input-bound pull pattern contributes its realized attributes"
+    (is (= {:datahike.query.dependency/sources
+            [{:datahike.query.source/symbol '$
+              :datahike.query.source/argument-position 0
+              :datahike.query.source/attributes
+              #{:person/id :person/friend :person/email}}]}
+           (d/query-dependency-plan
+            '[:find (pull ?e ?selector)
+              :in $ ?selector
+              :where [?e :person/id]]
+            ::people
+            [:person/id {:person/friend [:person/email]}])))))
+
 (deftest test-mixed-age-types
   (let [db (-> (db/empty-db)
                (d/db-with [{:db/id 1, :name  "Ivan", :age   15}
