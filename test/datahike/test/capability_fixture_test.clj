@@ -23,7 +23,7 @@
                       (every? ordinary-namespaced-data? (vals value)))
     (coll? value) (every? ordinary-namespaced-data? value)
     :else (or (nil? value) (boolean? value) (number? value)
-              (string? value) (keyword? value) (uuid? value)
+              (string? value) (keyword? value) (symbol? value) (uuid? value)
               (inst? value))))
 
 (deftest transport-free-capability-fixture-returns-only-ordinary-data

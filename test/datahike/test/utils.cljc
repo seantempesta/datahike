@@ -100,8 +100,9 @@
     conn))
 
 (defn teardown-db [conn]
-  (d/release conn)
-  (d/delete-database (:config @conn)))
+  (let [config (:config @conn)]
+    (d/release conn)
+    (d/delete-database config)))
 
 (defn with-db
   "Test database fixture"

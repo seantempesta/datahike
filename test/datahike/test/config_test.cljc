@@ -150,9 +150,21 @@
                               :irrelevant-property true}}
           _ (doall (map d/delete-database [mem-start mem-other file-start file-index mem-named mem-same]))]
       (d/create-database mem-start)
-      (is (= (d/connect mem-start) (d/connect mem-named) (d/connect mem-same)))
+      (let [start-connection (d/connect mem-start)
+            named-connection (d/connect mem-named)]
+        (try
+          (is (= start-connection named-connection))
+          (is (thrown-with-msg? Throwable
+                                #"Configuration does not match existing connections."
+                                (d/connect mem-same)))
+          (finally
+            (d/release named-connection)
+            (d/release start-connection))))
       (d/create-database file-start)
-      (d/connect file-start)
-      (is (thrown-with-msg? Throwable
-                            #"Configuration does not match existing connections."
-                            (d/connect file-index))))))
+      (let [file-connection (d/connect file-start)]
+        (try
+          (is (thrown-with-msg? Throwable
+                                #"Configuration does not match existing connections."
+                                (d/connect file-index)))
+          (finally
+            (d/release file-connection)))))))

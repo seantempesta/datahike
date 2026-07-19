@@ -3,9 +3,8 @@
                :clj [clojure.test :as t :refer [is deftest use-fixtures]])
             [clojure.string :as str]
             [clojure.walk :as cw]
-            [datahike.api :as d]
             [datahike.query :refer [query-stats]]
-            [datahike.test.utils :refer [with-db]]))
+            [datahike.test.utils :refer [setup-default-db teardown-db]]))
 
 (def config {:store {:backend :memory :id #uuid "00190000-0000-0000-0000-000000000019"}})
 
@@ -23,7 +22,20 @@
                 {:db/id 5 :name "Ivan" :age 50}
                 {:db/id 6 :name "Michal" :age 60}])
 
-(use-fixtures :once (partial with-db config (into test-schema test-data)))
+(def ^:dynamic *database* nil)
+
+(use-fixtures
+ :once
+ (fn [run-tests]
+   (let [connection (setup-default-db config (into test-schema test-data))]
+     (try
+       (binding [*database* @connection]
+         (run-tests))
+       (finally
+         (teardown-db connection))))))
+
+(defn- query-stats-for [query]
+  (query-stats query *database*))
 
 (defn unify-stats [stats]
   (cw/postwalk
@@ -51,10 +63,9 @@
                     :rels     [{:bound #{'?a '?e} :rows 5}]
                     :t        :measurement
                     :type     :not}]}
-         (unify-stats (query-stats '[:find [?a ...] :where
-                                     [?e :age ?a]
-                                     (not [?e :age 60])]
-                                   @(d/connect config))))))
+         (unify-stats (query-stats-for '[:find [?a ...] :where
+                                         [?e :age ?a]
+                                         (not [?e :age 60])])))))
 
 (deftest test-not-join
   (is (= {:consts {}
@@ -88,13 +99,12 @@
                     :rels     [{:bound #{'?a '?e} :rows  4}]
                     :t        :measurement
                     :type     :not}]}
-         (unify-stats (query-stats '[:find ?a :where
-                                     [?e :name]
-                                     [?e :age ?a]
-                                     (not-join [?e]
-                                               [?e :name "Oleg"]
-                                               [?e :age ?a])]
-                                   @(d/connect config))))))
+         (unify-stats (query-stats-for '[:find ?a :where
+                                         [?e :name]
+                                         [?e :age ?a]
+                                         (not-join [?e]
+                                                   [?e :name "Oleg"]
+                                                   [?e :age ?a])])))))
 
 (deftest test-or
   (is (= {:consts {}
@@ -122,11 +132,10 @@
                     :rels     [{:bound #{'?a '?e} :rows  5}]
                     :t        :measurement
                     :type     :or}]}
-         (unify-stats (query-stats '[:find ?a :where
-                                     [?e :age ?a]
-                                     (or [?e :name "Ivan"]
-                                         [?e :name "Oleg"])]
-                                   @(d/connect config))))))
+         (unify-stats (query-stats-for '[:find ?a :where
+                                         [?e :age ?a]
+                                         (or [?e :name "Ivan"]
+                                             [?e :name "Oleg"])])))))
 
 (deftest test-rules
   (let [db [[1 :follow 2]

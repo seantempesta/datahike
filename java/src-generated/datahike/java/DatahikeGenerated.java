@@ -34,6 +34,7 @@ class DatahikeGenerated {
     protected static final IFn dbWithFn = Clojure.var("datahike.api", "db-with");
     protected static final IFn deleteBranchAsyncFn = Clojure.var("datahike.api", "delete-branch!");
     protected static final IFn deleteDatabaseFn = Clojure.var("datahike.api", "delete-database");
+    protected static final IFn dependencyPlanAttributesFn = Clojure.var("datahike.api", "dependency-plan-attributes");
     protected static final IFn entityFn = Clojure.var("datahike.api", "entity");
     protected static final IFn entityDbFn = Clojure.var("datahike.api", "entity-db");
     protected static final IFn explainFn = Clojure.var("datahike.api", "explain");
@@ -52,11 +53,15 @@ class DatahikeGenerated {
     protected static final IFn metricsFn = Clojure.var("datahike.api", "metrics");
     protected static final IFn parentCommitIdsFn = Clojure.var("datahike.api", "parent-commit-ids");
     protected static final IFn pullFn = Clojure.var("datahike.api", "pull");
+    protected static final IFn pullDependencyPlanFn = Clojure.var("datahike.api", "pull-dependency-plan");
     protected static final IFn pullManyFn = Clojure.var("datahike.api", "pull-many");
+    protected static final IFn pullManyWithEvidenceFn = Clojure.var("datahike.api", "pull-many-with-evidence");
+    protected static final IFn pullWithEvidenceFn = Clojure.var("datahike.api", "pull-with-evidence");
     protected static final IFn qFn = Clojure.var("datahike.api", "q");
     protected static final IFn qWithEvidenceFn = Clojure.var("datahike.api", "q-with-evidence");
     protected static final IFn queryAttributeDependenciesFn = Clojure.var("datahike.api", "query-attribute-dependencies");
     protected static final IFn queryCacheEvidenceFn = Clojure.var("datahike.api", "query-cache-evidence");
+    protected static final IFn queryDependencyPlanFn = Clojure.var("datahike.api", "query-dependency-plan");
     protected static final IFn queryStatsFn = Clojure.var("datahike.api", "query-stats");
     protected static final IFn releaseFn = Clojure.var("datahike.api", "release");
     protected static final IFn releaseMaterializedDbFn = Clojure.var("datahike.api", "release-materialized-db");
@@ -410,6 +415,20 @@ class DatahikeGenerated {
     }
 
     /**
+     * Interprets one dependency plan as the union of all sources or as the attributes for one source argument position.
+     */
+    public static Object dependencyPlanAttributes(Object arg0) {
+        return (Object) dependencyPlanAttributesFn.invoke(arg0);
+    }
+
+    /**
+     * Interprets one dependency plan as the union of all sources or as the attributes for one source argument position.
+     */
+    public static Object dependencyPlanAttributes(Object arg0, Object arg1) {
+        return (Object) dependencyPlanAttributesFn.invoke(arg0, arg1);
+    }
+
+    /**
      * Retrieves an entity by its id. Returns lazy map-like structure.
      *
      * <h3>Examples:</h3>
@@ -755,6 +774,13 @@ class DatahikeGenerated {
     }
 
     /**
+     * Returns a parsed pull dependency plan including entity-ref lookup attributes without retaining a database value.
+     */
+    public static Object pullDependencyPlan(List<?> arg0, Iterable<?> arg1) {
+        return (Object) pullDependencyPlanFn.invoke(Util.normalizeCollections(arg0), arg1);
+    }
+
+    /**
      * Pulls one ordered map-or-nil result for each entity ref.
      *
      * <h3>Examples:</h3>
@@ -778,6 +804,34 @@ class DatahikeGenerated {
      */
     public static List<?> pullMany(Object arg0, List<?> arg1, Iterable<?> arg2) {
         return (List<?>) pullManyFn.invoke(arg0, Util.normalizeCollections(arg1), arg2);
+    }
+
+    /**
+     * Pulls input-aligned entities and returns their values with one parsed dependency plan.
+     */
+    public static Object pullManyWithEvidence(Object arg0, Object arg1) {
+        return (Object) pullManyWithEvidenceFn.invoke(arg0, arg1);
+    }
+
+    /**
+     * Pulls input-aligned entities and returns their values with one parsed dependency plan.
+     */
+    public static Object pullManyWithEvidence(Object arg0, List<?> arg1, Iterable<?> arg2) {
+        return (Object) pullManyWithEvidenceFn.invoke(arg0, Util.normalizeCollections(arg1), arg2);
+    }
+
+    /**
+     * Pulls one entity and returns its eager value with a parsed dependency plan.
+     */
+    public static Object pullWithEvidence(Object arg0, Object arg1) {
+        return (Object) pullWithEvidenceFn.invoke(arg0, arg1);
+    }
+
+    /**
+     * Pulls one entity and returns its eager value with a parsed dependency plan.
+     */
+    public static Object pullWithEvidence(Object arg0, List<?> arg1, Object arg2) {
+        return (Object) pullWithEvidenceFn.invoke(arg0, Util.normalizeCollections(arg1), arg2);
     }
 
     /**
@@ -842,6 +896,20 @@ class DatahikeGenerated {
      */
     public static Map<?,?> queryCacheEvidence() {
         return (Map<?,?>) queryCacheEvidenceFn.invoke();
+    }
+
+    /**
+     * Returns an execution-aware dependency plan partitioned by parsed database source. Parses inputs and supplied rules without executing or retaining a database value.
+     */
+    public static Object queryDependencyPlan(Object arg0) {
+        return (Object) queryDependencyPlanFn.invoke(arg0);
+    }
+
+    /**
+     * Returns an execution-aware dependency plan partitioned by parsed database source. Parses inputs and supplied rules without executing or retaining a database value.
+     */
+    public static Object queryDependencyPlan(Object arg0, Object arg1) {
+        return (Object) queryDependencyPlanFn.invoke(arg0, arg1);
     }
 
     /**

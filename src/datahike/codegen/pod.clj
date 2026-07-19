@@ -285,10 +285,12 @@
 
       ;; Case: no resolution, return conn-id
       (= returns :conn-id)
-      `(let [~result-sym ~(generate-api-call api-impl named-args variadic?)
-             ~conn-id-sym (~'generate-conn-id ~(or first-arg {}))]
-         (swap! ~'conns assoc ~conn-id-sym ~result-sym)
-         ~conn-id-sym)
+      `(let [~conn-id-sym (~'generate-conn-id ~(or first-arg {}))]
+         (if (contains? @~'conns ~conn-id-sym)
+           ~conn-id-sym
+           (let [~result-sym ~(generate-api-call api-impl named-args variadic?)]
+             (swap! ~'conns assoc ~conn-id-sym ~result-sym)
+             ~conn-id-sym)))
 
       ;; Case: no resolution, return value (database-exists?, create-database, etc.)
       :else
