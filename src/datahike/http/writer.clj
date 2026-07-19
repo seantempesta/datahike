@@ -2,8 +2,8 @@
   "Remote writer implementation for datahike.http.server through datahike.http.client."
   (:require [datahike.writer :refer [PWriter create-writer create-database delete-database]]
             [datahike.http.client :refer [request-json] :as client]
-            [datahike.json :as json]
             [datahike.connector :as connector]
+            [datahike.remote :as remote]
             [datahike.tools :as dt :refer [throwable-promise]]
             [replikativ.logging :as log]
             [clojure.core.async :refer [promise-chan put!]]))
@@ -18,11 +18,11 @@
       (log/trace :datahike/http-write-args {:arg-map arg-map})
       (put! p
             (try
-              (request-json :post
-                            (str op "-writer")
-                            remote-peer
-                            (vec (concat [config] args))
-                            json/mapper)
+              (binding [remote/*remote-peer* remote-peer]
+                (request-json :post
+                              (str op "-writer")
+                              remote-peer
+                              (vec (concat [config] args))))
               (catch Exception e
                 e)))
       p))

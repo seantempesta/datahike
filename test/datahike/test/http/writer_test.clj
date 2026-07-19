@@ -1,8 +1,11 @@
 (ns datahike.test.http.writer-test
   (:require
    [clojure.test :as t :refer [is deftest testing]]
+   [datahike.connections :refer [active-connection]]
    [datahike.http.server :refer [start-server stop-server]]
    [datahike.http.writer]
+   [datahike.remote :as remote]
+   [datahike.store :refer [connection-id]]
    [datahike.api :as d]))
 
 (deftest test-http-writer
@@ -29,8 +32,11 @@
                      (d/connect cfg))
               _ (reset! conn* conn)]
 
-          (d/transact conn [{:name "Alice"
-                             :age  25}])
+          (let [report (d/transact conn [{:name "Alice"
+                                          :age  25}])]
+            (is (instance? datahike.remote.RemoteDB (:db-before report)))
+            (is (instance? datahike.remote.RemoteDB (:db-after report)))
+            (is (= (:writer cfg) (remote/remote-peer (:db-after report)))))
           (is (= #{[25 "Alice"]}
                  (d/q '[:find ?a ?v
                         :in $ ?a
@@ -53,7 +59,9 @@
 
           (d/release conn)
           (reset! conn* nil)
-          (d/delete-database cfg))
+          (is (nil? (active-connection (connection-id cfg))))
+          (d/delete-database cfg)
+          (is (false? (d/database-exists? cfg))))
         (finally
           (when-let [conn @conn*]
             (d/release conn)
