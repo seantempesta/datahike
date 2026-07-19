@@ -850,15 +850,20 @@
                         :where [?e :src/title _ ?tx]
                                [?e :src/id "src-1"]
                                [?tx :db/txInstant ?at]]]
-    (testing "planner returns rows for the selective-clause-first order"
-      (let [compiled (binding [q/*disable-planner* false] (d/q failing-order db))]
-        (is (seq compiled)
-            "3-clause id-first order must not silently return #{}")))
-    (testing "both engines and both clause orders agree"
-      (assert-engines-agree db failing-order)
-      (assert-engines-agree db working-order)
-      (is (= (binding [q/*disable-planner* false] (d/q failing-order db))
-             (binding [q/*disable-planner* false] (d/q working-order db)))))))
+    (try
+      (testing "planner returns rows for the selective-clause-first order"
+        (let [compiled (binding [q/*disable-planner* false]
+                         (d/q failing-order db))]
+          (is (seq compiled)
+              "3-clause id-first order must not silently return #{}")))
+      (testing "both engines and both clause orders agree"
+        (assert-engines-agree db failing-order)
+        (assert-engines-agree db working-order)
+        (is (= (binding [q/*disable-planner* false] (d/q failing-order db))
+               (binding [q/*disable-planner* false] (d/q working-order db)))))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
 
 (deftest test-disjoint-component-dropped
   ;; Regression: in the cross-component (Cartesian) split, a component
