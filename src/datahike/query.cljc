@@ -2414,12 +2414,12 @@
 (def ^:private plan-cache (volatile! (datahike.lru/lru lru-cache-size)))
 
 ;; ---------------------------------------------------------------------------
-;; Query result cache with structural sharing across transactions
+;; Query result cache with lazy inheritance across transactions
 ;;
-;; Each DB snapshot (identified by max-tx) has a persistent map of cached results.
-;; When a transaction creates a new DB, the new DB inherits the parent's cache
-;; minus entries whose attribute-deps overlap with the transaction's modified attrs.
-;; This gives O(k) cache propagation where k = invalidated entries.
+;; A commit advances small, persistent attribute-version facts on its immutable
+;; DB value. It never copies cached result rows. On a demanded cache miss, a
+;; compatible older result may be inherited when every dependency's version is
+;; unchanged; only that demanded child snapshot receives a cache row.
 ;;
 ;; Cache structure: ConcurrentHashMap<Long(max-tx), PersistentHashMap<cache-key, {:result r :attrs deps}>>
 ;; Cache key: [query non-db-args]
@@ -2435,9 +2435,8 @@
 ;; Structure: {:generations {connection-id generation}
 ;;             :lru LRU {db-key -> {cache-key -> entry}}}
 ;;
-;; Propagation: on transaction, surviving entries (whose attr deps don't
-;; overlap with modified-attrs) are copied from parent db-key to child db-key
-;; via dissoc for structural sharing.
+;; Inheritance: on demand, an older compatible entry is copied to the exact
+;; current DB key after its dependency versions are proven unchanged.
 
 (def ^:dynamic *query-cache-size*
   "Maximum number of DB snapshots retained in the query result cache.
@@ -2534,16 +2533,6 @@
     (into #{} (map #(nth % 2)) (second source-key))
     #{source-key}))
 
-(defn- replace-source-database-key
-  [source-key parent-key child-key]
-  (if (= composite-source-key-tag (first source-key))
-    [composite-source-key-tag
-     (mapv (fn [[symbol position database-key]]
-             [symbol position
-              (if (= parent-key database-key) child-key database-key)])
-           (second source-key))]
-    (if (= parent-key source-key) child-key source-key)))
-
 (defn- dependency-plan-source-attributes
   [dependency-plan source-key database-key]
   (if (= dependency-plan :all)
@@ -2571,6 +2560,29 @@
                 #{}
                 selected)
         :all))))
+
+(defn advance-query-cache-context
+  "Advance immutable cache-validation facts for one committed transaction.
+
+   Only changed attribute revisions are associated. Unknown or schema-changing
+   transactions advance the conservative revision. Cached result rows are not
+   inspected or copied."
+  [context commit-id modified-attrs unsafe?]
+  (let [user-attrs (some-> modified-attrs (disj :db/txInstant))]
+    (cond-> (assoc context
+                   :datahike.cache/commit-id commit-id
+                   :datahike.cache/committed? true)
+      (or unsafe? (nil? user-attrs))
+      (assoc :datahike.cache/conservative-revision commit-id)
+
+      (some schema/schema-attr? user-attrs)
+      (assoc :datahike.cache/conservative-revision commit-id)
+
+      (and (seq user-attrs)
+           (not-any? schema/schema-attr? user-attrs))
+      (update :datahike.cache/attribute-revisions
+              (fn [revisions]
+                (reduce #(assoc %1 %2 commit-id) (or revisions {}) user-attrs))))))
 
 (defn- source-key-contains-generation?
   [source-key connection-id generation]
@@ -2927,27 +2939,86 @@
   [query-input]
   (dependency-plan-attributes (query-dependency-plan query-input)))
 
+(defn- source-key-members [source-key]
+  (if (= composite-source-key-tag (first source-key))
+    (second source-key)
+    [[nil nil source-key]]))
+
+(defn- compatible-source-keys?
+  [cached-source-key current-source-key]
+  (let [cached-members (source-key-members cached-source-key)
+        current-members (source-key-members current-source-key)]
+    (and (= (mapv #(subvec % 0 2) cached-members)
+            (mapv #(subvec % 0 2) current-members))
+         (every? true?
+                 (map (fn [cached current]
+                        (= (subvec (nth cached 2) 0 2)
+                           (subvec (nth current 2) 0 2)))
+                      cached-members current-members)))))
+
+(defn- source-context-unchanged?
+  [cached-context current-context attributes]
+  (and (map? cached-context)
+       (map? current-context)
+       (not= attributes :all)
+       (= (:datahike.cache/conservative-revision cached-context)
+          (:datahike.cache/conservative-revision current-context))
+       (every? (fn [attribute]
+                 (= (get-in cached-context
+                            [:datahike.cache/attribute-revisions attribute])
+                    (get-in current-context
+                            [:datahike.cache/attribute-revisions attribute])))
+               attributes)))
+
+(defn- inheritable-entry
+  [lru current-source-key cache-key current-contexts]
+  (some (fn [[cached-source-key entries]]
+          (when (and (not= cached-source-key current-source-key)
+                     (compatible-source-keys? cached-source-key
+                                              current-source-key))
+            (when-let [{:keys [dependency-plan source-contexts] :as entry}
+                       (get entries cache-key)]
+              (when (every?
+                     true?
+                     (map (fn [cached-member current-member]
+                            (let [cached-key (nth cached-member 2)
+                                  current-key (nth current-member 2)
+                                  attributes
+                                  (dependency-plan-source-attributes
+                                   dependency-plan cached-source-key cached-key)]
+                              (source-context-unchanged?
+                               (get source-contexts cached-key)
+                               (get current-contexts current-key)
+                               attributes)))
+                          (source-key-members cached-source-key)
+                          (source-key-members current-source-key)))
+                entry))))
+        (lru/weighted-entries lru)))
+
 (defn- result-cache-get
-  "Look up a cached query result for an exact composite source identity."
-  [source-key cache-key]
+  "Look up an exact result or lazily promote a dependency-safe older result."
+  [source-key cache-key current-contexts]
   (let [source-key (if (dbu/db? source-key)
                      (db-cache-key source-key)
                      source-key)]
     (when source-key
-      (when-let [snapshot-cache (get-in @query-result-cache [:lru source-key])]
-        (when-let [entry (get snapshot-cache cache-key)]
-          ;; Touch LRU atomically — re-assoc current value so LRU updates generation.
-          ;; Use swap! which retries on CAS conflict, reading fresh state each retry.
-          (swap! query-result-cache
-                 (fn [{:keys [lru] :as state}]
-                   (if-let [current (get lru source-key)]
-                     (assoc state :lru (assoc lru source-key current))
-                     state)))
-          entry)))))
+      (let [found (volatile! nil)]
+        (swap! query-result-cache
+               (fn [{:keys [lru] :as state}]
+                 (if-let [entry (or (get-in lru [source-key cache-key])
+                                    (inheritable-entry lru source-key cache-key
+                                                       current-contexts))]
+                   (let [promoted (assoc entry :source-contexts current-contexts)
+                         bucket (assoc (or (get lru source-key) {})
+                                       cache-key promoted)]
+                     (vreset! found promoted)
+                     (assoc state :lru (assoc lru source-key bucket)))
+                   state)))
+        @found))))
 
 (defn- result-cache-put!
   "Store a query result when every source generation remains admitted."
-  [source-key cache-key result dependency-plan expected-epoch]
+  [source-key cache-key result dependency-plan source-contexts expected-epoch]
   (let [source-key (if (dbu/db? source-key)
                      (db-cache-key source-key)
                      source-key)]
@@ -2967,66 +3038,10 @@
                                      (assoc existing cache-key
                                             {:result result
                                              :dependency-plan dependency-plan
+                                             :source-contexts source-contexts
                                              :weight weight}))))
                      state)))
           @stored?)))))
-
-(defn propagate-query-cache
-  "Propagate query result cache from parent DB to child DB after a transaction.
-   Entries whose attribute deps overlap with modified-attrs are evicted.
-   Uses dissoc for structural sharing — child cache shares most of parent's
-   persistent map when few entries are invalidated.
-   Parent cache is not removed because already-issued committed values remain
-   immutable and queryable. Called once after durable writer publication."
-  [parent-db child-db modified-attrs]
-  (let [parent-key (db-cache-key parent-db)
-        child-key  (db-cache-key child-db)]
-    (when (and parent-key child-key (not= parent-key child-key)
-               (= (subvec parent-key 0 2) (subvec child-key 0 2)))
-      ;; Only propagate if we have user-visible modified attrs for selective invalidation.
-      ;; If modified-attrs is empty or only has system attrs (e.g. purge ops where
-      ;; tx-data doesn't list affected user attrs), skip propagation entirely —
-      ;; the DB changed but we can't determine which queries are safe to keep.
-      (let [user-attrs (disj modified-attrs :db/txInstant)]
-        (when (and (seq user-attrs)
-                   (not-any? schema/schema-attr? user-attrs))
-          (swap! query-result-cache
-                 (fn [{:keys [lru generations] :as state}]
-                   (if-not (= (second child-key)
-                              (get generations (first child-key)))
-                     state
-                     (let [propagations
-                           (keep
-                            (fn [[source-key entries]]
-                              (when (contains? (source-database-keys source-key)
-                                               parent-key)
-                                (let [next-source-key
-                                      (replace-source-database-key
-                                       source-key parent-key child-key)
-                                      surviving
-                                      (into {}
-                                            (remove
-                                            (fn [[_ {:keys [dependency-plan]}]]
-                                               (let [attributes
-                                                     (dependency-plan-source-attributes
-                                                      dependency-plan source-key
-                                                      parent-key)]
-                                                 (or (= attributes :all)
-                                                     (some user-attrs
-                                                           attributes)))))
-                                            entries)]
-                                  (when (seq surviving)
-                                    [next-source-key surviving]))))
-                            (lru/weighted-entries lru))
-                           next-lru
-                           (reduce
-                            (fn [result [source-key inherited]]
-                              (let [existing (get result source-key)]
-                                (assoc result source-key
-                                       (merge inherited existing))))
-                            lru
-                            propagations)]
-                       (assoc state :lru next-lru))))))))))
 
 (defn memoized-parse-query [q]
   (if-some [cached (get @query-cache q nil)]
@@ -3061,6 +3076,14 @@
       (if (= 1 (count members))
         (nth (first members) 2)
         [composite-source-key-tag members]))))
+
+(defn- query-cache-source-contexts [query args]
+  (into {}
+        (keep (fn [{:datahike.query.source/keys [argument-position]}]
+                (let [database (nth args argument-position nil)]
+                  (when-let [database-key (db-cache-key database)]
+                    [database-key (:cache-context database)]))))
+        (query-source-bindings query)))
 
 (defn- query-cache-arguments
   [query args]
@@ -4589,7 +4612,8 @@
                 ;; first-cached scale. Keep them distinct.
                 cache-key (scale-sensitive-key
                            [query non-db-args offset limit order-by *disable-planner*])
-                cached (result-cache-get source-key cache-key)]
+                source-contexts (query-cache-source-contexts query args)
+                cached (result-cache-get source-key cache-key source-contexts)]
             ;; Completed hits never enter the in-flight path and therefore do
             ;; not allocate a promise, request identity, flight key, or delayed
             ;; dependency analysis. The coordinator rechecks on a miss to close
@@ -4625,7 +4649,8 @@
                         max-result-weight]
                        request-id
                        #(binding [resource/*evidence-sink* outer-evidence-sink]
-                          (when-let [entry (result-cache-get source-key cache-key)]
+                          (when-let [entry (result-cache-get source-key cache-key
+                                                            source-contexts)]
                             (resource/certify-cached-result!
                              (:result entry) resource-options)
                             (when cached-dependency-plan
@@ -4634,7 +4659,8 @@
                             {:value (:result entry)}))
                        compute
                        #(result-cache-put! source-key cache-key %
-                                           @dependency-plan cache-epoch)
+                                           @dependency-plan source-contexts
+                                           cache-epoch)
                        #(when cache-evidence (vreset! cache-evidence %))
                        #(cond-> {:datahike.read/dependency-plan
                                  (or (when cached-dependency-plan

@@ -524,8 +524,11 @@
              (is (pos? (:snapshot-count (dq/query-cache-metrics))))
              (d/release conn)
              (is (zero? (:snapshot-count (dq/query-cache-metrics))))
-             (#'dq/result-cache-put! committed ::late #{["stale"]} #{:c/note}
-                                     (:epoch @dq/query-result-cache))
+             (#'dq/result-cache-put!
+              committed ::late #{["stale"]} #{:c/note}
+              {(db/committed-cache-identity committed)
+               (:cache-context committed)}
+              (:epoch @dq/query-result-cache))
              (is (zero? (:snapshot-count (dq/query-cache-metrics)))
                  "a query finishing after release cannot resurrect its generation")
              (let [reconnected (d/connect cfg)
@@ -552,8 +555,11 @@
                admitted-epoch (:epoch @dq/query-result-cache)]
            (dq/clear-query-cache!)
            (is (false?
-                (#'dq/result-cache-put! database ::late #{["stale"]}
-                                        #{:c/note} admitted-epoch)))
+                (#'dq/result-cache-put!
+                 database ::late #{["stale"]} #{:c/note}
+                 {(db/committed-cache-identity database)
+                  (:cache-context database)}
+                 admitted-epoch)))
            (is (zero? (:snapshot-count (dq/query-cache-metrics)))))))))
 
 #?(:clj
@@ -689,6 +695,66 @@
            (is (= :datahike.cache.outcome/hit
                   (get-in inherited [:datahike.query/cache-evidence
                                      :datahike.cache/outcome]))))))))
+
+#?(:clj
+   (deftest write-only-transactions-do-not-create-query-cache-snapshots
+     (with-temp-db
+       (conj label-schema {:c/id "lazy-cache" :c/note "stable"})
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (is (= #{["stable"]}
+                (d/q '[:find ?value :where [_ :c/note ?value]] @conn)))
+         (let [before (dq/query-cache-metrics)]
+           (dotimes [index 100]
+             (d/transact conn
+                         [{:c/id "lazy-cache"
+                           :c/labels [(str "write-" index)]}]))
+           (is (= (:snapshot-count before)
+                  (:snapshot-count (dq/query-cache-metrics)))
+               "commits without cache demand must not manufacture cache rows")
+           (is (= (:total-weight before)
+                  (:total-weight (dq/query-cache-metrics)))
+               "commits without cache demand must not retain result weight")
+           (is (= #{:c/labels}
+                  (set (keys (get-in @conn
+                                     [:cache-context
+                                      :datahike.cache/attribute-revisions]))))
+               "revision state is bounded by changed attributes, not commits")
+           (let [demanded (dq/q-with-evidence
+                           '[:find ?value :where [_ :c/note ?value]] @conn)
+                 after-demand (dq/query-cache-metrics)]
+             (is (= #{["stable"]} (:datahike.query/result demanded)))
+             (is (= :datahike.cache.outcome/hit
+                    (get-in demanded [:datahike.query/cache-evidence
+                                      :datahike.cache/outcome])))
+             (is (zero? (get-in demanded [:datahike.query/resource-evidence
+                                          :datahike.resource/work]))
+                 "final demand must inherit without executing the query")
+             (is (= (inc (:snapshot-count before))
+                    (:snapshot-count after-demand))
+                 "only the demanded immutable database value gains a row")))))))
+
+#?(:clj
+   (deftest affected-transaction-recomputes-only-when-the-child-is-demanded
+     (with-temp-db
+       (conj label-schema {:c/id "lazy-affected" :c/note "before"})
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (let [query '[:find ?value :where [_ :c/note ?value]]
+               parent @conn
+               initial (dq/q-with-evidence query parent)
+               before-commit (dq/query-cache-metrics)
+               report (d/transact conn [{:c/id "lazy-affected"
+                                         :c/note "after"}])]
+           (is (= before-commit (dq/query-cache-metrics))
+               "even an affected commit must not mutate cached result rows")
+           (let [child (dq/q-with-evidence query (:db-after report))]
+             (is (= #{["after"]} (:datahike.query/result child)))
+             (is (= :datahike.cache.outcome/miss-owner
+                    (get-in child [:datahike.query/cache-evidence
+                                   :datahike.cache/outcome]))))
+           (is (= #{["before"]} (d/q query parent))
+               "the held immutable parent retains its exact cached value"))))))
 
 #?(:clj
    (deftest bounded-queries-share-completed-semantic-results
@@ -1065,15 +1131,15 @@
            (dq/clear-query-cache!))))))
 
 #?(:clj
-   (deftest unknown-batch-member-disables-cache-propagation
+   (deftest unknown-batch-member-advances-the-conservative-cache-revision
      (let [known {:db-after {:ref-ident-map nil}
                   :tx-data [{:a :c/note}]}
            unknown {:db-after {:ref-ident-map nil}
                     :tx-data []}]
        (is (= #{:c/note}
-              (writing/batch-cache-propagation-attributes [known])))
+              (writing/batch-cache-revision-attributes [known])))
        (is (nil?
-            (writing/batch-cache-propagation-attributes [known unknown]))
+            (writing/batch-cache-revision-attributes [known unknown]))
            "one unknowable change must make the complete commit conservative"))))
 
 (deftest test-pull-only-attr-retract-invalidates-cache
@@ -1175,7 +1241,7 @@
                                (:db-after tx))))))))))
 
 #?(:clj
-   (deftest schema-changing-transactions-do-not-propagate-query-results
+   (deftest schema-changing-transactions-do-not-inherit-query-results
      (with-temp-db
        (conj label-schema {:c/id "schema-cache" :c/note "value"})
        (fn [conn]
@@ -1300,7 +1366,7 @@
                    (is (zero? (:snapshot-count (dq/query-cache-metrics)))))))))))))
 
 #?(:clj
-   (deftest composite-source-cache-propagates-one-advanced-source-conservatively
+   (deftest composite-source-cache-inherits-one-advanced-source-conservatively
      (with-temp-db
        (conj label-schema {:c/id "left" :c/note "L"})
        (fn [left]
@@ -1333,7 +1399,7 @@
                                           :datahike.cache/outcome]))))))))))
 
 #?(:clj
-   (deftest composite-cache-propagation-checks-only-the-advanced-source-plan
+   (deftest composite-cache-inheritance-checks-only-the-advanced-source-plan
      (with-temp-db
        (conj label-schema {:c/id "left" :c/note "L"})
        (fn [left]

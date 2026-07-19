@@ -574,8 +574,8 @@
                 (map (fn [a] (if (and rim (number? a)) (get rim a a) a))))
           tx-data)))
 
-(defn cache-propagation-attributes
-  "Return known modified attributes, or nil when invalidation is unknowable."
+(defn cache-revision-attributes
+  "Return attributes whose cache revisions advance, or nil when unknowable."
   [{:keys [db-after tx-data]}]
   ;; Ordinary transactions always report datoms, including :db/txInstant.
   ;; Empty reports are used by internal index/schema operations whose logical
@@ -584,10 +584,10 @@
   (when (seq tx-data)
     (modified-attributes db-after tx-data)))
 
-(defn batch-cache-propagation-attributes
-  "Union known batch attributes; any unknown member makes the batch unknown."
+(defn batch-cache-revision-attributes
+  "Union cache revisions for a batch; any unknown member makes it unknown."
   [reports]
-  (let [attribute-sets (mapv cache-propagation-attributes reports)]
+  (let [attribute-sets (mapv cache-revision-attributes reports)]
     (when (every? some? attribute-sets)
       (reduce into #{} attribute-sets))))
 

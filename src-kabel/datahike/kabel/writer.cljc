@@ -215,22 +215,28 @@
           conn-store (:store current-state)
           ;; Convert stored format to live DB (roots already EAGER from the canonical read handler)
           live-db (dw/stored->db stored-db conn-store)
-          ;; Propagate query cache from old DB to new DB
-          ;; Get modified attrs from pending tx-report if available
+          ;; Advance immutable cache-validation revisions from the pending
+          ;; transaction when available. Cache rows remain demand-created.
           max-tx (:max-tx live-db)
           pending-entry (when writer
                           (get @(:pending-txs writer) max-tx))
           tx-data (get-in pending-entry [:tx-report :tx-data])
-          _ (when tx-data
-              ;; Known tx: selective invalidation
-              (let [rim (:ref-ident-map live-db)
-                    modified-attrs (into #{} (comp (map :a) (filter some?)
-                                                   (map (fn [a] (if (and rim (number? a)) (get rim a a) a)))) tx-data)]
-                (dq/propagate-query-cache current-state live-db modified-attrs)))
+          rim (:ref-ident-map live-db)
+          modified-attrs
+          (when tx-data
+            (into #{} (comp (map :a) (filter some?)
+                            (map (fn [a]
+                                   (if (and rim (number? a)) (get rim a a) a))))
+                  tx-data))
+          commit-id (get-in live-db [:meta :datahike/commit-id])
+          cache-context
+          (some-> (:cache-context current-state)
+                  (dq/advance-query-cache-context commit-id modified-attrs false))
           ;; Merge new db with connection state (preserve writer, store, etc.)
           new-state (assoc live-db
                            :store conn-store
-                           :writer writer)]
+                           :writer writer
+                           :cache-context cache-context)]
       ;; Update connection
       (reset! wrapped-atom new-state)
       (log/trace "Updated connection db via sync" {:max-tx (:max-tx live-db)})

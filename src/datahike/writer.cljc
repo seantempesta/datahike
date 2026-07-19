@@ -219,16 +219,17 @@
                           (let [start-ts (get-time-ms)
                                 {{:keys [datahike/commit-id]} :meta
                                  :as stored-commit-db} (<?- (w/commit! db merge-parents false last-cid))
-                                commit-db (assoc stored-commit-db :cache-context
-                                                 (some-> (:cache-context parent-db)
-                                                         (assoc :datahike.cache/commit-id commit-id
-                                                                :datahike.cache/committed? true)))
                                 modified-attrs
-                                (w/batch-cache-propagation-attributes
+                                (w/batch-cache-revision-attributes
                                  (mapv first txs))
+                                commit-db
+                                (assoc stored-commit-db :cache-context
+                                       (some-> (:cache-context parent-db)
+                                               (q/advance-query-cache-context
+                                                commit-id modified-attrs
+                                                (boolean merge-parents))))
                                 commit-time (- (get-time-ms) start-ts)]
                             (log/trace :datahike/commit-time {:duration-ms commit-time})
-                            (q/propagate-query-cache parent-db commit-db modified-attrs)
                             (reset! connection commit-db)
                     ;; notify all processes that transaction is complete
                             (doseq [[tx-report callback] txs]
