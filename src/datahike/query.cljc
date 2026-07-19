@@ -21,9 +21,9 @@
    [datalog.parser.impl :as dpi]
    [datalog.parser.impl.proto :as dpip]
    [datalog.parser.pull :as dpp]
-   #?(:cljs [datalog.parser.type :refer [Aggregate BindColl BindIgnore BindScalar BindTuple Constant
-                                         FindColl FindRel FindScalar FindTuple PlainSymbol Pull
-                                         RulesVar SrcVar Variable]])
+   #?(:cljs [datalog.parser.type :refer [Aggregate And BindColl BindIgnore BindScalar BindTuple Constant
+                                         FindColl FindRel FindScalar FindTuple Function Not Or Pattern
+                                         PlainSymbol Predicate Pull RuleExpr RulesVar SrcVar Variable]])
    [datahike.constants :as const]
    [datahike.query.relation :as rel]
    [datahike.resource :as resource]
@@ -47,9 +47,9 @@
                    [datahike.datom Datom]
                    [datahike.db DB AsOfDB SinceDB HistoricalDB]
                    [datahike.query.relation Relation]
-                   [datalog.parser.type Aggregate BindColl BindIgnore BindScalar BindTuple Constant
-                    FindColl FindRel FindScalar FindTuple PlainSymbol Pull
-                    RulesVar SrcVar Variable]
+                   [datalog.parser.type Aggregate And BindColl BindIgnore BindScalar BindTuple Constant
+                    FindColl FindRel FindScalar FindTuple Function Not Or Pattern
+                    PlainSymbol Predicate Pull RuleExpr RulesVar SrcVar Variable]
                    [java.lang.reflect Method]
                    [java.util Date Map HashSet HashSet])))
 
@@ -2623,51 +2623,103 @@
         (conj origin-key (long time-point))))
     (db/committed-cache-identity database)))
 
+(defn- merge-attr-deps
+  "Merge two attr-dep sets. :all dominates."
+  [a b]
+  (cond
+    (= a :all) :all
+    (= b :all) :all
+    :else (into a b)))
+
+(defn- constant-attribute
+  [argument]
+  (when (and (instance? Constant argument)
+             (keyword? (:value argument)))
+    (:value argument)))
+
+(defn- database-function-attr-deps
+  [clause]
+  (let [fn-symbol (some-> clause :fn :symbol)
+        args (:args clause)]
+    (case fn-symbol
+      missing?
+      (if-let [attribute (constant-attribute (nth args 2 nil))]
+        #{attribute}
+        :all)
+
+      get-else
+      (if-let [attribute (constant-attribute (nth args 2 nil))]
+        #{attribute}
+        :all)
+
+      get-some
+      (let [attributes (map constant-attribute (drop 2 args))]
+        (if (every? some? attributes)
+          (set attributes)
+          :all))
+
+      #{})))
+
+(declare parsed-clause-attr-deps)
+
+(defn- parsed-clauses-attr-deps
+  [clauses]
+  (reduce (fn [attributes clause]
+            (let [next-attributes (parsed-clause-attr-deps clause)]
+              (if (= next-attributes :all)
+                (reduced :all)
+                (into attributes next-attributes))))
+          #{}
+          clauses))
+
+(defn- parsed-clause-attr-deps
+  "Fold the datalog-parser clause representation rather than maintaining a
+   second raw Datalog grammar."
+  [clause]
+  (cond
+    (instance? Pattern clause)
+    (let [attribute (nth (:pattern clause) 1 nil)]
+      (cond
+        (instance? Variable attribute) :all
+        (instance? Constant attribute)
+        (if (keyword? (:value attribute)) #{(:value attribute)} :all)
+        :else :all))
+
+    (or (instance? Predicate clause)
+        (instance? Function clause))
+    (database-function-attr-deps clause)
+
+    (or (instance? Not clause)
+        (instance? Or clause)
+        (instance? And clause))
+    (parsed-clauses-attr-deps (:clauses clause))
+
+    ;; Resolving supplied rule bodies requires query inputs. The input-free
+    ;; public projection must remain conservative.
+    (instance? RuleExpr clause) :all
+
+    :else :all))
+
 (defn- extract-query-attr-deps
-  "Extract the set of attributes referenced in where-clauses.
-   Returns a set of keywords/symbols, or :all if deps cannot be determined.
-   Uses a work-queue loop so :all short-circuits cleanly without nested reduces."
-  [where-clauses]
-  (loop [clauses where-clauses
-         attrs   #{}]
-    (if (empty? clauses)
-      attrs
-      (let [[clause & rest-clauses] clauses]
-        (cond
-          ;; Data pattern: [?e :attr ?v] or with src-var [$ ?e :attr ?v]
-          (and (vector? clause) (not (vector? (first clause))))
-          (let [f (first clause)
-                src? (and (symbol? f) (clojure.string/starts-with? (name f) "$"))
-                a (if src? (nth clause 2 nil) (second clause))]
-            (if (symbol? a)
-              ;; Variable in attribute position — query touches all attributes
-              :all
-              (recur rest-clauses
-                     (if (some? a)
-                       (conj attrs a)
-                       attrs))))
+  [parsed-query]
+  (parsed-clauses-attr-deps (:qwhere parsed-query)))
 
-          ;; Predicate/function clause [(> ?a 50)] — deps come from binding
-          ;; pattern clauses, safe to skip.
-          (and (sequential? clause) (vector? (first clause)))
-          (recur rest-clauses attrs)
-
-          ;; or / not / and / or-join / not-join — add sub-clauses to work queue
-          (and (sequential? clause) (symbol? (first clause)))
-          (let [op-name (name (first clause))]
-            (case op-name
-              ("or" "and" "not")
-              (recur (into rest-clauses (rest clause)) attrs)
-
-              ("or-join" "not-join")
-              ;; Skip the binding-var vector (second element)
-              (recur (into rest-clauses (rest (rest clause))) attrs)
-
-              ;; Unknown: rule call, get-else, etc. — cannot determine attr deps
-              :all))
-
-          ;; Unknown shape — cache/caller must conservatively assume all attrs.
-          :else :all)))))
+(defn- pull-spec-attr-deps
+  [spec]
+  (if (:wildcard? spec)
+    :all
+    (reduce-kv
+     (fn [attributes _display-key options]
+       (let [attribute (:attr options)
+             nested (when-let [subpattern (:subpattern options)]
+                      (pull-spec-attr-deps subpattern))]
+         (cond
+           (not (keyword? attribute)) (reduced :all)
+           (= nested :all) (reduced :all)
+           :else (cond-> (conj attributes attribute)
+                   nested (into nested)))))
+     #{}
+     (:attrs spec))))
 
 (defn- extract-find-pull-attr-deps
   "Extract the set of attributes referenced in pull patterns within :find.
@@ -2686,21 +2738,14 @@
              (if-not (sequential? pattern)
                 ;; Pattern is a variable bound via :in — cannot determine attrs
                (reduced :all)
-               (let [spec (dpp/parse-pull pattern)]
-                 (if (:wildcard? spec)
+               (let [dependencies (pull-spec-attr-deps
+                                   (dpp/parse-pull pattern))]
+                 (if (= dependencies :all)
                    (reduced :all)
-                   (into attrs (keys (:attrs spec)))))))
+                   (into attrs dependencies)))))
            attrs)))
      #{}
      find-elements)))
-
-(defn- merge-attr-deps
-  "Merge two attr-dep sets. :all dominates."
-  [a b]
-  (cond
-    (= a :all) :all
-    (= b :all) :all
-    :else (into a b)))
 
 (defn query-attribute-dependencies
   "Conservatively project the attributes that can affect a query result.
@@ -2712,11 +2757,11 @@
    This function is pure: it neither executes the query nor retains data."
   [query-input]
   (try
-    (let [query (:query (normalize-q-input query-input []))]
+    (let [query (:query (normalize-q-input query-input []))
+          parsed-query (memoized-parse-query query)]
       (merge-attr-deps
-       (extract-query-attr-deps (:where query))
-       (extract-find-pull-attr-deps
-        (:qfind (memoized-parse-query query)))))
+       (extract-query-attr-deps parsed-query)
+       (extract-find-pull-attr-deps (:qfind parsed-query))))
     (catch #?(:clj Throwable :cljs :default) _
       :all)))
 

@@ -60,6 +60,23 @@
             '[:find (pull ?e [:person/id :person/name
                               {:person/friend [:person/id]}])
               :where [?e :person/id]]))))
+  (testing "database functions contribute their literal attributes"
+    (is (= #{:person/deleted?}
+           (d/query-attribute-dependencies
+            '[:find ?e
+              :where [(missing? $ ?e :person/deleted?)]]))))
+  (testing "nested pulls contribute every realized attribute"
+    (is (= #{:person/id :person/friend :person/email}
+           (d/query-attribute-dependencies
+            '[:find (pull ?e [:person/id
+                              {:person/friend [:person/email]}])
+              :where [?e :person/id]]))))
+  (testing "reverse pulls use the canonical stored forward attribute"
+    (is (= #{:person/id :person/friend :person/email}
+           (d/query-attribute-dependencies
+            '[:find (pull ?e [:person/id
+                              {:person/_friend [:person/email]}])
+              :where [?e :person/id]]))))
   (testing "unsafe or unknown shapes widen"
     (is (= :all
            (d/query-attribute-dependencies

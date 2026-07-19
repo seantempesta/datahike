@@ -50,6 +50,12 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Notable fixes
 
+- **Query dependency projection follows parsed query and pull semantics** —
+  database functions such as `missing?`, nested pull patterns, and reverse
+  pull attributes now contribute their canonical stored attributes. Query
+  cache inheritance and selective committed-report interests no longer miss
+  changes visible only through those valid forms. ([#TODO])
+
 - **Schema updates retain every invalid difference** — comparing a schema
   entity no longer forgets an incompatible earlier change when a later map
   entry is unchanged or explicitly mutable. Incompatible updates are rejected
