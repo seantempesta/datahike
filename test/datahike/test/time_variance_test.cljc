@@ -392,7 +392,11 @@
                  [3 :age 25 536870916 true]
                  [536870917 :db/txInstant :timestamp 536870917 true]
                  [3 :age 25 536870917 false]}
-               (set datoms)))))))
+               (set datoms)))))
+    (d/release conn)
+    ;; delete-database is synchronous on JVM (no channel to <!) and async on cljs
+    #?(:clj  (d/delete-database cfg)
+       :cljs (<! (d/delete-database cfg)))))
 
 (deftest-async test-no-duplicates-on-history-search
   (let [schema [{:db/ident       :name
