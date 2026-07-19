@@ -299,7 +299,7 @@
                  "/tmp/dh-test-persistence")
           cfg {:store {:backend :file
                        :path path
-                       :id #uuid "5c6e0000-0000-0000-0000-000000000001"}
+                       :id (random-uuid)}
                :initial-tx [name-schema]}
           _ (d/delete-database cfg)
           _ (d/create-database cfg)
@@ -314,17 +314,24 @@
       (d/delete-database cfg)))
   (testing "test mem persistence"
     (let [cfg {:store {:backend :memory
-                       :id #uuid "5c100000-0000-0000-0000-000000000005"}
+                       :id (random-uuid)}
                :initial-tx [name-schema]}
+          _ (d/delete-database cfg)
           _ (d/create-database cfg)
           conn (d/connect cfg)]
-      (testing "schema exists on creation and first connection"
-        (is (= #{[:name :db.type/string :db.cardinality/one]} (d/q find-schema-q (d/db conn)))))
-      (testing "reconnect with db"
-        (let [new-conn (d/connect cfg)]
-          (is (= #{[:name :db.type/string :db.cardinality/one]} (d/q find-schema-q (d/db new-conn))))))
-      (d/release conn)
-      (d/delete-database cfg))))
+      (try
+        (testing "schema exists on creation and first connection"
+          (is (= #{[:name :db.type/string :db.cardinality/one]} (d/q find-schema-q (d/db conn)))))
+        (testing "reconnect with db"
+          (let [new-conn (d/connect cfg)]
+            (try
+              (is (= #{[:name :db.type/string :db.cardinality/one]}
+                     (d/q find-schema-q (d/db new-conn))))
+              (finally
+                (d/release new-conn)))))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
 
 (deftest test-schema-on-read-db
   (testing "test database creation with schema-on-read"
