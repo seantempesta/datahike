@@ -36,15 +36,6 @@
        (not (analyze/free-var? (:e ci)))
        (contains? rules (:e ci))))
 
-(defn- blank-var?
-  "Blank/anonymous Datalog variable — a symbol whose name starts with `_`.
-   Each occurrence should get its own group so patterns don't accidentally
-   share an entity."
-  [x]
-  (and (symbol? x)
-       #?(:clj  (.startsWith (name x) "_")
-          :cljs (= "_" (subs (name x) 0 1)))))
-
 (defn- entity-group-key
   "Grouping key for scans: [entity-var source]. Blank/anonymous vars
    each get a unique group. Works with both LScan and LOptionalScan
@@ -52,7 +43,7 @@
   [scan blank-counter]
   (let [e-var  (:e scan)
         source (:source scan)]
-    (if (blank-var? e-var)
+    (if (analyze/blank-var? e-var)
       [(symbol (str "_anon_" (swap! blank-counter inc))) source]
       [e-var source])))
 

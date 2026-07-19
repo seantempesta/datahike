@@ -369,8 +369,13 @@
        (= \$ (first (name sym)))))
 
 (defn free-var? [sym]
-  (and (symbol? sym)
-       (= \? (first (name sym)))))
+  (analyze/free-var? sym))
+
+(defn- pattern-var?
+  "True for a free or blank variable in a data pattern."
+  [x]
+  (or (analyze/free-var? x)
+      (analyze/blank-var? x)))
 
 (defn attr? [form]
   (or (keyword? form) (string? form)))
@@ -1003,7 +1008,7 @@
                                      datoms)))))
 
 (defn replace-symbols-by-nil [pattern]
-  (mapv #(if (symbol? %) nil %) pattern))
+  (mapv #(if (pattern-var? %) nil %) pattern))
 
 (defn resolve-pattern-eid [db search-pattern]
   (let [first-p (first search-pattern)]
@@ -1060,7 +1065,7 @@
     (if (and tuple pattern)
       (let [t (first tuple)
             p (first pattern)]
-        (if (or (symbol? p) (= t p))
+        (if (or (pattern-var? p) (= t p))
           (recur (next tuple) (next pattern))
           false))
       true)))
@@ -1106,7 +1111,7 @@
         tuples-args (da/make-array len)]
     (dotimes [i len]
       (let [arg (nth args i)]
-        (if (symbol? arg)
+        (if (or (free-var? arg) (source? arg))
           (if-let [const (get (:consts context) arg)]
             (da/aset static-args i const)
             (if-some [source (get sources arg)]
@@ -1166,7 +1171,7 @@
                  (when (nil? (rel-with-attr context f))
                    (log/raise "Unknown predicate '" f " in " clause
                               {:error :query/where, :form clause, :var f})))
-        [context production] (rel-prod-by-attrs context (filter symbol? args))
+        [context production] (rel-prod-by-attrs context (filter free-var? args))
         new-rel (if pred
                   (let [tuple-pred (-call-fn context production pred args)
                         safe-pred (fn [tuple]
@@ -1193,7 +1198,7 @@
                 (when (nil? (rel-with-attr context f))
                   (log/raise "Unknown function '" f " in " clause
                              {:error :query/where, :form clause, :var f})))
-        attrs (filter symbol? args)
+        attrs (filter free-var? args)
         [context production] (rel-prod-by-attrs context attrs)
         symbols-with-values (into #{}
                                   (mapcat keys)
@@ -1531,7 +1536,7 @@
 
 (defn replace-unbound-symbols-by-nil [bsm pattern]
   (normalize-pattern
-   (mapv #(when-not (and (symbol? %) (not (contains? bsm %)))
+   (mapv #(when-not (and (pattern-var? %) (not (contains? bsm %)))
             %)
          pattern)))
 
@@ -1906,7 +1911,7 @@
           (map-indexed (fn [i x]
                          (cond
                            (subst-pattern-positions i) x
-                           (symbol? x) nil
+                           (pattern-var? x) nil
                            :else x)))
           pattern)))
 
@@ -1994,8 +1999,7 @@
                                                     strategy-vec
                                                     clean-pattern)
                    :when (= :filter strategy)
-                   :when (and (some? pattern-value)
-                              (not (symbol? pattern-value)))]
+                   :when (analyze/ground? pattern-value)]
                i)
         extractor (index-feature-extractor
                    inds
@@ -2088,16 +2092,16 @@
     (let [[e a v] pattern1
           tx (get pattern1 3)
           a-ground? (or (keyword? a) (number? a))
-          tx-free? (or (nil? tx) (symbol? tx))]
+          tx-free? (or (nil? tx) (pattern-var? tx))]
       (cond
         ;; [e a ?v] — lookup on EAVT with EA comparator
-        (and (number? e) a-ground? (symbol? v) tx-free?
+        (and (number? e) a-ground? (pattern-var? v) tx-free?
              (not (dbu/multival? source a)))
         :ea
 
         ;; [?e a v] — lookup on AVET with AV comparator
         ;; v must be a scalar, attr must be :db/unique (guarantees single result)
-        (and (symbol? e) a-ground? tx-free?
+        (and (pattern-var? e) a-ground? tx-free?
              (scalar-value? v)
              (:avet source)
              (dbu/is-attr? source a :db/unique))
@@ -3704,7 +3708,7 @@
                                                           (nth clause 2))
                                                   a-raw (when (and (sequential? clause) (>= (count clause) 2))
                                                           (nth clause 1))]
-                                              (when (and v-sym (symbol? v-sym) a-raw (not (symbol? a-raw)))
+                                              (when (and (free-var? v-sym) (analyze/ground? a-raw))
                                                 [v-sym (attr-col-key (resolve-attr a-raw))]))))
                                     sub-ops)
                      entity-vars (into #{}
@@ -3801,7 +3805,7 @@
                                                                  result
                                                                  (cond
                                                                    ;; a=var, b=const → normal direction
-                                                                   (and (symbol? a) (not (symbol? b))
+                                                                   (and (free-var? a) (analyze/ground? b)
                                                                         (get var->col a)
                                                                         (let [col (get var->col a)]
                                                                           (some (fn [sub-op]
@@ -3813,7 +3817,7 @@
                                                                    [stratum-op (get var->col a) b]
 
                                                                    ;; b=var, a=const → flip operator direction
-                                                                   (and (symbol? b) (not (symbol? a))
+                                                                   (and (free-var? b) (analyze/ground? a)
                                                                         (get var->col b)
                                                                         (some (fn [sub-op]
                                                                                 (let [attr (resolve-attr (or (:attr sub-op) (get-in sub-op [:schema-info :attr])))]

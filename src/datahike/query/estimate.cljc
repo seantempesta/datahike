@@ -42,10 +42,9 @@
     (log/info :datahike/estimate-heuristic-fallback
               "Index lacks precomputed subtree counts (old database format). Using heuristic estimates for query planning. Consider re-indexing for optimal performance."))
   (let [{:keys [e a v]} pattern-info
-        ground? (fn [x] (and (some? x) (not (symbol? x))))
-        e-ground? (ground? e)
-        a-ground? (ground? a)
-        v-ground? (ground? v)
+        e-ground? (analyze/ground? e)
+        a-ground? (analyze/ground? a)
+        v-ground? (analyze/ground? v)
         total (max 1 (di/-count (:eavt db)))]
     (cond
       ;; [e a ?v] — single datom for card-one, small fan-out for card-many
@@ -79,10 +78,9 @@
   "Estimate cardinality using O(log n) count-slice on indices with subtree counts."
   [db pattern-info schema-info]
   (let [{:keys [e a v tx]} pattern-info
-        ground? (fn [x] (and (some? x) (not (symbol? x))))
-        e-ground? (ground? e)
-        a-ground? (ground? a)
-        v-ground? (ground? v)
+        e-ground? (analyze/ground? e)
+        a-ground? (analyze/ground? a)
+        v-ground? (analyze/ground? v)
         resolved-a (when a-ground?
                      (if (and (:attribute-refs? (dbi/-config db)) (keyword? a))
                        (dbi/-ref-for db a)
@@ -177,9 +175,8 @@
    extrapolating against the total slice count.
    Returns a positive long, or nil if estimation isn't possible."
   [db pattern-info schema-info]
-  (let [{:keys [a]} pattern-info
-        ground? (fn [x] (and (some? x) (not (symbol? x))))]
-    (when (ground? a)
+  (let [{:keys [a]} pattern-info]
+    (when (analyze/ground? a)
       (let [resolved-a (if (and (:attribute-refs? (dbi/-config db)) (keyword? a))
                          (dbi/-ref-for db a)
                          a)
@@ -333,7 +330,7 @@
               (throw (ex-info "predicate var not found in scan clause"
                               {:pred-var pred-var :clause clause})))
           a-val (nth clause 1)
-          resolved-a (if (and a-val (not (symbol? a-val)))
+          resolved-a (if (analyze/ground? a-val)
                        (if (:attribute-refs? (dbi/-config db))
                          (if (keyword? a-val)
                            (dbi/-ref-for db a-val)

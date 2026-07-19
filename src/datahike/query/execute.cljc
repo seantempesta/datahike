@@ -355,7 +355,7 @@
   (let [[e a v tx added] clause
         filters
         (cond-> []
-          (and (not (nil? v)) (not (symbol? v)) (not= :avet index))
+          (and (analyze/ground? v) (not= :avet index))
           (conj (fn [^Datom d] (val-eq? (.-v d) v)))
           (and (not (nil? e)) (not (symbol? e)) (number? e) (not= :eavt index))
           (conj (let [le #?(:clj (long e) :cljs e)] (fn [^Datom d] (= (.-e d) le))))
@@ -500,7 +500,7 @@
    touched."
   [db clause index pushdown-preds rels scan-n]
   (let [[e a v] clause
-        resolved-a (when (and (some? a) (not (symbol? a))) (resolve-attr db a))
+        resolved-a (when (analyze/ground? a) (resolve-attr db a))
         resolved-e (when (and (some? e) (not (symbol? e)) (number? e)) #?(:clj (long e) :cljs e))
         pushdown-bounds (when (seq pushdown-preds) (plan/pushdown-to-bounds pushdown-preds))
         [from to] (compute-slice-bounds clause index pushdown-bounds resolved-a resolved-e)
@@ -1294,7 +1294,7 @@
   [resolve-db merge-ops]
   (to-array (mapv (fn [op]
                     (let [ma (second (:clause op))]
-                      (when (and (some? ma) (not (symbol? ma)))
+                      (when (analyze/ground? ma)
                         (resolve-attr resolve-db ma))))
                   merge-ops)))
 
@@ -1304,11 +1304,11 @@
   [merge-ops scan-clause]
   [(to-array (mapv (fn [op]
                      (let [mv (get (:clause op) 2)]
-                       (boolean (and (some? mv) (not (symbol? mv))))))
+                       (boolean (analyze/ground? mv))))
                    merge-ops))
    (to-array (mapv (fn [op]
                      (let [mv (get (:clause op) 2)]
-                       (when (and (some? mv) (not (symbol? mv))) mv)))
+                       (when (analyze/ground? mv) mv)))
                    merge-ops))
    (to-array (mapv #(boolean (:anti? %)) merge-ops))
    (to-array (mapv (fn [op]
@@ -1770,7 +1770,7 @@
         ;; For temporal queries, resolve against the unwrapped origin-db
         origin-db (when temporal (:origin-db temporal))
         index-db (or origin-db db)
-        resolved-a (when (and (some? a) (not (symbol? a))) (resolve-attr index-db a))
+        resolved-a (when (analyze/ground? a) (resolve-attr index-db a))
         resolved-e (when (and (some? e) (not (symbol? e)) (number? e)) #?(:clj (long e) :cljs e))
         pushdown-bounds (when (seq pushdown-preds) (plan/pushdown-to-bounds pushdown-preds))
         [from-datom to-datom] (compute-slice-bounds clause index pushdown-bounds resolved-a resolved-e)
@@ -1833,7 +1833,7 @@
                                                      (get-in op [:schema-info :card-one?] true)
                                                      (not (dbu/no-history? index-db
                                                                            (let [ma (second (:clause op))]
-                                                                             (when (and (some? ma) (not (symbol? ma)))
+                                                                             (when (analyze/ground? ma)
                                                                                (resolve-attr index-db ma)))))))
                                               merge-ops)))
         temporal-cursors
@@ -2936,7 +2936,7 @@
   (let [cancel (:cancel context)
         {:keys [clause index pushdown-preds]} scan-op
         [e a v tx] clause
-        resolved-a (when (and (some? a) (not (symbol? a))) (resolve-attr db a))
+        resolved-a (when (analyze/ground? a) (resolve-attr db a))
         resolved-e (when (and (some? e) (not (symbol? e)) (number? e)) #?(:clj (long e) :cljs e))
         pushdown-bounds (when (seq pushdown-preds) (plan/pushdown-to-bounds pushdown-preds))
         [from-datom to-datom] (compute-slice-bounds clause index pushdown-bounds resolved-a resolved-e)
@@ -2949,14 +2949,14 @@
         eavt-pss (:eavt db)
         n-merges (count merge-ops)
         merge-attrs (to-array (mapv (fn [op] (let [ma (second (:clause op))]
-                                               (when (and (some? ma) (not (symbol? ma)))
+                                               (when (analyze/ground? ma)
                                                  (resolve-attr db ma))))
                                     merge-ops))
         merge-v-ground (to-array (mapv (fn [op] (let [mv (get (:clause op) 2)]
-                                                  (boolean (and (some? mv) (not (symbol? mv))))))
+                                                  (boolean (analyze/ground? mv))))
                                        merge-ops))
         merge-v-vals (to-array (mapv (fn [op] (let [mv (get (:clause op) 2)]
-                                                (when (and (some? mv) (not (symbol? mv))) mv)))
+                                                (when (analyze/ground? mv) mv)))
                                      merge-ops))
         merge-anti (to-array (mapv #(boolean (:anti? %)) merge-ops))
         ;; Anti-merge shared-variable checks (same as temporal variant)
@@ -3132,7 +3132,7 @@
         scan-clause (:clause scan-op)
         index-db    (or (:origin-db temporal) db)
         a           (second scan-clause)
-        resolved-a  (when (and (some? a) (not (symbol? a))) (resolve-attr index-db a))
+        resolved-a  (when (analyze/ground? a) (resolve-attr index-db a))
         scan-n      (or (:estimated-card scan-op)
                         (di/-count (get index-db (:index scan-op))))
         ;; SIP probe-set is a JVM-only fast-path optimization (HashSet + ForwardCursor
@@ -4372,7 +4372,7 @@
                       (if (and (some? ti)
                                (pss-instance? (:eavt (:origin-db ti)))
                                (not (:optional? op))
-                               (some? scan-attr) (not (symbol? scan-attr)))
+                               (analyze/ground? scan-attr))
                     ;; Temporal DB with a PSS-backed origin and a concrete-attr,
                     ;; non-optional pattern: stay on the FUSED seek path (per bound
                     ;; entity/value temporal index seeks via execute-group-direct +

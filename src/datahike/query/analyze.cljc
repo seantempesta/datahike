@@ -12,10 +12,23 @@
 ;; Variable extraction
 
 (defn free-var?
-  "A free variable is a symbol starting with '?'"
+  "A free variable is a symbol starting with '?'."
   [x]
   (and (symbol? x)
        (= \? (first (name x)))))
+
+(defn blank-var?
+  "A blank variable is an underscore-prefixed symbol ignored by projection."
+  [x]
+  (and (symbol? x)
+       (= \_ (first (name x)))))
+
+(defn ground?
+  "True for a concrete pattern value, including ordinary symbol values."
+  [x]
+  (and (some? x)
+       (not (free-var? x))
+       (not (blank-var? x))))
 
 (defn extract-vars
   "Extract all free variables from a clause form."
@@ -218,7 +231,7 @@
    from the database. Returns map with :cardinality, :indexed?, :unique?, :ref?"
   [db pattern-info]
   (let [a (:a pattern-info)]
-    (when (and (some? a) (not (symbol? a)))
+    (when (ground? a)
       {:attr a
        :card-one? (not (dbu/multival? db a))
        :indexed? (dbu/indexing? db a)

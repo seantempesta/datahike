@@ -697,6 +697,68 @@
                                      :datahike.cache/outcome]))))))))
 
 #?(:clj
+   (deftest ordinary-symbol-inputs-remain-ground-through-planning-and-caching
+     (with-temp-db
+       [{:db/ident :ordinary.namespace/name
+         :db/valueType :db.type/symbol
+         :db/unique :db.unique/identity
+         :db/cardinality :db.cardinality/one}
+        {:db/ident :ordinary.agent/namespace
+         :db/valueType :db.type/ref
+         :db/cardinality :db.cardinality/one}
+        {:db/ident :ordinary.agent/id
+         :db/valueType :db.type/string
+         :db/unique :db.unique/identity
+         :db/cardinality :db.cardinality/one}
+        {:db/ident :ordinary.agent/terminated-at
+         :db/valueType :db.type/instant
+         :db/cardinality :db.cardinality/one}
+        {:db/ident :ordinary.agent/state
+         :db/valueType :db.type/symbol
+         :db/cardinality :db.cardinality/one}
+        {:ordinary.namespace/name 'ordinary.namespace.known}
+        {:ordinary.agent/id "ordinary-agent"
+         :ordinary.agent/state 'ordinary.state/active
+         :ordinary.agent/namespace
+         [:ordinary.namespace/name 'ordinary.namespace.known]}]
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (let [query '[:find ?id .
+                       :in $ ?name
+                       :where [?namespace :ordinary.namespace/name ?name]
+                              [?agent :ordinary.agent/namespace ?namespace]
+                              [?agent :ordinary.agent/id ?id]
+                              (not [?agent :ordinary.agent/terminated-at _])]
+               state-query
+               '[:find ?id .
+                 :in $ ?state
+                 :where [?agent :ordinary.agent/state ?state]
+                        [?agent :ordinary.agent/id ?id]]
+               database @conn]
+           (is (= "ordinary-agent"
+                  (d/q query database 'ordinary.namespace.known)))
+           (is (nil? (d/q query database 'ordinary.namespace.missing))
+               "a completed query and cached plan must not retain a prior :in value")
+           (is (= "ordinary-agent"
+                  (d/q query database 'ordinary.namespace.known))
+               "the original ordinary input remains independently cacheable")
+           (is (= "ordinary-agent"
+                  (d/q state-query database 'ordinary.state/active)))
+           (is (nil? (d/q state-query database 'ordinary.state/missing))
+               "a non-indexed symbol value is a ground scan constraint")
+           (doseq [[candidate-query candidate]
+                   [[query 'ordinary.namespace.known]
+                    [query 'ordinary.namespace.missing]
+                    [state-query 'ordinary.state/active]
+                    [state-query 'ordinary.state/missing]]]
+             (is (= (binding [dq/*disable-planner* true]
+                      (d/q candidate-query database candidate))
+                    (binding [dq/*disable-planner* false]
+                      (d/q candidate-query database candidate)))
+                 (str "planned execution must preserve legacy symbol-value semantics for "
+                      candidate " in " candidate-query))))))))
+
+#?(:clj
    (deftest write-only-transactions-do-not-create-query-cache-snapshots
      (with-temp-db
        (conj label-schema {:c/id "lazy-cache" :c/note "stable"})

@@ -33,10 +33,9 @@
    and whether pushdown predicates constrain the value."
   [pattern-info schema-info has-avet? has-pushdown?]
   (let [{:keys [e a v]} pattern-info
-        ground? (fn [x] (and (some? x) (not (symbol? x))))
-        e? (ground? e)
-        a? (ground? a)
-        v? (ground? v)]
+        e? (analyze/ground? e)
+        a? (analyze/ground? a)
+        v? (analyze/ground? v)]
     (cond
       e? :eavt
       (and a? v? has-avet? (:indexed? schema-info)) :avet
@@ -100,10 +99,9 @@
    Returns [op actually-consumed-pred-clauses]."
   [db pattern-info schema-info pushdown-preds bound-var-cards]
   (let [{:keys [e a v tx pattern]} pattern-info
-        ground? (fn [x] (and (some? x) (not (symbol? x))))
-        e? (ground? e)
-        a? (ground? a)
-        v? (ground? v)
+        e? (analyze/ground? e)
+        a? (analyze/ground? a)
+        v? (analyze/ground? v)
         has-avet? (boolean (:avet db))
         index (select-index pattern-info schema-info has-avet? (seq pushdown-preds))
         effective-preds (if (= :avet index) pushdown-preds [])
@@ -520,7 +518,7 @@
    is ground (not a variable). Variable-attribute patterns must be the scan."
   [op]
   (let [a (second (:clause op))]
-    (and (some? a) (not (symbol? a)))))
+    (analyze/ground? a)))
 
 (defn- scan-cost-of
   "Cost a pattern would have if used as the entity-group's scan, based on
@@ -616,7 +614,7 @@
   (let [n-merges (count merge-ops)
         {:keys [clause index]} scan-op
         [_e a _v _tx] clause
-        scan-attr-ground? (and (some? a) (not (symbol? a)))
+        scan-attr-ground? (analyze/ground? a)
         has-card-many? (boolean (some #(not (get-in % [:schema-info :card-one?] true)) merge-ops))
         has-anti? (boolean (some :anti? merge-ops))
         has-optional? (boolean (some :optional? merge-ops))
