@@ -96,10 +96,21 @@
         a-ident (if attribute-refs? (dbi/ident-for db a :error-on-missing) a)
         v-ident (if (and attribute-refs? (contains? (dbi/-system-entities db) v))
                   (dbi/ident-for db v :error-on-missing)
-                  v)]
+                  v)
+        schema-entry (schema e)]
     (when (and attribute-refs? (contains? (dbi/-system-entities db) e))
       (log/raise "System schema entity cannot be changed"
                  {:error :transact/schema :entity-id e}))
+    (when (and (= :db/index a-ident)
+               (keyword? schema-entry)
+               (let [old-value (get-in schema [schema-entry :db/index])]
+                 (not (or (= old-value v-ident)
+                          (and (nil? old-value) (true? v-ident))))))
+      (log/raise "Update not supported for these schema attributes"
+                 {:error :transact/schema
+                  :entity schema-entry
+                  :invalid-updates {:db/index [(get-in schema [schema-entry :db/index])
+                                               v-ident]}}))
     (if (= a-ident :db/ident)
       (if (schema v-ident)
         (log/raise (str "Schema with attribute " v-ident " already exists")
@@ -267,6 +278,12 @@
     (when (and attribute-refs? (contains? (dbi/-system-entities db) e))
       (log/raise "System schema entity cannot be changed"
                  {:error :retract/schema :entity-id e}))
+    (when (= a-ident :db/index)
+      (let [schema-entry (schema e)]
+        (log/raise "Update not supported for these schema attributes"
+                   {:error :transact/schema
+                    :entity schema-entry
+                    :invalid-updates {:db/index [v-ident nil]}})))
     (if (= a-ident :db/ident)
       (if-not (schema v-ident)
         (let [err-msg (str "Schema with attribute " v-ident " does not exist")
@@ -528,10 +545,11 @@
                  {:error :transact/secondary-only-uncovered :attribute a-ident :datom datom}))
     (cond-> db
             ;; Optimistic removal of the schema entry (because we don't know whether it is already present or not)
-      schema? (try
-                (-> db (remove-schema datom) update-rschema)
-                (catch ExceptionInfo _e
-                  db))
+      (and schema? (not= :db/index a-ident))
+      (try
+        (-> db (remove-schema datom) update-rschema)
+        (catch ExceptionInfo _e
+          db))
 
       keep-history? (update-in [:temporal-eavt] #(di/-temporal-upsert % prim :eavt op-count old-datom))
       true          (update-in [:eavt] #(di/-upsert % prim :eavt op-count old-datom))

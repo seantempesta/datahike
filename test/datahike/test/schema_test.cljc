@@ -451,8 +451,9 @@
     (try
       (d/transact conn [{:db/id 100 :event/at 1000}
                         {:db/id 200 :event/at 1500}])
-      (d/transact conn [{:db/id 100 :event/at 2000}])
-      (let [target-eavt (vec (d/datoms @conn :eavt 100 :event/at))
+      (let [before-update-t (:max-tx @conn)
+            _ (d/transact conn [{:db/id 100 :event/at 2000}])
+            target-eavt (vec (d/datoms @conn :eavt 100 :event/at))
             target-aevt (vec (d/datoms @conn :aevt :event/at))]
         (is (empty? (d/datoms @conn :avet :event/at)))
         (d/transact conn [indexed-schema])
@@ -464,7 +465,13 @@
         (testing "retained additions and retractions are backfilled into temporal AVET"
           (is (= [[1000 true] [1000 false] [1500 true] [2000 true]]
                  (mapv (juxt :v :added)
-                       (d/datoms (d/history @conn) :avet :event/at)))))
+                       (d/datoms (d/history @conn) :avet :event/at))))
+          (is (= 1000
+                 (d/q '[:find ?v . :where [100 :event/at ?v]]
+                      (d/as-of @conn before-update-t))))
+          (is (= 2000
+                 (d/q '[:find ?v . :where [100 :event/at ?v]]
+                      (d/since @conn before-update-t)))))
         (testing "later writes maintain both current and temporal AVET"
           (d/transact conn [{:db/id 100 :event/at 2500}])
           (is (= [1500 2500]
@@ -480,14 +487,81 @@
             (d/transact conn [indexed-schema])
             (is (= before
                    (vec (d/datoms (d/history @conn) :avet :event/at))))))
-        (testing "an index cannot be removed"
-          (let [before (vec (d/datoms (d/history @conn) :avet :event/at))]
-            (is (thrown-with-msg? Throwable
-                                  #"Update not supported for these schema attributes"
-                                  (d/transact conn [(assoc indexed-schema :db/index false)])))
-            (is (true? (get-in (dbi/-schema @conn) [:event/at :db/index])))
-            (is (= before
-                   (vec (d/datoms (d/history @conn) :avet :event/at)))))))
+        (testing "every transaction syntax rejects index removal atomically"
+          (let [snapshot (fn []
+                           {:max-tx (:max-tx @conn)
+                            :schema (get-in (dbi/-schema @conn) [:event/at])
+                            :current (vec (d/datoms @conn :avet :event/at))
+                            :history (vec (d/datoms (d/history @conn) :avet :event/at))})
+                before (snapshot)
+                removals [[(assoc indexed-schema :db/index false)]
+                          [[:db/add :event/at :db/index false]]
+                          [[:db/retract :event/at :db/index true]]
+                          [[:db.fn/cas :event/at :db/index true false]]
+                          [[:db.fn/retractAttribute :event/at :db/index]]
+                          [[:db.fn/retractEntity :event/at]]]]
+            (doseq [tx-data removals]
+              (is (thrown-with-msg? Throwable
+                                    #"Update not supported for these schema attributes"
+                                    (d/transact conn tx-data)))
+              (is (= before (snapshot))))
+            (d/transact conn [{:db/id 300 :event/at 3000}])
+            (is (= [1500 2500 3000]
+                   (mapv :v (d/datoms @conn :avet :event/at)))))))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
+
+(deftest additive-index-update-covers-same-transaction-orderings
+  (doseq [[label tx-data]
+          [["data before schema"
+            [{:db/id 100 :event/at 1000}
+             {:db/ident :event/at
+              :db/valueType :db.type/long
+              :db/cardinality :db.cardinality/one
+              :db/index true}]]
+           ["schema before data"
+            [{:db/ident :event/at
+              :db/valueType :db.type/long
+              :db/cardinality :db.cardinality/one
+              :db/index true}
+             {:db/id 100 :event/at 1000}]]]]
+    (testing label
+      (let [schema {:db/ident :event/at
+                    :db/valueType :db.type/long
+                    :db/cardinality :db.cardinality/one}
+            cfg {:store {:backend :memory :id (random-uuid)}
+                 :schema-flexibility :write
+                 :keep-history? true
+                 :initial-tx [schema]}
+            _ (d/delete-database cfg)
+            _ (d/create-database cfg)
+            conn (d/connect cfg)]
+        (try
+          (d/transact conn tx-data)
+          (is (= [1000] (mapv :v (d/datoms @conn :avet :event/at))))
+          (finally
+            (d/release conn)
+            (d/delete-database cfg)))))))
+
+(deftest explicit-index-facet-preserves-implicitly-indexed-content
+  (let [schema {:db/ident :event/id
+                :db/valueType :db.type/string
+                :db/cardinality :db.cardinality/one
+                :db/unique :db.unique/identity}
+        cfg {:store {:backend :memory :id (random-uuid)}
+             :schema-flexibility :write
+             :keep-history? true
+             :initial-tx [schema]}
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)]
+    (try
+      (d/transact conn [{:event/id "a"} {:event/id "b"}])
+      (let [before (vec (d/datoms (d/history @conn) :avet :event/id))]
+        (d/transact conn [(assoc schema :db/index true)])
+        (is (true? (get-in (dbi/-schema @conn) [:event/id :db/index])))
+        (is (= before (vec (d/datoms (d/history @conn) :avet :event/id)))))
       (finally
         (d/release conn)
         (d/delete-database cfg)))))
