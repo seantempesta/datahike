@@ -9,7 +9,7 @@
    [datahike.db.search :as dbs]
    [datahike.db.utils :as dbu]
    [datahike.bitemporal.platform :as bp]
-   [datahike.constants :refer [tx0]]
+   [datahike.constants :refer [e0 emax tx0 txmax]]
    [datahike.tools :refer [get-date date->epoch-ms]]
    [replikativ.logging :as log]
    [datahike.schema :as ds]
@@ -358,6 +358,46 @@
   [v]
   (str (hasch/uuid v)))
 
+(defn- additive-index-attribute
+  "Attribute ident when `datom` adds :db/index to an existing schema."
+  [db ^Datom datom]
+  (let [attribute-refs? (:attribute-refs? (dbi/-config db))
+        a-ident (if attribute-refs?
+                  (dbi/ident-for db (.-a datom) :error-on-missing)
+                  (.-a datom))
+        v-ident (if (and attribute-refs?
+                         (contains? (dbi/-system-entities db) (.-v datom)))
+                  (dbi/ident-for db (.-v datom) :error-on-missing)
+                  (.-v datom))
+        attr-ident (get-in db [:schema (.-e datom)])]
+    (when (and (= :db/index a-ident)
+               (true? v-ident)
+               (keyword? attr-ident)
+               (nil? (get-in db [:schema attr-ident :db/index])))
+      attr-ident)))
+
+(defn- insert-index-datoms
+  [db index-key insert-fn datoms]
+  (reduce (fn [db' datom]
+            (-> db'
+                (update index-key #(insert-fn % datom :avet (:op-count db')))
+                (update :op-count inc)))
+          db
+          datoms))
+
+(defn- backfill-avet
+  "Backfill current and retained temporal AVET for `attr-ident`."
+  [db attr-ident]
+  (let [{attr-ref :ref} (dbu/attr-info db attr-ident :error-on-missing)
+        from (datom e0 attr-ref nil tx0)
+        to (datom emax attr-ref nil txmax)
+        current (di/-slice (:aevt db) from to :aevt)
+        temporal (when (dbi/-keep-history? db)
+                   (di/-slice (:temporal-aevt db) from to :aevt))]
+    (cond-> (insert-index-datoms db :avet di/-insert current)
+      (seq temporal)
+      (insert-index-datoms :temporal-avet di/-temporal-insert temporal))))
+
 (defn- project-primary
   "For an *added* `:db.secondary/only` datom, a copy with its value replaced by
    the content hash (what the primary EAVT/AEVT/AVET store). Preserves e/a/tx.
@@ -372,6 +412,7 @@
 (defn- with-datom [db ^Datom datom current-datom]
   (validate-datom db datom)
   (let [{a-ident :ident} (dbu/attr-info db (.-a datom) :error-on-missing)
+        additive-index-attr (additive-index-attribute db datom)
         indexing? (dbu/indexing? db a-ident)
         schema? (or (ds/schema-attr? a-ident) (ds/entity-spec-attr? a-ident)
                     (ds/secondary-index-attr? a-ident))
@@ -395,7 +436,8 @@
         true (update :hash + (hash prim))
         schema? (-> (update-schema datom)
                     update-rschema)
-        true (update :op-count inc))
+        true (update :op-count inc)
+        additive-index-attr (backfill-avet additive-index-attr))
 
       (if-some [removing ^Datom current-datom]
         (cond-> db
@@ -468,7 +510,8 @@
 
 (defn- with-datom-upsert [db ^Datom datom old-datom]
   (validate-datom-upsert db datom)
-  (let [indexing?     (dbu/indexing? db (.-a datom))
+  (let [additive-index-attr (additive-index-attribute db datom)
+        indexing?     (dbu/indexing? db (.-a datom))
         {a-ident :ident} (dbu/attr-info db (.-a datom) :error-on-missing)
         schema?       (or (ds/schema-attr? a-ident)
                           (ds/secondary-index-attr? a-ident))
@@ -507,7 +550,8 @@
       true    (advance-max-eid (.-e datom))
       true    (update :hash + (hash prim))
       schema? (-> (update-schema datom)
-                  update-rschema))))
+                  update-rschema)
+      additive-index-attr (backfill-avet additive-index-attr))))
 
 (defn- transact-report
   ([report datom] (transact-report report datom false))

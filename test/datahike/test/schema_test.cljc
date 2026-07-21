@@ -436,6 +436,126 @@
         (d/release conn)
         (d/delete-database cfg)))))
 
+(deftest additive-index-update-backfills-current-and-history
+  (let [event-at-schema {:db/ident :event/at
+                         :db/valueType :db.type/long
+                         :db/cardinality :db.cardinality/one}
+        indexed-schema (assoc event-at-schema :db/index true)
+        cfg {:store {:backend :memory :id (random-uuid)}
+             :schema-flexibility :write
+             :keep-history? true
+             :initial-tx [event-at-schema]}
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)]
+    (try
+      (d/transact conn [{:db/id 100 :event/at 1000}
+                        {:db/id 200 :event/at 1500}])
+      (d/transact conn [{:db/id 100 :event/at 2000}])
+      (let [target-eavt (vec (d/datoms @conn :eavt 100 :event/at))
+            target-aevt (vec (d/datoms @conn :aevt :event/at))]
+        (is (empty? (d/datoms @conn :avet :event/at)))
+        (d/transact conn [indexed-schema])
+        (testing "existing values are backfilled in AVET value order"
+          (is (= [1500 2000]
+                 (mapv :v (d/datoms @conn :avet :event/at))))
+          (is (= target-eavt (vec (d/datoms @conn :eavt 100 :event/at))))
+          (is (= target-aevt (vec (d/datoms @conn :aevt :event/at)))))
+        (testing "retained additions and retractions are backfilled into temporal AVET"
+          (is (= [[1000 true] [1000 false] [1500 true] [2000 true]]
+                 (mapv (juxt :v :added)
+                       (d/datoms (d/history @conn) :avet :event/at)))))
+        (testing "later writes maintain both current and temporal AVET"
+          (d/transact conn [{:db/id 100 :event/at 2500}])
+          (is (= [1500 2500]
+                 (mapv :v (d/datoms @conn :avet :event/at))))
+          (is (= [[1000 true] [1000 false]
+                  [1500 true]
+                  [2000 true] [2000 false]
+                  [2500 true]]
+                 (mapv (juxt :v :added)
+                       (d/datoms (d/history @conn) :avet :event/at)))))
+        (testing "redeclaring the converged schema does not duplicate index content"
+          (let [before (vec (d/datoms (d/history @conn) :avet :event/at))]
+            (d/transact conn [indexed-schema])
+            (is (= before
+                   (vec (d/datoms (d/history @conn) :avet :event/at))))))
+        (testing "an index cannot be removed"
+          (let [before (vec (d/datoms (d/history @conn) :avet :event/at))]
+            (is (thrown-with-msg? Throwable
+                                  #"Update not supported for these schema attributes"
+                                  (d/transact conn [(assoc indexed-schema :db/index false)])))
+            (is (true? (get-in (dbi/-schema @conn) [:event/at :db/index])))
+            (is (= before
+                   (vec (d/datoms (d/history @conn) :avet :event/at)))))))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
+
+(deftest additive-index-update-rejects-incompatible-sibling-change-atomically
+  (let [schema {:db/ident :event/at
+                :db/valueType :db.type/long
+                :db/cardinality :db.cardinality/one}
+        cfg {:store {:backend :memory :id (random-uuid)}
+             :schema-flexibility :write
+             :keep-history? true
+             :initial-tx [schema]}
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)]
+    (try
+      (d/transact conn [{:db/id 100 :event/at 1000}])
+      (let [before @conn]
+        (is (thrown-with-msg? Throwable
+                              #"Update not supported for these schema attributes"
+                              (d/transact conn [(assoc schema
+                                                       :db/valueType :db.type/string
+                                                       :db/index true)])))
+        (is (= (:max-tx before) (:max-tx @conn)))
+        (is (nil? (get-in (dbi/-schema @conn) [:event/at :db/index])))
+        (is (empty? (d/datoms @conn :avet :event/at))))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
+
+#?(:clj
+   (deftest additive-index-backfill-survives-reopen
+     (let [schema {:db/ident :event/tag
+                   :db/valueType :db.type/string
+                   :db/cardinality :db.cardinality/many}
+           indexed-schema (assoc schema :db/index true)
+           cfg {:store {:backend :file
+                        :path (str (System/getProperty "java.io.tmpdir")
+                                   "/datahike-additive-index-backfill")
+                        :id (random-uuid)}
+                :schema-flexibility :write
+                :keep-history? true}
+           _ (d/delete-database cfg)
+           _ (d/create-database cfg)]
+       (try
+         (let [conn (d/connect cfg)]
+           (d/transact conn [schema])
+           (d/transact conn [{:db/id 100 :event/tag ["z" "a"]}
+                             {:db/id 200 :event/tag ["m"]}])
+           (d/transact conn [[:db/retract 100 :event/tag "z"]])
+           (d/transact conn [indexed-schema])
+           (d/release conn))
+         (let [conn (d/connect cfg)]
+           (testing "schema and both AVET projections reopen together"
+             (is (true? (get-in (dbi/-schema @conn) [:event/tag :db/index])))
+             (is (= ["a" "m"]
+                    (mapv :v (d/datoms @conn :avet :event/tag))))
+             (is (= [["a" true] ["m" true] ["z" true] ["z" false]]
+                    (mapv (juxt :v :added)
+                          (d/datoms (d/history @conn) :avet :event/tag)))))
+           (testing "later cardinality-many values maintain reopened AVET"
+             (d/transact conn [{:db/id 200 :event/tag ["b"]}])
+             (is (= ["a" "b" "m"]
+                    (mapv :v (d/datoms @conn :avet :event/tag)))))
+           (d/release conn))
+         (finally
+           (d/delete-database cfg))))))
+
 (deftest incompatible-schema-update-survives-later-entries
   (let [old-schema #:db{:ident :name
                         :valueType :db.type/string

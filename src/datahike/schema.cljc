@@ -274,6 +274,14 @@
              (assoc m attr-def [old-value new-value])
              m)
 
+           ;; An index may be added monotonically to an existing attribute.
+           ;; The transactor atomically backfills AVET before publishing the
+           ;; resulting database value. Removing an index remains unsupported.
+           :db/index
+           (if (and (nil? old-value) (true? new-value))
+             m
+             (assoc m attr-def [old-value new-value]))
+
            ;; Always allow these attributes to be updated.
            :db/doc m
            :db/noHistory m
