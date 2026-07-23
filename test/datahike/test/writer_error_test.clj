@@ -16,6 +16,67 @@
         [value port] (async/alts!! [channel timeout])]
     (if (= port timeout) ::timeout value)))
 
+(deftest queued-expected-basis-observes-the-threaded-uncommitted-head
+  (let [processed (atom 0)
+        both-processed (promise)
+        cfg {:store {:backend :memory :id (random-uuid)}
+             :schema-flexibility :read
+             :writer
+             {:backend :self
+              :write-fn-map
+              {'transact!
+               (fn [db argument]
+                 (try
+                   (dw/transact! db argument)
+                   (finally
+                     (when (= 2 (swap! processed inc))
+                       (deliver both-processed true)))))}}}
+        _ (d/create-database cfg)
+        conn (d/connect cfg)]
+    (try
+      (d/transact conn [{:db/id 1 :n 0}])
+      (reset! processed 0)
+      (let [expected (:max-tx @conn)
+            original-create-commit-id dw/create-commit-id
+            commit-entered (promise)
+            release-commit (promise)
+            results
+            (with-redefs
+              [dw/create-commit-id
+               (fn [& arguments]
+                 (deliver commit-entered true)
+                 @release-commit
+                 (apply original-create-commit-id arguments))]
+              (let [left
+                    (d/transact! conn
+                                 {:tx-data [{:db/id 2 :n 1}]
+                                  :datahike/expected-basis-t expected})
+                    _ (is (true? (deref commit-entered 10000 false))
+                          "the first report waits before durable publication")
+                    right
+                    (d/transact! conn
+                                 {:tx-data [{:db/id 3 :n 2}]
+                                  :datahike/expected-basis-t expected})
+                    _ (is (true? (deref both-processed 10000 false))
+                          "both uncompleted calls reach the LocalWriter apply seam")]
+                (deliver release-commit true)
+                (mapv take-with-timeout [left right])))
+            reports (filterv map? results)
+            errors (filterv #(instance? Throwable %) results)]
+        (is (= 1 (count reports))
+            "exactly one same-basis transaction commits")
+        (is (= 1 (count errors))
+            "the second same-basis transaction is rejected")
+        (is (= :transaction/stale-basis
+               (:error (ex-data (first errors)))))
+        (is (= #{0 1}
+               (set (d/q '[:find [?n ...] :where [_ :n ?n]] @conn)))
+            "the baseline and winning fact land; the rejected fact does not"))
+      (finally
+        (try (d/release conn) (catch Throwable _))
+        (when (d/database-exists? cfg)
+          (d/delete-database cfg))))))
+
 (deftest fatal-error-in-commit-fails-loudly
   (testing "a fatal Error during commit propagates to the caller within a bounded time"
     (let [cfg {:store {:backend :file

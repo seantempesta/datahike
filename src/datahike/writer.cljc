@@ -102,9 +102,14 @@
                     (do
                       (when (> (count transaction-queue-buffer) (* 0.9 transaction-queue-size))
                         (log/warn :datahike/tx-queue-pressure "Transaction queue buffer >90% full" {:count (count transaction-queue-buffer) :size transaction-queue-size}))
-                      (let [;; TODO remove this after import is ported to writer API
-                            old (if-not (= (:max-tx old) (:max-tx @(:wrapped-atom connection)))
-                                  (assoc old :max-tx (:max-tx @(:wrapped-atom connection)))
+                      (let [;; TODO remove this after import is ported to writer API.
+                            ;; An external writer may advance the committed basis,
+                            ;; but the connection remains behind while this writer's
+                            ;; own reports await batch commit. Never rewind the
+                            ;; threaded uncommitted basis in that interval.
+                            committed-max-tx (:max-tx @(:wrapped-atom connection))
+                            old (if (> committed-max-tx (:max-tx old))
+                                  (assoc old :max-tx committed-max-tx)
                                   old)
 
                             op-fn (write-fn-map op)

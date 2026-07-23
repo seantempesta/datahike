@@ -58,6 +58,13 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Notable fixes
 
+- **Pipelined expected-basis transactions retain the evolving writer head** —
+  LocalWriter no longer rewinds its threaded uncommitted `:max-tx` to the
+  older committed connection value while reports await batch commit. A second
+  queued transaction pinned to the same `:datahike/expected-basis-t` is now
+  rejected with `:transaction/stale-basis` instead of reusing the first
+  transaction id and committing both fact sets. ([#TODO])
+
 - **Query dependency projection follows parsed query and pull semantics** —
   database functions such as `missing?`, nested pull patterns, and reverse
   pull attributes now contribute their canonical stored attributes.
