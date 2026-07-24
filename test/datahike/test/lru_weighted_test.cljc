@@ -41,6 +41,19 @@
     (is (nil? (get c :b)))
     (is (= 3 (get c :c)))))
 
+(deftest weighted-touch-does-not-reweigh-an-unchanged-entry
+  (let [weigh-calls (atom 0)
+        weigh (fn [value] (swap! weigh-calls inc) (count value))
+        before (-> (lru/weighted-lru 2 100 weigh)
+                   (assoc :a [1 2 3])
+                   (assoc :b [4 5]))
+        touched (lru/weighted-touch before :a)]
+    (is (= 2 @weigh-calls))
+    (is (= 5 (lru/weighted-total-weight touched)))
+    (let [after (assoc touched :c [6])]
+      (is (= [1 2 3] (get after :a)))
+      (is (nil? (get after :b))))))
+
 (deftest shrink-loop-evicts-until-within-budget
   (let [c (reduce (fn [c k] (assoc c k [k k k]))
                   (lru/weighted-lru 100 4 count)

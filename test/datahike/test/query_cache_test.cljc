@@ -569,7 +569,8 @@
              (d/release conn)
              (is (zero? (:snapshot-count (dq/query-cache-metrics))))
              (#'dq/result-cache-put!
-              committed ::late #{["stale"]} #{:c/note}
+              (db/committed-cache-identity committed)
+              ::late #{["stale"]} #{:c/note}
               {(db/committed-cache-identity committed)
                (:cache-context committed)}
               (:epoch @dq/query-result-cache))
@@ -600,7 +601,8 @@
            (dq/clear-query-cache!)
            (is (false?
                 (#'dq/result-cache-put!
-                 database ::late #{["stale"]} #{:c/note}
+                 (db/committed-cache-identity database)
+                 ::late #{["stale"]} #{:c/note}
                  {(db/committed-cache-identity database)
                   (:cache-context database)}
                  admitted-epoch)))
@@ -770,14 +772,14 @@
          (let [query '[:find ?id .
                        :in $ ?name
                        :where [?namespace :ordinary.namespace/name ?name]
-                              [?agent :ordinary.agent/namespace ?namespace]
-                              [?agent :ordinary.agent/id ?id]
-                              (not [?agent :ordinary.agent/terminated-at _])]
+                       [?agent :ordinary.agent/namespace ?namespace]
+                       [?agent :ordinary.agent/id ?id]
+                       (not [?agent :ordinary.agent/terminated-at _])]
                state-query
                '[:find ?id .
                  :in $ ?state
                  :where [?agent :ordinary.agent/state ?state]
-                        [?agent :ordinary.agent/id ?id]]
+                 [?agent :ordinary.agent/id ?id]]
                database @conn]
            (is (= "ordinary-agent"
                   (d/q query database 'ordinary.namespace.known)))
@@ -1429,7 +1431,7 @@
                :where [(identity ?ordinary)]])))))
 
 #?(:clj
-   (deftest three-source-query-cache-has-one-composite-ordinary-key-and-all-member-lifetime
+   (deftest four-source-query-cache-has-one-composite-ordinary-key-and-all-member-lifetime
      (with-temp-db
        (conj label-schema {:c/id "a" :c/note "A"})
        (fn [a]
@@ -1439,37 +1441,47 @@
              (with-temp-db
                (conj label-schema {:c/id "c" :c/note "C"})
                (fn [c]
-                 (dq/clear-query-cache!)
-                 (let [query '[:find ?a ?b ?c
-                               :in $a $b $c
-                               :where
-                               [$a _ :c/note ?a]
-                               [$b _ :c/note ?b]
-                               [$c _ :c/note ?c]]
-                       first-result (dq/q-with-evidence query @a @b @c)
-                       second-result (dq/q-with-evidence query @a @b @c)
-                       cache-keys (query-cache-keys)
-                       cache-entries
-                       (lru/weighted-entries (:lru @dq/query-result-cache))
-                       [_ connection-b generation-b]
-                       (let [[connection generation _]
-                             (db/committed-cache-identity @b)]
-                         [nil connection generation])]
-                   (is (= #{["A" "B" "C"]}
-                          (:datahike.query/result first-result)))
-                   (is (= :datahike.cache.outcome/miss-owner
-                          (get-in first-result
-                                  [:datahike.query/cache-evidence
-                                   :datahike.cache/outcome])))
-                   (is (= :datahike.cache.outcome/hit
-                          (get-in second-result
-                                  [:datahike.query/cache-evidence
-                                   :datahike.cache/outcome])))
-                   (is (= 1 (count cache-keys)))
-                   (is (not-any? dbu/db?
-                                 (tree-seq coll? seq cache-entries)))
-                   (d/close-query-cache-generation! connection-b generation-b)
-                   (is (zero? (:snapshot-count (dq/query-cache-metrics)))))))))))))
+                 (with-temp-db
+                   (conj label-schema {:c/id "d" :c/note "D"})
+                   (fn [d]
+                     (dq/clear-query-cache!)
+                     (let [query '[:find ?a ?b ?c ?d
+                                   :in $a $b $c $d
+                                   :where
+                                   [$a _ :c/note ?a]
+                                   [$b _ :c/note ?b]
+                                   [$c _ :c/note ?c]
+                                   [$d _ :c/note ?d]]
+                           first-result (dq/q-with-evidence
+                                         query @a @b @c @d)
+                           second-result (dq/q-with-evidence
+                                          query @a @b @c @d)
+                           cache-keys (query-cache-keys)
+                           cache-entries
+                           (lru/weighted-entries
+                            (:lru @dq/query-result-cache))
+                           [_ connection-b generation-b]
+                           (let [[connection generation _]
+                                 (db/committed-cache-identity @b)]
+                             [nil connection generation])]
+                       (is (= #{["A" "B" "C" "D"]}
+                              (:datahike.query/result first-result)))
+                       (is (= :datahike.cache.outcome/miss-owner
+                              (get-in first-result
+                                      [:datahike.query/cache-evidence
+                                       :datahike.cache/outcome])))
+                       (is (= :datahike.cache.outcome/hit
+                              (get-in second-result
+                                      [:datahike.query/cache-evidence
+                                       :datahike.cache/outcome])))
+                       (is (= 1 (count cache-keys)))
+                       (is (not-any? dbu/db?
+                                     (tree-seq coll? seq cache-entries)))
+                       (d/close-query-cache-generation!
+                        connection-b generation-b)
+                       (is (zero?
+                            (:snapshot-count
+                             (dq/query-cache-metrics)))))))))))))))
 
 #?(:clj
    (deftest composite-source-cache-inherits-one-advanced-source-conservatively

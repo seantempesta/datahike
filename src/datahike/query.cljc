@@ -3002,104 +3002,121 @@
 (defn- result-cache-get
   "Look up an exact result or lazily promote a dependency-safe older result."
   [source-key cache-key current-contexts]
-  (let [source-key (if (dbu/db? source-key)
-                     (db-cache-key source-key)
-                     source-key)]
-    (when source-key
-      (let [found (volatile! nil)]
-        (swap! query-result-cache
-               (fn [{:keys [lru] :as state}]
-                 (if-let [entry (or (get-in lru [source-key cache-key])
-                                    (inheritable-entry lru source-key cache-key
-                                                       current-contexts))]
-                   (let [promoted (assoc entry :source-contexts current-contexts)
+  (when source-key
+    (let [found (volatile! nil)]
+      (swap! query-result-cache
+             (fn [{:keys [lru] :as state}]
+               (if-let [entry (get-in lru [source-key cache-key])]
+                 (do
+                   (vreset! found entry)
+                   (assoc state :lru
+                          (lru/weighted-touch lru source-key)))
+                 (if-let [entry
+                          (inheritable-entry lru source-key cache-key
+                                             current-contexts)]
+                   (let [promoted
+                         (assoc entry :source-contexts current-contexts)
                          bucket (assoc (or (get lru source-key) {})
                                        cache-key promoted)]
                      (vreset! found promoted)
-                     (assoc state :lru (assoc lru source-key bucket)))
-                   state)))
-        @found))))
+                     (assoc state :lru
+                            (assoc lru source-key bucket)))
+                   state))))
+      @found)))
 
 (defn- result-cache-put!
   "Store a query result when every source generation remains admitted."
   [source-key cache-key result dependency-plan source-contexts expected-epoch]
-  (let [source-key (if (dbu/db? source-key)
-                     (db-cache-key source-key)
-                     source-key)]
-    (when-let [weight (and (pos? *query-cache-weight-limit*)
-                           (result-weight result))]
-      (when source-key
-        (let [stored? (volatile! false)]
-          (swap! query-result-cache
-                 (fn [{:keys [lru generations epoch] :as state}]
-                   (if (and (= expected-epoch epoch)
-                            (source-key-generations-current?
-                             source-key generations))
-                     (let [existing (or (get lru source-key) {})]
-                       (vreset! stored? true)
-                       (assoc state :lru
-                              (assoc lru source-key
-                                     (assoc existing cache-key
-                                            {:result result
-                                             :dependency-plan dependency-plan
-                                             :source-contexts source-contexts
-                                             :weight weight}))))
-                     state)))
-          @stored?)))))
+  (when-let [weight (and (pos? *query-cache-weight-limit*)
+                         (result-weight result))]
+    (when source-key
+      (let [stored? (volatile! false)]
+        (swap! query-result-cache
+               (fn [{:keys [lru generations epoch] :as state}]
+                 (if (and (= expected-epoch epoch)
+                          (source-key-generations-current?
+                           source-key generations))
+                   (let [existing (or (get lru source-key) {})]
+                     (vreset! stored? true)
+                     (assoc state :lru
+                            (assoc lru source-key
+                                   (assoc existing cache-key
+                                          {:result result
+                                           :dependency-plan dependency-plan
+                                           :source-contexts source-contexts
+                                           :weight weight}))))
+                   state)))
+        @stored?))))
 
-(defn memoized-parse-query [q]
+(defn- parsed-query-cache-entry [q]
   (if-some [cached (get @query-cache q nil)]
     cached
-    (let [qp (parse q)]
-      (vswap! query-cache assoc q qp)
-      qp)))
+    (let [parsed (parse q)
+          entry {:parsed parsed
+                 :source-bindings (parsed-source-bindings parsed)
+                 :input-count (count (:qin parsed))}]
+      (vswap! query-cache assoc q entry)
+      entry)))
+
+(defn memoized-parse-query [q]
+  (:parsed (parsed-query-cache-entry q)))
 
 (defn query-source-bindings
   "Return the ordered top-level argument positions declared as query sources."
   [query-input]
-  (let [query (:query (normalize-q-input query-input []))
-        parsed-query (memoized-parse-query query)]
-    (parsed-source-bindings parsed-query)))
+  (let [query (:query (normalize-q-input query-input []))]
+    (:source-bindings (parsed-query-cache-entry query))))
 
 (defn query-input-count
   "Return the number of top-level arguments declared by a normalized query."
   [query-input]
   (let [query (:query (normalize-q-input query-input []))]
-    (count (:qin (memoized-parse-query query)))))
+    (:input-count (parsed-query-cache-entry query))))
 
 (defn- query-cache-sources
-  [query args]
-  (let [sources (query-source-bindings query)
-        members
-        (mapv
-         (fn [{:datahike.query.source/keys [symbol argument-position]}]
-           [symbol argument-position
-            (some-> (nth args argument-position nil) db-cache-key)])
-         sources)]
-    (when (and (seq members) (every? #(some? (nth % 2)) members))
-      (if (= 1 (count members))
-        (nth (first members) 2)
+  [source-bindings args]
+  (if (= 1 (count source-bindings))
+    (let [position (:datahike.query.source/argument-position
+                    (first source-bindings))]
+      (some-> (nth args position nil) db-cache-key))
+    (let [members
+          (mapv
+           (fn [{:datahike.query.source/keys [symbol argument-position]}]
+             [symbol argument-position
+              (some-> (nth args argument-position nil) db-cache-key)])
+           source-bindings)]
+      (when (and (seq members) (every? #(some? (nth % 2)) members))
         [composite-source-key-tag members]))))
 
-(defn- query-cache-source-contexts [query args]
-  (into {}
-        (keep (fn [{:datahike.query.source/keys [argument-position]}]
-                (let [database (nth args argument-position nil)]
-                  (when-let [database-key (db-cache-key database)]
-                    [database-key (:cache-context database)]))))
-        (query-source-bindings query)))
+(defn- query-cache-source-contexts [source-bindings args source-key]
+  (if (= 1 (count source-bindings))
+    {source-key
+     (:cache-context
+      (nth args
+           (:datahike.query.source/argument-position
+            (first source-bindings))))}
+    (into {}
+          (keep (fn [{:datahike.query.source/keys [argument-position]}]
+                  (let [database (nth args argument-position nil)]
+                    (when-let [database-key (db-cache-key database)]
+                      [database-key (:cache-context database)]))))
+          source-bindings)))
 
 (defn- query-cache-arguments
-  [query args]
-  (let [source-positions
-        (into #{}
-              (map :datahike.query.source/argument-position)
-              (query-source-bindings query))]
-    (into []
-          (keep-indexed (fn [position value]
-                          (when-not (contains? source-positions position)
-                            value)))
-          args)))
+  [source-bindings args]
+  (if (and (= 1 (count source-bindings))
+           (zero? (:datahike.query.source/argument-position
+                   (first source-bindings))))
+    (rest args)
+    (let [source-positions
+          (into #{}
+                (map :datahike.query.source/argument-position)
+                source-bindings)]
+      (into []
+            (keep-indexed (fn [position value]
+                            (when-not (contains? source-positions position)
+                              value)))
+            args))))
 
 (defn convert-to-return-maps [{:keys [mapping-type mapping-keys]} resultset]
   (let [mapping-keys (map #(get % :mapping-key) mapping-keys)
@@ -4594,7 +4611,9 @@
                     (uncached nil))
              :cljs (uncached nil)))
       ;; Try result cache
-      (let [source-key (query-cache-sources query args)]
+      (let [source-bindings
+            (:source-bindings (parsed-query-cache-entry query))
+            source-key (query-cache-sources source-bindings args)]
         (if-not source-key
           (do (when cache-evidence
                 (vreset! cache-evidence
@@ -4608,7 +4627,7 @@
                             (uncached nil)))
                         (uncached nil))
                  :cljs (uncached nil)))
-          (let [non-db-args (query-cache-arguments query args)
+          (let [non-db-args (query-cache-arguments source-bindings args)
                 cache-epoch (:epoch @query-result-cache)
                 ;; scale-sensitive-key: BigDecimal args/consts of equal value but
                 ;; different scale (1.50M vs 1.500M) are `=` with equal hash in
@@ -4616,7 +4635,8 @@
                 ;; first-cached scale. Keep them distinct.
                 cache-key (scale-sensitive-key
                            [query non-db-args offset limit order-by *disable-planner*])
-                source-contexts (query-cache-source-contexts query args)
+                source-contexts
+                (query-cache-source-contexts source-bindings args source-key)
                 cached (result-cache-get source-key cache-key source-contexts)]
             ;; Completed hits never enter the in-flight path and therefore do
             ;; not allocate a promise, request identity, flight key, or delayed
@@ -4654,7 +4674,7 @@
                        request-id
                        #(binding [resource/*evidence-sink* outer-evidence-sink]
                           (when-let [entry (result-cache-get source-key cache-key
-                                                            source-contexts)]
+                                                             source-contexts)]
                             (resource/certify-cached-result!
                              (:result entry) resource-options)
                             (when cached-dependency-plan

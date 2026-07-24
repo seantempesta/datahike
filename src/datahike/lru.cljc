@@ -167,6 +167,17 @@
   [^WeightedLRU lru]
   (:total-weight (.-state lru)))
 
+(defn weighted-touch
+  "Mark an existing entry as recent without replacing or reweighing it."
+  [^WeightedLRU lru k]
+  (let [{:keys [key-value] :as state} (.-state lru)]
+    (if (contains? key-value k)
+      (->WeightedLRU
+       (-> state
+           (forget-generation k)
+           (record-generation k)))
+      lru)))
+
 (defn weighted-remove-where
   "Remove every entry whose key satisfies `pred`, preserving all LRU accounting."
   [^WeightedLRU lru pred]
