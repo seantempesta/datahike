@@ -21,6 +21,7 @@
             [datahike.db.utils :refer [db?]]
             [datahike.tools :as dt]
             [replikativ.logging :as log]
+            [clojure.core.async :as async]
             [konserve.utils :refer [#?(:clj async+sync) multi-key-capable? *default-sync-translation*]
              #?@(:cljs [:refer-macros [async+sync]])]
             #?(:cljs [clojure.core.async :refer [<!]]))
@@ -170,6 +171,37 @@
       {}
       source-key-maps)))
 
+(defonce ^:private branches-locks (atom {}))
+
+(defn- new-branches-lock []
+  (let [channel (async/chan 1)]
+    (async/put! channel :unlocked)
+    channel))
+
+(defn- branches-lock [store-id]
+  (get (swap! branches-locks
+              #(if (contains? % store-id)
+                 %
+                 (assoc % store-id (new-branches-lock))))
+       store-id))
+
+(defn- update-branches! [store-id store update-fn opts]
+  (let [channel (branches-lock store-id)]
+    (if (:sync? opts)
+      #?(:clj (do
+                (async/<!! channel)
+                (try
+                  (k/update store :branches update-fn opts)
+                  (finally
+                    (async/>!! channel :unlocked))))
+         :cljs (k/update store :branches update-fn opts))
+      (go-try-
+       (<?- channel)
+       (try
+         (<?- (k/update store :branches update-fn opts))
+         (finally
+           (async/put! channel :unlocked)))))))
+
 ;; ========================= public API =========================
 
 (defn branches
@@ -254,7 +286,7 @@
                                            (seq branched-sec-keys) (assoc :secondary-index-keys branched-sec-keys))]
                           (<?- (k/assoc store new-branch updated-db opts))
                           ;; :branches is the GC discovery pointer and is published last.
-                          (<?- (k/update store :branches #(conj (set %) new-branch) opts))))
+                          (<?- (update-branches! gc-sid store #(conj (set %) new-branch) opts))))
                       (finally
                         (guard/done! gc-sid gc-token)))))))))
 
@@ -271,12 +303,12 @@
      (async+sync (:sync? opts) *default-sync-translation*
                  (go-try-
                   (let [store (:store @conn)
+                        store-id (store-identity (get-in @conn [:config :store]))
                         existing-branches (<?- (k/get store :branches nil opts))]
                     (when-not (and existing-branches (existing-branches branch))
                       (log/raise "Branch does not exist." {:type :branch-does-not-exist
                                                            :branch branch}))
-                    (let [store-id (store-identity (get-in @conn [:config :store]))
-                          active-connections
+                    (let [active-connections
                           (filterv (fn [[candidate-store candidate-branch & _]]
                                      (and (= store-id candidate-store)
                                           (= branch candidate-branch)))
@@ -286,7 +318,7 @@
                                    {:type :branch-has-active-connection
                                     :branch branch
                                     :connections active-connections})))
-                    (<?- (k/update store :branches #(disj (set %) branch) opts))))))))
+                    (<?- (update-branches! store-id store #(disj (set %) branch) opts))))))))
 
 (defn force-branch!
   "Force the branch to point to the provided db value. Branch will be created if
@@ -398,7 +430,7 @@
                               opts))
 
                         ;; Publish the GC discovery pointer only after its head exists.
-                        (<?- (k/update store :branches #(conj (set %) branch) opts))
+                        (<?- (update-branches! gc-sid store #(conj (set %) branch) opts))
                         (let [stored-head (<?- (k/get store branch nil opts))
                               stored-commit (get-in stored-head [:meta :datahike/commit-id])]
                           (when-not (= cid stored-commit)

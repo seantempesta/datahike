@@ -2,7 +2,7 @@
   (:require #?(:cljs [cljs.test :as t :refer-macros [is deftest testing]]
                :clj  [clojure.test :as t :refer [is deftest testing]])
             [datahike.versioning :refer
-             [branch-history branch! delete-branch! merge! force-branch! branch-as-db parent-commit-ids
+             [branches branch-history branch! delete-branch! merge! force-branch! branch-as-db parent-commit-ids
               commit-id commit-as-db]]
             [datahike.constants :as const]
             [datahike.db.utils :refer [db?]]
@@ -26,6 +26,66 @@
        (is (= 1 @closed))
        (is (= [] (writing/release-db materialized)))
        (is (= 1 @closed)))))
+
+#?(:clj
+   (deftest concurrent-branches-from-separate-connections-stay-discoverable
+     (let [cfg {:store {:backend :file
+                        :path (str "target/concurrent-branches-" (random-uuid))
+                        :id (random-uuid)}
+                :keep-history? true
+                :schema-flexibility :read}
+           _ (d/create-database cfg)
+           base (d/connect cfg)]
+       (try
+         (branch! base :db :left)
+         (branch! base :db :right)
+         (let [left (d/connect (assoc cfg :branch :left))
+               right (d/connect (assoc cfg :branch :right))]
+           (try
+             (is (not (identical? (:store @left) (:store @right))))
+             (let [branch-count 32
+                   start (java.util.concurrent.CountDownLatch. 1)
+                   futures
+                   (mapv (fn [i]
+                           (future
+                             (.await start)
+                             (let [branch (keyword (str "concurrent-" i))]
+                               (try
+                                 (branch! (if (even? i) left right) :db branch)
+                                 {:branch branch :ok? true}
+                                 (catch Throwable error
+                                   {:branch branch :ok? false :error error})))))
+                         (range branch-count))]
+               (.countDown start)
+               (let [outcomes (mapv deref futures)
+                     successful (into #{} (comp (filter :ok?) (map :branch)) outcomes)
+                     roster (set (branches left))
+                     readable
+                     (into #{}
+                           (keep (fn [branch]
+                                   (try
+                                     (let [connection (d/connect (assoc cfg :branch branch))]
+                                       (try
+                                         @connection
+                                         branch
+                                         (finally
+                                           (d/release connection))))
+                                     (catch Throwable _
+                                       nil))))
+                           successful)]
+                 (is (every? :ok? outcomes) (pr-str outcomes))
+                 (is (every? roster successful)
+                     (str "Successful branches missing from roster: "
+                          (pr-str (remove roster successful))))
+                 (is (= successful readable)
+                     (str "Successful branches not readable: "
+                          (pr-str (remove readable successful))))))
+             (finally
+               (d/release left)
+               (d/release right))))
+         (finally
+           (d/release base)
+           (d/delete-database cfg))))))
 
 (deftest datahike-versioning-test
   (testing "Testing versioning functionality."
