@@ -1123,3 +1123,56 @@
     (testing "AVET-seek path returns exactly the matching entities (large target)"
       (is (= expected (binding [q/*disable-planner* false] (d/q query dba dbb))))
       (is (= expected (binding [q/*disable-planner* true] (d/q query dba dbb)))))))
+
+;; ---------------------------------------------------------------------------
+;; Cardinality-many SCAN in a fused entity-group
+;;
+;; `:sorted-merge` walks each merge attribute with ONE forward cursor across
+;; the whole scan. That is sound only while the scan visits every entity once:
+;; the cursor cannot seek backwards. A cardinality-MANY scan attribute emits
+;; several datoms for the SAME entity, so every repeat probes a key the cursor
+;; has already passed and the row is silently dropped — the query answers with
+;; the first value of the collection and no error.
+;;
+;; The pipeline used to derive "is anything card-many here?" from the MERGE ops
+;; alone, which says nothing about the scan. Costing puts the card-many pattern
+;; in the scan position whenever it looks cheaper, so an ordinary two-clause
+;; query reaches it.
+
+(def card-many-scan-db
+  (delay
+    (d/db-with (db/empty-db {:kind   {:db/index false}
+                             :id     {:db/unique :db.unique/identity}
+                             :blocks {:db/valueType   :db.type/ref
+                                      :db/cardinality :db.cardinality/many}})
+               ;; 200 extra :kind datoms make the :kind pattern the expensive
+               ;; one, so the planner selects the card-many :blocks pattern as
+               ;; the entity-group's scan.
+               (into [{:db/id 1 :kind :agent :id "root"
+                       :blocks [{:db/id -1 :name :header}
+                                {:db/id -2 :name :problems}
+                                {:db/id -3 :name :agents}
+                                {:db/id -4 :name :messages}]}]
+                     (map (fn [i] {:db/id (+ 100 i) :kind :agent :id (str "a" i)}))
+                     (range 200)))))
+
+(deftest test-card-many-scan-emits-every-value
+  (let [db @card-many-scan-db]
+    (testing "every value of the cardinality-many ref is returned"
+      (is (= 4 (count (binding [q/*disable-planner* false]
+                        (d/q '[:find ?block :where
+                               [?agent :kind :agent]
+                               [?agent :blocks ?block]]
+                             db))))))
+    (testing "planner and legacy engine agree, constant and :in forms alike"
+      (assert-engines-agree db '[:find ?block :where
+                                 [?agent :kind :agent]
+                                 [?agent :blocks ?block]])
+      (assert-engines-agree db '[:find ?block :in $ ?k :where
+                                 [?agent :kind ?k]
+                                 [?agent :blocks ?block]]
+                            [:agent])
+      (assert-engines-agree db '[:find ?agent ?block :in $ ?k :where
+                                 [?agent :kind ?k]
+                                 [?agent :blocks ?block]]
+                            [:agent]))))

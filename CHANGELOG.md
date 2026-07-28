@@ -58,6 +58,15 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Notable fixes
 
+- **A cardinality-many scan no longer returns only its first value** — the
+  planner's fused `:sorted-merge` path walks each merge attribute with one
+  forward cursor, which is sound only while the scan visits every entity once.
+  When costing put a cardinality-many pattern in the scan position, that
+  pattern emitted several datoms for the same entity, each repeat probed a key
+  the cursor had already passed, and the query silently answered with the first
+  value of the collection. The path now also requires a cardinality-one scan
+  attribute; such groups take the cursor-per-merge path instead. ([#TODO])
+
 - **Pipelined expected-basis transactions retain the evolving writer head** —
   LocalWriter no longer rewinds its threaded uncommitted `:max-tx` to the
   older committed connection value while reports await batch commit. A second

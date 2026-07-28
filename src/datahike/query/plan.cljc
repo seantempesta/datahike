@@ -616,6 +616,18 @@
         [_e a _v _tx] clause
         scan-attr-ground? (analyze/ground? a)
         has-card-many? (boolean (some #(not (get-in % [:schema-info :card-one?] true)) merge-ops))
+        ;; THE SCAN's own cardinality, and it is not the same question.
+        ;; `:sorted-merge` walks each merge attribute with ONE forward
+        ;; cursor across the whole scan, which is only sound while the
+        ;; scan visits each entity once: the cursor cannot seek
+        ;; backwards. A cardinality-MANY scan attribute emits several
+        ;; datoms for the same entity, so every repeat probes a key the
+        ;; cursor has already passed, silently dropping the row. Costing
+        ;; can put the card-many pattern in the scan position (it does
+        ;; whenever that pattern looks cheaper), so this is reachable
+        ;; from an ordinary two-clause query and shows up as a
+        ;; cardinality-many ref answering with only its first value.
+        scan-card-many? (not (get-in scan-op [:schema-info :card-one?] true))
         has-anti? (boolean (some :anti? merge-ops))
         has-optional? (boolean (some :optional? merge-ops))
         use-cursors? #?(:clj (and (pos? n-merges)
@@ -629,6 +641,7 @@
                                       (pos? n-merges)
                                       scan-attr-ground?
                                       (not has-card-many?)
+                                      (not scan-card-many?)
                                       (not has-anti?)
                                       (not has-optional?))
                             :cljs false)
