@@ -1541,7 +1541,12 @@
   ([ops] (order-plan-ops ops nil nil))
   ([ops outer-bound-vars] (order-plan-ops ops outer-bound-vars nil))
   ([ops outer-bound-vars db]
-   (let [;; Correlated variable-attribute driving scans get :requires-bound so
+   (let [remove-identical
+         (fn [ops chosen]
+           (let [[before from-chosen]
+                 (split-with #(not (identical? chosen %)) ops)]
+             (into (vec before) (next from-chosen))))
+         ;; Correlated variable-attribute driving scans get :requires-bound so
         ;; they leave the DP producer pool and wait for their (attr, value) —
         ;; see mark-correlated-var-attr-scans.
          ops (mark-correlated-var-attr-scans ops)
@@ -1578,7 +1583,7 @@
          seed-cards (if (map? outer-bound-vars) outer-bound-vars {})]
      (if (empty? groups)
       ;; No groups — pure greedy on non-group ops
-       (loop [remaining (set ops)
+       (loop [remaining (vec ops)
               bound-vars seed-bound
               var-cards seed-cards
               ordered []]
@@ -1588,7 +1593,7 @@
                  executable (filter #(< (second %) max-cost) scored)
                  best (first (sort-by second (if (seq executable) executable scored)))
                  [chosen-op _] best]
-             (recur (disj remaining chosen-op)
+             (recur (remove-identical remaining chosen-op)
                     (into bound-vars (:vars chosen-op))
                     (merge-with min var-cards (op-output-cards chosen-op))
                     (conj ordered chosen-op)))))
@@ -1600,7 +1605,7 @@
           ;; Interleave: walk the group order, inserting non-group ops
           ;; as soon as their dependencies are satisfied
            (loop [group-q (seq ordered-groups)
-                  remaining (set non-groups)
+                  remaining (vec non-groups)
                   bound-vars seed-bound
                   var-cards seed-cards
                   result []]
@@ -1626,7 +1631,7 @@
                      ;; runtime (execute.cljc/hoist-expensive-fn), since whether a
                      ;; join expands or reduces is not knowable statically.
                      best-ng  (when (seq ready)
-                                (apply min-key #(op-cost % bound-vars var-cards) ready))
+                                (first (sort-by #(op-cost % bound-vars var-cards) ready)))
                      ng-cost  (when best-ng (long (op-cost best-ng bound-vars var-cards)))
                      next-g   (first group-q)
                      g-cost   (when next-g (long (group-effective-card next-g)))
@@ -1643,7 +1648,7 @@
                                      (merge-with min var-cards (op-output-cards next-g))
                                      (conj result next-g))
                    :non-group (recur group-q
-                                     (disj remaining best-ng)
+                                     (remove-identical remaining best-ng)
                                      (into bound-vars (:vars best-ng))
                                      (merge-with min var-cards (op-output-cards best-ng))
                                      (conj result best-ng))
@@ -1652,7 +1657,7 @@
                    :force     (let [scored (map (fn [op] [op (op-cost op bound-vars var-cards)]) remaining)
                                     [chosen-op _] (first (sort-by second scored))]
                                 (recur nil
-                                       (disj remaining chosen-op)
+                                       (remove-identical remaining chosen-op)
                                        (into bound-vars (:vars chosen-op))
                                        (merge-with min var-cards (op-output-cards chosen-op))
                                        (conj result chosen-op)))))))))))))

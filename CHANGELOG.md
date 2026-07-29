@@ -58,6 +58,17 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Notable fixes
 
+- **Equal-cost query plans no longer depend on variable names** — the planner
+  now preserves its existing operation order when costs tie instead of
+  iterating a hash set whose order changes with variable-symbol hashes.
+  Consistent alpha-renaming therefore leaves physical plan selection
+  unchanged.
+
+- **Cardinality-many merges emit each cross-product row once** — the JVM
+  direct executor no longer runs the cardinality-one cursor probe after the
+  cardinality-many slice path. Public set results had hidden the extra
+  emission, which also advanced a shared forward cursor unnecessarily.
+
 - **A cardinality-many scan no longer returns only its first value** — the
   planner's fused `:sorted-merge` path walks each merge attribute with one
   forward cursor, which is sound only while the scan visits every entity once.

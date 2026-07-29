@@ -1034,19 +1034,19 @@
                                      (doseq [^Datom d mslice]
                                        (when (merge-datom-match? d eid ra vg? vgv check-v? check-tx? scan-d)
                                          (aset merge-datoms mi d)
-                                         (process-merges (inc mi)))))))
-                               (let [probe (datom eid ra vgv tx0)
-                                     ^Datom d (if merge-cursors
-                                                (.seekGE ^PersistentSortedSet$ForwardCursor
-                                                 (aget merge-cursors mi) probe)
-                                                (.lookupGE ^PersistentSortedSet eavt-pss probe))
-                                     found? (and d (merge-datom-match? d eid ra vg? vgv check-v? check-tx? scan-d))]
-                                 (if anti?
-                                   (when (not found?)
-                                     (process-merges (inc mi)))
-                                   (when found?
-                                     (aset merge-datoms mi d)
-                                     (process-merges (inc mi))))))))]
+                                         (process-merges (inc mi))))))
+                                 (let [probe (datom eid ra vgv tx0)
+                                       ^Datom d (if merge-cursors
+                                                  (.seekGE ^PersistentSortedSet$ForwardCursor
+                                                   (aget merge-cursors mi) probe)
+                                                  (.lookupGE ^PersistentSortedSet eavt-pss probe))
+                                       found? (and d (merge-datom-match? d eid ra vg? vgv check-v? check-tx? scan-d))]
+                                   (if anti?
+                                     (when (not found?)
+                                       (process-merges (inc mi)))
+                                     (when found?
+                                       (aset merge-datoms mi d)
+                                       (process-merges (inc mi)))))))))]
                    (process-merges 0)))))))
        :cljs
        (doseq [scan-d slice

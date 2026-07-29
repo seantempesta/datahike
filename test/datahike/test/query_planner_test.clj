@@ -5,7 +5,8 @@
    [clojure.test :refer [is are deftest testing]]
    [datahike.api :as d]
    [datahike.db :as db]
-   [datahike.query :as q]))
+   [datahike.query :as q]
+   [datahike.query.execute :as execute]))
 
 ;; ---------------------------------------------------------------------------
 ;; Test infrastructure
@@ -1176,3 +1177,28 @@
                                  [?agent :kind ?k]
                                  [?agent :blocks ?block]]
                             [:agent]))))
+
+(deftest test-card-many-merge-emits-once-per-cross-product-row
+  (let [db @card-many-scan-db
+        group (first
+               (:ops
+                (#'q/create-plan-via-ir
+                 db
+                 '[[?agent :id "root"] [?agent :blocks ?block]]
+                 #{}
+                 nil
+                 nil)))
+        result-list (java.util.ArrayList.)]
+    (is (= :card-many-merge (get-in group [:pipeline :fused-path])))
+    (#'execute/execute-group-direct
+     db
+     (:scan-op group)
+     (:merge-ops group)
+     ['?block]
+     {}
+     result-list
+     nil 0 nil 0 -1 nil
+     :pipeline (:pipeline group))
+    (is (= [2 3 4 5]
+           (mapv #(aget ^objects % 0) result-list))
+        "the card-one probe path must not run after the card-many slice")))

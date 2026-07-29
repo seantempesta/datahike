@@ -46,6 +46,42 @@
      (set (keys (lru/weighted-entries (:lru @dq/query-result-cache))))))
 
 #?(:clj
+   (deftest query-result-cache-binding-suppresses-reads-and-writes
+     (with-temp-db
+       (conj label-schema {:c/id "cache-dial" :c/note "value"})
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (let [query '[:find ?note :where [_ :c/note ?note]]
+               first-disabled
+               (binding [dq/*query-result-cache?* false]
+                 (dq/q-with-evidence query @conn))]
+           (is (= :datahike.cache.outcome/uncacheable
+                  (get-in first-disabled
+                          [:datahike.query/cache-evidence
+                           :datahike.cache/outcome])))
+           (is (zero? (:snapshot-count (dq/query-cache-metrics)))
+               "a disabled query must not write a cache bucket")
+           (let [enabled (dq/q-with-evidence query @conn)]
+             (is (= :datahike.cache.outcome/miss-owner
+                    (get-in enabled
+                            [:datahike.query/cache-evidence
+                             :datahike.cache/outcome])))
+             (is (= 1 (:snapshot-count (dq/query-cache-metrics)))))
+           (let [second-disabled
+                 (binding [dq/*query-result-cache?* false]
+                   (dq/q-with-evidence query @conn))]
+             (is (= :datahike.cache.outcome/uncacheable
+                    (get-in second-disabled
+                            [:datahike.query/cache-evidence
+                             :datahike.cache/outcome])))
+             (is (pos? (get-in second-disabled
+                               [:datahike.query/resource-evidence
+                                :datahike.resource/work]))
+                 "a disabled query must execute instead of reading the hit")
+             (is (= 1 (:snapshot-count (dq/query-cache-metrics)))
+                 "a disabled query must not replace the existing bucket")))))))
+
+#?(:clj
    (deftest committed-identity-ignores-forced-legacy-collision-across-stores
      (let [cfg-a {:store {:backend :memory :id (random-uuid)}
                   :schema-flexibility :write :attribute-refs? false}
