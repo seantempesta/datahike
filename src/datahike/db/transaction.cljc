@@ -289,7 +289,7 @@
       (let [schema-entry (schema e)]
         ;; retractEntity removes :db/ident before :db/index, leaving the
         ;; schema map at e. Its indexed-data check ran in the :db/ident arm.
-        (when (keyword? schema-entry)
+        (when (dbu/ident-name? schema-entry)
           (reject-index-removal-with-current-data db schema-entry schema-entry))))
     (if (= a-ident :db/ident)
       (if-not (schema v-ident)
