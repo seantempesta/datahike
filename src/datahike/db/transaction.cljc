@@ -133,12 +133,13 @@
 (defn update-rschema [db]
   (assoc db :rschema (dbu/rschema (:schema db))))
 
-(defn- reject-index-removal-with-current-data [db attr entity]
+(defn- reject-schema-removal-with-current-data [db attr entity]
   (when (seq (dbi/-datoms db :aevt [attr] (dbi/-search-context db)))
     (log/raise "Update not supported for these schema attributes"
-               {:error :transact/schema
+               {:error :retract/schema
                 :entity entity
-                :invalid-updates {:db/index [true nil]}})))
+                :attribute attr
+                :reason :current-data})))
 
 (defn- last-tx-instant
   "Read the :db/txInstant value of the most-recently-committed tx
@@ -288,17 +289,16 @@
     (when (= a-ident :db/index)
       (let [schema-entry (schema e)]
         ;; retractEntity removes :db/ident before :db/index, leaving the
-        ;; schema map at e. Its indexed-data check ran in the :db/ident arm.
+        ;; schema map at e. Its current-data check ran in the :db/ident arm.
         (when (dbu/ident-name? schema-entry)
-          (reject-index-removal-with-current-data db schema-entry schema-entry))))
+          (reject-schema-removal-with-current-data db schema-entry schema-entry))))
     (if (= a-ident :db/ident)
       (if-not (schema v-ident)
         (let [err-msg (str "Schema with attribute " v-ident " does not exist")
               err-map {:error :retract/schema :attribute v-ident}]
           (throw (ex-info err-msg err-map)))
         (let [attribute-schema (schema v-ident)]
-          (when (:db/index attribute-schema)
-            (reject-index-removal-with-current-data db v-ident v-ident))
+          (reject-schema-removal-with-current-data db v-ident v-ident)
           (-> (assoc-in db [:schema e] (dissoc attribute-schema a-ident))
               (update-in [:schema] #(dissoc % v-ident))
               (update-in [:ident-ref-map] #(dissoc % v-ident))
