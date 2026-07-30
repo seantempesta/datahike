@@ -26,7 +26,13 @@
   :type-mismatch
   {:namespaces
    {datahike.api
-    {unlisten {:arities {2 {:args [:any :any], :ret :any}}},
+    {valid-all {:arities {1 {:args [:any], :ret :any}}},
+     merge-db!
+     {:arities
+      {3 {:args [:any :set :any], :ret :any},
+       4 {:args [:any :set :any :any], :ret :any}}},
+     valid-during {:arities {3 {:args [:any :any :any], :ret :any}}},
+     unlisten {:arities {2 {:args [:any :any], :ret :any}}},
      delete-database
      {:arities {1 {:args [:any], :ret :any}, 0 {:args [], :ret :any}}},
      pull
@@ -36,25 +42,58 @@
      entity {:arities {2 {:args [:any :any], :ret :any}}},
      metrics {:arities {1 {:args [:any], :ret :any}}},
      reverse-schema {:arities {1 {:args [:any], :ret :any}}},
+     pull-many-with-evidence
+     {:arities
+      {2 {:args [:any :any], :ret :any},
+       3 {:args [:any :vector :seqable], :ret :any}}},
+     valid-between {:arities {3 {:args [:any :any :any], :ret :any}}},
+     close-query-cache-generation!
+     {:arities {2 {:args [:any :any], :ret :any}}},
      datoms
      {:arities
       {2 {:args [:any :any], :ret :any},
        3 {:args [:any :keyword :any], :ret :any}}},
+     q-with-evidence
+     {:arities
+      {1 {:args [:any], :ret :any}, 2 {:args [:any :any], :ret :any}}},
+     query-attribute-dependencies
+     {:arities {1 {:args [:any], :ret :any}}},
      load-entities {:arities {2 {:args [:any :any], :ret :any}}},
+     commit-as-db
+     {:arities
+      {2 {:args [:any :any], :ret :any},
+       3 {:args [:any :any :map], :ret :any}}},
+     branch-as-db {:arities {2 {:args [:any :keyword], :ret :any}}},
+     rseek-datoms
+     {:arities
+      {2 {:args [:any :any], :ret :any},
+       3 {:args [:any :keyword :any], :ret :any}}},
      is-filtered {:arities {1 {:args [:any], :ret :boolean}}},
      q
      {:arities
       {1 {:args [:any], :ret :any}, 2 {:args [:any :any], :ret :any}}},
+     capabilities {:arities {0 {:args [], :ret :any}}},
      schema {:arities {1 {:args [:any], :ret :any}}},
      index-range {:arities {2 {:args [:any :any], :ret :any}}},
      pull-many
      {:arities
-      {2 {:args [:any :any], :ret :seqable},
-       3 {:args [:any :vector :any], :ret :seqable}}},
+      {2 {:args [:any :any], :ret :vector},
+       3 {:args [:any :vector :seqable], :ret :vector}}},
+     explain {:arities {2 {:args [:any :any], :ret :string}}},
      since {:arities {2 {:args [:any :any], :ret :any}}},
+     query-dependency-plan
+     {:arities
+      {1 {:args [:any], :ret :any}, 2 {:args [:any :any], :ret :any}}},
+     force-branch!
+     {:arities
+      {3 {:args [:any :keyword :set], :ret :nil},
+       4 {:args [:any :keyword :set :map], :ret :nil}}},
      query-stats
      {:arities
       {1 {:args [:any], :ret :any}, 2 {:args [:any :any], :ret :any}}},
+     committed-value-identity {:arities {1 {:args [:any], :ret :any}}},
+     release-materialized-db
+     {:arities {1 {:args [:any], :ret :seqable}}},
      entity-db {:arities {1 {:args [:any], :ret :any}}},
      gc-storage
      {:arities
@@ -62,19 +101,43 @@
      create-database
      {:arities {1 {:args [:any], :ret :any}, 0 {:args [], :ret :any}}},
      db {:arities {1 {:args [:any], :ret :any}}},
+     pull-dependency-plan
+     {:arities {2 {:args [:vector :seqable], :ret :any}}},
      connect
      {:arities
       {1 {:args [:any], :ret :any},
        2 {:args [:any :any], :ret :any},
        0 {:args [], :ret :any}}},
+     dependency-plan-attributes
+     {:arities
+      {1 {:args [:any], :ret :any}, 2 {:args [:any :any], :ret :any}}},
      release {:arities {1 {:args [:any], :ret :nil}}},
+     parent-commit-ids {:arities {1 {:args [:any], :ret :set}}},
+     query-cache-evidence {:arities {0 {:args [], :ret :any}}},
      history {:arities {1 {:args [:any], :ret :any}}},
+     branches {:arities {1 {:args [:any], :ret :set}}},
+     index-page {:arities {2 {:args [:any :any], :ret :any}}},
+     delete-branch! {:arities {2 {:args [:any :keyword], :ret :any}}},
      transact! {:arities {2 {:args [:any :any], :ret :any}}},
+     pull-with-evidence
+     {:arities
+      {2 {:args [:any :any], :ret :any},
+       3 {:args [:any :vector :any], :ret :any}}},
+     fork-database
+     {:arities
+      {2 {:args [:any :any], :ret :any},
+       3 {:args [:any :any :any], :ret :any}}},
      database-exists?
      {:arities
       {1 {:args [:any], :ret :boolean}, 0 {:args [], :ret :boolean}}},
+     valid-at {:arities {2 {:args [:any :any], :ret :any}}},
      transact {:arities {2 {:args [:any :any], :ret :any}}},
      as-of {:arities {2 {:args [:any :any], :ret :any}}},
+     cancel-query! {:arities {1 {:args [:string], :ret :any}}},
+     merge-db
+     {:arities
+      {3 {:args [:any :set :any], :ret :any},
+       4 {:args [:any :set :any :any], :ret :any}}},
      seek-datoms
      {:arities
       {2 {:args [:any :any], :ret :any},
@@ -85,10 +148,12 @@
       {2 {:args [:any :any], :ret :any},
        3 {:args [:any :any :any], :ret :any}}},
      db-with {:arities {2 {:args [:any :any], :ret :any}}},
+     commit-id {:arities {1 {:args [:any], :ret :any}}},
      with
      {:arities
       {2 {:args [:any :any], :ret :any},
        3 {:args [:any :any :any], :ret :any}}},
+     branch! {:arities {3 {:args [:any :any :keyword], :ret :any}}},
      tempid
      {:arities
       {1 {:args [:any], :ret :any},
