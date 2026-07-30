@@ -33,9 +33,8 @@
   #?(:cljs (:require-macros [datahike.api :refer [emit-api]]))
   (:require [datahike.connector :as dc]
             [datahike.config :as config]
-            [datahike.api.specification :refer [api-specification
-                                                host-api-specification
-                                                malli-schema->argslist]]
+            [datahike.api.specification :as specification
+             :refer [malli-schema->argslist]]
             [datahike.api.impl]
             #?(:cljs [datahike.api.async])
             [datahike.writer :as dw]
@@ -58,7 +57,7 @@
               [datahike.db HistoricalDB AsOfDB SinceDB FilteredDB]
               [datahike.impl.entity Entity])))
 
-(defmacro ^:private emit-api []
+(defmacro ^{:private true :clj-kondo/macroexpand-hook true} emit-api []
   (let [cljs? (some? (:js-globals &env))]
     `(do
        ~@(reduce
@@ -83,7 +82,8 @@
           ()
           (into (sorted-map)
                 (if cljs?
-                  api-specification
-                  (concat api-specification host-api-specification)))))))
+                  specification/api-specification
+                  (concat specification/api-specification
+                          specification/host-api-specification)))))))
 
 (emit-api)

@@ -20,7 +20,8 @@
     :referentially-transparent? - true if pure (no side effects, deterministic)
     :examples                 - structured usage examples (optional)
     :params                   - detailed parameter documentation (optional)"
-  (:require [malli.core :as m]
+  (:require [clojure.string :as str]
+            [malli.core :as m]
             [datahike.api.types :as types]))
 
 ;; =============================================================================
@@ -32,7 +33,7 @@
    Removes ? and ! suffixes, uses kebab-case as-is."
   [op-name]
   (-> (str op-name)
-      (clojure.string/replace #"[?!]$" "")))
+      (str/replace #"[?!]$" "")))
 
 (defn ->cli-command
   "Derives CLI command from operation name.
@@ -43,8 +44,8 @@
      q → query"
   [op-name]
   (-> (str op-name)
-      (clojure.string/replace #"^database-" "db-")
-      (clojure.string/replace #"[?!]$" "")))
+      (str/replace #"^database-" "db-")
+      (str/replace #"[?!]$" "")))
 
 (defn malli-schema->argslist
   "Extract argument list from malli function schema for defn metadata.
@@ -110,7 +111,7 @@
 ;; API Specification
 ;; =============================================================================
 
-(def host-api-specification
+(def ^:clj-kondo/macroexpand-hook host-api-specification
   "JVM-host-only operations for process-local authority integration.
 
    These descriptions are consumed only by the Clojure API. They are not part
@@ -190,7 +191,7 @@
      :doc "Runs an acquired host query owner exactly once on this thread."
      :impl datahike.query/run-q!}})
 
-(def api-specification
+(def ^:clj-kondo/macroexpand-hook api-specification
   "Complete API specification for Datahike.
 
    Operation names become:
