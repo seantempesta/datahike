@@ -133,6 +133,13 @@
 (defn update-rschema [db]
   (assoc db :rschema (dbu/rschema (:schema db))))
 
+(defn- reject-index-removal-with-current-data [db attr entity]
+  (when (seq (dbi/-datoms db :aevt [attr] (dbi/-search-context db)))
+    (log/raise "Update not supported for these schema attributes"
+               {:error :transact/schema
+                :entity entity
+                :invalid-updates {:db/index [true nil]}})))
+
 (defn- last-tx-instant
   "Read the :db/txInstant value of the most-recently-committed tx
    (`:max-tx`). Returns nil only on a truly empty DB that has not
@@ -280,19 +287,22 @@
                  {:error :retract/schema :entity-id e}))
     (when (= a-ident :db/index)
       (let [schema-entry (schema e)]
-        (log/raise "Update not supported for these schema attributes"
-                   {:error :transact/schema
-                    :entity schema-entry
-                    :invalid-updates {:db/index [v-ident nil]}})))
+        ;; retractEntity removes :db/ident before :db/index, leaving the
+        ;; schema map at e. Its indexed-data check ran in the :db/ident arm.
+        (when (keyword? schema-entry)
+          (reject-index-removal-with-current-data db schema-entry schema-entry))))
     (if (= a-ident :db/ident)
       (if-not (schema v-ident)
         (let [err-msg (str "Schema with attribute " v-ident " does not exist")
               err-map {:error :retract/schema :attribute v-ident}]
           (throw (ex-info err-msg err-map)))
-        (-> (assoc-in db [:schema e] (dissoc (schema v-ident) a-ident))
-            (update-in [:schema] #(dissoc % v-ident))
-            (update-in [:ident-ref-map] #(dissoc % v-ident))
-            (update-in [:ref-ident-map] #(dissoc % e))))
+        (let [attribute-schema (schema v-ident)]
+          (when (:db/index attribute-schema)
+            (reject-index-removal-with-current-data db v-ident v-ident))
+          (-> (assoc-in db [:schema e] (dissoc attribute-schema a-ident))
+              (update-in [:schema] #(dissoc % v-ident))
+              (update-in [:ident-ref-map] #(dissoc % v-ident))
+              (update-in [:ref-ident-map] #(dissoc % e)))))
       (if-let [schema-entry (schema e)]
         (if (schema schema-entry)
           (update-in db [:schema schema-entry] #(dissoc % a-ident))

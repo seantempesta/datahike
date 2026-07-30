@@ -544,6 +544,61 @@
             (d/release conn)
             (d/delete-database cfg)))))))
 
+(deftest indexed-schema-removal-requires-empty-current-aevt
+  (let [schema {:db/ident :event/at
+                :db/valueType :db.type/long
+                :db/cardinality :db.cardinality/one
+                :db/index true}
+        cfg {:store {:backend :memory :id (random-uuid)}
+             :schema-flexibility :write
+             :keep-history? true
+             :initial-tx [schema]}
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)]
+    (try
+      (d/transact conn [{:db/id 100 :event/at 1000}])
+      (let [data-t (:max-tx @conn)
+            before @conn]
+        (testing "current data refuses whole-schema removal atomically"
+          (is (thrown-with-msg? Throwable
+                                #"Update not supported for these schema attributes"
+                                (d/transact conn [[:db.fn/retractEntity :event/at]])))
+          (is (= (:max-tx before) (:max-tx @conn)))
+          (is (= schema (get-in (dbi/-schema @conn) [:event/at])))
+          (is (= 1000
+                 (d/q '[:find ?v . :where [100 :event/at ?v]] @conn))))
+        (testing "removal succeeds after current data is retracted and preserves history"
+          (d/transact conn [[:db/retract 100 :event/at 1000]])
+          (d/transact conn [[:db.fn/retractEntity :event/at]])
+          (is (not (contains? (dbi/-schema @conn) :event/at)))
+          (is (nil? (d/q '[:find ?v . :where [100 :event/at ?v]] @conn)))
+          (is (= 1000
+                 (d/q '[:find ?v . :where [100 :event/at ?v]]
+                      (d/as-of @conn data-t))))))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
+
+(deftest never-used-indexed-schema-can-be-removed
+  (let [schema {:db/ident :event/at
+                :db/valueType :db.type/long
+                :db/cardinality :db.cardinality/one
+                :db/index true}
+        cfg {:store {:backend :memory :id (random-uuid)}
+             :schema-flexibility :write
+             :keep-history? true
+             :initial-tx [schema]}
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)]
+    (try
+      (d/transact conn [[:db.fn/retractEntity :event/at]])
+      (is (not (contains? (dbi/-schema @conn) :event/at)))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
+
 (deftest explicit-index-facet-preserves-implicitly-indexed-content
   (let [schema {:db/ident :event/id
                 :db/valueType :db.type/string
