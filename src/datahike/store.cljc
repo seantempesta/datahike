@@ -4,15 +4,12 @@
    Most store lifecycle operations (create, connect, delete, release) are now
    handled by konserve.store directly. This namespace provides:
 
-   - add-cache-and-handlers: Wraps konserve stores with LRU cache and BTSet handlers
+   - add-cache-and-handlers: Adds BTSet handlers and its node cache
    - store-identity: Returns store UUID from config
    - ready-store: Tiered-specific initialization (populate cache from backend)"
   (:require [konserve.tiered :as kt]
             [clojure.walk :as walk]
             [datahike.index :as di]
-            [konserve.cache :as kc]
-            #?(:clj [clojure.core.cache :as cache]
-               :cljs [cljs.cache :as cache])
             [konserve.utils :refer [#?(:clj async+sync) *default-sync-translation*]
              #?@(:cljs [:refer-macros [async+sync]])]
             [superv.async #?(:clj :refer :cljs :refer-macros) [go-try- <?-]]
@@ -23,16 +20,13 @@
 ;; =============================================================================
 
 (defn add-cache-and-handlers
-  "Wrap a raw konserve store with LRU cache and Datahike BTSet handlers.
+  "Add Datahike BTSet handlers and their node cache to a raw konserve store.
 
-   The cache improves read performance by keeping frequently accessed keys
-   in memory. The handlers enable persistent-sorted-set serialization."
+   The persistent-set handler owns the one read cache in CachedStorage. The
+   generic Konserve API does not read through a wrapper cache, so allocating a
+   second one here retained an empty LRU for every connection."
   [raw-store config]
-  (di/add-konserve-handlers
-   config
-   (kc/ensure-cache
-    raw-store
-    (atom (cache/lru-cache-factory {} :threshold (:store-cache-size config))))))
+  (di/add-konserve-handlers config raw-store))
 
 ;; =============================================================================
 ;; Store Identity

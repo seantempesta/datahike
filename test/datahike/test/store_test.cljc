@@ -18,6 +18,11 @@
       (is (= (d/q '[:find ?e :where [?e :name]] @conn)
              #{[3] [2] [1]}))
 
+      (is (nil? (:cache (:store @conn)))
+          "the raw Konserve store has no unused wrapper LRU")
+      (is (some? (:cache (:storage (:store @conn))))
+          "CachedStorage owns the one persistent-set node cache")
+
       (d/release conn)
       (is (d/database-exists? cfg)))))
 
