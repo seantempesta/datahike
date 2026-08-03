@@ -419,6 +419,27 @@
       (is (= [{"foo" "Charlie"} {"foo" "Alice"} {"foo" "Bob"}]
              (d/q {:query '[:find ?name :strs foo :where [?e :name ?name]]
                    :args [db]}))))
+    (testing "orders and limits positional tuples before applying return-map keys"
+      (is (= [{:name "Alice" :age 15}
+              {:name "Bob" :age 37}]
+             (d/q {:query '[:find ?name ?age
+                            :keys name age
+                            :where [?e :name ?name]
+                                   [?e :age ?age]]
+                   :args [db]
+                   :order-by '?name
+                   :limit 2}))))
+    (testing "applies non-ordered offset and limit with return-map keys"
+      (let [result (d/q {:query '[:find ?name
+                                  :keys name
+                                  :where [?e :name ?name]]
+                         :args [db]
+                         :offset 1
+                         :limit 1})]
+        (is (set? result))
+        (is (= 1 (count result)))
+        (is (contains? #{"Alice" "Bob" "Charlie"}
+                       (:name (first result))))))
     (testing "return map with keys using multiple find vars"
       (is (= #{["Bob" {:age 37 :db/id 2}]
                ["Charlie" {:age 37 :db/id 3}]

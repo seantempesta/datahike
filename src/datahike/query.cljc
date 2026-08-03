@@ -4184,8 +4184,8 @@
 
 (defn- post-process-result
   "Shared post-processing pipeline for both planned-relation and legacy paths.
-   Applies :with truncation, aggregation, pull, post-process, return-maps,
-   ordering, offset/limit, and stats wrapping."
+   Applies :with truncation, aggregation, pull, post-process, ordering with
+   offset/limit, return-maps, non-ordered offset/limit, and stats wrapping."
   [deduped context-in context-out query qfind find-elements
    result-arity order-spec offset limit stats? qreturnmaps]
   (cond->> deduped
@@ -4193,8 +4193,8 @@
     (some #(instance? Aggregate %) find-elements) (aggregate find-elements context-in)
     (some #(instance? Pull %) find-elements)      (pull find-elements context-in)
     true                                          (-post-process qfind)
-    qreturnmaps                                   (convert-to-return-maps qreturnmaps)
     order-spec                                    (#(apply-order-by % order-spec offset limit))
+    qreturnmaps                                   (convert-to-return-maps qreturnmaps)
     (and (not order-spec) (or offset (and limit (pos? limit))))
     (into #{}
           (comp (if offset (drop offset) identity)
