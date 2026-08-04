@@ -82,6 +82,37 @@
 ;; at the cost of higher latency
 (def ^:const DEFAULT_COMMIT_WAIT_TIME 0) ;; in ms
 
+(def ^:private expected-refusal-cause-limit 256)
+
+(defn- one-line-cause
+  "Render a bounded single-line cause for an expected writer refusal."
+  [error]
+  (let [message (or (ex-message error) "Transaction rejected.")
+        characters (into [] (take (inc expected-refusal-cause-limit)) message)
+        truncated? (> (count characters) expected-refusal-cause-limit)
+        shown (if truncated?
+                (take (dec expected-refusal-cause-limit) characters)
+                characters)]
+    (str (apply str
+                (map (fn [character]
+                       (if (or (= character \newline)
+                               (= character \return))
+                         \space
+                         character))
+                     shown))
+         (when truncated? "…"))))
+
+(defn- expected-refusal-face
+  "Return the bounded log face for a classified transaction refusal."
+  [error]
+  (let [data (ex-data error)
+        kind (or (:seon.error/kind data) (:error data))]
+    (when (some? kind)
+      (cond-> {:kind kind
+               :cause (one-line-cause error)}
+        (some? (:attribute data))
+        (assoc :attribute (:attribute data))))))
+
 (defn create-thread
   "Creates new transaction thread"
   [connection write-fn-map transaction-queue-size commit-queue-size commit-wait-time]
@@ -118,13 +149,12 @@
                             ;; Catch all Throwables to handle AssertionError and other Errors
                             ;; These should crash the writer, but we deliver to callback first to prevent hangs
                                     (catch #?(:clj Throwable :cljs js/Error) e
-                                      ;; A stale expected basis is an ordinary
-                                      ;; optimistic-concurrency rejection. The
-                                      ;; caller receives and handles the error;
-                                      ;; logging the entire rejected tx-data at
-                                      ;; error level is noisy and can be huge.
-                                      (when-not (= :transaction/stale-basis
-                                                   (:error (ex-data e)))
+                                      (if-let [face (expected-refusal-face e)]
+                                        ;; A classified refusal is an ordinary
+                                        ;; transaction result. Keep its log to
+                                        ;; one bounded face and never attach the
+                                        ;; throwable, invocation, or tx args.
+                                        (log/error :datahike/write-rejected face)
                                         (log/error :datahike/write-error
                                                    {:invocation invocation
                                                     :error e
