@@ -39,6 +39,7 @@
    is outside that model (and outside it for a more basic reason than GC: without head
    fencing, two writers on a branch can lose each other's commits — issue #878).
    Readers are unconstrained."
+  (:require [clojure.core.async :as async])
   #?(:clj (:import [java.util Date])))
 
 (defn- now [] #?(:clj (Date.) :cljs (js/Date.)))
@@ -53,6 +54,234 @@
 ;; Tokens are counter values, not fresh objects: a token is a MAP KEY, and a bare
 ;; `(js/Object.)` implements neither IHash nor IEquiv in cljs, so it cannot be one.
 (defonce ^:private token-seq (atom 0))
+
+;; One store-id-scoped reachability gate owns both branch-roster publication
+;; and exclusive collection. Its queue is data: a queued sweep closes publisher
+;; admission, admitted publishers drain, and release grants the next compatible
+;; prefix without polling or a correctness timeout.
+(defonce ^:private reachability-gates (atom {}))
+
+(defn- empty-gate []
+  {:datahike.gc-guard/roster nil
+   :datahike.gc-guard/blobs {}
+   :datahike.gc-guard/sweep nil
+   :datahike.gc-guard/waiting []})
+
+(defn- reachability-gate [store-id]
+  (get (swap! reachability-gates
+              #(if (contains? % store-id)
+                 %
+                 (assoc % store-id (atom (empty-gate)))))
+       store-id))
+
+(defn- permit [store-id mode maintenance-receipt]
+  (cond-> {::token (swap! token-seq inc)
+           ::store-id store-id
+           ::mode mode}
+    maintenance-receipt
+    (assoc ::maintenance-receipt maintenance-receipt)))
+
+(defn- sweep-waiting? [state]
+  (boolean (some #(= :sweep (get-in % [::permit ::mode]))
+                 (::waiting state))))
+
+(defn- active? [state]
+  (or (::roster state) (seq (::blobs state)) (::sweep state)))
+
+(defn- grant [state p]
+  (case (::mode p)
+    :roster (assoc state ::roster p)
+    :blob (assoc-in state [::blobs (::token p)] p)
+    :sweep (assoc state ::sweep p)))
+
+(defn- immediately-admissible? [state mode]
+  (case mode
+    :roster (and (nil? (::sweep state))
+                 (nil? (::roster state))
+                 (empty? (::waiting state)))
+    :blob (and (nil? (::sweep state))
+               (not (sweep-waiting? state)))
+    :sweep (and (not (active? state))
+                (empty? (::waiting state)))
+    false))
+
+(defn- request-permit! [gate p]
+  (let [ready (async/promise-chan)]
+    (loop []
+      (let [before @gate
+            granted? (immediately-admissible? before (::mode p))
+            after (if granted?
+                    (grant before p)
+                    (update before ::waiting conj {::permit p ::ready ready}))]
+        (if (compare-and-set! gate before after)
+          (do
+            (when granted? (async/put! ready p))
+            ready)
+          (recur))))))
+
+(defn- grant-waiting [state]
+  (loop [state state
+         granted []]
+    (if-let [{:keys [datahike.gc-guard/permit] :as waiter}
+             (first (::waiting state))]
+      (let [mode (::mode permit)
+            admissible?
+            (case mode
+              :sweep (not (active? state))
+              :roster (and (nil? (::sweep state))
+                           (nil? (::roster state)))
+              :blob (nil? (::sweep state))
+              false)]
+        (if admissible?
+          (recur (-> state
+                     (update ::waiting #(vec (rest %)))
+                     (grant permit))
+                 (conj granted waiter))
+          [state granted]))
+      [state granted])))
+
+(defn- remove-active [state p]
+  (case (::mode p)
+    :roster
+    (if (= p (::roster state))
+      (assoc state ::roster nil)
+      (throw (ex-info "Reachability roster permit is not held."
+                      {:datahike.error/kind :reachability-permit-not-held
+                       ::permit p})))
+
+    :blob
+    (if (= p (get-in state [::blobs (::token p)]))
+      (update state ::blobs dissoc (::token p))
+      (throw (ex-info "Reachability blob permit is not held."
+                      {:datahike.error/kind :reachability-permit-not-held
+                       ::permit p})))
+
+    :sweep
+    (if (= p (::sweep state))
+      (assoc state ::sweep nil)
+      (throw (ex-info "Reachability sweep permit is not held."
+                      {:datahike.error/kind :reachability-permit-not-held
+                       ::permit p})))
+
+    (throw (ex-info "Unknown reachability permit mode."
+                    {:datahike.error/kind :invalid-reachability-permit
+                     ::permit p}))))
+
+(defn- release-permit! [p]
+  (let [gate (reachability-gate (::store-id p))]
+    (loop []
+      (let [before @gate
+            without (remove-active before p)
+            [after granted] (grant-waiting without)]
+        (if (compare-and-set! gate before after)
+          (do
+            (doseq [{:keys [datahike.gc-guard/permit
+                            datahike.gc-guard/ready]} granted]
+              (async/put! ready permit))
+            nil)
+          (recur))))))
+
+(defn- mode-check [mode]
+  (when-not (#{:roster :blob} mode)
+    (throw (ex-info "Reachability publisher mode must be :roster or :blob."
+                    {:datahike.error/kind :invalid-reachability-mode
+                     ::mode mode}))))
+
+(defn acquire-reachability-permit!
+  "Acquire a publisher permit for `store-id` in `:roster` or `:blob` mode.
+
+   A queued or active sweep closes admission. With `:sync? false`, returns a
+   channel that delivers the opaque permit when admitted; otherwise blocks
+   eventfully and returns the permit. Release it in `finally`."
+  ([store-id mode]
+   (acquire-reachability-permit! store-id mode {:sync? true}))
+  ([store-id mode opts]
+   (mode-check mode)
+   (let [p (permit store-id mode nil)
+         ready (request-permit! (reachability-gate store-id) p)]
+     (if (:sync? opts true)
+       #?(:clj (async/<!! ready)
+          :cljs (throw (ex-info "Synchronous reachability acquisition is unavailable in ClojureScript."
+                                {:datahike.error/kind :synchronous-acquisition-unavailable})))
+       ready))))
+
+(defn- sweep-receipt [state]
+  (or (some-> (::sweep state) ::maintenance-receipt)
+      (some (fn [waiter]
+              (let [p (::permit waiter)]
+                (when (= :sweep (::mode p))
+                  (::maintenance-receipt p))))
+            (::waiting state))))
+
+(defn try-reachability-permit!
+  "Try publisher admission without waiting.
+
+   Returns an opaque permit when immediately admitted. A queued or active
+   sweep returns a flat retryable `:sweep-in-progress` refusal. Other roster
+   contention returns `:reachability-permit-unavailable`; neither case queues
+   or mutates reachability."
+  [store-id mode]
+  (mode-check mode)
+  (let [gate (reachability-gate store-id)]
+    (loop []
+      (let [before @gate]
+        (if (immediately-admissible? before mode)
+          (let [p (permit store-id mode nil)]
+            (if (compare-and-set! gate before (grant before p))
+              p
+              (recur)))
+          (if (or (::sweep before) (sweep-waiting? before))
+            (cond-> {:seon.error/kind :sweep-in-progress
+                     :seon.error/retryable? true
+                     :seon.store/id store-id}
+              (sweep-receipt before)
+              (assoc ::maintenance-receipt (sweep-receipt before)))
+            {:seon.error/kind :reachability-permit-unavailable
+             :seon.error/retryable? true
+             :seon.store/id store-id
+             ::mode mode}))))))
+
+(defn acquire-sweep-permit!
+  "Queue one exclusive sweep and return its permit when publishers drain."
+  ([store-id]
+   (acquire-sweep-permit! store-id {:sync? true}))
+  ([store-id opts]
+   (let [p (permit store-id :sweep (::maintenance-receipt opts))
+         ready (request-permit! (reachability-gate store-id) p)]
+     (if (:sync? opts true)
+       #?(:clj (async/<!! ready)
+          :cljs (throw (ex-info "Synchronous sweep acquisition is unavailable in ClojureScript."
+                                {:datahike.error/kind :synchronous-acquisition-unavailable})))
+       ready))))
+
+(defn reachability-permit-held?
+  "True when `p` is the currently held permit for its store and mode."
+  [p]
+  (when (and (map? p) (::store-id p) (::mode p) (::token p))
+    (let [state @(reachability-gate (::store-id p))]
+      (case (::mode p)
+        :roster (= p (::roster state))
+        :blob (= p (get-in state [::blobs (::token p)]))
+        :sweep (= p (::sweep state))
+        false))))
+
+(defn require-reachability-permit!
+  "Return `p` when it is a held permit for `store-id` and `mode`; else throw."
+  [store-id mode p]
+  (when-not (and (= store-id (::store-id p))
+                 (= mode (::mode p))
+                 (reachability-permit-held? p))
+    (throw (ex-info "Required reachability permit is not held."
+                    {:datahike.error/kind :invalid-reachability-permit
+                     ::store-id store-id
+                     ::mode mode
+                     ::permit p})))
+  p)
+
+(defn release-reachability-permit!
+  "Release an opaque publisher or sweep permit and grant queued waiters."
+  [p]
+  (release-permit! p))
 
 (defn writing!
   "Open an unreferenced-write sequence on `store-id`. Returns a token to close it

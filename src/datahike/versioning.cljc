@@ -171,36 +171,11 @@
       {}
       source-key-maps)))
 
-(defonce ^:private branches-locks (atom {}))
-
-(defn- new-branches-lock []
-  (let [channel (async/chan 1)]
-    (async/put! channel :unlocked)
-    channel))
-
-(defn- branches-lock [store-id]
-  (get (swap! branches-locks
-              #(if (contains? % store-id)
-                 %
-                 (assoc % store-id (new-branches-lock))))
-       store-id))
-
-(defn- update-branches! [store-id store update-fn opts]
-  (let [channel (branches-lock store-id)]
-    (if (:sync? opts)
-      #?(:clj (do
-                (async/<!! channel)
-                (try
-                  (k/update store :branches update-fn opts)
-                  (finally
-                    (async/>!! channel :unlocked))))
-         :cljs (k/update store :branches update-fn opts))
-      (go-try-
-       (<?- channel)
-       (try
-         (<?- (k/update store :branches update-fn opts))
-         (finally
-           (async/put! channel :unlocked)))))))
+(defn- update-branches-held!
+  "Update the branch roster while the caller holds the store's roster permit."
+  [store-id permit store update-fn opts]
+  (guard/require-reachability-permit! store-id :roster permit)
+  (k/update store :branches update-fn opts))
 
 ;; ========================= public API =========================
 
@@ -240,15 +215,23 @@
   ([conn from new-branch] (branch! conn from new-branch {:sync? true}))
   ([conn from new-branch opts]
    (branch-check new-branch)
-   (let [opts (select-keys opts [:sync?])]
+   (let [opts (select-keys opts [:sync? :datahike.gc-guard/reachability-permit])]
      (async+sync (:sync? opts) *default-sync-translation*
                  (go-try-
-                  ;; GC GUARD: a secondary index's -sec-flush writes konserve keys, and
-                  ;; the new branch's head record is written before `:branches` names it
-                  ;; — until then NOTHING points at either, so a concurrent collector
-                  ;; would sweep them (GC's whitelist comes from `:branches`).
-                  (let [gc-sid   (:id (:store (:config @conn)))
-                        gc-token (guard/writing! gc-sid)]
+                  ;; The roster permit starts before either source or roster is
+                  ;; read and ends after head + roster publication. A caller such
+                  ;; as Seon start may pass its already-held permit explicitly;
+                  ;; nested acquisition is rejected by validation, not made
+                  ;; implicitly reentrant.
+                  (let [gc-sid (:id (:store (:config @conn)))
+                        supplied-permit (:datahike.gc-guard/reachability-permit opts)
+                        roster-permit
+                        (or (some->> supplied-permit
+                                     (guard/require-reachability-permit! gc-sid :roster))
+                            (<?- (guard/acquire-reachability-permit!
+                                  gc-sid :roster {:sync? (:sync? opts)})))
+                        owned-permit? (nil? supplied-permit)
+                        store-opts (dissoc opts :datahike.gc-guard/reachability-permit)]
                     (try
                       (let [store (:store @conn)
                             commit-source? (uuid? from)
@@ -261,11 +244,11 @@
                             _ (when-not (or (keyword? from) commit-source?)
                                 (log/raise "From must be a branch keyword or commit UUID."
                                            {:type :invalid-branch-source :from from}))
-                            existing-branches (<?- (k/get store :branches nil opts))
+                            existing-branches (<?- (k/get store :branches nil store-opts))
                             _ (when (and existing-branches (existing-branches new-branch))
                                 (log/raise "Branch already exists." {:type :branch-already-exists
                                                                      :new-branch new-branch}))
-                            stored-db (<?- (k/get store from nil opts))]
+                            stored-db (<?- (k/get store from nil store-opts))]
                         (when-not (stored-db? stored-db)
                           (log/raise (if commit-source?
                                        "Commit record does not exist."
@@ -284,11 +267,14 @@
                                  :cljs nil)
                               updated-db (cond-> (assoc-in stored-db [:config :branch] new-branch)
                                            (seq branched-sec-keys) (assoc :secondary-index-keys branched-sec-keys))]
-                          (<?- (k/assoc store new-branch updated-db opts))
+                          (<?- (k/assoc store new-branch updated-db store-opts))
                           ;; :branches is the GC discovery pointer and is published last.
-                          (<?- (update-branches! gc-sid store #(conj (set %) new-branch) opts))))
+                          (<?- (update-branches-held! gc-sid roster-permit store
+                                                     #(conj (set %) new-branch)
+                                                     store-opts))))
                       (finally
-                        (guard/done! gc-sid gc-token)))))))))
+                        (when owned-permit?
+                          (guard/release-reachability-permit! roster-permit))))))))))
 
 (defn delete-branch!
   "Removes this branch from set of known branches. The branch will still be
@@ -299,26 +285,40 @@
    (when (= branch :db)
      (log/raise "Cannot delete main :db branch. Delete database instead."
                 {:type :cannot-delete-main-db-branch}))
-   (let [opts (select-keys opts [:sync?])]
+   (let [opts (select-keys opts [:sync? :datahike.gc-guard/reachability-permit])]
      (async+sync (:sync? opts) *default-sync-translation*
                  (go-try-
                   (let [store (:store @conn)
                         store-id (store-identity (get-in @conn [:config :store]))
-                        existing-branches (<?- (k/get store :branches nil opts))]
-                    (when-not (and existing-branches (existing-branches branch))
-                      (log/raise "Branch does not exist." {:type :branch-does-not-exist
-                                                           :branch branch}))
-                    (let [active-connections
-                          (filterv (fn [[candidate-store candidate-branch & _]]
-                                     (and (= store-id candidate-store)
-                                          (= branch candidate-branch)))
-                                   (keys @*connections*))]
-                      (when (seq active-connections)
-                        (log/raise "Cannot delete a branch with an active connection. Release it first."
-                                   {:type :branch-has-active-connection
-                                    :branch branch
-                                    :connections active-connections})))
-                    (<?- (update-branches! store-id store #(disj (set %) branch) opts))))))))
+                        supplied-permit (:datahike.gc-guard/reachability-permit opts)
+                        roster-permit
+                        (or (some->> supplied-permit
+                                     (guard/require-reachability-permit! store-id :roster))
+                            (<?- (guard/acquire-reachability-permit!
+                                  store-id :roster {:sync? (:sync? opts)})))
+                        owned-permit? (nil? supplied-permit)
+                        store-opts (dissoc opts :datahike.gc-guard/reachability-permit)]
+                    (try
+                      (let [existing-branches (<?- (k/get store :branches nil store-opts))]
+                        (when-not (and existing-branches (existing-branches branch))
+                          (log/raise "Branch does not exist." {:type :branch-does-not-exist
+                                                               :branch branch}))
+                        (let [active-connections
+                              (filterv (fn [[candidate-store candidate-branch & _]]
+                                         (and (= store-id candidate-store)
+                                              (= branch candidate-branch)))
+                                       (keys @*connections*))]
+                          (when (seq active-connections)
+                            (log/raise "Cannot delete a branch with an active connection. Release it first."
+                                       {:type :branch-has-active-connection
+                                        :branch branch
+                                        :connections active-connections})))
+                        (<?- (update-branches-held! store-id roster-permit store
+                                                   #(disj (set %) branch)
+                                                   store-opts)))
+                      (finally
+                        (when owned-permit?
+                          (guard/release-reachability-permit! roster-permit))))))))))
 
 (defn force-branch!
   "Force the branch to point to the provided db value. Branch will be created if
@@ -339,7 +339,9 @@
    (db-check db)
    (branch-check branch)
    (parent-check parents)
-   (let [unknown-opts (seq (remove #{:sync? :expected-current-commit} (keys opts)))
+   (let [unknown-opts (seq (remove #{:sync? :expected-current-commit
+                                    :datahike.gc-guard/reachability-permit}
+                                  (keys opts)))
          _ (when unknown-opts
              (log/raise "Unknown force-branch! option."
                         {:type :invalid-force-branch-options
@@ -348,18 +350,23 @@
          expected-current-commit (:expected-current-commit opts)
          _ (when (and guard? (some? expected-current-commit))
              (commit-id-check expected-current-commit))
-         opts (merge {:sync? true} (select-keys opts [:sync?]))
+         opts (merge {:sync? true}
+                     (select-keys opts [:sync? :datahike.gc-guard/reachability-permit]))
          sync? (:sync? opts)]
      (async+sync sync? *default-sync-translation*
                  (go-try-
-                  ;; GC GUARD: same values-then-pointer sequence as commit!, but this
-                  ;; runs on the CALLER's thread and needs no writer at all — which is
-                  ;; exactly why the guard lives in the store rather than in the writer.
-                  (let [gc-sid   (:id (:store (:config db)))
-                        gc-token (guard/writing! gc-sid)]
+                  (let [gc-sid (:id (:store (:config db)))
+                        supplied-permit (:datahike.gc-guard/reachability-permit opts)
+                        roster-permit
+                        (or (some->> supplied-permit
+                                     (guard/require-reachability-permit! gc-sid :roster))
+                            (<?- (guard/acquire-reachability-permit!
+                                  gc-sid :roster {:sync? sync?})))
+                        owned-permit? (nil? supplied-permit)
+                        store-opts (dissoc opts :datahike.gc-guard/reachability-permit)]
                     (try
                       (let [store (:store db)
-                            current-stored (<?- (k/get store branch nil opts))
+                            current-stored (<?- (k/get store branch nil store-opts))
                             current-commit (get-in current-stored [:meta :datahike/commit-id])
                             resolved-parents (branch-heads-as-commits store parents)
                             _ (when (and guard? (not= expected-current-commit current-commit))
@@ -400,7 +407,7 @@
                                          schema-meta-kv-to-write (conj [meta-key meta-val])
                                          commit-graph?           (conj [cid db-to-store]))
                                 metas (into {} (map (fn [[key _]] [key {:immutable? true}])) writes)]
-                            (<?- (k/multi-assoc store writes metas opts)))
+                            (<?- (k/multi-assoc store writes metas store-opts)))
                           (do
                             (<?- (write-pending-kvs! store pending-kvs sync?))
                             (when schema-meta-kv-to-write
@@ -408,9 +415,10 @@
                                             (first schema-meta-kv-to-write)
                                             (second schema-meta-kv-to-write)
                                             {:immutable? true}
-                                            opts)))
+                                            store-opts)))
                             (when commit-graph?
-                              (<?- (k/assoc store cid db-to-store {:immutable? true} opts)))))
+                              (<?- (k/assoc store cid db-to-store {:immutable? true}
+                                           store-opts)))))
 
                         ;; Recheck inside the mutable head update. The GC guard
                         ;; protects the values-to-head window; the expected head
@@ -427,11 +435,13 @@
                                                 :expected-current-commit expected-current-commit
                                                 :current-commit stored-commit}))
                                   db-to-store))
-                              opts))
+                              store-opts))
 
                         ;; Publish the GC discovery pointer only after its head exists.
-                        (<?- (update-branches! gc-sid store #(conj (set %) branch) opts))
-                        (let [stored-head (<?- (k/get store branch nil opts))
+                        (<?- (update-branches-held! gc-sid roster-permit store
+                                                   #(conj (set %) branch)
+                                                   store-opts))
+                        (let [stored-head (<?- (k/get store branch nil store-opts))
                               stored-commit (get-in stored-head [:meta :datahike/commit-id])]
                           (when-not (= cid stored-commit)
                             (log/raise "Forced branch head did not match on readback."
@@ -441,7 +451,8 @@
                                         :stored-commit stored-commit})))
                         nil)
                       (finally
-                        (guard/done! gc-sid gc-token)))))))))
+                        (when owned-permit?
+                          (guard/release-reachability-permit! roster-permit))))))))))
 
 (defn commit-id
   "Retrieve the commit-id for this db."
@@ -514,6 +525,28 @@
     (log/raise "Fork point :at must be a transaction id (long) or an inst."
                {:type :invalid-fork-point :at at})))
 
+(defn- acquire-ordered-roster-permits [store-ids sync?]
+  (async+sync
+   sync? *default-sync-translation*
+   (go-try-
+    (loop [[store-id & more] (sort-by str (distinct store-ids))
+           permits []]
+      (if store-id
+        (let [acquired
+              (try
+                {:datahike.gc-guard/permit
+                 (<?- (guard/acquire-reachability-permit!
+                       store-id :roster {:sync? sync?}))}
+                (catch #?(:clj Throwable :cljs js/Error) failure
+                  {:datahike.gc-guard/failure failure}))]
+          (if-let [failure (:datahike.gc-guard/failure acquired)]
+            (do
+              (doseq [p (reverse permits)]
+                (guard/release-reachability-permit! p))
+              (throw failure))
+            (recur more (conj permits (:datahike.gc-guard/permit acquired)))))
+        permits)))))
+
 (defn fork-database
   "Fork the source database into an independent, WRITABLE target database.
 
@@ -572,7 +605,14 @@
      (async+sync
       sync? *default-sync-translation*
       (go-try-
-       (let [src-exists? (<?- (ks/store-exists? src-store-config opts))
+       (let [src-store-id (store-identity src-store-config)
+             tgt-store-id (store-identity tgt-store-config)
+             permits (<?- (acquire-ordered-roster-permits
+                           [src-store-id tgt-store-id] sync?))
+             permit-by-store (into {} (map (juxt :datahike.gc-guard/store-id identity))
+                                   permits)]
+         (try
+          (let [src-exists? (<?- (ks/store-exists? src-store-config opts))
              _ (when-not src-exists?
                  (log/raise "Source database does not exist."
                             {:type :db-does-not-exist :config source-config}))
@@ -680,10 +720,16 @@
                              (cond-> (:name target-config)
                                (assoc :name (:name target-config))))
              at-db (stored->db (assoc at-stored :config fork-config) tgt-store)
-             _ (<?- (force-branch! at-db :db #{at-cid} opts))]
-         (ks/release-store src-store-config src-store)
-         (ks/release-store tgt-store-config tgt-store)
-         fork-config))))))
+             _ (<?- (force-branch!
+                     at-db :db #{at-cid}
+                     (assoc opts :datahike.gc-guard/reachability-permit
+                            (get permit-by-store tgt-store-id))))]
+            (ks/release-store src-store-config src-store)
+            (ks/release-store tgt-store-config tgt-store)
+            fork-config)
+          (finally
+            (doseq [p (reverse permits)]
+              (guard/release-reachability-permit! p))))))))))
 
 (defn merge!
   "Create a merge commit to the current branch of this connection for parent

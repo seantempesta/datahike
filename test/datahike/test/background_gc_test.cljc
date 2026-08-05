@@ -16,6 +16,7 @@
                      [datahike.writing :as dw]
                      [datahike.test.async :refer [deftest-async]]
                      [konserve.core :as k]
+                     [konserve.impl.defaults :as kd]
                      [clojure.core.async :as a :refer [<! go]]
                      [superv.async :refer [<?? S]])
      :cljs (:require [cljs.test :refer [is testing] :include-macros true]
@@ -324,9 +325,17 @@
                                  (deliver nodes-written true)
                                  @release-head
                                  (if sync? v (go v))))]
-                 (let [tx (future (d/transact conn (mapv (fn [i] {:id (long i) :score (long 1)})
-                                                         (range 3000))))]
-                   @nodes-written
+                 (let [tx (future
+                            (try
+                              (d/transact conn
+                                          (mapv (fn [i] {:id (long i) :score (long 1)})
+                                                (range 3000)))
+                              (catch Throwable failure
+                                (deliver nodes-written failure)
+                                (throw failure))))
+                       write-event @nodes-written]
+                   (when (instance? Throwable write-event)
+                     (throw write-event))
                    (reset! in-flight (clojure.set/difference (kset store) before))
                    (reset! swept (set (<?? S (gc/gc-storage! @conn))))
                    (deliver release-head true)
@@ -402,15 +411,11 @@
            (d/delete-database cfg))))
 
      ;; -----------------------------------------------------------------------
-     ;; `branch!` writes the new branch's head record and only THEN publishes it
-     ;; into `:branches` — and GC builds its whitelist FROM `:branches`. A mark in
-     ;; that window sees no such branch and deletes its head record.
-     ;;
-     ;; This is the case that decides WHERE the guard belongs: `branch!` runs on
-     ;; the CALLER's thread and never touches the writer, so no amount of writer
-     ;; serialization would cover it. The guard is in the store, so it does.
+     ;; Complementary reachability-gate ordering: branch creation is admitted
+     ;; first and pauses before roster publication. A later sweep request must
+     ;; wait, then mark the published branch before issuing any delete batch.
      (deftest sweep-spares-in-flight-branch
-       (testing "a branch being created survives a racing collection"
+       (testing "an admitted branch publishes before a queued collection marks"
          (let [cfg {:store {:backend :file
                             :path (str (System/getProperty "java.io.tmpdir") "/dh-bgc-branch")
                             :id #uuid "b6c00000-0000-0000-0000-000000000005"}
@@ -421,23 +426,128 @@
              (d/transact conn schema)
              (doseq [b (partition-all 500 (range 2000))]
                (d/transact conn (mapv (fn [i] {:id (long i) :score (long 0)}) b)))
-             (let [head-written (promise) release-branches (promise)
-                   orig         k/update]
+             (let [head-written    (promise)
+                   release-branches (promise)
+                   sweep-requested (promise)
+                   batch-issued    (promise)
+                   orig-update     k/update
+                   orig-acquire    guard/acquire-sweep-permit!]
                ;; gate between the new branch's head record and the `:branches` publish
-               (with-redefs [k/update (fn [store key & more]
-                                        (when (= key :branches)
-                                          (deliver head-written true)
-                                          @release-branches)
-                                        (apply orig store key more))]
-                 (let [br (future (d/branch! conn :db :experiment))]
-                   @head-written
-                   (<?? S (gc/gc-storage! @conn (java.util.Date.)))  ;; prune history => real sweeping
+               (with-redefs [k/update
+                             (fn [store key & more]
+                               (when (= key :branches)
+                                 (deliver head-written true)
+                                 @release-branches)
+                               (apply orig-update store key more))
+                             guard/acquire-sweep-permit!
+                             (fn [store-id opts]
+                               (let [result (orig-acquire store-id opts)]
+                                 (deliver sweep-requested true)
+                                 result))]
+                 (let [br (future (d/branch! conn :db :experiment))
+                       _ @head-written
+                       sweep (future
+                               (<?? S
+                                    (gc/gc-storage!
+                                     @conn
+                                     (java.util.Date.)
+                                     {:datahike.gc/sweep-opts
+                                      {:konserve.gc/batch-issued
+                                       (fn [_] (deliver batch-issued true))}})))]
+                   @sweep-requested
+                   (is (not (realized? batch-issued))
+                       "collection issues no delete batch while branch holds the roster permit")
+                   (is (not (realized? sweep))
+                       "collection remains pending behind the admitted branch")
                    (deliver release-branches true)
-                   @br))
+                   @br
+                   (is (set? @sweep))
+                   (is (realized? batch-issued)
+                       "collection starts only after the branch publishes"))
                (d/release conn))
              ;; the new branch must be openable — its head record was not swept
              (let [c (d/connect (assoc cfg :branch :experiment))]
                (is (= 2000 (d/q '[:find (count ?e) . :where [?e :id _]] @c))
                    "the branch created during the collection is intact")
                (d/release c)))
-           (d/delete-database cfg))))))
+           (d/delete-database cfg)))))
+
+     ;; Strong ordering: collection has already fixed a physical delete batch
+     ;; containing an old commit before a branch request arrives. The request
+     ;; must remain outside the gate until deletion completes, then refuse
+     ;; honestly because its source commit is gone.
+     (deftest batch-contained-old-commit-cannot-be-resurrected-by-branch
+       (testing "a branch request cannot publish from a commit in an issued batch"
+         (let [cfg {:store {:backend :file
+                            :path (str (System/getProperty "java.io.tmpdir")
+                                       "/dh-bgc-batch-contained-branch")
+                            :id #uuid "b6c00000-0000-0000-0000-000000000006"}
+                    :schema-flexibility :write
+                    :keep-history? false}]
+           (d/delete-database cfg)
+           (d/create-database cfg)
+           (let [conn (d/connect cfg)]
+             (d/transact conn schema)
+             (d/transact conn [{:id 1 :score 0}])
+             (let [old-cid (d/commit-id @conn)]
+               (doseq [score (range 1 7)]
+                 (d/transact conn [{:id 1 :score (long score)}]))
+               (let [target-store-key (kd/key->store-key old-cid)
+                     batch-fixed (promise)
+                     release-batch (promise)
+                     branch-requested (promise)
+                     orig-acquire guard/acquire-reachability-permit!
+                     sweep
+                     (future
+                       (<?? S
+                            (gc/gc-storage!
+                             @conn
+                             (java.util.Date.)
+                             {:datahike.gc/sweep-opts
+                              {:konserve.gc/batch-issued
+                               (fn [store-keys]
+                                 (when (some #{target-store-key} store-keys)
+                                   (deliver batch-fixed true)
+                                   @release-batch))}})))]
+                 @batch-fixed
+                 (with-redefs [guard/acquire-reachability-permit!
+                               (fn [store-id mode opts]
+                                 (deliver branch-requested true)
+                                 (orig-acquire store-id mode opts))]
+                   (let [branch-result
+                         (future
+                           (try
+                             (d/branch! conn old-cid :resurrected)
+                             {:datahike.test/ok? true}
+                             (catch Throwable error
+                               {:datahike.test/ok? false
+                                :datahike.test/error error})))]
+                     @branch-requested
+                     (is (not (realized? branch-result))
+                         "branch remains pending while its source is in the issued batch")
+                     (is (not (contains? (set (d/branches conn)) :resurrected))
+                         "pending branch publishes no roster row")
+                     (deliver release-batch true)
+                     (let [{:keys [datahike.test/ok? datahike.test/error]}
+                           @branch-result]
+                       (is (false? ok?))
+                       (is (= :commit-not-found (:type (ex-data error)))
+                           "branch refuses with the missing-commit fact after collection"))))
+                 (let [first-pass @sweep
+                       second-pass (<?? S (gc/gc-storage! @conn (java.util.Date.)))]
+                   (is (pos? (count first-pass))
+                       "the first pass reclaimed real unreachable data")
+                   (is (contains? first-pass old-cid)
+                       "the fixed batch actually deleted the old source commit")
+                   (is (zero? (count second-pass))
+                       "an unchanged second pass converges to zero")))
+               (d/release conn)
+               (let [cold (d/connect cfg)]
+                 (is (= #{:db} (set (d/branches cold))))
+                 (is (= 6 (d/q '[:find ?score .
+                                  :where [?e :id 1]
+                                         [?e :score ?score]]
+                                @cold))
+                     "every published branch remains readable after cold reconnect")
+                 (d/release cold)))
+           (d/delete-database cfg)))))))

@@ -117,33 +117,56 @@
   of GC. See issue #878.) Readers are unconstrained."
   ([db] (gc-storage! db (#?(:clj Date. :cljs js/Date.) 0)))
   ([db remove-before]
+   (gc-storage! db remove-before {}))
+  ([db remove-before opts]
    (go-try S
            (let [{:keys [config store]} db
                  store-id (:id (:store config))
-                 now #?(:clj (Date.) :cljs (js/Date.))
-                 ;; Capture `now` BEFORE reading the guard: a sequence that opened
-                 ;; and closed between the two reads has landed its pointer, and the
-                 ;; mark (which runs after) sees it. Reading the guard first would
-                 ;; miss a sequence that opens in between.
-                 cutoff (let [sp (guard/safe-point store-id)]
-                          (if (< (get-time sp) (get-time now)) sp now))
-                 _ (log/debug :datahike/gc-start {:time now :cutoff cutoff})
-                 _ (when-not (= :self (:backend (:writer config)))
-                     (log/warn :datahike/gc-without-local-writer
-                               {:writer (:backend (:writer config))
-                                :note "collecting a store this process does not write: in-flight commits elsewhere are invisible and may be swept"}))
-                 _ (sc/clear-write-cache (:store config)) ; Clear the schema write cache for this store
-                 branches (<? S (k/get store :branches))
-                 _ (log/trace :datahike/gc-retain-branches {:branches branches})
-                 reachable (->> branches
-                                (map #(reachable-in-branch store % remove-before config))
-                                async/merge
-                                (<<? S)
-                                (apply set/union))
-                 reachable (conj reachable :branches)]
-             (log/trace :datahike/gc-reachable {:reachable-count (count reachable)
-                                                :cutoff cutoff})
-             (<? S (sweep! store reachable cutoff))))))
+                 sweep-permit
+                 (<? S (guard/acquire-sweep-permit!
+                        store-id
+                        {:sync? false
+                         :datahike.gc-guard/maintenance-receipt
+                         (:datahike.gc/maintenance-receipt opts)}))]
+             (try
+               (let [now #?(:clj (Date.) :cljs (js/Date.))
+                     ;; Capture `now` before reading the safe point. Ordinary
+                     ;; prior-head commits do not take the reachability gate and
+                     ;; remain protected by this values-before-pointer cutoff.
+                     cutoff (let [sp (guard/safe-point store-id)]
+                              (if (< (get-time sp) (get-time now)) sp now))
+                     _ (log/debug :datahike/gc-start {:time now :cutoff cutoff})
+                     _ (when-not (= :self (:backend (:writer config)))
+                         (log/warn :datahike/gc-without-local-writer
+                                   {:writer (:backend (:writer config))
+                                    :note "collecting a store this process does not write: in-flight commits elsewhere are invisible and may be swept"}))
+                     _ (sc/clear-write-cache (:store config))
+                     branches (<? S (k/get store :branches))
+                     _ (log/trace :datahike/gc-retain-branches {:branches branches})
+                     native-reachable (->> branches
+                                           (map #(reachable-in-branch store % remove-before config))
+                                           async/merge
+                                           (<<? S)
+                                           (apply set/union))
+                     extension
+                     (if-let [extend-reachable (:datahike.gc/reachable-extension opts)]
+                       (or (extend-reachable
+                            {:datahike.gc/store store
+                             :datahike.gc/store-id store-id
+                             :datahike.gc/branches branches
+                             :datahike.gc/config config
+                             :datahike.gc/remove-before remove-before
+                             :datahike.gc/reachable native-reachable})
+                           #{})
+                       #{})
+                     reachable (into (conj native-reachable :branches) extension)
+                     batch-size (or (:datahike.gc/batch-size opts) 1000)
+                     sweep-opts (or (:datahike.gc/sweep-opts opts) {})]
+                 (log/trace :datahike/gc-reachable {:reachable-count (count reachable)
+                                                    :cutoff cutoff})
+                 (<? S (sweep! store reachable cutoff batch-size sweep-opts)))
+               (finally
+                 (guard/release-reachability-permit! sweep-permit)))))))
 
 (defn start-background-gc!
   "Runs `gc-storage!` on `conn`'s database periodically in the background and

@@ -7,7 +7,9 @@
             [datahike.constants :as const]
             [datahike.db.utils :refer [db?]]
             [datahike.writing :as writing]
+            [datahike.gc-guard :as guard]
             [datahike.api :as d]
+            #?(:clj [clojure.core.async :as async])
             [konserve.core :as k]
             [superv.async :refer [<?? S]]))
 
@@ -279,6 +281,30 @@
            (d/delete-database cfg))))))
 
 #?(:clj
+   (deftest reachability-gate-refuses-start-while-sweep-is-queued
+     (let [store-id (random-uuid)
+           receipt {:datahike.test.maintenance/id "sweep-1"}
+           roster (guard/acquire-reachability-permit! store-id :roster)
+           sweep-ready (guard/acquire-sweep-permit!
+                        store-id
+                        {:sync? false
+                         :datahike.gc-guard/maintenance-receipt receipt})]
+       (try
+         (let [refusal (guard/try-reachability-permit! store-id :roster)]
+           (is (= :sweep-in-progress (:seon.error/kind refusal)))
+           (is (true? (:seon.error/retryable? refusal)))
+           (is (= store-id (:seon.store/id refusal)))
+           (is (= receipt (:datahike.gc-guard/maintenance-receipt refusal)))
+           (is (not (guard/reachability-permit-held? refusal))))
+         (finally
+           (guard/release-reachability-permit! roster)))
+       (let [sweep (async/<!! sweep-ready)]
+         (try
+           (is (guard/reachability-permit-held? sweep))
+           (finally
+             (guard/release-reachability-permit! sweep)))))))
+
+#?(:clj
    (deftest datahike-fork-database-test
      (testing "Testing fork-database: independent writable forks at head, tx-id and inst."
        (let [src-cfg {:store              {:backend :file
@@ -365,6 +391,15 @@
              (d/release fconn)
              (d/delete-database fork-cfg)))
          (testing "Error cases leave no target store behind."
+           (is (= :fork-target-same-store-identity
+                  (try
+                    (d/fork-database
+                     src-cfg
+                     {:store {:backend :file
+                              :path "/tmp/dh-fork-test-same-id"
+                              :id (get-in src-cfg [:store :id])}})
+                    (catch Exception e (:type (ex-data e)))))
+               "same-store fork refuses before acquiring the non-reentrant gate twice")
            (is (= :fork-point-after-head
                   (try (d/fork-database src-cfg (tgt-store "err" tgt-err-id) {:at (+ t-head 10)})
                        (catch Exception e (:type (ex-data e))))))

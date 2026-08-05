@@ -445,7 +445,14 @@
                 ;; writes konserve keys from inside it. Closed in the finally: an
                 ;; aborted commit leaves orphans, which are genuinely collectable.
                 (let [gc-store-id (:id (:store (:config db)))
-                      gc-token    (guard/writing! gc-store-id)]
+                      ;; Explicit parents may name an old commit that a fixed
+                      ;; collection whitelist would otherwise omit. Acquire the
+                      ;; roster publisher permit before resolving those parents.
+                      reachability-permit
+                      (when (some? parents)
+                        (<?- (guard/acquire-reachability-permit!
+                              gc-store-id :roster {:sync? sync?})))
+                      gc-token (guard/writing! gc-store-id)]
                   (try
                     (let [{:keys [store config]} db
                         ;; Head-cid cache: for an ORDINARY commit (no explicit
@@ -562,7 +569,10 @@
                                                e))
                          :cljs (throw e)))
                     (finally
-                      (guard/done! gc-store-id gc-token))))))))
+                      (guard/done! gc-store-id gc-token)
+                      (when reachability-permit
+                        (guard/release-reachability-permit!
+                         reachability-permit)))))))))
 
 (defn modified-attributes
   "Return the user and system attributes modified by transaction datoms."

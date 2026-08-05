@@ -1141,6 +1141,7 @@
 
     gc-storage
     {:args [:function
+            [:=> [:cat :datahike/SConnection types/time-point? :map] :any]
             [:=> [:cat :datahike/SConnection types/time-point?] :any]
             [:=> [:cat :datahike/SConnection] :any]]
      :ret :any
@@ -1148,11 +1149,13 @@
      :stability :stable
      :supports-remote? true
      :referentially-transparent? false
-     :doc "Invokes garbage collection on connection's store. Removes old snapshots before given time point."
+     :doc "Invokes garbage collection on connection's store. Removes old snapshots before given time point. The optional map supports :datahike.gc/reachable-extension, :datahike.gc/maintenance-receipt, :datahike.gc/batch-size, and :datahike.gc/sweep-opts. The reachability callback runs after exclusive acquisition and receives the locked roster plus native reachable set."
      :examples [{:desc "GC all old snapshots"
                  :code "(gc-storage conn)"}
                 {:desc "GC snapshots before date"
-                 :code "(gc-storage conn (java.util.Date.))"}]
+                 :code "(gc-storage conn (java.util.Date.))"}
+                {:desc "Extend reachability and observe fixed sweep batches"
+                 :code "(gc-storage conn (java.util.Date.) {:datahike.gc/reachable-extension mark-more :datahike.gc/sweep-opts {:konserve.gc/batch-issued batch-issued}})"}]
      :impl datahike.writer/gc-storage!}
 
     ;; =========================================================================
