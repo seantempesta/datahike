@@ -305,6 +305,26 @@
              (guard/release-reachability-permit! sweep)))))))
 
 #?(:clj
+   (deftest public-branch-wrappers-forward-reachability-permits
+     (let [store-id (random-uuid)
+           cfg {:store {:backend :memory :id store-id}
+                :schema-flexibility :read}
+           _ (d/create-database cfg)
+           conn (d/connect cfg)
+           permit (guard/acquire-reachability-permit! store-id :roster)]
+       (try
+         (d/branch! conn :db :permitted
+                    {:datahike.gc-guard/reachability-permit permit})
+         (is (contains? (d/branches conn) :permitted))
+         (d/delete-branch! conn :permitted
+                           {:datahike.gc-guard/reachability-permit permit})
+         (is (not (contains? (d/branches conn) :permitted)))
+         (finally
+           (guard/release-reachability-permit! permit)
+           (d/release conn)
+           (d/delete-database cfg))))))
+
+#?(:clj
    (deftest datahike-fork-database-test
      (testing "Testing fork-database: independent writable forks at head, tx-id and inst."
        (let [src-cfg {:store              {:backend :file

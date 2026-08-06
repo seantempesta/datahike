@@ -926,7 +926,9 @@
      :impl datahike.api.impl/branches}
 
     branch!
-    {:args [:=> [:cat :datahike/SConnection :any :keyword] :any]
+    {:args [:function
+            [:=> [:cat :datahike/SConnection :any :keyword] :any]
+            [:=> [:cat :datahike/SConnection :any :keyword :map] :any]]
      :ret :any
      :categories [:versioning :write :async]
      :stability :stable
@@ -940,7 +942,9 @@
      :impl datahike.api.impl/branch!}
 
     delete-branch!
-    {:args [:=> [:cat :datahike/SConnection :keyword] :any]
+    {:args [:function
+            [:=> [:cat :datahike/SConnection :keyword] :any]
+            [:=> [:cat :datahike/SConnection :keyword :map] :any]]
      :ret :any
      :categories [:versioning :write :async]
      :stability :stable

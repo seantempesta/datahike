@@ -333,13 +333,19 @@
   #?(:clj  (dv/branches conn {:sync? true})
      :cljs (dv/branches conn {:sync? false})))
 
-(defn branch! [conn from new-branch]
-  #?(:clj  (dv/branch! conn from new-branch {:sync? true})
-     :cljs (dv/branch! conn from new-branch {:sync? false})))
+(defn branch!
+  ([conn from new-branch]
+   (branch! conn from new-branch {}))
+  ([conn from new-branch opts]
+   #?(:clj  (dv/branch! conn from new-branch (assoc opts :sync? true))
+      :cljs (dv/branch! conn from new-branch (assoc opts :sync? false)))))
 
-(defn delete-branch! [conn branch]
-  #?(:clj  (dv/delete-branch! conn branch {:sync? true})
-     :cljs (dv/delete-branch! conn branch {:sync? false})))
+(defn delete-branch!
+  ([conn branch]
+   (delete-branch! conn branch {}))
+  ([conn branch opts]
+   #?(:clj  (dv/delete-branch! conn branch (assoc opts :sync? true))
+      :cljs (dv/delete-branch! conn branch (assoc opts :sync? false)))))
 
 (defn force-branch!
   ([db branch parents]
