@@ -126,6 +126,37 @@
                    [:datahike.query.dependency/sources 0
                     :datahike.query.source/attributes])))))
 
+#?(:clj
+   (deftest compiled-pull-plan-parses-once-across-all-consumers
+     (let [selector '[:name {:child [:name {:_friend [:name]}]}]
+           parse-pull dpp/parse-pull
+           parse-count (atom 0)]
+       (with-redefs [dpp/parse-pull
+                     (fn [edn-selector]
+                       (swap! parse-count inc)
+                       (parse-pull edn-selector))]
+         (let [response
+               (p/pull-plan-with-evidence ordered-test-db selector
+                                          [:person/id "petr"])
+               plan (:datahike.pull/plan response)
+               parsed (p/pull-plan-spec plan)]
+           (is (= {:name "Petr"
+                   :child [{:name "David"} {:name "Thomas"}]}
+                  (:datahike.pull/result response))
+               "pull execution consumes the compiled plan")
+           (is (= #{:person/id :name :child :friend}
+                  (get-in response
+                          [:datahike.read/dependency-plan
+                           :datahike.query.dependency/sources 0
+                           :datahike.query.source/attributes]))
+               "dependency evidence consumes the same compiled plan")
+           (is (= selector (p/pull-plan-selector plan)))
+           (is (seq (:attrs parsed))
+               "the decode consumer receives the same parsed PullSpec")
+           (is (identical? plan (p/compile-pull-plan plan)))
+           (is (= 1 @parse-count)
+               "compile, dependency evidence, execution, and decode parse once"))))))
+
 (deftest automatic-component-expansion-widens-pull-dependencies
   (let [selector '[:part]
         before-db (d/db-with test-db [[:db/add 11 :detail "before"]])

@@ -97,12 +97,16 @@
      entity-db {:arities {1 {:args [:any], :ret :any}}},
      gc-storage
      {:arities
-      {2 {:args [:any :any], :ret :any}, 1 {:args [:any], :ret :any}}},
+      {3 {:args [:any :any :any], :ret :any},
+       2 {:args [:any :any], :ret :any},
+       1 {:args [:any], :ret :any}}},
      create-database
      {:arities {1 {:args [:any], :ret :any}, 0 {:args [], :ret :any}}},
      db {:arities {1 {:args [:any], :ret :any}}},
      pull-dependency-plan
-     {:arities {2 {:args [:vector :seqable], :ret :any}}},
+     {:arities
+      {2 {:args [:vector :seqable], :ret :any},
+       3 {:args [:any :vector :seqable], :ret :any}}},
      connect
      {:arities
       {1 {:args [:any], :ret :any},
@@ -117,7 +121,10 @@
      history {:arities {1 {:args [:any], :ret :any}}},
      branches {:arities {1 {:args [:any], :ret :set}}},
      index-page {:arities {2 {:args [:any :any], :ret :any}}},
-     delete-branch! {:arities {2 {:args [:any :keyword], :ret :any}}},
+     delete-branch!
+     {:arities
+      {2 {:args [:any :keyword], :ret :any},
+       3 {:args [:any :keyword :any], :ret :any}}},
      transact! {:arities {2 {:args [:any :any], :ret :any}}},
      pull-with-evidence
      {:arities
@@ -153,7 +160,10 @@
      {:arities
       {2 {:args [:any :any], :ret :any},
        3 {:args [:any :any :any], :ret :any}}},
-     branch! {:arities {3 {:args [:any :any :keyword], :ret :any}}},
+     branch!
+     {:arities
+      {3 {:args [:any :any :keyword], :ret :any},
+       4 {:args [:any :any :keyword :any], :ret :any}}},
      tempid
      {:arities
       {1 {:args [:any], :ret :any},

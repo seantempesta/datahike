@@ -15,6 +15,34 @@
 
 (def ^:private ^:const +default-limit+ 1000)
 
+(defrecord PullPlan [selector spec])
+
+(defn pull-plan?
+  "Returns true when `value` is a compiled pull plan."
+  [value]
+  (instance? PullPlan value))
+
+(defn compile-pull-plan
+  "Compiles one EDN pull selector into an immutable pull plan."
+  [selector-or-plan]
+  (if (pull-plan? selector-or-plan)
+    selector-or-plan
+    (->PullPlan selector-or-plan (dpp/parse-pull selector-or-plan))))
+
+(defn pull-plan-selector
+  "Returns the original EDN selector from a compiled pull plan."
+  [plan]
+  (:selector plan))
+
+(defn pull-plan-spec
+  "Returns the parsed PullSpec from a compiled pull plan."
+  [plan]
+  (:spec plan))
+
+(defn- options-pull-plan
+  [{:keys [selector] plan :datahike.pull/plan}]
+  (compile-pull-plan (or plan selector)))
+
 (defn pull-spec-attribute-dependencies
   "Returns canonical stored attributes from a parsed PullSpec.
 
@@ -67,9 +95,10 @@
    a bare forward attribute widens because it may be a component ref."
   ([selector entity-refs]
    (pull-dependency-plan nil selector entity-refs))
-  ([db selector entity-refs]
+  ([db selector-or-plan entity-refs]
    (let [selector-attributes
-         (pull-spec-attribute-dependencies db (dpp/parse-pull selector))
+         (pull-spec-attribute-dependencies
+          db (pull-plan-spec (compile-pull-plan selector-or-plan)))
          attributes
          (if (= selector-attributes :all)
            :all
@@ -421,46 +450,75 @@
           (dissoc options :max-results)))))))
 
 (defn pull
-  ([db {:keys [selector eid max-work max-results max-result-weight]}]
+  ([db {:keys [eid max-work max-results max-result-weight] :as options}]
    {:pre [(dbu/db? db)]}
-   (pull-spec db (dpp/parse-pull selector) [eid] false
+   (pull-spec db (pull-plan-spec (options-pull-plan options)) [eid] false
               {:max-work max-work
                :max-results max-results
                :max-result-weight max-result-weight}))
-  ([db selector eid]
+  ([db selector-or-plan eid]
    {:pre [(dbu/db? db)]}
-   (pull-spec db (dpp/parse-pull selector) [eid] false)))
+   (pull-spec db
+              (pull-plan-spec (compile-pull-plan selector-or-plan))
+              [eid] false)))
 
 (defn pull-many
   "Pulls one input-aligned eager result for each entity ref.
 
    Well-formed missing refs return nil in their original positions. Malformed
    refs and lookup attributes without uniqueness remain errors."
-  ([db {:keys [selector eids max-work max-results max-result-weight]}]
+  ([db {:keys [eids max-work max-results max-result-weight] :as options}]
    {:pre [(dbu/db? db)]}
-   (pull-spec db (dpp/parse-pull selector) eids true
+   (pull-spec db (pull-plan-spec (options-pull-plan options)) eids true
               {:max-work max-work
                :max-results max-results
                :max-result-weight max-result-weight}))
-  ([db selector eids]
+  ([db selector-or-plan eids]
    {:pre [(dbu/db? db)]}
-   (pull-spec db (dpp/parse-pull selector) eids true)))
+   (pull-spec db
+              (pull-plan-spec (compile-pull-plan selector-or-plan))
+              eids true)))
+
+(defn pull-plan-with-evidence
+  "Pulls one entity through one compiled plan and returns that plan."
+  ([db {:keys [eid] :as options}]
+   (let [plan (options-pull-plan options)]
+     {:datahike.pull/result
+      (pull db (assoc options :datahike.pull/plan plan))
+      :datahike.read/dependency-plan (pull-dependency-plan db plan [eid])
+      :datahike.pull/plan plan}))
+  ([db selector-or-plan eid]
+   (let [plan (compile-pull-plan selector-or-plan)]
+     {:datahike.pull/result (pull db plan eid)
+      :datahike.read/dependency-plan (pull-dependency-plan db plan [eid])
+      :datahike.pull/plan plan})))
 
 (defn pull-with-evidence
   "Pulls one entity and returns the value with its parsed dependency plan."
-  ([db {:keys [selector eid] :as options}]
-   {:datahike.pull/result (pull db options)
-    :datahike.read/dependency-plan (pull-dependency-plan db selector [eid])})
+  ([db options]
+   (dissoc (pull-plan-with-evidence db options) :datahike.pull/plan))
   ([db selector eid]
-   {:datahike.pull/result (pull db selector eid)
-    :datahike.read/dependency-plan (pull-dependency-plan db selector [eid])}))
+   (dissoc (pull-plan-with-evidence db selector eid) :datahike.pull/plan)))
+
+(defn pull-many-plan-with-evidence
+  "Pulls aligned entities through one compiled plan and returns that plan."
+  ([db {:keys [eids] :as options}]
+   (let [plan (options-pull-plan options)]
+     {:datahike.pull-many/result
+      (pull-many db (assoc options :datahike.pull/plan plan))
+      :datahike.read/dependency-plan (pull-dependency-plan db plan eids)
+      :datahike.pull/plan plan}))
+  ([db selector-or-plan eids]
+   (let [plan (compile-pull-plan selector-or-plan)]
+     {:datahike.pull-many/result (pull-many db plan eids)
+      :datahike.read/dependency-plan (pull-dependency-plan db plan eids)
+      :datahike.pull/plan plan})))
 
 (defn pull-many-with-evidence
   "Pulls input-aligned entities and returns the values with one shared parsed
    dependency plan."
-  ([db {:keys [selector eids] :as options}]
-   {:datahike.pull-many/result (pull-many db options)
-    :datahike.read/dependency-plan (pull-dependency-plan db selector eids)})
+  ([db options]
+   (dissoc (pull-many-plan-with-evidence db options) :datahike.pull/plan))
   ([db selector eids]
-   {:datahike.pull-many/result (pull-many db selector eids)
-    :datahike.read/dependency-plan (pull-dependency-plan db selector eids)}))
+   (dissoc (pull-many-plan-with-evidence db selector eids)
+           :datahike.pull/plan)))

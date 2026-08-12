@@ -189,7 +189,67 @@
      :supports-remote? false
      :referentially-transparent? false
      :doc "Runs an acquired host query owner exactly once on this thread."
-     :impl datahike.query/run-q!}})
+     :impl datahike.query/run-q!}
+
+    compile-pull-plan
+    {:args [:=> [:cat :any] :any]
+     :ret :any
+     :categories [:query :pull :host]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? true
+     :returns-host-value? true
+     :doc "Compiles one EDN pull selector into an immutable host pull plan."
+     :impl datahike.pull-api/compile-pull-plan}
+
+    pull-plan-selector
+    {:args [:=> [:cat :any] :any]
+     :ret :any
+     :categories [:query :pull :host]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? true
+     :returns-host-value? true
+     :doc "Returns the original EDN selector from a compiled host pull plan."
+     :impl datahike.pull-api/pull-plan-selector}
+
+    pull-plan-spec
+    {:args [:=> [:cat :any] :any]
+     :ret :any
+     :categories [:query :pull :host]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? true
+     :returns-host-value? true
+     :doc "Returns the parsed PullSpec from a compiled host pull plan."
+     :impl datahike.pull-api/pull-plan-spec}
+
+    pull-plan-with-evidence
+    {:args [:function
+            [:=> [:cat :datahike/SDB :any] :any]
+            [:=> [:cat :datahike/SDB :any :datahike/SEId] :any]]
+     :ret :any
+     :categories [:query :pull :host]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? true
+     :returns-host-value? true
+     :doc "Pulls one entity with evidence and returns its compiled host plan."
+     :impl datahike.pull-api/pull-plan-with-evidence}
+
+    pull-many-plan-with-evidence
+    {:args [:function
+            [:=> [:cat :datahike/SDB :any] :any]
+            [:=> [:cat :datahike/SDB :any [:sequential :datahike/SEId]]
+             :any]]
+     :ret :any
+     :categories [:query :pull :host]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? true
+     :returns-host-value? true
+     :doc "Pulls aligned entities with evidence and returns the compiled host plan."
+     :impl datahike.pull-api/pull-many-plan-with-evidence}})
 
 (def ^:clj-kondo/macroexpand-hook api-specification
   "Complete API specification for Datahike.
