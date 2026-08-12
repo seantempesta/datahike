@@ -19,6 +19,59 @@
 
 (defrecord PullPlan [selector spec attribute-dependencies])
 
+(def ^:private pull-recursion-operators
+  #{'limit :limit "limit" 'default :default "default"})
+
+(defn- nested-pull-pattern?
+  [value]
+  (or (sequential? value) (set? value)))
+
+(defn- shallow-pull-pattern
+  [pattern]
+  (mapv (fn [clause]
+          (if (map? clause)
+            (into (empty clause)
+                  (map (fn [[attribute nested]]
+                         [attribute
+                          (if (nested-pull-pattern? nested)
+                            [:db/id]
+                            nested)]))
+                  clause)
+            clause))
+        pattern))
+
+(defn- pull-map-display-key
+  [attribute]
+  (if (sequential? attribute)
+    (if (contains? pull-recursion-operators (first attribute))
+      (second attribute)
+      (first attribute))
+    attribute))
+
+(defn- compile-pull-spec
+  "Compiles shared selector subpatterns once and retains their identity."
+  [selector]
+  (let [compiled (atom {})]
+    (letfn [(compile-pattern [pattern]
+              (if-let [entry (find @compiled pattern)]
+                (val entry)
+                (let [spec (dpp/parse-pull (shallow-pull-pattern pattern))
+                      spec
+                      (reduce
+                       (fn [result [attribute nested]]
+                         (if (nested-pull-pattern? nested)
+                           (assoc-in result
+                                     [:attrs
+                                      (pull-map-display-key attribute)
+                                      :subpattern]
+                                     (compile-pattern nested))
+                           result))
+                       spec
+                       (mapcat seq (filter map? pattern)))]
+                  (swap! compiled assoc pattern spec)
+                  spec)))]
+      (compile-pattern selector))))
+
 (defn pull-plan?
   "Returns true when `value` is a compiled pull plan."
   [value]
@@ -29,7 +82,7 @@
   ([selector-or-plan]
    (if (pull-plan? selector-or-plan)
      selector-or-plan
-     (->PullPlan selector-or-plan (dpp/parse-pull selector-or-plan) nil)))
+     (->PullPlan selector-or-plan (compile-pull-spec selector-or-plan) nil)))
   ([db selector-or-plan]
    (let [plan (compile-pull-plan selector-or-plan)]
      (if (some? (:attribute-dependencies plan))
@@ -59,27 +112,38 @@
   ([spec]
    (pull-spec-attribute-dependencies nil spec))
   ([db spec]
-   (if (:wildcard? spec)
-     :all
-     (reduce-kv
-      (fn [attributes display-key options]
-        (let [attribute (:attr options)
-              nested (when-let [subpattern (:subpattern options)]
-                       (pull-spec-attribute-dependencies db subpattern))
-              automatic-component-expansion?
-              (and (= display-key attribute)
-                   (not (contains? options :subpattern))
-                   (not (contains? options :recursion))
-                   (not= :db/id attribute)
-                   (or (nil? db) (dbu/component? db attribute)))]
-          (cond
-            (not (keyword? attribute)) (reduced :all)
-            automatic-component-expansion? (reduced :all)
-            (= nested :all) (reduced :all)
-            :else (cond-> (conj attributes attribute)
-                    nested (into nested)))))
-      #{}
-      (:attrs spec)))))
+   (let [derived (atom {})]
+     (letfn [(dependencies [pull-spec]
+               (if-let [entry (find @derived pull-spec)]
+                 (val entry)
+                 (let [result
+                       (if (:wildcard? pull-spec)
+                         :all
+                         (reduce-kv
+                          (fn [attributes display-key options]
+                            (let [attribute (:attr options)
+                                  nested
+                                  (when-let [subpattern
+                                             (:subpattern options)]
+                                    (dependencies subpattern))
+                                  automatic-component-expansion?
+                                  (and (= display-key attribute)
+                                       (not (contains? options :subpattern))
+                                       (not (contains? options :recursion))
+                                       (not= :db/id attribute)
+                                       (or (nil? db)
+                                           (dbu/component? db attribute)))]
+                              (cond
+                                (not (keyword? attribute)) (reduced :all)
+                                automatic-component-expansion? (reduced :all)
+                                (= nested :all) (reduced :all)
+                                :else (cond-> (conj attributes attribute)
+                                        nested (into nested)))))
+                          #{}
+                          (:attrs pull-spec)))]
+                   (swap! derived assoc pull-spec result)
+                   result)))]
+       (dependencies spec)))))
 
 (defn- entity-ref-attribute-dependencies
   [entity-refs]

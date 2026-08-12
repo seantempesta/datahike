@@ -161,10 +161,33 @@
            (is (seq (:attrs parsed))
                "the decode consumer receives the same parsed PullSpec")
            (is (identical? plan (p/compile-pull-plan plan)))
-           (is (= 1 @parse-count)
-               "compile, dependency evidence, execution, and decode parse once")
+           (is (= 3 @parse-count)
+               "each unique selector level parses once during compilation")
            (is (zero? @dependency-walk-count)
                "concrete dependency attributes ride the compiled plan"))))))
+
+#?(:clj
+   (deftest compiled-pull-plan-retains-shared-selector-subpatterns
+     (let [shared [:name]
+           attributes (mapv #(keyword "shared" (str "edge-" %))
+                            (range 1024))
+           selector (mapv #(hash-map % shared) attributes)
+           parse-pull dpp/parse-pull
+           parse-count (atom 0)]
+       (with-redefs [dpp/parse-pull
+                     (fn [edn-selector]
+                       (swap! parse-count inc)
+                       (parse-pull edn-selector))]
+         (let [plan (p/compile-pull-plan selector)
+               spec (p/pull-plan-spec plan)
+               subpatterns (mapv #(get-in spec [:attrs % :subpattern])
+                                 attributes)]
+           (is (= 2 @parse-count)
+               "the root and one shared leaf are the only parsed patterns")
+           (is (every? #(identical? (first subpatterns) %)
+                       (rest subpatterns))
+               "compiled pull specs preserve the selector DAG")
+           (is (identical? plan (p/compile-pull-plan plan))))))))
 
 (deftest automatic-component-expansion-widens-pull-dependencies
   (let [selector '[:part]
