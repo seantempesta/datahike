@@ -192,7 +192,9 @@
      :impl datahike.query/run-q!}
 
     compile-pull-plan
-    {:args [:=> [:cat :any] :any]
+    {:args [:function
+            [:=> [:cat :any] :any]
+            [:=> [:cat :datahike/SDB :any] :any]]
      :ret :any
      :categories [:query :pull :host]
      :stability :experimental

@@ -130,15 +130,22 @@
    (deftest compiled-pull-plan-parses-once-across-all-consumers
      (let [selector '[:name {:child [:name {:_friend [:name]}]}]
            parse-pull dpp/parse-pull
-           parse-count (atom 0)]
+           parse-count (atom 0)
+           dependency-walk-count (atom 0)
+           dependency-walk p/pull-spec-attribute-dependencies]
        (with-redefs [dpp/parse-pull
                      (fn [edn-selector]
                        (swap! parse-count inc)
-                       (parse-pull edn-selector))]
-         (let [response
-               (p/pull-plan-with-evidence ordered-test-db selector
+                       (parse-pull edn-selector))
+                     p/pull-spec-attribute-dependencies
+                     (fn [& arguments]
+                       (swap! dependency-walk-count inc)
+                       (apply dependency-walk arguments))]
+         (let [plan (p/compile-pull-plan ordered-test-db selector)
+               _ (reset! dependency-walk-count 0)
+               response
+               (p/pull-plan-with-evidence ordered-test-db plan
                                           [:person/id "petr"])
-               plan (:datahike.pull/plan response)
                parsed (p/pull-plan-spec plan)]
            (is (= {:name "Petr"
                    :child [{:name "David"} {:name "Thomas"}]}
@@ -155,7 +162,9 @@
                "the decode consumer receives the same parsed PullSpec")
            (is (identical? plan (p/compile-pull-plan plan)))
            (is (= 1 @parse-count)
-               "compile, dependency evidence, execution, and decode parse once"))))))
+               "compile, dependency evidence, execution, and decode parse once")
+           (is (zero? @dependency-walk-count)
+               "concrete dependency attributes ride the compiled plan"))))))
 
 (deftest automatic-component-expansion-widens-pull-dependencies
   (let [selector '[:part]

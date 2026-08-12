@@ -15,7 +15,9 @@
 
 (def ^:private ^:const +default-limit+ 1000)
 
-(defrecord PullPlan [selector spec])
+(declare pull-spec-attribute-dependencies)
+
+(defrecord PullPlan [selector spec attribute-dependencies])
 
 (defn pull-plan?
   "Returns true when `value` is a compiled pull plan."
@@ -24,10 +26,16 @@
 
 (defn compile-pull-plan
   "Compiles one EDN pull selector into an immutable pull plan."
-  [selector-or-plan]
-  (if (pull-plan? selector-or-plan)
-    selector-or-plan
-    (->PullPlan selector-or-plan (dpp/parse-pull selector-or-plan))))
+  ([selector-or-plan]
+   (if (pull-plan? selector-or-plan)
+     selector-or-plan
+     (->PullPlan selector-or-plan (dpp/parse-pull selector-or-plan) nil)))
+  ([db selector-or-plan]
+   (let [plan (compile-pull-plan selector-or-plan)]
+     (if (some? (:attribute-dependencies plan))
+       plan
+       (assoc plan :attribute-dependencies
+              (pull-spec-attribute-dependencies db (:spec plan)))))))
 
 (defn pull-plan-selector
   "Returns the original EDN selector from a compiled pull plan."
@@ -96,9 +104,13 @@
   ([selector entity-refs]
    (pull-dependency-plan nil selector entity-refs))
   ([db selector-or-plan entity-refs]
-   (let [selector-attributes
-         (pull-spec-attribute-dependencies
-          db (pull-plan-spec (compile-pull-plan selector-or-plan)))
+   (let [plan (if db
+                (compile-pull-plan db selector-or-plan)
+                (compile-pull-plan selector-or-plan))
+         retained-attributes (:attribute-dependencies plan)
+         selector-attributes
+         (or retained-attributes
+             (pull-spec-attribute-dependencies (pull-plan-spec plan)))
          attributes
          (if (= selector-attributes :all)
            :all
