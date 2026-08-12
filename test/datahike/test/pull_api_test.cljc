@@ -113,9 +113,34 @@
                     :datahike.query.source/attributes]))))
   (testing "keyword entity refs include the ident lookup dependency"
     (is (= #{:db/ident :name}
-           (get-in (d/pull-dependency-plan '[:name] [:person/petr])
+           (get-in (d/pull-dependency-plan ordered-test-db
+                                           '[:name]
+                                           [:person/petr])
+                   [:datahike.query.dependency/sources 0
+                    :datahike.query.source/attributes]))))
+  (testing "recursion retains its canonical concrete attribute"
+    (is (= #{:name :friend}
+           (get-in (d/pull-dependency-plan test-db
+                                           '[:name {:friend ...}]
+                                           [1])
                    [:datahike.query.dependency/sources 0
                     :datahike.query.source/attributes])))))
+
+(deftest automatic-component-expansion-widens-pull-dependencies
+  (let [selector '[:part]
+        before-db (d/db-with test-db [[:db/add 11 :detail "before"]])
+        before (d/pull-with-evidence before-db selector 10)
+        changed-db (d/db-with before-db [[:db/add 11 :detail "after"]])
+        after (d/pull-with-evidence changed-db selector 10)]
+    (is (not= (:datahike.pull/result before)
+              (:datahike.pull/result after))
+        "changing only an automatically expanded child changes the pull")
+    (is (= :all
+           (get-in before
+                   [:datahike.read/dependency-plan
+                    :datahike.query.dependency/sources 0
+                    :datahike.query.source/attributes]))
+        "automatic wildcard expansion must retain every attribute read")))
 
 (deftest ordered-pull-many-preserves-input-positions
   (testing "empty and repeated inputs preserve exact vector shape"

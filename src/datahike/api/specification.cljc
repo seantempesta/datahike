@@ -596,14 +596,18 @@
      :impl datahike.pull-api/pull}
 
     pull-dependency-plan
-    {:args [:=> [:cat [:vector :any] [:sequential :datahike/SEId]]
-            :datahike/SReadDependencyPlan]
+    {:args [:function
+            [:=> [:cat [:vector :any] [:sequential :datahike/SEId]]
+             :datahike/SReadDependencyPlan]
+            [:=> [:cat :datahike/SDB [:vector :any]
+                  [:sequential :datahike/SEId]]
+             :datahike/SReadDependencyPlan]]
      :ret :datahike/SReadDependencyPlan
      :categories [:query :pull :diagnostics]
      :stability :experimental
      :supports-remote? false
      :referentially-transparent? true
-     :doc "Returns a parsed pull dependency plan including entity-ref lookup attributes without retaining a database value."
+     :doc "Returns a pull dependency plan. A database value resolves component-ref expansion precisely; without one, bare forward attributes widen conservatively."
      :impl datahike.pull-api/pull-dependency-plan}
 
     pull-with-evidence

@@ -58,6 +58,12 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Notable fixes
 
+- **Automatic component pulls invalidate on child changes** — pull dependency
+  evidence now widens bare forward component refs to `:all`, matching the
+  wildcard expansion that reads the component entity. Explicit nested,
+  reverse, and recursive selectors retain concrete attribute dependencies.
+  ([#TODO])
+
 - **Equal-cost query plans no longer depend on variable names** — the planner
   now preserves its existing operation order when costs tie instead of
   iterating a hash set whose order changes with variable-symbol hashes.
