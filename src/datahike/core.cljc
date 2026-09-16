@@ -130,13 +130,14 @@
    {:pre [(dbu/db? db)]}
    (if (is-filtered db)
      (throw (ex-info "Filtered DB cannot be modified" {:error :transaction/filtered}))
-     (let [report (dbt/transact-tx-data (db/map->TxReport
-                                         {:db-before db
-                                          :db-after  db
-                                          :tx-data   []
-                                          :tempids   {}
-                                         :tx-meta   tx-meta}) tx-data)]
-       (update report :db-after assoc :cache-context nil)))))
+     (dbt/transact-tx-data
+      (db/map->TxReport
+       {:db-before db
+        :db-after  (db/clear-cache-context db)
+        :tx-data   []
+        :tempids   {}
+        :tx-meta   tx-meta})
+      tx-data))))
 
 (defn load-entities-with [db entities tx-meta]
   (update (dbt/transact-entities-directly

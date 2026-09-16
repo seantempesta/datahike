@@ -46,6 +46,42 @@
      (set (keys (lru/weighted-entries (:lru @dq/query-result-cache))))))
 
 #?(:clj
+   (deftest transaction-functions-query-the-speculative-value
+     (with-temp-db label-schema
+       (fn [conn]
+         (doseq [commit? [false true]]
+           (let [before @conn
+                 query '[:find ?type . :in $ ?ident
+                         :where [?a :db/ident ?ident]
+                                [?a :db/valueType ?type]]
+                 observed (atom nil)
+                 identity-before (db/committed-cache-identity before)
+                 _ (is (some? identity-before))
+                 _ (is (nil? (d/q query before :c/new)))
+                 tx [{:db/ident :c/new
+                      :db/valueType :db.type/string
+                      :db/cardinality :db.cardinality/one}
+                     [:db.fn/call
+                      (fn [during]
+                        (reset! observed
+                                {:identity (db/committed-cache-identity during)
+                                 :query (dq/q-with-evidence query during :c/new)})
+                        [[:db.fn/retractEntity :c/new]])]]
+                 report (if commit? (d/transact conn tx) (d/with before tx))]
+             (is (nil? (:identity @observed)))
+             (is (= :db.type/string
+                    (get-in @observed [:query :datahike.query/result])))
+             (is (= :datahike.cache.outcome/uncacheable
+                    (get-in @observed
+                            [:query :datahike.query/cache-evidence
+                             :datahike.cache/outcome])))
+             (is (nil? (d/q query (:db-after report) :c/new)))
+             (is (= identity-before (db/committed-cache-identity before)))
+             (when-not commit?
+               (is (identical? before (:db-before report))))
+             (is (not (contains? (:schema (:db-after report)) :c/new)))))))))
+
+#?(:clj
    (deftest query-result-cache-binding-suppresses-reads-and-writes
      (with-temp-db
        (conj label-schema {:c/id "cache-dial" :c/note "value"})
