@@ -426,7 +426,7 @@
      :referentially-transparent? false
      :capability-operation :datahike.operation/transact
      :returns-host-value? true
-     :doc "Applies transaction to the database and updates connection. Blocks until committed. WARNING: Do not call from listener callbacks or transaction functions — use transact! instead to avoid deadlocks."
+     :doc "Applies transaction to the database and updates connection. Blocks until committed. Optional :tx-meta key :datahike/validate-report is a process-local callback, removed before metadata is stored. It receives the final report plus :datahike/attempted-tx-data (including idempotent assertions). Return nil to accept or any value to reject the entire transaction with :transaction/validation-rejected and :datahike/validation-refusal; throwing also rejects. Runs once after expansion, before commit, without replaying transaction functions. WARNING: Do not call from listener callbacks or transaction functions — use transact! instead to avoid deadlocks."
      :examples [{:desc "Add single datom"
                  :code "(transact conn [[:db/add 1 :name \"Ivan\"]])"}
                 {:desc "Retract datom"

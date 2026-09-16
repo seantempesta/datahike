@@ -6,6 +6,7 @@
    queued transact hung. commit! now converts Errors to ex-info at the go
    boundary, so callbacks receive the error and the writer shuts down."
   (:require [datahike.api :as d]
+            [datahike.core :as core]
             [datahike.writer :as writer]
             [datahike.writing :as dw]
             [clojure.core.async :as async]
@@ -91,6 +92,86 @@
         (is (instance? Throwable (:error unexpected-payload)))
         (is (map? (:invocation unexpected-payload)))
         (is (= [] (:args unexpected-payload)))))))
+
+(deftest final-report-validation-is-atomic-and-preserves-composition
+  (doseq [history? [true false]]
+    (let [cfg {:store {:backend :memory :id (random-uuid)}
+               :schema-flexibility :write :keep-history? history?}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          calls (atom 0)
+          observations (atom [])
+          notifications (atom 0)
+          refusal {:test/entity "incomplete" :test/key :test/y}
+          validate (fn [report]
+                     (swap! observations conj report)
+                     (when (some (fn [datom]
+                                   (and (= :test/id (:a datom))
+                                        (= "incomplete" (:v datom))))
+                                 (:datahike/attempted-tx-data report))
+                       refusal))]
+      (try
+        (d/transact conn [{:db/ident :test/id :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+                          {:db/ident :test/x :db/valueType :db.type/long
+                           :db/cardinality :db.cardinality/one}
+                          {:db/ident :test/y :db/valueType :db.type/long
+                           :db/cardinality :db.cardinality/one}
+                          {:db/ident :test/xy :db/tupleAttrs [:test/x :test/y]
+                           :db/valueType :db.type/tuple :db/cardinality :db.cardinality/one}])
+        (core/listen! conn ::validation (fn [_] (swap! notifications inc)))
+        (let [basis (:max-tx @conn)
+              rejected (try
+                         (d/transact conn
+                           {:tx-data [{:test/id "valid" :test/x 1 :test/y 2}
+                                      [:db/add -1 :test/id "incomplete"]]
+                            :tx-meta {:datahike/validate-report validate}})
+                         nil
+                         (catch Exception failure
+                           (some #(when (:error (ex-data %)) (ex-data %))
+                                 (take-while some? (iterate ex-cause failure)))))]
+          (is (= :transaction/validation-rejected (:error rejected)))
+          (is (= refusal (:datahike/validation-refusal rejected)))
+          (is (= basis (:max-tx @conn)))
+          (is (empty? (d/q '[:find ?e :where [?e :test/id]] @conn)))
+          (is (zero? @notifications)))
+        (reset! observations [])
+        (let [result (d/transact conn
+                       {:tx-data [{:test/id "composed" :test/x 3}
+                                  [:db.fn/call
+                                   (fn [_]
+                                     (swap! calls inc)
+                                     [[:db.fn/call
+                                       (fn [_]
+                                         [[:db/add [:test/id "composed"] :test/y 4]])]])]]
+                        :tx-meta {:datahike/validate-report validate}})]
+          (is (= 1 @calls) "validation does not replay transaction functions")
+          (is (= 1 (count @observations)))
+          (is (= [3 4] (:test/xy (d/pull (:db-after (first @observations))
+                                       '[*] [:test/id "composed"]))))
+          (is (not (contains? (:tx-meta result) :datahike/validate-report)))
+          (is (not (contains? result :datahike/attempted-tx-data))))
+        (reset! observations [])
+        (d/transact conn {:tx-data [[:db/add [:test/id "composed"] :test/x 3]]
+                          :tx-meta {:datahike/validate-report validate}})
+        (is (some #(= :test/x (:a %))
+                  (:datahike/attempted-tx-data (first @observations)))
+            "idempotent assertions still reach validation")
+        (reset! observations [])
+        (d/transact conn {:tx-data [[:db/add -1 :test/x 5]
+                                   [:db/add -1 :test/id "composed"]]
+                          :tx-meta {:datahike/validate-report validate}})
+        (is (= 1 (count @observations))
+            "native tempid retries preserve the final callback and invoke it once")
+        (is (= 5 (:test/x (d/pull @conn '[*] [:test/id "composed"]))))
+        (reset! observations [])
+        (d/transact conn {:tx-data [[:db/retract [:test/id "composed"] :test/y 4]]
+                          :tx-meta {:datahike/validate-report validate}})
+        (is (nil? (:test/y (d/pull (:db-after (first @observations))
+                                 '[*] [:test/id "composed"]))))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
 
 (deftest queued-expected-basis-observes-the-threaded-uncommitted-head
   (let [processed (atom 0)

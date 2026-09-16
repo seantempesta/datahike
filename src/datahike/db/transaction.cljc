@@ -1,6 +1,7 @@
 (ns datahike.db.transaction
   (:require
    [clojure.spec.alpha :as s]
+   [clojure.set]
    [clojure.string :as str]
    [datahike.index :as di]
    [datahike.datom :as dd :refer [datom datom-tx datom-added datom?]]
@@ -1202,12 +1203,28 @@
                         :db.valid/from vf
                         :db.valid/to vt})))))))
 
+(defn- validate-report
+  "Run the optional final-report validator once; nil accepts, any value rejects.
+   Attempted datoms include idempotent assertions; public :tx-data stays effective.
+   The callback and its diagnostic are never stored as transaction metadata."
+  [report validator attempted]
+  (when validator
+    (when-some [refusal (validator (assoc report :datahike/attempted-tx-data attempted))]
+      (throw (ex-info "Transaction report validation rejected."
+                      {:error :transaction/validation-rejected
+                       :datahike/validation-refusal refusal}))))
+  report)
+
 (defn transact-tx-data [{:keys [db-before] :as initial-report} initial-es]
   (when-not (or (nil? initial-es)
                 (sequential? initial-es))
     (log/raise "Bad transaction data " initial-es ", expected sequential collection"
                {:error :transact/syntax, :tx-data initial-es}))
-  (let [has-tuples? (seq (dbi/-attrs-by (:db-after initial-report) :db.type/tuple))
+  (let [validator (or (::report-validator initial-report)
+                      (get-in initial-report [:tx-meta :datahike/validate-report]))
+        initial-report (cond-> (update initial-report :tx-meta dissoc :datahike/validate-report)
+                         validator (assoc ::report-validator validator))
+        has-tuples? (seq (dbi/-attrs-by (:db-after initial-report) :db.type/tuple))
         initial-es' (if has-tuples?
                       (interleave initial-es (repeat ::flush-tuples))
                       initial-es)
@@ -1249,13 +1266,14 @@
             ;; discipline.
             (validate-cross-tx-vt-windows! report)
             (-> report
-                (dissoc ::pending-vt-validation)
+                (dissoc ::pending-vt-validation ::report-validator)
                 (assoc :tx-data (vec (::effective-tx-data report)))
                 (dissoc ::effective-tx-data)
                 (assoc-in [:tempids :db/current-tx] (current-tx report))
                 (update-in [:db-after :max-tx] inc)
                 (update :db-after persistent!)
-                (update :db-after finalize-secondary-indices)))
+                (update :db-after finalize-secondary-indices)
+                (validate-report validator (:tx-data report))))
 
           (nil? entity)
           (recur report entities)
