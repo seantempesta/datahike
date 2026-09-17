@@ -58,6 +58,12 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Notable fixes
 
+- **Committed writes complete independently of listeners** — `transact!` and
+  `merge-db!` now realize their committed reports before invoking listeners,
+  and isolate each listener failure with an error diagnostic so one faulty or
+  blocked callback cannot strand the caller or suppress later callbacks.
+  ([#TODO])
+
 - **Automatic component pulls invalidate on child changes** — pull dependency
   evidence now widens bare forward component refs to `:all`, matching the
   wildcard expansion that reads the component entity. Explicit nested,

@@ -390,6 +390,17 @@
                 ident))
             after))))
 
+(defn- notify-listeners!
+  "Notify every listener independently after a committed result is settled."
+  [listeners tx-report]
+  (doseq [[listener-key callback] listeners]
+    (try
+      (callback tx-report)
+      (catch #?(:clj Throwable :cljs :default) exception
+        (log/error :datahike/listener-error
+                   {:listener-key listener-key
+                    :exception exception})))))
+
 (defn transact!
   [connection arg-map]
   (let [p (throwable-promise)
@@ -397,7 +408,9 @@
     (go
       (let [tx-report (<! (dispatch! writer
                                      {:op 'transact!
-                                      :args [arg-map]}))]
+                                      :args [arg-map]}))
+            listeners (some-> (:listeners (meta connection)) deref)]
+        (#?(:clj deliver :cljs put!) p tx-report)
         (when (map? tx-report) ;; not error
           ;; Dispatch backfill for any newly created secondary indices
           #?(:clj
@@ -411,9 +424,7 @@
                    (when (map? build-result)
                      (dispatch! writer {:op 'install-secondary-index!
                                         :args [build-result]}))))))
-          (doseq [[_ callback] (some-> (:listeners (meta connection)) (deref))]
-            (callback tx-report)))
-        (#?(:clj deliver :cljs put!) p tx-report)))
+          (notify-listeners! listeners tx-report))))
     p))
 
 (defn load-entities [connection entities]
@@ -436,11 +447,11 @@
     (go
       (let [tx-report (<! (dispatch! writer
                                      {:op 'merge!
-                                      :args [arg-map]}))]
+                                      :args [arg-map]}))
+            listeners (some-> (:listeners (meta connection)) deref)]
+        (#?(:clj deliver :cljs put!) p tx-report)
         (when (map? tx-report)
-          (doseq [[_ callback] (some-> (:listeners (meta connection)) (deref))]
-            (callback tx-report)))
-        (#?(:clj deliver :cljs put!) p tx-report)))
+          (notify-listeners! listeners tx-report))))
     p))
 
 (defn gc-storage! [conn & args]

@@ -33,6 +33,96 @@
     {:error :transact/schema
      :attribute :test/value})))
 
+(defn- listener-operation!
+  [operation conn value]
+  (case operation
+    :transact (d/transact! conn [{:db/id -1 :listener/value value}])
+    :merge (d/merge-db! conn #{:listener-parent}
+                        [{:db/id -1 :listener/value value}])))
+
+(defn- prepare-listener-operation!
+  [operation conn]
+  (when (= :merge operation)
+    (d/branch! conn :db :listener-parent)))
+
+(deftest listener-failure-cannot-suppress-committed-results-or-other-listeners
+  (doseq [operation [:transact :merge]]
+    (testing (name operation)
+      (let [cfg {:store {:backend :memory :id (random-uuid)}
+                 :schema-flexibility :read}
+            _ (d/create-database cfg)
+            conn (d/connect cfg)
+            survivor-count (atom 0)
+            diagnostic (promise)
+            listener-error (ex-info "synthetic listener failure"
+                                    {:type :test/listener-failure})
+            log-fn (fn [_logger-ns _coordinates level id lazy-data]
+                     (let [data (force (force lazy-data))
+                           payload (or (:msg data) (:data data))]
+                       (when (= :datahike/listener-error id)
+                         (deliver diagnostic {:level level
+                                              :payload payload}))))]
+        (try
+          (prepare-listener-operation! operation conn)
+          (core/listen! conn ::throwing (fn [_] (throw listener-error)))
+          (core/listen! conn ::survivor (fn [_] (swap! survivor-count inc)))
+          (binding [trove/*log-fn* log-fn]
+            (let [first-report (deref (listener-operation! operation conn 1)
+                                      10000 ::timeout)
+                  logged (deref diagnostic 10000 ::timeout)
+                  next-report (deref (d/transact! conn
+                                                  [{:db/id -1
+                                                    :listener/value 2}])
+                                     10000 ::timeout)]
+              (is (map? first-report)
+                  "the committed operation result is realized")
+              (is (= :error (:level logged)))
+              (is (= ::throwing (get-in logged [:payload :listener-key])))
+              (is (identical? listener-error
+                              (get-in logged [:payload :exception])))
+              (is (map? next-report)
+                  "a later transaction succeeds with the faulty listener installed")
+              (is (= 2 @survivor-count)
+                  "other listeners receive both committed reports")))
+          (finally
+            (core/unlisten! conn ::throwing)
+            (core/unlisten! conn ::survivor)
+            (d/release conn)
+            (d/delete-database cfg)))))))
+
+(deftest committed-results-are-realized-before-blocked-listeners-return
+  (doseq [operation [:transact :merge]]
+    (testing (name operation)
+      (let [cfg {:store {:backend :memory :id (random-uuid)}
+                 :schema-flexibility :read}
+            _ (d/create-database cfg)
+            conn (d/connect cfg)
+            entered (java.util.concurrent.CountDownLatch. 1)
+            release (java.util.concurrent.CountDownLatch. 1)
+            finished (java.util.concurrent.CountDownLatch. 1)]
+        (try
+          (prepare-listener-operation! operation conn)
+          (core/listen!
+           conn ::blocked
+           (fn [_]
+             (.countDown entered)
+             (try
+               (.await release 10 java.util.concurrent.TimeUnit/SECONDS)
+               (finally
+                 (.countDown finished)))))
+          (let [pending (listener-operation! operation conn 1)]
+            (is (.await entered 10 java.util.concurrent.TimeUnit/SECONDS)
+                "the listener entered its bounded block")
+            (is (map? (deref pending 10000 ::timeout))
+                "the committed result is available before listener release"))
+          (finally
+            (.countDown release)
+            (is (.await finished 10 java.util.concurrent.TimeUnit/SECONDS)
+                "the listener exits after release")
+            (core/unlisten! conn ::blocked)
+            (d/release conn)
+            (d/delete-database cfg)))))))
+
 (deftest expected-refusal-log-is-bounded-and-unexpected-error-stays-complete
   (let [events (atom [])
         console-log (trove-console/get-log-fn {:min-level :error})
