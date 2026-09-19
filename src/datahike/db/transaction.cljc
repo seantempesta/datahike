@@ -363,6 +363,20 @@
    :cljs
    (defn finalize-secondary-indices [db] db))
 
+(defn- prune-retracted-schema-entry
+  "Drop entity `e`'s schema entry once every attribute of it has been
+   retracted. Retracting `:db/ident` parks the attribute's remaining schema
+   under its entity id so the remaining retractions can find it; without
+   this, the emptied `e -> {}` stayed in the schema map forever, so a
+   workload that creates and drops attributes (DROP/CREATE TABLE in
+   pg-datahike) grew the schema map without bound and every schema scan
+   slowed down with it. A live attribute's entry is its ident keyword, never
+   a map, so only fully retracted entries match."
+  [db e]
+  (if (= {} (get-in db [:schema e]))
+    (update db :schema dissoc e)
+    db))
+
 (defn remove-schema [db ^Datom datom]
   (let [schema (dbi/-schema db)
         attribute-refs? (:attribute-refs? (dbi/-config db))
@@ -392,11 +406,13 @@
           (-> (assoc-in db [:schema e] (dissoc attribute-schema a-ident))
               (update :schema #(dissoc % v-ident))
               (update :ident-ref-map #(dissoc % v-ident))
-              (update :ref-ident-map #(dissoc % e)))))
+              (update :ref-ident-map #(dissoc % e))
+              (prune-retracted-schema-entry e))))
       (if-let [schema-entry (schema e)]
         (if (schema schema-entry)
           (update-in db [:schema schema-entry] #(dissoc % a-ident))
-          (update-in db [:schema e] #(dissoc % a-ident v-ident)))
+          (-> (update-in db [:schema e] #(dissoc % a-ident v-ident))
+              (prune-retracted-schema-entry e)))
         (let [err-msg (str "Schema with entity id " e " does not exist")
               err-map {:error :retract/schema :entity-id e :attribute a :value e}]
           (throw (ex-info err-msg err-map)))))))
