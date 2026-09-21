@@ -82,36 +82,25 @@
 ;; at the cost of higher latency
 (def ^:const DEFAULT_COMMIT_WAIT_TIME 0) ;; in ms
 
-(def ^:private expected-refusal-cause-limit 256)
-
-(defn- one-line-cause
-  "Render a bounded single-line cause for an expected writer refusal."
-  [error]
-  (let [message (or (ex-message error) "Transaction rejected.")
-        characters (into [] (take (inc expected-refusal-cause-limit)) message)
-        truncated? (> (count characters) expected-refusal-cause-limit)
-        shown (if truncated?
-                (take (dec expected-refusal-cause-limit) characters)
-                characters)]
-    (str (apply str
-                (map (fn [character]
-                       (if (or (= character \newline)
-                               (= character \return))
-                         \space
-                         character))
-                     shown))
-         (when truncated? "…"))))
-
-(defn- expected-refusal-face
-  "Return the bounded log face for a classified transaction refusal."
-  [error]
-  (let [data (ex-data error)
-        kind (or (:seon.error/kind data) (:error data))]
-    (when (some? kind)
-      (cond-> {:kind kind
-               :cause (one-line-cause error)}
-        (some? (:attribute data))
-        (assoc :attribute (:attribute data))))))
+(defn- write-error-log
+  "Log exception structure and identities, never invocation arguments or exception data."
+  [database invocation error]
+  (let [identity-keys [:seon.cluster/name :seon.test/sym :seon.test.run/id
+                       :seon.error/id]
+        identities (merge (select-keys (:seon.error/diagnostic-evidence (ex-data error)) identity-keys)
+                          (select-keys (ex-data error) identity-keys)
+                          (select-keys (get-in invocation [:args 0 :tx-meta]) identity-keys)
+                          (select-keys invocation identity-keys))]
+    (merge identities
+           {:op (:op invocation)
+            :branch (get-in database [:config :branch])
+            :datahike/commit-id (get-in database [:meta :datahike/commit-id])
+            :error #?(:clj (-> (Throwable->map error)
+                               (dissoc :data)
+                               (update :via #(mapv (fn [cause] (dissoc cause :data)) %)))
+                      :cljs {:type (.-name error)
+                             :cause (.-message error)
+                             :trace (.-stack error)})})))
 
 (defn create-thread
   "Creates new transaction thread"
@@ -149,16 +138,8 @@
                             ;; Catch all Throwables to handle AssertionError and other Errors
                             ;; These should crash the writer, but we deliver to callback first to prevent hangs
                                     (catch #?(:clj Throwable :cljs js/Error) e
-                                      (if-let [face (expected-refusal-face e)]
-                                        ;; A classified refusal is an ordinary
-                                        ;; transaction result. Keep its log to
-                                        ;; one bounded face and never attach the
-                                        ;; throwable, invocation, or tx args.
-                                        (log/error :datahike/write-rejected face)
-                                        (log/error :datahike/write-error
-                                                   {:invocation invocation
-                                                    :error e
-                                                    :args args}))
+                                      (log/error :datahike/write-error
+                                                 (write-error-log old invocation e))
                               ;; take a guess that a NPE was triggered by an invalid connection
                               ;; short circuit on errors
                                       #?(:cljs (put! callback e)

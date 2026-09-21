@@ -11,27 +11,12 @@
             [datahike.writing :as dw]
             [clojure.core.async :as async]
             [clojure.test :refer [deftest is testing]]
-            [taoensso.trove :as trove]
-            [taoensso.trove.console :as trove-console]))
+            [taoensso.trove :as trove]))
 
 (defn- take-with-timeout [channel]
   (let [timeout (async/timeout 10000)
         [value port] (async/alts!! [channel timeout])]
     (if (= port timeout) ::timeout value)))
-
-(defn- line-count [text]
-  (if (empty? text)
-    0
-    (inc (count (filter #{\newline} text)))))
-
-(defn- oversized-refusal [_]
-  (throw
-   (ex-info
-    (str (apply str (repeat 2048 "x"))
-         "\n"
-         (apply str (repeat 2048 "y")))
-    {:error :transact/schema
-     :attribute :test/value})))
 
 (defn- listener-operation!
   [operation conn value]
@@ -123,65 +108,45 @@
             (d/release conn)
             (d/delete-database cfg)))))))
 
-(deftest expected-refusal-log-is-bounded-and-unexpected-error-stays-complete
+(deftest writer-log-preserves-exception-and-identities-without-arguments
   (let [events (atom [])
-        console-log (trove-console/get-log-fn {:min-level :error})
-        log-fn (fn [namespace coordinates level id lazy-data]
-                 (let [data (force (force lazy-data))]
-                   (swap! events conj
-                          {:namespace namespace
-                           :coordinates coordinates
-                           :level level
-                           :id id
-                           :payload (or (:msg data) (:data data))})
-                   (when (= :datahike/write-rejected id)
-                     (console-log namespace coordinates level id data))))
+        argument (Object.)
+        failure (ex-info "unexpected writer failure" {:offending-value argument})
         cfg {:store {:backend :memory :id (random-uuid)}
              :schema-flexibility :read
-             :writer
-             {:backend :self
-              :write-fn-map
-              {'unexpected-op
-               (fn [_]
-                 (throw (ex-info "unexpected writer failure"
-                                 {:type :test/unexpected-writer-failure})))}}}]
-    (binding [trove/*log-fn* log-fn]
-      (let [stderr (java.io.StringWriter.)
-            _ (binding [*err* stderr]
-                (d/create-database cfg)
-                (let [conn (d/connect cfg)]
-                  (try
-                    (is (thrown? Throwable
-                                 (d/transact conn
-                                             [[:db.fn/call oversized-refusal]])))
-                    (let [error (take-with-timeout
-                                 (writer/dispatch! (:writer @conn)
-                                                   {:op 'unexpected-op
-                                                    :args []}))]
-                      (is (instance? Throwable error)))
-                    (finally
-                      (try (d/release conn) (catch Throwable _)))))
-                (when (d/database-exists? cfg)
-                  (d/delete-database cfg)))
-            output (str stderr)
-            refusal-events (filterv #(= :datahike/write-rejected (:id %)) @events)
-            unexpected-events (filterv #(= :datahike/write-error (:id %)) @events)
-            refusal-payload (:payload (first refusal-events))
-            unexpected-payload (:payload (first unexpected-events))]
-        (is (= 1 (count refusal-events)))
-        (is (= :transact/schema (:kind refusal-payload))
-            (pr-str (first refusal-events)))
-        (is (= :test/value (:attribute refusal-payload))
-            (pr-str (first refusal-events)))
-        (is (<= (count (:cause refusal-payload)) 256))
-        (is (<= (line-count output) 3)
-            (str "expected refusal emitted " (line-count output) " stderr lines"))
-        (is (<= (count output) 512)
-            (str "expected refusal emitted " (count output) " stderr characters"))
-        (is (= 1 (count unexpected-events)))
-        (is (instance? Throwable (:error unexpected-payload)))
-        (is (map? (:invocation unexpected-payload)))
-        (is (= [] (:args unexpected-payload)))))))
+             :writer {:backend :self
+                      :write-fn-map {'unexpected-op (fn [_ supplied]
+                                                     (is (identical? argument supplied))
+                                                     (throw failure))}}}]
+    (binding [trove/*log-fn*
+              (fn [_ _ _ id lazy-data]
+                (let [data (force (force lazy-data))]
+                  (swap! events conj [id (or (:msg data) (:data data))])))]
+      (d/create-database cfg)
+      (let [conn (d/connect cfg)]
+        (try
+          (let [database @conn
+                result (take-with-timeout
+                        (writer/dispatch! (:writer database)
+                                          {:op 'unexpected-op :args [argument]
+                                           :seon.cluster/name "writer-test"
+                                           :seon.test/sym 'datahike.test.writer-error-test/example}))
+                [event payload] (first (filter #(= :datahike/write-error (first %)) @events))]
+            (is (identical? failure result) "Callback retains the actual offending value.")
+            (is (= :datahike/write-error event))
+            (is (= 'unexpected-op (:op payload)))
+            (is (= "writer-test" (:seon.cluster/name payload)))
+            (is (= 'datahike.test.writer-error-test/example (:seon.test/sym payload)))
+            (is (= (get-in database [:config :branch]) (:branch payload)))
+            (is (= (get-in database [:meta :datahike/commit-id]) (:datahike/commit-id payload)))
+            (is (= "unexpected writer failure" (get-in payload [:error :cause])))
+            (is (= 'clojure.lang.ExceptionInfo (get-in payload [:error :via 0 :type])))
+            (is (seq (get-in payload [:error :trace])))
+            (is (not-any? #(and (map? %) (some (partial contains? %) [:args :invocation :data :offending-value]))
+                          (tree-seq coll? seq payload))))
+          (finally
+            (d/release conn)
+            (d/delete-database cfg)))))))
 
 (deftest final-report-validation-is-atomic-and-preserves-composition
   (doseq [history? [true false]]
