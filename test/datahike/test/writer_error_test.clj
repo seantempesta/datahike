@@ -111,7 +111,10 @@
 (deftest writer-log-preserves-exception-and-identities-without-arguments
   (let [events (atom [])
         argument (Object.)
-        failure (ex-info "unexpected writer failure" {:offending-value argument})
+        failure (ex-info "unexpected writer failure"
+                         {:offending-value argument
+                          :seon.error/data {:seon.error/diagnostic-evidence
+                                            {:seon.test.run/id "writer-run"}}})
         cfg {:store {:backend :memory :id (random-uuid)}
              :schema-flexibility :read
              :writer {:backend :self
@@ -136,6 +139,7 @@
             (is (= :datahike/write-error event))
             (is (= 'unexpected-op (:op payload)))
             (is (= "writer-test" (:seon.cluster/name payload)))
+            (is (= "writer-run" (:seon.test.run/id payload)))
             (is (= 'datahike.test.writer-error-test/example (:seon.test/sym payload)))
             (is (= (get-in database [:config :branch]) (:branch payload)))
             (is (= (get-in database [:meta :datahike/commit-id]) (:datahike/commit-id payload)))

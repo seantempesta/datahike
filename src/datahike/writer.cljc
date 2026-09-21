@@ -87,7 +87,7 @@
   [database invocation error]
   (let [identity-keys [:seon.cluster/name :seon.test/sym :seon.test.run/id
                        :seon.error/id]
-        identities (merge (select-keys (:seon.error/diagnostic-evidence (ex-data error)) identity-keys)
+        identities (merge (select-keys (get-in (ex-data error) [:seon.error/data :seon.error/diagnostic-evidence]) identity-keys)
                           (select-keys (ex-data error) identity-keys)
                           (select-keys (get-in invocation [:args 0 :tx-meta]) identity-keys)
                           (select-keys invocation identity-keys))]
