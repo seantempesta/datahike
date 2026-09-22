@@ -58,6 +58,8 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Notable fixes
 
+- **Writer refusal completion** — non-map diagnostic evidence no longer crashes refusal logging, and an accepted invocation receives its failure before diagnostic formatting or delivery can fail. ([#TODO])
+
 - **Committed writes complete independently of listeners** — `transact!` and
   `merge-db!` now realize their committed reports before invoking listeners,
   and isolate each listener failure with an error diagnostic so one faulty or

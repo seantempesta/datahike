@@ -87,10 +87,13 @@
   [database invocation error]
   (let [identity-keys [:seon.cluster/name :seon.test/sym :seon.test.run/id
                        :seon.error/id]
-        identities (merge (select-keys (get-in (ex-data error) [:seon.error/data :seon.error/diagnostic-evidence]) identity-keys)
-                          (select-keys (ex-data error) identity-keys)
-                          (select-keys (get-in invocation [:args 0 :tx-meta]) identity-keys)
-                          (select-keys invocation identity-keys))]
+        identities (into {}
+                         (comp (filter map?)
+                               (mapcat #(select-keys % identity-keys)))
+                         [(get-in (ex-data error) [:seon.error/data :seon.error/diagnostic-evidence])
+                          (ex-data error)
+                          (get-in invocation [:args 0 :tx-meta])
+                          invocation])]
     (merge identities
            {:op (:op invocation)
             :branch (get-in database [:config :branch])
@@ -138,8 +141,6 @@
                             ;; Catch all Throwables to handle AssertionError and other Errors
                             ;; These should crash the writer, but we deliver to callback first to prevent hangs
                                     (catch #?(:clj Throwable :cljs js/Error) e
-                                      (log/error :datahike/write-error
-                                                 (write-error-log old invocation e))
                               ;; take a guess that a NPE was triggered by an invalid connection
                               ;; short circuit on errors
                                       #?(:cljs (put! callback e)
@@ -152,6 +153,10 @@
                                                            :connection connection
                                                            :error      e})
                                                  e)))
+                                      ;; The accepted caller must receive its failure even
+                                      ;; when formatting or delivering the diagnostic throws.
+                                      (log/error :datahike/write-error
+                                                 (write-error-log old invocation e))
                               ;; Re-throw Errors (AssertionError, OutOfMemoryError, etc.) to crash the writer
                               ;; Only Exceptions should be handled and allow the writer to continue.
                               ;; CLOSE the queues first: a dead loop with open queues would accept

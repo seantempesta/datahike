@@ -109,47 +109,82 @@
             (d/delete-database cfg)))))))
 
 (deftest writer-log-preserves-exception-and-identities-without-arguments
-  (let [events (atom [])
-        argument (Object.)
-        failure (ex-info "unexpected writer failure"
-                         {:offending-value argument
-                          :seon.error/data {:seon.error/diagnostic-evidence
-                                            {:seon.test.run/id "writer-run"}}})
+  (doseq [evidence [{:seon.test.run/id "writer-run"} "effect-id" :effect/id ["effect-id"] nil]]
+    (let [events (atom [])
+          logged (promise)
+          argument (Object.)
+          failure (ex-info "unexpected writer failure"
+                           {:offending-value argument
+                            :seon.error/data {:seon.error/diagnostic-evidence
+                                              evidence}})
+          cfg {:store {:backend :memory :id (random-uuid)}
+               :schema-flexibility :read
+               :writer {:backend :self
+                        :write-fn-map {'unexpected-op (fn [_ supplied]
+                                                       (is (identical? argument supplied))
+                                                       (throw failure))}}}]
+      (binding [trove/*log-fn*
+                (fn [_ _ _ id lazy-data]
+                  (let [data (force (force lazy-data))]
+                    (swap! events conj [id (or (:msg data) (:data data))])
+                    (when (= :datahike/write-error id)
+                      (deliver logged true))))]
+        (d/create-database cfg)
+        (let [conn (d/connect cfg)]
+          (try
+            (let [database @conn
+                  result (take-with-timeout
+                          (writer/dispatch! (:writer database)
+                                            {:op 'unexpected-op :args [argument]
+                                             :seon.cluster/name "writer-test"
+                                             :seon.test/sym 'datahike.test.writer-error-test/example}))
+                  _ (is (true? (deref logged 10000 false)) "The refusal diagnostic completes.")
+                  [event payload] (first (filter #(= :datahike/write-error (first %)) @events))]
+              (is (identical? failure result) "Callback retains the actual offending value.")
+              (is (= :datahike/write-error event))
+              (is (= 'unexpected-op (:op payload)))
+              (is (= "writer-test" (:seon.cluster/name payload)))
+              (is (= (when (map? evidence) "writer-run") (:seon.test.run/id payload)))
+              (is (= 'datahike.test.writer-error-test/example (:seon.test/sym payload)))
+              (is (= (get-in database [:config :branch]) (:branch payload)))
+              (is (= (get-in database [:meta :datahike/commit-id]) (:datahike/commit-id payload)))
+              (is (= "unexpected writer failure" (get-in payload [:error :cause])))
+              (is (= 'clojure.lang.ExceptionInfo (get-in payload [:error :via 0 :type])))
+              (is (seq (get-in payload [:error :trace])))
+              (is (not-any? #(and (map? %) (some (partial contains? %) [:args :invocation :data :offending-value]))
+                            (tree-seq coll? seq payload)))
+              (is (map? (deref (d/transact! conn [{:db/id -1 :test/value 1}]) 10000 ::timeout))
+                  "Expected refusals leave the writer able to commit."))
+            (finally
+              (d/release conn)
+              (d/delete-database cfg))))))))
+
+(deftest diagnostic-failure-cannot-strand-the-refused-invocation
+  (let [refusal (ex-info "expected refusal" {:type ::refused})
+        log-failure (ex-info "diagnostic sink failed" {:type ::diagnostic-failed})
         cfg {:store {:backend :memory :id (random-uuid)}
              :schema-flexibility :read
              :writer {:backend :self
-                      :write-fn-map {'unexpected-op (fn [_ supplied]
-                                                     (is (identical? argument supplied))
-                                                     (throw failure))}}}]
-    (binding [trove/*log-fn*
-              (fn [_ _ _ id lazy-data]
-                (let [data (force (force lazy-data))]
-                  (swap! events conj [id (or (:msg data) (:data data))])))]
+                      :write-fn-map {'refuse (fn [_] (throw refusal))}}}]
+    (binding [trove/*log-fn* (fn [_ _ _ id _]
+                              (when (= :datahike/write-error id)
+                                (throw log-failure)))]
       (d/create-database cfg)
-      (let [conn (d/connect cfg)]
+      (let [conn (d/connect cfg)
+            local-writer (:writer @conn)]
         (try
-          (let [database @conn
-                result (take-with-timeout
-                        (writer/dispatch! (:writer database)
-                                          {:op 'unexpected-op :args [argument]
-                                           :seon.cluster/name "writer-test"
-                                           :seon.test/sym 'datahike.test.writer-error-test/example}))
-                [event payload] (first (filter #(= :datahike/write-error (first %)) @events))]
-            (is (identical? failure result) "Callback retains the actual offending value.")
-            (is (= :datahike/write-error event))
-            (is (= 'unexpected-op (:op payload)))
-            (is (= "writer-test" (:seon.cluster/name payload)))
-            (is (= "writer-run" (:seon.test.run/id payload)))
-            (is (= 'datahike.test.writer-error-test/example (:seon.test/sym payload)))
-            (is (= (get-in database [:config :branch]) (:branch payload)))
-            (is (= (get-in database [:meta :datahike/commit-id]) (:datahike/commit-id payload)))
-            (is (= "unexpected writer failure" (get-in payload [:error :cause])))
-            (is (= 'clojure.lang.ExceptionInfo (get-in payload [:error :via 0 :type])))
-            (is (seq (get-in payload [:error :trace])))
-            (is (not-any? #(and (map? %) (some (partial contains? %) [:args :invocation :data :offending-value]))
-                          (tree-seq coll? seq payload))))
+          (is (identical? refusal
+                          (take-with-timeout
+                           (writer/dispatch! local-writer {:op 'refuse :args []})))
+              "The actual transaction refusal reaches its accepted caller.")
+          (is (instance? Throwable
+                         (take-with-timeout
+                          (writer/dispatch! local-writer
+                                            {:op 'transact!
+                                             :args [{:tx-data [{:test/value 1}]}]})))
+              "A later accepted invocation also resolves after diagnostic failure.")
           (finally
-            (d/release conn)
+            (try (d/release conn) (catch Throwable _))
             (d/delete-database cfg)))))))
 
 (deftest final-report-validation-is-atomic-and-preserves-composition
