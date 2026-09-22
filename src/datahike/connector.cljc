@@ -190,9 +190,10 @@
   "Top-level config keys that describe how records in the store are laid out
    and are therefore fixed when the database is created: :fuse-index-roots?
    (index roots inlined into the db record) and :commit-graph? (whether each
-   commit persists an immutable cid record). Adopted at connect like the
+   commit persists an immutable cid record), and :keep-history? (whether
+   temporal indexes are retained). Adopted at connect like the
    create-time-fixed :index-config sub-keys."
-  #{:fuse-index-roots? :commit-graph?})
+  #{:fuse-index-roots? :commit-graph? :keep-history?})
 
 (defn- adopt-create-time-fixed
   "Adopt store-fixed settings from the stored config into `config`: the
@@ -252,7 +253,7 @@
          ;; connection may carry adopted keys the caller's config omits;
          ;; conflicts are guarded on the fresh-connect path, not here.
          (dissoc :writer :store :store-cache-size :search-cache-size
-                 :index-config :fuse-index-roots? :commit-graph?))
+                 :index-config :fuse-index-roots? :commit-graph? :keep-history?))
       writer-key (assoc :writer writer-key))))
 
 (defn close-secondary-indices
@@ -272,6 +273,18 @@
            (:secondary-indices db))
      :cljs []))
 
+(declare release)
+
+(defn- checked-shared-connection
+  [config conn]
+  (try
+    (adopt-create-time-fixed config (:config @conn))
+    conn
+    (catch #?(:clj Throwable :cljs js/Error) failure
+      ;; The reservation already acquired this caller's reference.
+      (release conn)
+      (throw failure))))
+
 (defn -connect-impl* [config opts]
   (async+sync (:sync? opts) *default-sync-translation*
               (go-try-
@@ -286,7 +299,7 @@
                                                   acquisition-key physical-store-key)]
                  (case state
                    :existing
-                   conn
+                   (checked-shared-connection config conn)
 
                    :opening
                    (let [opened #?(:clj (if (:sync? opts)
@@ -296,7 +309,7 @@
                      (when (instance? #?(:clj Throwable :cljs js/Error) opened)
                        (throw opened))
                      (if opened
-                       opened
+                       (checked-shared-connection config opened)
                        (log/raise "Connection opening completed without a published connection."
                                   {:type :connection-opening-not-published
                                    :conn-id conn-id})))
@@ -448,7 +461,8 @@
                       (string? config) (dc/uri->config config)
                       (map? config) config
                       :else config)
-         loaded (dissoc (dc/load-config normalized) :initial-tx :remote-peer :name)]
+         loaded (cond-> (dissoc (dc/load-config normalized) :initial-tx :remote-peer :name)
+                  (not (contains? normalized :keep-history?)) (dissoc :keep-history?))]
      (-connect* loaded opts))))
 
 (defn release
