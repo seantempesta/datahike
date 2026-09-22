@@ -409,6 +409,10 @@
          (d/pull test-db '[* :_child] 2))))
 
 (deftest test-pull-limit
+  (let [database (db/init-db (map #(dd/datom 8 :aka (str "aka-" %))
+                                  (range 1001)) test-schema)]
+    (is (= 1001 (count (:aka (d/pull database [:aka] 8)))))
+    (is (= 5 (count (:aka (d/pull database '[[:aka :limit 5]] 8))))))
   (let [db (db/init-db
             (concat
              test-datoms
@@ -420,14 +424,16 @@
                (dd/datom 8 :aka (str "aka-" idx))))
             test-schema)]
 
-    (testing "Without an explicit limit, the default is 1000"
-      (is (= 1000 (->> (d/pull db '[:aka] 8) :aka count))))
+    (testing "Without an explicit limit, every member is returned"
+      (is (= 2000 (->> (d/pull db '[:aka] 8) :aka count)))
+      (is (= 2000 (->> (d/pull db '[*] 8) :aka count))))
 
-    (testing "Explicit limit can reduce the default"
+    (testing "Explicit limits still request partial collections"
+      (is (= 5 (->> (d/pull db '[[:aka :limit 5]] 8) :aka count)))
       (is (= 500 (->> (d/pull db '[(limit :aka 500)] 8) :aka count)))
       (is (= 500 (->> (d/pull db '[[:aka :limit 500]] 8) :aka count))))
 
-    (testing "Explicit limit can increase the default"
+    (testing "Explicit limits above the former default are honored"
       (is (= 1500 (->> (d/pull db '[(limit :aka 1500)] 8) :aka count))))
 
     (testing "A nil limit produces unlimited results"

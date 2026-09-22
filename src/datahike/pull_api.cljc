@@ -13,7 +13,7 @@
   [transient-coll items]
   (reduce conj! transient-coll items))
 
-(def ^:private ^:const +default-limit+ 1000)
+(def ^:private ^:const +default-limit+ nil)
 
 (declare pull-spec-attribute-dependencies)
 
