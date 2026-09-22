@@ -253,6 +253,7 @@
                               (branch-as-db conn :db)))))
 
              (let [events (atom [])
+                   installed (atom nil)
                    multi-assoc k/multi-assoc
                    update-store k/update]
                (with-redefs [k/multi-assoc
@@ -263,8 +264,12 @@
                              (fn [store key update-fn & args]
                                (swap! events conj [:update key])
                                (apply update-store store key update-fn args))]
-                 (force-branch! db-t :db #{cid-t}
-                                {:expected-current-commit cid-head}))
+                 (reset! installed
+                         (force-branch! db-t :db #{cid-t}
+                                        {:expected-current-commit cid-head})))
+               (is (uuid? @installed))
+               (is (= @installed (commit-id (branch-as-db conn :db)))
+                   "force-branch! returns the head it installed")
                (is (= [:db :branches]
                       (->> @events
                            (keep #(when (= :update (first %)) (second %)))

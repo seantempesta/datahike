@@ -326,7 +326,8 @@
 
   By default this overwrites the branch head unconditionally, like git reset --hard.
   Pass `:expected-current-commit` in opts to reject a stale branch head before
-  mutation. The new head is read back and verified before this function returns.
+  mutation. The new head is read back and verified before this function returns;
+  its commit id is the return value.
 
   The caller must hold exclusive write access to this store before forcing a
   branch. The expected-head check catches stale plans, but konserve does not
@@ -449,7 +450,10 @@
                                         :branch branch
                                         :expected-commit cid
                                         :stored-commit stored-commit})))
-                        nil)
+                        ;; The installed head, verified under the roster
+                        ;; permit: callers identify their own update by it
+                        ;; instead of rereading a head another writer may move.
+                        cid)
                       (finally
                         (when owned-permit?
                           (guard/release-reachability-permit! roster-permit))))))))))
