@@ -379,16 +379,40 @@
                 ident))
             after))))
 
+(defn- retire-listener!
+  "Remove `listener-key` only while it still names the captured `callback`.
+   True when this call removed it; a replacement registered under the same
+   key survives."
+  [listeners listener-key callback]
+  (let [[before _] (swap-vals! listeners
+                               (fn [registered]
+                                 (if (identical? (get registered listener-key) callback)
+                                   (dissoc registered listener-key)
+                                   registered)))]
+    (identical? (get before listener-key) callback)))
+
 (defn- notify-listeners!
-  "Notify every listener independently after a committed result is settled."
-  [listeners tx-report]
+  "Notify every listener independently after a committed result is settled.
+   A failing callback with a `:listener-failure` handler in the connection's
+   meta (installed with `alter-meta!` on its `:wrapped-atom`) is retired by identity
+   first, then the handler receives the failure on this thread. Without a
+   handler the failure is logged and the listener stays registered."
+  [connection listeners tx-report]
   (doseq [[listener-key callback] listeners]
     (try
       (callback tx-report)
       (catch #?(:clj Throwable :cljs :default) exception
-        (log/error :datahike/listener-error
-                   {:listener-key listener-key
-                    :exception exception})))))
+        (if-let [handler (:listener-failure (meta connection))]
+          (let [retired? (retire-listener! (:listeners (meta connection))
+                                           listener-key callback)]
+            (handler {:listener-key listener-key
+                      :callback callback
+                      :exception exception
+                      :tx-report tx-report
+                      :retired? retired?}))
+          (log/error :datahike/listener-error
+                     {:listener-key listener-key
+                      :exception exception}))))))
 
 (defn transact!
   [connection arg-map]
@@ -413,7 +437,7 @@
                    (when (map? build-result)
                      (dispatch! writer {:op 'install-secondary-index!
                                         :args [build-result]}))))))
-          (notify-listeners! listeners tx-report))))
+          (notify-listeners! connection listeners tx-report))))
     p))
 
 (defn load-entities [connection entities]
@@ -440,7 +464,7 @@
             listeners (some-> (:listeners (meta connection)) deref)]
         (#?(:clj deliver :cljs put!) p tx-report)
         (when (map? tx-report)
-          (notify-listeners! listeners tx-report))))
+          (notify-listeners! connection listeners tx-report))))
     p))
 
 (defn gc-storage! [conn & args]
