@@ -187,6 +187,24 @@
            (.-state lru)
            (keys (:key-value (.-state lru))))))
 
+(defn weighted-update-where
+  "Replace each entry's value with `(f k v)`, removing the entry when that
+   returns nil. Recency is preserved; a changed value is reweighed and the
+   budget re-enforced."
+  [^WeightedLRU lru f]
+  (->WeightedLRU
+   (shrink-to-budget
+    (reduce-kv (fn [state k v]
+                 (let [updated (f k v)]
+                   (cond
+                     (nil? updated) (evict-key state k)
+                     (identical? updated v) state
+                     :else (-> state
+                               (reweigh k (entry-weight state updated))
+                               (store-value k updated)))))
+               (.-state lru)
+               (:key-value (.-state lru))))))
+
 (defcache LRUDatomCache [cache lru counts n-total-datoms tick datom-limit]
   CacheProtocol
   (lookup [_ item]

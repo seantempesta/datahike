@@ -143,9 +143,12 @@
                (is (= ["store-a" "store-b" "store-a" "store-b"]
                       [(d/q query db-a) (d/q query db-b)
                        (d/q query db-a) (d/q query db-b)]))
-               (is (= #{identity-a identity-b} (query-cache-keys)))
+               (is (= #{(#'dq/database-result-key identity-a)
+                        (#'dq/database-result-key identity-b)}
+                      (query-cache-keys)))
                (d/release conn-a)
-               (is (= #{identity-b} (query-cache-keys)))
+               (is (= #{(#'dq/database-result-key identity-b)}
+                      (query-cache-keys)))
                (is (= "store-b" (d/q query db-b))))
              (finally
                (try (d/release conn-a) (catch Exception _))
@@ -156,7 +159,12 @@
            (dq/clear-query-cache!))))))
 
 #?(:clj
-   (deftest sibling-branches-at-one-commit-have-independent-cache-scopes
+   (defn- cache-outcome [query database]
+     (get-in (dq/q-with-evidence query database)
+             [:datahike.query/cache-evidence :datahike.cache/outcome])))
+
+#?(:clj
+   (deftest sibling-branches-at-one-commit-share-one-result-bucket
      (let [cfg {:store {:backend :memory :id (random-uuid)}
                 :schema-flexibility :write :attribute-refs? false}]
        (try
@@ -173,20 +181,82 @@
                (try
                  (let [left-id (db/committed-cache-identity @left)
                        right-id (db/committed-cache-identity @right)
+                       shared [(:id (:store cfg)) head]
                        query '[:find ?n . :where [_ :c/note ?n]]]
-                   (is (= (last left-id) (last right-id)))
-                   (is (not= (first left-id) (first right-id)))
-                   (is (not= (second left-id) (second right-id)))
-                   (is (= ["base" "base"] [(d/q query @left) (d/q query @right)]))
-                   (is (= #{left-id right-id} (query-cache-keys)))
-                   (d/transact left [{:c/id "branch" :c/note "left-new"}])
-                   (is (= ["left-new" "base"] [(d/q query @left) (d/q query @right)]))
-                   (d/release left)
-                   (is (= #{right-id} (query-cache-keys)))
-                   (is (= "base" (d/q query @right))))
+                   (is (= (last left-id) (last right-id) head))
+                   (is (not= (first left-id) (first right-id))
+                       "the scoped identity still names each branch")
+                   (is (= :datahike.cache.outcome/miss-owner
+                          (cache-outcome query @left)))
+                   (is (= :datahike.cache.outcome/hit
+                          (cache-outcome query @right))
+                       "a sibling at the same commit reads the stored result")
+                   (is (= #{shared} (query-cache-keys)))
+                   (is (= #{left-id right-id}
+                          (get-in (lru/weighted-entries
+                                   (:lru @dq/query-result-cache))
+                                  [shared :owners])))
+                   (testing "a speculative value never enters the shared cache"
+                     (let [local (:db-after
+                                  (d/with @right [{:c/id "branch"
+                                                   :c/note "local"}]))]
+                       (is (= :datahike.cache.outcome/uncacheable
+                              (cache-outcome query local)))
+                       (is (= "local" (d/q query local)))
+                       (is (= #{shared} (query-cache-keys)))
+                       (is (= "base" (d/q query @right)))))
+                   (testing "a write moves only the writer to a new result key"
+                     (d/transact left [{:c/id "branch" :c/note "left-new"}])
+                     (is (= ["left-new" "base"]
+                            [(d/q query @left) (d/q query @right)]))
+                     (is (= #{shared [(:id (:store cfg)) (d/commit-id @left)]}
+                            (query-cache-keys))))
+                   (testing "release drops the scope, not a shared bucket"
+                     (d/release left)
+                     (is (= #{shared} (query-cache-keys)))
+                     (is (= #{right-id}
+                            (get-in (lru/weighted-entries
+                                     (:lru @dq/query-result-cache))
+                                    [shared :owners])))
+                     (is (= :datahike.cache.outcome/hit
+                            (cache-outcome query @right))))
+                   (testing "the last owner's release evicts the bucket"
+                     (d/release right)
+                     (is (empty? (query-cache-keys)))))
                  (finally
                    (try (d/release left) (catch Exception _))
-                   (d/release right))))))
+                   (try (d/release right) (catch Exception _)))))))
+         (finally
+           (d/delete-database cfg)
+           (dq/clear-query-cache!))))))
+
+#?(:clj
+   (deftest revisions-never-promote-a-result-across-connection-lineages
+     ;; A connection opens with no attribute revisions. An entry that `main`
+     ;; stored at its opening commit C0 and a fresh branch connection at K1
+     ;; therefore carry equal (empty) revisions although :c/note changed
+     ;; between them; only the lineage check refuses the promotion.
+     (let [cfg {:store {:backend :memory :id (random-uuid)}
+                :schema-flexibility :write :attribute-refs? false}
+           query '[:find ?n . :where [_ :c/note ?n]]]
+       (try
+         (dq/clear-query-cache!)
+         (d/create-database cfg)
+         (let [setup (d/connect cfg)]
+           (d/transact setup (conj label-schema {:c/id "x" :c/note "before"}))
+           (d/release setup))
+         (let [main (d/connect cfg)]
+           (try
+             (is (nil? (get-in @main [:cache-context
+                                      :datahike.cache/attribute-revisions])))
+             (is (= "before" (d/q query @main)))
+             (d/transact main [{:c/id "x" :c/note "after"}])
+             (d/branch! main (d/commit-id @main) :later)
+             (let [later (d/connect (assoc cfg :branch :later))]
+               (try
+                 (is (= "after" (d/q query @later)))
+                 (finally (d/release later))))
+             (finally (d/release main))))
          (finally
            (d/delete-database cfg)
            (dq/clear-query-cache!))))))
@@ -641,9 +711,10 @@
              (d/release conn)
              (is (zero? (:snapshot-count (dq/query-cache-metrics))))
              (#'dq/result-cache-put!
+              (#'dq/database-result-key (db/committed-cache-identity committed))
               (db/committed-cache-identity committed)
               ::late #{["stale"]} #{:c/note}
-              {(db/committed-cache-identity committed)
+              {(#'dq/database-result-key (db/committed-cache-identity committed))
                (:cache-context committed)}
               (:epoch @dq/query-result-cache))
              (is (zero? (:snapshot-count (dq/query-cache-metrics)))
@@ -673,9 +744,10 @@
            (dq/clear-query-cache!)
            (is (false?
                 (#'dq/result-cache-put!
+                 (#'dq/database-result-key (db/committed-cache-identity database))
                  (db/committed-cache-identity database)
                  ::late #{["stale"]} #{:c/note}
-                 {(db/committed-cache-identity database)
+                 {(#'dq/database-result-key (db/committed-cache-identity database))
                   (:cache-context database)}
                  admitted-epoch)))
            (is (zero? (:snapshot-count (dq/query-cache-metrics)))))))))

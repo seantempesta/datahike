@@ -2429,14 +2429,27 @@
 ;; ---------------------------------------------------------------------------
 ;; Query result cache
 ;;
-;; Global LRU cache keyed by exact committed identity
-;; [connection-id generation commit-id]. Speculative and temporal values do
-;; not cache. One atom owns both generation admission and LRU state so release
-;; cannot race a late cache put.
+;; Global LRU cache of results keyed by what they are a function of: a
+;; committed value's store identity and commit id ([store-id commit-id], plus
+;; the time point of an earlier numeric as-of view). Every branch and
+;; connection of one store at one commit shares one bucket. Speculative,
+;; filtered and non-numeric temporal values do not cache.
+;;
+;; The scoped key [connection-id generation commit-id] still owns lifetime:
+;; a put requires its scope's generation admitted, each bucket records the
+;; scoped keys that put or read it (:owners), single-flight coordinates per
+;; scope, and final release drops that scope from every bucket, evicting a
+;; bucket no admitted scope owns. One atom owns both generation admission
+;; and LRU state so release cannot race a late cache put.
 ;; Inspectable: @datahike.query/query-result-cache
 ;;
 ;; Structure: {:generations {connection-id generation}
-;;             :lru LRU {db-key -> {cache-key -> entry}}}
+;;             :lru LRU {result-key -> {:owners #{scoped-key}
+;;                                      :entries {cache-key -> entry}}}}
+;;
+;; Bound: *query-cache-size* buckets and *query-cache-weight-limit* total
+;; shallow result weight, both declared below; the weight of a bucket is the
+;; sum of its entries' weights.
 ;;
 ;; Inheritance: on demand, an older compatible entry is copied to the exact
 ;; current DB key after its dependency versions are proven unchanged.
@@ -2473,7 +2486,9 @@
   "Total cached structural weight of one DB-snapshot bucket — sums the
    per-entry :weight precomputed at cache-put time (see `result-weight`)."
   [bucket]
-  (reduce-kv (fn [acc _ entry] (+ acc (:weight entry 0))) 0 bucket))
+  (reduce-kv (fn [acc _ entry] (+ acc (:weight entry 0))) 0 (:entries bucket)))
+
+(def ^:private empty-result-bucket {:owners #{} :entries {}})
 
 (defn- empty-query-result-cache [size weight-limit]
   {:lru (lru/weighted-lru size weight-limit bucket-weight)
@@ -2598,10 +2613,18 @@
              (if (= generation (get generations connection-id))
                (let [before (count (lru/weighted-entries lru))
                      next-lru
-                     (lru/weighted-remove-where
+                     (lru/weighted-update-where
                       lru
-                      #(source-key-contains-generation?
-                        % connection-id generation))]
+                      (fn [_ {:keys [owners] :as bucket}]
+                        (let [remaining
+                              (into #{}
+                                    (remove #(source-key-contains-generation?
+                                              % connection-id generation))
+                                    owners)]
+                          (cond
+                            (empty? remaining) nil
+                            (= (count remaining) (count owners)) bucket
+                            :else (assoc bucket :owners remaining)))))]
                  (vreset! release {:current? true
                                    :snapshots (- before
                                                  (count (lru/weighted-entries
@@ -2657,6 +2680,31 @@
                  (< time-point (dbi/-max-tx origin)))
         (conj origin-key (long time-point))))
     (db/committed-cache-identity database)))
+
+(defn- database-result-key
+  "Return the shared result identity of one scoped database cache key.
+
+   A committed value's datoms are a function of its store and commit id: in
+   one store a commit id names one stored value (`datahike.writing/
+   create-commit-id`), and a connection id begins with its store identity
+   (`datahike.store/connection-id`). Branch and generation are dropped, so
+   every connection of that store at that commit shares the result."
+  [scoped-key]
+  (let [store-id (nth (nth scoped-key 0) 0)
+        commit-id (nth scoped-key 2)]
+    (if (== 3 (count scoped-key))
+      [store-id commit-id]
+      [store-id commit-id (nth scoped-key 3)])))
+
+(defn- source-result-key
+  "Map a scoped one-source or composite source key to its result key."
+  [source-key]
+  (if (= composite-source-key-tag (first source-key))
+    [composite-source-key-tag
+     (mapv (fn [[symbol position database-key]]
+             [symbol position (database-result-key database-key)])
+           (second source-key))]
+    (database-result-key source-key)))
 
 (defn- merge-attr-deps
   "Merge two attr-dep sets. :all dominates."
@@ -2937,6 +2985,7 @@
     [[nil nil source-key]]))
 
 (defn- compatible-source-keys?
+  "Same source bindings over the same stores; lineage is checked per context."
   [cached-source-key current-source-key]
   (let [cached-members (source-key-members cached-source-key)
         current-members (source-key-members current-source-key)]
@@ -2944,15 +2993,21 @@
             (mapv #(subvec % 0 2) current-members))
          (every? true?
                  (map (fn [cached current]
-                        (= (subvec (nth cached 2) 0 2)
-                           (subvec (nth current 2) 0 2)))
+                        (= (first (nth cached 2)) (first (nth current 2))))
                       cached-members current-members)))))
 
 (defn- source-context-unchanged?
+  "Revisions are comparable only within one connection generation: a
+   connection opens with no attribute revisions, so equal revisions across
+   two lineages would not prove equal datoms."
   [cached-context current-context attributes]
   (and (map? cached-context)
        (map? current-context)
        (not= attributes :all)
+       (= (:datahike.cache/connection-id cached-context)
+          (:datahike.cache/connection-id current-context))
+       (= (:datahike.cache/generation cached-context)
+          (:datahike.cache/generation current-context))
        (= (:datahike.cache/conservative-revision cached-context)
           (:datahike.cache/conservative-revision current-context))
        (every? (fn [attribute]
@@ -2964,7 +3019,7 @@
 
 (defn- inheritable-entry
   [lru current-source-key cache-key current-contexts]
-  (some (fn [[cached-source-key entries]]
+  (some (fn [[cached-source-key {:keys [entries]}]]
           (when (and (not= cached-source-key current-source-key)
                      (compatible-source-keys? cached-source-key
                                               current-source-key))
@@ -2988,51 +3043,68 @@
         (lru/weighted-entries lru)))
 
 (defn- result-cache-get
-  "Look up an exact result or lazily promote a dependency-safe older result."
-  [source-key cache-key current-contexts]
-  (when source-key
+  "Look up an exact result or lazily promote a dependency-safe older result.
+
+   `result-key` names the values; `scope-key` names the reading connection
+   generations. An admitted reader joins the bucket's owners."
+  [result-key scope-key cache-key current-contexts]
+  (when result-key
     (let [found (volatile! nil)]
       (swap! query-result-cache
-             (fn [{:keys [lru] :as state}]
-               (if-let [entry (get-in lru [source-key cache-key])]
-                 (do
-                   (vreset! found entry)
-                   (assoc state :lru
-                          (lru/weighted-touch lru source-key)))
-                 (if-let [entry
-                          (inheritable-entry lru source-key cache-key
-                                             current-contexts)]
-                   (let [promoted
-                         (assoc entry :source-contexts current-contexts)
-                         bucket (assoc (or (get lru source-key) {})
-                                       cache-key promoted)]
-                     (vreset! found promoted)
+             (fn [{:keys [lru generations] :as state}]
+               (let [bucket (get lru result-key)]
+                 (if-let [entry (get (:entries bucket) cache-key)]
+                   (do
+                     (vreset! found entry)
                      (assoc state :lru
-                            (assoc lru source-key bucket)))
-                   state))))
+                            (if (or (contains? (:owners bucket) scope-key)
+                                    (not (source-key-generations-current?
+                                          scope-key generations)))
+                              (lru/weighted-touch lru result-key)
+                              (assoc lru result-key
+                                     (update bucket :owners conj scope-key)))))
+                   (if-let [entry
+                            (inheritable-entry lru result-key cache-key
+                                               current-contexts)]
+                     (let [promoted
+                           (assoc entry :source-contexts current-contexts)]
+                       (vreset! found promoted)
+                       (if (source-key-generations-current?
+                            scope-key generations)
+                         (assoc state :lru
+                                (assoc lru result-key
+                                       (-> (or bucket empty-result-bucket)
+                                           (update :owners conj scope-key)
+                                           (assoc-in [:entries cache-key]
+                                                     promoted))))
+                         state))
+                     state)))))
       @found)))
 
 (defn- result-cache-put!
   "Store a query result when every source generation remains admitted."
-  [source-key cache-key result dependency-plan source-contexts expected-epoch]
+  [result-key scope-key cache-key result dependency-plan source-contexts
+   expected-epoch]
   (when-let [weight (and (pos? *query-cache-weight-limit*)
                          (result-weight result))]
-    (when source-key
+    (when result-key
       (let [stored? (volatile! false)]
         (swap! query-result-cache
                (fn [{:keys [lru generations epoch] :as state}]
                  (if (and (= expected-epoch epoch)
                           (source-key-generations-current?
-                           source-key generations))
-                   (let [existing (or (get lru source-key) {})]
+                           scope-key generations))
+                   (let [bucket (or (get lru result-key) empty-result-bucket)]
                      (vreset! stored? true)
                      (assoc state :lru
-                            (assoc lru source-key
-                                   (assoc existing cache-key
-                                          {:result result
-                                           :dependency-plan dependency-plan
-                                           :source-contexts source-contexts
-                                           :weight weight}))))
+                            (assoc lru result-key
+                                   (-> bucket
+                                       (update :owners conj scope-key)
+                                       (assoc-in [:entries cache-key]
+                                                 {:result result
+                                                  :dependency-plan dependency-plan
+                                                  :source-contexts source-contexts
+                                                  :weight weight})))))
                    state)))
         @stored?))))
 
@@ -3076,9 +3148,9 @@
       (when (and (seq members) (every? #(some? (nth % 2)) members))
         [composite-source-key-tag members]))))
 
-(defn- query-cache-source-contexts [source-bindings args source-key]
+(defn- query-cache-source-contexts [source-bindings args result-key]
   (if (= 1 (count source-bindings))
-    {source-key
+    {result-key
      (:cache-context
       (nth args
            (:datahike.query.source/argument-position
@@ -3087,7 +3159,8 @@
           (keep (fn [{:datahike.query.source/keys [argument-position]}]
                   (let [database (nth args argument-position nil)]
                     (when-let [database-key (db-cache-key database)]
-                      [database-key (:cache-context database)]))))
+                      [(database-result-key database-key)
+                       (:cache-context database)]))))
           source-bindings)))
 
 (defn- query-cache-arguments
@@ -4616,6 +4689,7 @@
                         (uncached nil))
                  :cljs (uncached nil)))
           (let [non-db-args (query-cache-arguments source-bindings args)
+                result-key (source-result-key source-key)
                 cache-epoch (:epoch @query-result-cache)
                 ;; scale-sensitive-key: BigDecimal args/consts of equal value but
                 ;; different scale (1.50M vs 1.500M) are `=` with equal hash in
@@ -4624,8 +4698,9 @@
                 cache-key (scale-sensitive-key
                            [query non-db-args offset limit order-by *disable-planner*])
                 source-contexts
-                (query-cache-source-contexts source-bindings args source-key)
-                cached (result-cache-get source-key cache-key source-contexts)]
+                (query-cache-source-contexts source-bindings args result-key)
+                cached (result-cache-get result-key source-key cache-key
+                                         source-contexts)]
             ;; Completed hits never enter the in-flight path and therefore do
             ;; not allocate a promise, request identity, flight key, or delayed
             ;; dependency analysis. The coordinator rechecks on a miss to close
@@ -4661,7 +4736,8 @@
                         max-result-weight]
                        request-id
                        #(binding [resource/*evidence-sink* outer-evidence-sink]
-                          (when-let [entry (result-cache-get source-key cache-key
+                          (when-let [entry (result-cache-get result-key source-key
+                                                             cache-key
                                                              source-contexts)]
                             (resource/certify-cached-result!
                              (:result entry) resource-options)
@@ -4670,7 +4746,7 @@
                                        (:dependency-plan entry)))
                             {:value (:result entry)}))
                        compute
-                       #(result-cache-put! source-key cache-key %
+                       #(result-cache-put! result-key source-key cache-key %
                                            @dependency-plan source-contexts
                                            cache-epoch)
                        #(when cache-evidence (vreset! cache-evidence %))
