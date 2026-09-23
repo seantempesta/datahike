@@ -410,6 +410,58 @@
   [db]
   (if (instance? DB db) (assoc db :cache-context nil) db))
 
+(defn modified-attributes
+  "Return the user and system attributes modified by transaction datoms."
+  [db tx-data]
+  (let [rim (:ref-ident-map db)]
+    (into #{}
+          (comp (map :a)
+                (filter some?)
+                (map (fn [a] (if (and rim (number? a)) (get rim a a) a))))
+          tx-data)))
+
+(defn advance-cache-context
+  "Advance cache-validation revisions in `context` to `revision`.
+
+   Only the revisions of `modified-attrs` change. An unknown attribute set
+   (nil), an `unsafe?` change or a schema attribute advances the
+   conservative revision instead, which every revision-keyed reader compares."
+  [context revision modified-attrs unsafe?]
+  (let [user-attrs (some-> modified-attrs (disj :db/txInstant))]
+    (cond-> context
+      (or unsafe? (nil? user-attrs))
+      (assoc :datahike.cache/conservative-revision revision)
+
+      (some ds/schema-attr? user-attrs)
+      (assoc :datahike.cache/conservative-revision revision)
+
+      (and (seq user-attrs)
+           (not-any? ds/schema-attr? user-attrs))
+      (update :datahike.cache/attribute-revisions
+              (fn [revisions]
+                (reduce #(assoc %1 %2 revision) (or revisions {}) user-attrs))))))
+
+(defn speculative-cache-context
+  "Derive the revision context of an uncommitted value built on `basis`.
+
+   `tx-data` must be every effective datom that separates the value from
+   `basis`. Each attribute it touched gets a fresh revision that no other
+   value carries; every untouched attribute keeps the basis revision, which
+   still names its datoms. The context is never committed, so committed
+   identity (`committed-value-identity`) and Datahike's query cache keep
+   ignoring it. A basis without a connection identity has no revisions to
+   inherit and yields nil: the value stays detached, never falsely current."
+  [basis db tx-data]
+  (let [{:datahike.cache/keys [connection-id generation] :as context}
+        (when (instance? DB basis) (:cache-context basis))]
+    (when (and connection-id generation)
+      (-> context
+          (dissoc :datahike.cache/commit-id)
+          (advance-cache-context (random-uuid)
+                                 (modified-attributes db tx-data)
+                                 false)
+          (assoc :datahike.cache/committed? false)))))
+
 ;; FilteredDB
 
 (defrecord-updatable FilteredDB [unfiltered-db pred]

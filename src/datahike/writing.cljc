@@ -577,12 +577,7 @@
 (defn modified-attributes
   "Return the user and system attributes modified by transaction datoms."
   [db tx-data]
-  (let [rim (:ref-ident-map db)]
-    (into #{}
-          (comp (map :a)
-                (filter some?)
-                (map (fn [a] (if (and rim (number? a)) (get rim a a) a))))
-          tx-data)))
+  (db/modified-attributes db tx-data))
 
 (defn cache-revision-attributes
   "Return attributes whose cache revisions advance, or nil when unknowable."
@@ -601,12 +596,18 @@
     (when (every? some? attribute-sets)
       (reduce into #{} attribute-sets))))
 
-(defn complete-db-update [old tx-report]
+(defn complete-db-update
+  "Finish one writer report. Its value keeps the speculative revision context
+   `core/with` derived from `old` (`db/speculative-cache-context`), so the next
+   queued transaction inherits untouched revisions before the commit lands; a
+   value with no derivable context stays detached. The commit loop replaces it
+   with the committed context."
+  [old tx-report]
   (let [{:keys [writer]} old
-        {:keys [db-after tx-data]
+        {:keys [db-after]
          {:keys [db/txInstant]} :tx-meta} tx-report
         new-meta  (assoc (:meta db-after) :datahike/updated-at txInstant)
-        db        (assoc db-after :meta new-meta :writer writer :cache-context nil)
+        db        (assoc db-after :meta new-meta :writer writer)
         tx-report (assoc tx-report :db-after db)]
     tx-report))
 
@@ -851,7 +852,10 @@
      (let [db-after (-> old
                         (assoc-in [:secondary-indices idx-ident] index)
                         (assoc-in [:schema idx-ident :db.secondary/status] :ready)
-                        (update-in [:schema idx-ident] dissoc :db.secondary/building-since-tx))]
+                        (update-in [:schema idx-ident] dissoc :db.secondary/building-since-tx)
+                        ;; A schema change with no datoms: no revision can
+                        ;; describe it, so the value is detached (unknown).
+                        (db/clear-cache-context))]
        (complete-db-update old {:db-before old
                                 :db-after db-after
                                 :tx-data []

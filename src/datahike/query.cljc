@@ -27,7 +27,6 @@
    [datahike.constants :as const]
    [datahike.query.relation :as rel]
    [datahike.resource :as resource]
-   [datahike.schema :as schema]
    [datahike.query.plan :as plan]
    [datahike.query.analyze :as analyze]
    #?(:clj [datahike.query.logical :as logical])
@@ -2572,21 +2571,10 @@
    transactions advance the conservative revision. Cached result rows are not
    inspected or copied."
   [context commit-id modified-attrs unsafe?]
-  (let [user-attrs (some-> modified-attrs (disj :db/txInstant))]
-    (cond-> (assoc context
-                   :datahike.cache/commit-id commit-id
-                   :datahike.cache/committed? true)
-      (or unsafe? (nil? user-attrs))
-      (assoc :datahike.cache/conservative-revision commit-id)
-
-      (some schema/schema-attr? user-attrs)
-      (assoc :datahike.cache/conservative-revision commit-id)
-
-      (and (seq user-attrs)
-           (not-any? schema/schema-attr? user-attrs))
-      (update :datahike.cache/attribute-revisions
-              (fn [revisions]
-                (reduce #(assoc %1 %2 commit-id) (or revisions {}) user-attrs))))))
+  (-> context
+      (assoc :datahike.cache/commit-id commit-id
+             :datahike.cache/committed? true)
+      (db/advance-cache-context commit-id modified-attrs unsafe?)))
 
 (defn- source-key-contains-generation?
   [source-key connection-id generation]

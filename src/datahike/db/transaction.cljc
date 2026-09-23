@@ -5,7 +5,8 @@
    [clojure.string :as str]
    [datahike.index :as di]
    [datahike.datom :as dd :refer [datom datom-tx datom-added datom?]]
-   #?(:cljs [datahike.db :refer [HistoricalDB]])
+   #?(:clj [datahike.db :as db]
+      :cljs [datahike.db :as db :refer [HistoricalDB]])
    [datahike.db.interface :as dbi]
    [datahike.db.search :as dbs]
    [datahike.db.utils :as dbu]
@@ -1051,6 +1052,23 @@
        (contains? filtered-tx-ids (datom-tx d)))
      datoms)))
 
+(defn- in-transaction-db
+  "The in-flight value a transaction function reads, with the revision context
+   its effective datoms so far derive from the transaction's basis."
+  [db report]
+  (if-some [context (db/speculative-cache-context
+                     (:db-before report) db (::effective-tx-data report))]
+    (assoc db :cache-context context)
+    db))
+
+(defn- attach-speculative-cache-context
+  "Give a finished report's value the revision context its effective datoms
+   derive from the basis. `core/with` detached it; the writer replaces it
+   with the committed context once the commit is durable."
+  [{:keys [db-before db-after tx-data] :as report}]
+  (assoc-in report [:db-after :cache-context]
+            (db/speculative-cache-context db-before db-after tx-data)))
+
 (defn apply-db-op [db report op-vec]
   (let [[op e a v] op-vec]
     (case op
@@ -1151,7 +1169,7 @@
       :db/cas (compare-and-swap db report op-vec)
 
       :db.fn/call (let [[_ f & args] op-vec]
-                    [report (apply f db args)])
+                    [report (apply f (in-transaction-db db report) args)])
 
       (if (and (keyword? op)
                (not (builtin-op? op)))
@@ -1159,7 +1177,7 @@
           (let [fun (-> (dbi/search db [ident :db/fn]) first :v)
                 args (next op-vec)]
             (if (fn? fun)
-              [report (apply fun db args)]
+              [report (apply fun (in-transaction-db db report) args)]
               (log/raise "Entity " op " expected to have :db/fn attribute with fn? value"
                          {:error :transact/syntax, :operation :db.fn/call, :tx-data op-vec})))
           (log/raise "Can’t find entity for transaction fn " op
@@ -1273,6 +1291,7 @@
                 (update-in [:db-after :max-tx] inc)
                 (update :db-after persistent!)
                 (update :db-after finalize-secondary-indices)
+                (attach-speculative-cache-context)
                 (validate-report validator (:tx-data report))))
 
           (nil? entity)

@@ -12,6 +12,8 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Features
 
+- **Speculative attribute revisions** — a transaction function's database argument and a `with` result now carry an uncommitted `:cache-context`: every attribute the transaction has not yet written keeps its basis revision, each written attribute gets a fresh revision, and a schema write advances the conservative revision. Revision-keyed caches can therefore reuse work across an unrelated in-flight write. The context is never committed, so committed identity and the shared query cache still ignore speculative values; a basis without connection identity stays detached. *Experimental.* ([#TODO])
+
 - **Bounded host structural weight** — JVM hosts can call `datahike.api/shallow-weight-within` to obtain the exact existing shallow structural weight of an eager value within a caller-supplied bound. Uncounted or lazy values return nil without realization, and values exceeding the bound stop early. The operation is intentionally absent from remote and generated binding surfaces. *Experimental.* ([#TODO])
 
 - **Two-phase host query admission** — JVM hosts can now acquire an opaque query call, inspect whether it is already completed, owns work, waits on shared work, or was rejected, register one nonblocking completion handoff, and run an admitted owner exactly once on a selected worker thread. Final cancellation removes an owner that has not started; running owners remain generation-fenced until completion. Ordinary `q` / `q-with-evidence` stay synchronous, and ClojureScript retains direct synchronous execution. The host-only operations are intentionally absent from remote capability catalogs. *Experimental.* ([#TODO])
