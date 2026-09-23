@@ -742,7 +742,11 @@
   the parents. This function ensures that the parent commits are properly tracked.
 
   Routed through the writer for proper serialization with concurrent transactions.
-  Returns a tx-report (sync) or promise/channel (async)."
+  The arg-map form `{:parents :tx-data :tx-meta :datahike/expected-basis-t}`
+  shares `transact!`'s basis fence. Returns a tx-report."
+  ([conn {:keys [parents] :as arg-map}]
+   (parent-check parents)
+   @(datahike.writer/merge-db! conn arg-map))
   ([conn parents tx-data]
    (merge! conn parents tx-data nil))
   ([conn parents tx-data tx-meta]
@@ -753,6 +757,9 @@
 
 (defn merge-async!
   "Async version of merge!. Returns a promise (CLJ) or channel (CLJS)."
+  ([conn {:keys [parents] :as arg-map}]
+   (parent-check parents)
+   (datahike.writer/merge-db! conn arg-map))
   ([conn parents tx-data]
    (merge-async! conn parents tx-data nil))
   ([conn parents tx-data tx-meta]

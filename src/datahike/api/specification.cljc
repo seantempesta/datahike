@@ -1040,6 +1040,7 @@
 
     merge-db
     {:args [:function
+            [:=> [:cat :datahike/SConnection [:map [:parents [:set :any]] [:tx-data :datahike/STransactions]]] :datahike/STransactionReport]
             [:=> [:cat :datahike/SConnection [:set :any] :datahike/STransactions] :datahike/STransactionReport]
             [:=> [:cat :datahike/SConnection [:set :any] :datahike/STransactions :any] :datahike/STransactionReport]]
      :ret :datahike/STransactionReport
@@ -1047,7 +1048,7 @@
      :stability :stable
      :supports-remote? true
      :referentially-transparent? false
-     :doc "Create a merge commit combining the current branch with parent branches/commits. The caller provides the merged tx-data. Routed through the writer for serialization. Blocks until committed. WARNING: Do not call from listener callbacks — use merge-db! instead to avoid deadlocks."
+     :doc "Create a merge commit combining the current branch with parent branches/commits. The caller provides the merged tx-data. An arg map {:parents :tx-data :tx-meta :datahike/expected-basis-t} shares transact's basis fence and report validation. Routed through the writer for serialization. Blocks until committed. WARNING: Do not call from listener callbacks — use merge-db! instead to avoid deadlocks."
      :examples [{:desc "Merge feature into main"
                  :code "(d/merge-db conn #{:feature} [{:name \"merged entity\"}])"}
                 {:desc "Merge with metadata"
@@ -1056,6 +1057,7 @@
 
     merge-db!
     {:args [:function
+            [:=> [:cat :datahike/SConnection [:map [:parents [:set :any]] [:tx-data :datahike/STransactions]]] :any]
             [:=> [:cat :datahike/SConnection [:set :any] :datahike/STransactions] :any]
             [:=> [:cat :datahike/SConnection [:set :any] :datahike/STransactions :any] :any]]
      :ret :any

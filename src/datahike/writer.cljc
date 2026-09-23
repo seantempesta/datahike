@@ -195,7 +195,9 @@
                                 ;; false; ignoring that result strands the
                                 ;; callback forever.
                                 (if (>! commit-queue [res callback])
-                                  (recur (:db-after res))
+                                  ;; Merge parents belong to the report that
+                                  ;; set them, never to the next operation.
+                                  (recur (update (:db-after res) :meta dissoc :datahike/merge-parents))
                                   (let [error (writer-shut-down-error)]
                                     (put! callback error)
                                     (close! transaction-queue)
@@ -230,8 +232,9 @@
               ;; commit latest tx to disk
                       (let [parent-db @connection
                             db (:db-after (first (peek txs)))
-                            ;; Check for merge parents (set by merge-writer!)
-                            merge-parents (get-in db [:meta :datahike/merge-parents])
+                            ;; Merge parents of every report in the batch
+                            ;; (set by merge-writer!); the batch commits once.
+                            merge-parents (not-empty (into #{} (mapcat #(get-in (first %) [:db-after :meta :datahike/merge-parents])) txs))
                             ;; Clear merge-parents from db meta before persisting
                             db (if merge-parents
                                  (update db :meta dissoc :datahike/merge-parents)

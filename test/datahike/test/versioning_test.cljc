@@ -443,3 +443,42 @@
                        (catch Exception e (:type (ex-data e)))))))
          (d/release conn)
          (d/delete-database src-cfg)))))
+
+#?(:clj
+   (deftest merge-shares-the-transaction-basis-fence-and-keeps-lineage-exact
+     (let [cfg {:store {:backend :memory :id (random-uuid)} :keep-history? true :schema-flexibility :read}
+           _ (d/create-database cfg)
+           conn (d/connect cfg)
+           _ (d/transact conn [{:db/id 1 :name "base"}])
+           _ (branch! conn :db :foo)
+           foo (d/connect (assoc cfg :branch :foo))
+           _ (d/transact foo [{:db/id 2 :name "candidate"}])
+           foo-cid (commit-id @foo)
+           h (:max-tx @conn)
+           h-cid (commit-id @conn)
+           refusal (fn [arg-map]
+                     (try (d/merge-db conn (merge {:parents #{foo-cid} :tx-data [{:db/id 2 :name "candidate"}]} arg-map))
+                          (catch Exception e (:error (ex-data (last (take-while some? (iterate ex-cause e))))))))
+           carrying (fn [] (count (filter #(contains? (set (parent-commit-ids %)) foo-cid)
+                                          (<?? S (branch-history conn)))))]
+       (try
+         (d/transact conn [{:db/id 3 :name "moved"}])
+         (is (= :transaction/stale-basis (refusal {:datahike/expected-basis-t h})))
+         (is (nil? (:name (d/entity @conn 2))) "a stale merge lands no datom")
+         (is (= :transaction/validation-rejected
+                (refusal {:tx-meta {:datahike/validate-report (constantly :refused)}})))
+         (is (= 0 (carrying)) "refused merges record no lineage")
+         (let [moved (commit-id @conn)
+               report (d/merge-db conn {:parents #{foo-cid} :tx-data [{:db/id 2 :name "candidate"}]
+                                        :datahike/expected-basis-t (:max-tx @conn)})]
+           (is (= #{moved foo-cid} (set (parent-commit-ids @conn))) "immutable parents")
+           (is (= (commit-id (:db-after report)) (commit-id @conn)) "held connection advanced")
+           (is (not= h-cid moved)))
+         (d/transact conn [{:db/id 4 :name "after"}])
+         (is (= 1 (carrying)) "a later transaction does not inherit merge parents")
+         (let [merged @(d/merge-db! conn {:parents #{foo-cid} :tx-data [{:db/id 5 :name "again"}]})
+               pending (d/transact! conn [{:db/id 6 :name "queued"}])]
+           @pending
+           (is (map? merged))
+           (is (= 2 (carrying)) "a merge batched with a transaction keeps its parents"))
+         (finally (d/release foo) (d/release conn) (d/delete-database cfg))))))

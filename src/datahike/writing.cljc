@@ -861,18 +861,6 @@
                                 :tx-data []
                                 :tx-meta {}}))))
 
-(defn merge-writer!
-  "Writer operation for merge. Applies tx-data and records merge parents
-   on the db meta so the commit loop creates a multi-parent merge commit."
-  [old {:keys [parents tx-data tx-meta]}]
-  (log/trace :datahike/merge {:parent-count (count parents) :tx-count (count tx-data)})
-  (let [tx-report (complete-db-update old (core/with old tx-data tx-meta))
-        ;; Add merge parents to db meta — commit loop picks these up
-        branch (get-in old [:config :branch])
-        all-parents (conj (set parents) branch)]
-    (update tx-report :db-after
-            assoc-in [:meta :datahike/merge-parents] all-parents)))
-
 (defn transact!
   "Apply one transaction to the writer's current immutable database value.
 
@@ -891,6 +879,17 @@
                :datahike/expected-basis-t expected-basis-t
                :datahike/current-basis-t (:max-tx old)})))
   (complete-db-update old (core/with old tx-data tx-meta)))
+
+(defn merge-writer!
+  "Writer operation for merge: the ordinary `transact!` (so its
+   `:datahike/expected-basis-t` fence and report validation apply unchanged)
+   plus merge parents on the db meta, from which the commit loop creates a
+   multi-parent merge commit."
+  [old {:keys [parents tx-data] :as arg-map}]
+  (log/trace :datahike/merge {:parent-count (count parents) :tx-count (count tx-data)})
+  (update (transact! old arg-map) :db-after
+          assoc-in [:meta :datahike/merge-parents]
+          (conj (set parents) (get-in old [:config :branch]))))
 
 (defn load-entities [old entities]
   (log/debug :datahike/load-entities {:entity-count (count entities)})

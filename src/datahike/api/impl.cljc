@@ -355,6 +355,10 @@
       :cljs (dv/force-branch! db branch parents (assoc opts :sync? false)))))
 
 (defn merge-db
+  ([conn arg-map]
+   #?(:clj  (dv/merge! conn arg-map)
+      :cljs (throw (ex-info "Synchronous merge not supported in ClojureScript, use merge-db! instead."
+                            {:error :merge/sync-not-supported}))))
   ([conn parents tx-data]
    (merge-db conn parents tx-data nil))
   ([conn parents tx-data tx-meta]
@@ -363,6 +367,8 @@
                             {:error :merge/sync-not-supported})))))
 
 (defn merge-db!
+  ([conn arg-map]
+   (dv/merge-async! conn arg-map))
   ([conn parents tx-data]
    (merge-db! conn parents tx-data nil))
   ([conn parents tx-data tx-meta]
