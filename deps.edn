@@ -2,11 +2,14 @@
         org.replikativ/hasch                        {:mvn/version "0.4.100"
                                                      :exclusions [org.clojure/clojurescript]}
         org.replikativ/konserve                     {:git/url "https://github.com/seantempesta/konserve"
-                                                     :git/sha "07377c27c8288b7484f0aa7b82e8158b415985be"
+                                                     :git/sha "5b39fddd6ae58bae7d08880daecd1ad7242ea273"
                                                      :exclusions [org.clojure/clojurescript
                                                                   org.clojars.mmb90/cljs-cache]}
 
-        org.replikativ/superv.async                 {:mvn/version "0.3.50"
+        ;; Our fork: go-try-/<?- carry every Throwable (an Error used to close
+        ;; the channel and read as a successful write).
+        org.replikativ/superv.async                 {:git/url "https://github.com/seantempesta/superv.async"
+                                                     :git/sha "501b42945693804fd3e57276cc2a07ed4fe1d602"
                                                      :exclusions [org.clojure/clojurescript]}
         org.replikativ/datalog-parser               {:mvn/version "0.2.37"}
         ;; canonical fressian node+root handlers + MST boundary (0.4.126); diff-buf write-buffering
