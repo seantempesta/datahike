@@ -1748,3 +1748,17 @@
                       (:type (ex-data (:throwable @waiter-result)))))
                (is (zero? (get-in (dq/query-cache-metrics)
                                   [:single-flight :active-flights]))))))))))
+
+#?(:clj
+   (deftest a-single-source-cache-key-does-not-retain-the-caller-argument-array
+     ;; `(rest args)` over the caller's argument array kept the database at
+     ;; element 0 reachable from every cached key, across branches.
+     (let [database (Object.)
+           args (to-array [database :a 1])
+           key-arguments (#'dq/query-cache-arguments
+                          [{:datahike.query.source/argument-position 0}] args)]
+       (is (vector? key-arguments))
+       (is (= [:a 1] key-arguments))
+       (aset args 1 :changed)
+       (is (= [:a 1] key-arguments)
+           "the key owns its values; it shares no storage with the caller's array"))))

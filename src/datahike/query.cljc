@@ -3168,7 +3168,9 @@
   (if (and (= 1 (count source-bindings))
            (zero? (:datahike.query.source/argument-position
                    (first source-bindings))))
-    (rest args)
+    ;; A fresh vector, as upstream: `(rest args)` shares the caller's argument
+    ;; array, so the cache key would retain the database at element 0.
+    (vec (rest args))
     (let [source-positions
           (into #{}
                 (map :datahike.query.source/argument-position)
