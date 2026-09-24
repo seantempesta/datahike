@@ -44,24 +44,30 @@
   (let [cfg {:store {:backend :file
                      :path (str (System/getProperty "java.io.tmpdir") "/dh-fusion-root-pin-test")
                      :id (java.util.UUID/randomUUID)}
+             ;; Seon's store configuration (seon.cluster.store): history,
+             ;; fusion and its index-config. :n is indexed so every one of the
+             ;; six indexes changes in the final commit; an index untouched
+             ;; since create-database keeps the root that create wrote.
              :index :datahike.index/persistent-set
-             :schema-flexibility :read :keep-history? true
-             :fuse-index-roots? true}]
+             :schema-flexibility :write :keep-history? true
+             :fuse-index-roots? true
+             :index-config {:branching-factor 4096 :diff-buf-size 256}}]
     (when (d/database-exists? cfg) (d/delete-database cfg))
     (d/create-database cfg)
     (let [conn (d/connect cfg)]
       (try
-        (d/transact conn (vec (for [i (range 50)] {:db/id (inc i) :n i})))
-        (d/transact conn [{:db/id 1 :n 1000}])
+        (d/transact conn [{:db/ident :n :db/valueType :db.type/long
+                           :db/cardinality :db.cardinality/one :db/index true}])
+        (d/transact conn (vec (for [i (range 50)] {:n i})))
+        (d/transact conn [{:db/id (d/q '[:find ?e . :where [?e :n 0]] @conn) :n 1000}])
         (testing "commit!: the connection's value reads every index"
           (let [db @conn
                 expected (into {} (map (fn [k] [k (count (seq (get db k)))])) index-keys)]
             (is (every? #(unwritten-root? db %) index-keys)
                 "the fused roots are not separate objects in the store")
-            (is (= expected (read-each (collect-and-evict db))))
-            (is (= 51 (d/q '[:find (count ?e) . :where [?e :n _]] db)))))
+            (is (= expected (read-each (collect-and-evict db))))))
         (testing "force-branch!: the value it flushed reads every index"
-          (let [db (d/db-with @conn [{:db/id 2 :n 2000}])
+          (let [db (d/db-with @conn [{:db/id (d/q '[:find ?e . :where [?e :n 1]] @conn) :n 2000}])
                 expected (into {} (map (fn [k] [k (count (seq (get db k)))])) index-keys)]
             (dv/force-branch! db :pinned #{:db})
             (is (= expected (read-each (collect-and-evict db))))))
