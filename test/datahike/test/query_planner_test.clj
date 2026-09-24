@@ -1125,6 +1125,64 @@
       (is (= expected (binding [q/*disable-planner* false] (d/q query dba dbb))))
       (is (= expected (binding [q/*disable-planner* true] (d/q query dba dbb)))))))
 
+;; A variable attribute bound by an earlier clause while its value is free
+;; (`[?r :link/attr ?a] [?e ?a ?v]`) used to read the whole EAVT index and then
+;; join. It must read one AEVT slice per bound attribute: the same rows as the
+;; ground patterns, at the cost of those attributes, not of the store — through
+;; the fused direct path (probe on the attribute field, a merge whose cursor
+;; must not walk the concatenated slices) and the relation path (a rule).
+;; Bound values that cannot be attributes (a string, a long) join nothing.
+(def var-attr-bound-db
+  (delay
+    (d/db-with (db/empty-db {:link/attr {:db/cardinality :db.cardinality/many}
+                             :x/ref {:db/valueType :db.type/ref}})
+               (into [{:db/id -1 :link/attr [:x/target :x/ref]}
+                      {:db/id -2 :link/attr "x/target"}
+                      {:db/id -6 :link/attr 7}
+                      {:db/id -3 :x/target "t1" :x/tag :a}
+                      {:db/id -4 :x/target "t2" :x/ref -3 :x/tag :b}
+                      {:db/id -5 :x/ref -4}]
+                     (map (fn [i] {:x/bulk1 i :x/bulk2 (str i) :x/bulk3 i :x/bulk4 (double i)}))
+                     (range 50000)))))
+
+(defn- best-ms [f]
+  (reduce min (repeatedly 5 #(let [t0 (System/nanoTime)] (f) (/ (- (System/nanoTime) t0) 1e6)))))
+
+(deftest test-variable-attribute-bound-upstream-reads-bound-slices
+  (let [db @var-attr-bound-db
+        ground '[:find ?e ?a ?v :where
+                 (or (and [?e :x/target ?v] [(ground :x/target) ?a])
+                     (and [?e :x/ref ?v] [(ground :x/ref) ?a]))]
+        expected (d/q ground db)
+        queries {:direct '[:find ?e ?a ?v :where [?r :link/attr ?a] [?e ?a ?v]]
+                 :merge '[:find ?e ?a ?v ?t :where [?r :link/attr ?a] [?e ?a ?v] [?e :x/tag ?t]]
+                 :rule '[:find ?e ?a ?v :in $ % :where [?r :link/attr ?a] (edge ?e ?a ?v)]}
+        rules '[[(edge ?e ?a ?v) [?e ?a ?v]]]
+        run (fn [k] (if (= k :rule) (d/q (queries k) db rules) (d/q (queries k) db)))]
+    (is (= 4 (count expected)))
+    (is (= expected (run :direct)))
+    (is (= expected (run :rule)))
+    (is (= (d/q '[:find ?e ?a ?v ?t :where
+                  (or (and [?e :x/target ?v] [(ground :x/target) ?a])
+                      (and [?e :x/ref ?v] [(ground :x/ref) ?a]))
+                  [?e :x/tag ?t]]
+                db)
+           (run :merge)))
+    (is (= 3 (count (run :merge))))
+    (assert-engines-agree db (:direct queries))
+    (assert-engines-agree db (:merge queries))
+    (assert-engines-agree-with-rules db (:rule queries) rules)
+    (testing "costs the bound attributes, not the store (200k bulk datoms)"
+      ;; Fresh values defeat the result cache. Measured 2026-09-24: ground
+      ;; 0.3-0.6 ms; the EAVT scan it replaces 11-23 ms.
+      (let [bound (+ 2 (* 5 (best-ms #(d/q ground (d/db-with db [])))))]
+        (doseq [k (keys queries)]
+          (is (< (best-ms #(if (= k :rule)
+                             (d/q (queries k) (d/db-with db []) rules)
+                             (d/q (queries k) (d/db-with db []))))
+                 bound)
+              (str k)))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Cardinality-many SCAN in a fused entity-group
 ;;

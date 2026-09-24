@@ -484,6 +484,44 @@
                            ps)))))))
              rels))))
 
+;; A variable attribute bound upstream while the value is free reads one AEVT
+;; slice per bound attribute (Σ attribute sizes), not the whole EAVT index.
+;; Only values that can equal a datom attribute are sliced — keywords, or
+;; entity ids in an `:attribute-refs?` database — so the attribute comparator
+;; never meets an alien value; any other value joins nothing. Result-preserving:
+;; the downstream join or probe filter enforces the same attribute set. The
+;; concatenated slices are not in EAVT order, so no forward merge cursor may
+;; walk them.
+#?(:clj
+   (defn- datom-attribute-pred [db]
+     (if (:attribute-refs? (dbi/-config db)) int? keyword?)))
+
+#?(:clj
+   (defn- bound-attribute-slices [db attrs]
+     (mapcat (fn [pa] (di/-slice (:aevt db) (datom e0 pa nil tx0) (datom emax pa nil txmax) :aevt))
+             attrs)))
+
+#?(:clj
+   (defn- var-attr-bound-attrs
+     "Distinct datom attributes bound in `rels` for a VARIABLE-attribute clause
+      `[?e ?a ...]`; nil when no rel binds ?a or it binds `scan-n` or more
+      distinct values."
+     [db clause rels scan-n]
+     (let [a (nth clause 1)
+           attr? (datom-attribute-pred db)]
+       (some (fn [rel]
+               (when-let [ai (get (:attrs rel) a)]
+                 (let [seen (java.util.HashSet.)
+                       aborted (reduce (fn [_ t]
+                                         (let [pa (if (instance? clojure.lang.Indexed t)
+                                                    (.nth ^clojure.lang.Indexed t (int ai))
+                                                    (nth t ai))]
+                                           (when (attr? pa) (.add seen pa)))
+                                         (when (>= (.size seen) (long scan-n)) (reduced true)))
+                                       nil (:tuples rel))]
+                   (when-not aborted (vec seen)))))
+             rels))))
+
 (defn- scan-datoms
   "Datoms for a scan clause, driven by the currently-bound `rels` (sideways
    information passing) when beneficial — the single retrieval seam shared by
@@ -506,7 +544,14 @@
         [from to] (compute-slice-bounds clause index pushdown-bounds resolved-a resolved-e)
         db-index (get db index)
         scan-n (long (or scan-n (di/-count db-index)))
-        full (fn [] (di/-slice db-index from to index))]
+        bound-attrs #?(:clj (when (and (nil? resolved-a) (nil? resolved-e)
+                                       (symbol? a) (analyze/free-var? a)
+                                       (#{:eavt :aevt} index) (:aevt db))
+                              (var-attr-bound-attrs db clause rels scan-n))
+                       :cljs nil)
+        full (if bound-attrs
+               #?(:clj (fn [] (bound-attribute-slices db bound-attrs)) :cljs nil)
+               (fn [] (di/-slice db-index from to index)))]
     #?(:clj
        (if-let [avet-pairs (when (and (:avet db)
                                       (nil? resolved-a)
@@ -1854,7 +1899,13 @@
 
         ;; Non-temporal pipeline annotation
         _ (when-not temporal (assert pipeline "Plans must have :pipeline annotation"))
-        use-cursors? (when pipeline (:use-cursors? pipeline))
+        ;; Variable attribute probed by an upstream group's attribute values.
+        probe-attrs #?(:clj (when (and (not temporal) (nil? resolved-a) (nil? resolved-e)
+                                       probe-set (== 1 (int probe-datom-field))
+                                       (#{:eavt :aevt} index) (:aevt index-db))
+                              (filterv (datom-attribute-pred index-db) (.toArray ^java.util.HashSet probe-set)))
+                       :cljs nil)
+        use-cursors? (when (and pipeline (not probe-attrs)) (:use-cursors? pipeline))
         attr-refs? (when pipeline (:attr-refs? pipeline))
         fused-path (when pipeline (:fused-path pipeline))
 
@@ -1925,10 +1976,11 @@
                         (if (= pf 2) (:avet index-db) (:eavt index-db))
                         resolved-a probe-set pf))
                      :cljs nil))
-                (if temporal
-                  (build-scan-slice db db-index from-datom to-datom index
-                                    temporal index-db resolved-a)
-                  (di/-slice db-index from-datom to-datom index)))
+                (cond
+                  temporal (build-scan-slice db db-index from-datom to-datom index
+                                             temporal index-db resolved-a)
+                  probe-attrs #?(:clj (bound-attribute-slices index-db probe-attrs) :cljs nil)
+                  :else (di/-slice db-index from-datom to-datom index)))
         ;; When probe-driven, filtering is baked into the seeks — nil out probe-set
         probe-set (if use-probe-driven? nil probe-set)
         max-n (int (or max-results -1))]

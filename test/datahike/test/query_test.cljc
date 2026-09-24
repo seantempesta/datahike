@@ -118,6 +118,21 @@
               :in $ ?attribute
               :where [_ ?attribute ?value]]
             ::people :person/name))))
+  (testing "a keyword collection input narrows an attribute variable to its members"
+    (is (= #{:person/name :person/email}
+           (d/dependency-plan-attributes
+            (d/query-dependency-plan
+             '[:find ?value
+               :in $ [?attribute ...]
+               :where [_ ?attribute ?value]]
+             ::people [:person/name :person/email]))))
+    (is (= :all
+           (d/dependency-plan-attributes
+            (d/query-dependency-plan
+             '[:find ?value
+               :in $ [?attribute ...]
+               :where [_ ?attribute ?value]]
+             ::people [:person/name "not-an-attribute"])))))
   (testing "supplied rule bodies and their input-bound attributes are folded"
     (is (= {:datahike.query.dependency/sources
             [{:datahike.query.source/symbol '$

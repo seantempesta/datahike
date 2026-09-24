@@ -2833,10 +2833,11 @@
     (let [source (parsed-source-symbol (:source clause) inherited-source)
           value (dependency-argument-value (nth (:pattern clause) 1 nil)
                                            bindings)]
-      (source-attr-deps source (if (and (not= value dependency-unbound)
-                                        (keyword? value))
-                                 #{value}
-                                 :all)))
+      (source-attr-deps source (cond
+                                 (= value dependency-unbound) :all
+                                 (keyword? value) #{value}
+                                 (::one-of value) (::one-of value)
+                                 :else :all)))
 
     (or (instance? Predicate clause)
         (instance? Function clause))
@@ -2886,6 +2887,16 @@
             (instance? Variable (:variable binding)))
        (assoc-in environment [:bindings (get-in binding [:variable :symbol])]
                  value)
+
+       ;; A collection input `[?a ...]` of keywords bounds ?a to that set.
+       (and (instance? BindColl binding)
+            (instance? BindScalar (:binding binding))
+            (instance? Variable (get-in binding [:binding :variable]))
+            (coll? value)
+            (every? keyword? value))
+       (assoc-in environment
+                 [:bindings (get-in binding [:binding :variable :symbol])]
+                 {::one-of (set value)})
 
        (and (instance? BindScalar binding)
             (instance? RulesVar (:variable binding)))
