@@ -442,13 +442,15 @@
                                  (when-let [hs (extract rel ci)]
                                    {:field 0 :values hs :seekable? true})))
                              rels))
-             v-probe (when (and (not e-probe) resolved-a
+             ;; A variable attribute filters by bound value (no seek: an
+             ;; AVET seek needs a resolved attribute).
+             v-probe (when (and (not e-probe)
                                 (symbol? v) (analyze/free-var? v))
                        (some (fn [rel]
                                (when-let [ci (get (:attrs rel) v)]
                                  (when-let [hs (extract rel ci)]
                                    {:field 2 :values hs
-                                    :seekable? (boolean (and (:avet db) (dbu/indexing? db resolved-a)))})))
+                                    :seekable? (boolean (and resolved-a (:avet db) (dbu/indexing? db resolved-a)))})))
                              rels))]
          (or e-probe v-probe)))))
 

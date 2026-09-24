@@ -1183,6 +1183,20 @@
                  bound)
               (str k)))))))
 
+(deftest test-variable-attribute-and-value-bound-by-different-inputs
+  ;; ?a and ?v bound by two collection inputs: the scan filters the bound
+  ;; attributes' slices by the bound values instead of merging every datom.
+  (let [db @var-attr-bound-db
+        product '[:find ?e ?a ?v ?t :in $ [?a ...] [?v ...] :where [?e ?a ?v] [?e :x/bulk1 ?t]]
+        ground '[:find ?e ?a ?v ?t :in $ ?a [?v ...] :where [?e ?a ?v] [?e :x/bulk1 ?t]]
+        values ["7" "8"]
+        expected (into #{} (mapcat #(d/q ground db % values)) [:x/bulk2 :x/target])]
+    (is (= 2 (count expected)))
+    (is (= expected (d/q product db [:x/bulk2 :x/target] values)))
+    (assert-engines-agree db product [[:x/bulk2 :x/target] values])
+    (let [bound (+ 2 (* 5 (best-ms #(d/q ground (d/db-with db []) :x/bulk2 values))))]
+      (is (< (best-ms #(d/q product (d/db-with db []) [:x/bulk2 :x/target] values)) bound)))))
+
 ;; ---------------------------------------------------------------------------
 ;; Cardinality-many SCAN in a fused entity-group
 ;;
