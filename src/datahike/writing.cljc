@@ -150,14 +150,27 @@
           fuse? (and flush!
                      (:fuse-index-roots? config)
                      (= (:index config) :datahike.index/persistent-set))
+          ;; Pin the fused root strongly in the flushed live set, as
+          ;; stored->db's attach does on restore. Its address is never
+          ;; written as its own object, yet PSS store() leaves the root in a
+          ;; Soft/Weak reference with root() falling back to restore(address):
+          ;; once the reference clears and the node cache evicts it, every
+          ;; read of this db value fails "Node not found in storage." This
+          ;; set is the writer's own value (-flush returns it), and the seed
+          ;; replaces a reference to the node with that same node, so
+          ;; concurrent readers see an equivalent root either way.
+          pin-root (fn [idx]
+                     (let [root (di/-root-node idx)]
+                       (di/-seed-root! idx root)
+                       root))
           fused-roots (when fuse?
-                        (cond-> {:eavt-root (di/-root-node eavt')
-                                 :aevt-root (di/-root-node aevt')
-                                 :avet-root (di/-root-node avet')}
+                        (cond-> {:eavt-root (pin-root eavt')
+                                 :aevt-root (pin-root aevt')
+                                 :avet-root (pin-root avet')}
                           (:keep-history? config)
-                          (assoc :temporal-eavt-root (di/-root-node temporal-eavt')
-                                 :temporal-aevt-root (di/-root-node temporal-aevt')
-                                 :temporal-avet-root (di/-root-node temporal-avet'))))]
+                          (assoc :temporal-eavt-root (pin-root temporal-eavt')
+                                 :temporal-aevt-root (pin-root temporal-aevt')
+                                 :temporal-avet-root (pin-root temporal-avet'))))]
       [schema-meta-kv-to-write
        (merge
         {:schema-meta-key  schema-meta-key
