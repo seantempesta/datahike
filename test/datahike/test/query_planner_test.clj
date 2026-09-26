@@ -1274,3 +1274,54 @@
     (is (= [2 3 4 5]
            (mapv #(aget ^objects % 0) result-list))
         "the card-one probe path must not run after the card-many slice")))
+
+;; ---------------------------------------------------------------------------
+;; A probe-driven read keeps every constraint of the planned slice
+;;
+;; [?run :run/kind "x"] and [?run :run/n ?n] [(>= ?n 5)] plan AVET slices whose
+;; bounds carry the value constraint. When an upstream group binds ?run, the
+;; executor seeks EAVT per bound entity instead; those seeks bound only e and
+;; a, so the ground value and the inclusive range must be re-checked per datom.
+;; History and as-of values take the probe whenever the probe set is smaller
+;; than the estimate; a current value only past the seek break-even (2,500 x),
+;; hence 3,000 entities.
+
+(def ^:private probe-bounds-db
+  (delay
+    (let [cfg {:store {:backend :memory :id (random-uuid)}
+               :keep-history? true :schema-flexibility :write}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)]
+      (d/transact conn [{:db/ident :run/kind :db/valueType :db.type/string
+                         :db/cardinality :db.cardinality/one :db/index true}
+                        {:db/ident :run/n :db/valueType :db.type/long
+                         :db/cardinality :db.cardinality/one :db/index true}
+                        {:db/ident :rcpt/run :db/valueType :db.type/ref
+                         :db/cardinality :db.cardinality/one}])
+      (d/transact conn (vec (for [i (range 3000)] {:run/kind "x" :run/n (+ 10 i)})))
+      (d/transact conn [{:db/id "y" :run/kind "y" :run/n 1} {:rcpt/run "y"}])
+      @conn)))
+
+(deftest test-probe-driven-read-keeps-the-planned-value-bounds
+  (let [db @probe-bounds-db
+        kind '[:find ?r ?run :in $ ?k :where [?r :rcpt/run ?run] [?run :run/kind ?k]]
+        kind-first '[:find ?r ?run :in $ ?k :where [?run :run/kind ?k] [?r :rcpt/run ?run]]
+        literal '[:find ?r ?run :where [?r :rcpt/run ?run] [?run :run/kind "x"]]
+        at-least '[:find ?r ?n :where [?r :rcpt/run ?run] [?run :run/n ?n] [(>= ?n 5)]]
+        at-most '[:find ?r ?n :where [?r :rcpt/run ?run] [?run :run/n ?n] [(<= ?n 0)]]
+        receipt (d/q '[:find ?r . :where [?r :rcpt/run _]] db)
+        run (d/q '[:find ?e . :where [?e :run/kind "y"]] db)]
+    (binding [q/*query-result-cache?* false]
+      (doseq [[label value] [[:current db]
+                             [:history (d/history db)]
+                             [:as-of (d/as-of db (d/q '[:find (max ?t) . :where [_ :rcpt/run _ ?t]] db))]]]
+        (testing label
+          (is (= #{} (set (seq (d/q kind value "x")))))
+          (is (= #{} (set (seq (d/q kind-first value "x")))))
+          (is (= #{} (set (seq (d/q literal value)))))
+          (is (= #{[receipt run]} (set (seq (d/q kind value "y")))))
+          (is (= #{} (set (seq (d/q at-least value)))))
+          (is (= #{} (set (seq (d/q at-most value)))))
+          (is (= #{[receipt 1]}
+                 (set (seq (d/q '[:find ?r ?n :where [?r :rcpt/run ?run] [?run :run/n ?n] [(< ?n 5)]]
+                                value))))))))))

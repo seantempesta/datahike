@@ -383,6 +383,29 @@
                                     {:op op :pred pred}))))
                 strict-preds)))))
 
+;; A probe-driven read seeks per bound value (EAVT for a bound entity, AVET for
+;; a bound value) instead of reading the planned slice, and each seek bounds only
+;; the probed field and the attribute. `build-ground-filter` omits what the
+;; planned index's bounds enforce, so the probe-driven read re-applies exactly
+;; that, mirroring `compute-slice-bounds`.
+(defn- slice-bounds-filter
+  [clause index pushdown-preds]
+  (let [[e _ v] clause]
+    (case index
+      :eavt (when (and (some? e) (not (symbol? e)) (number? e))
+              (let [le #?(:clj (long e) :cljs e)] (fn [^Datom d] (= (.-e d) le))))
+      :avet (let [bounds (when (seq pushdown-preds) (plan/pushdown-to-bounds pushdown-preds))
+                  ground-v (when (and (some? v) (not (analyze/free-var? v))) v)
+                  from-v (or (:from-v bounds) ground-v)
+                  to-v (or (:to-v bounds) ground-v)]
+              (when (or (some? from-v) (some? to-v))
+                ;; The index's own value order; nil compares as unbounded.
+                (fn [^Datom d]
+                  (let [dv (.-v d)]
+                    (and (or (nil? from-v) (not (neg? (or (datom/cmp-nil dv from-v) 0))))
+                         (or (nil? to-v) (not (pos? (or (datom/cmp-nil dv to-v) 0)))))))))
+      nil)))
+
 (defn- compute-slice-bounds
   "Compute [from-datom to-datom] for an index slice given clause, index, and pushdown."
   [clause index pushdown-bounds resolved-a resolved-e]
@@ -581,7 +604,10 @@
                       (some? resolved-a)
                       (pss-instance? seek-index)
                       (< (* (long k) (long probe-driven-threshold)) scan-n))
-               (probe-driven-iterable seek-index resolved-a (:values probe) field)
+               (let [seeks (probe-driven-iterable seek-index resolved-a (:values probe) field)]
+                 (if-let [bounds (slice-bounds-filter clause index pushdown-preds)]
+                   (filter bounds seeks)
+                   seeks))
                (let [^java.util.HashSet hs (:values probe)]
                  (filter (fn [^Datom d]
                            (.contains hs (if (== field 0) (.-e d) (.-v d))))
@@ -1958,10 +1984,13 @@
                                             (datom (long v) resolved-a nil txmax)]
                                            [(datom e0 resolved-a v tx0)
                                             (datom emax resolved-a v txmax)])
+                               ;; An entity seek reads EAVT whatever index
+                               ;; the plan chose; entity bounds over AVET
+                               ;; would slice the whole attribute.
                                sub-slice (build-scan-slice db
-                                                           (if (== pf 2) (:avet index-db) db-index)
+                                                           (if (== pf 2) (:avet index-db) (:eavt index-db))
                                                            from to
-                                                           (if (== pf 2) :avet index)
+                                                           (if (== pf 2) :avet :eavt)
                                                            temporal index-db resolved-a)]
                            (when sub-slice
                              (let [iter (.iterator ^Iterable sub-slice)]
@@ -1985,6 +2014,11 @@
                   :else (di/-slice db-index from-datom to-datom index)))
         ;; When probe-driven, filtering is baked into the seeks — nil out probe-set
         probe-set (if use-probe-driven? nil probe-set)
+        ground-filter (let [bounds (when use-probe-driven?
+                                     (slice-bounds-filter clause index pushdown-preds))]
+                        (cond (nil? bounds) ground-filter
+                              (nil? ground-filter) bounds
+                              :else (fn [d] (and (ground-filter d) (bounds d)))))
         max-n (int (or max-results -1))]
 
     (if temporal
