@@ -460,7 +460,10 @@
 
 (defn create-storage [store config]
   (CachedStorage. store config
-                  (atom (cache/lru-cache-factory {} :threshold (:store-cache-size config)))
+                  ;; nodes are immutable by address: every connection to one
+                  ;; physical store shares the cache its connection reserved
+                  (or (get store di/node-cache-key)
+                      (di/make-node-cache (:store-cache-size config)))
                   (atom init-stats)
                   (atom [])
                   (atom [])  ;; freed-addresses: vector of [address timestamp] pairs

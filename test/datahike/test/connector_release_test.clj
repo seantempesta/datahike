@@ -35,14 +35,16 @@
         id-a [(random-uuid) :db]
         id-b [(first id-a) :branch]
         a (connections/reserve-connection-opening! id-a completion-a
-                                                   {:branch :db} physical-key)
+                                                   {:branch :db} physical-key 1000 #(atom :a))
         b (connections/reserve-connection-opening! id-b completion-b
-                                                   {:branch :branch} physical-key)]
+                                                   {:branch :branch} physical-key 1000 #(atom :b))]
     (try
       (is (= :owner (:state a)))
       (is (= :owner (:state b)))
       (is (identical? (:write-hooks a) (:write-hooks b))
           "separate branch reservations converge atomically on one hook atom")
+      (is (identical? (:node-cache a) (:node-cache b))
+          "a branch opening shares its sibling's node cache: nodes are immutable by address")
       (finally
         (connections/fail-connection-opening! id-a completion-a)
         (connections/fail-connection-opening! id-b completion-b)))))
@@ -52,13 +54,13 @@
         physical-key {:backend :memory :id (first conn-id)}
         completion (async/promise-chan)
         owner (connections/reserve-connection-opening!
-               conn-id completion {:branch :db} physical-key)
+               conn-id completion {:branch :db} physical-key 1000 #(atom :n))
         published-conn (atom :published)]
     (try
       (connections/complete-connection-opening!
        conn-id completion published-conn)
       (let [existing (connections/reserve-connection-opening!
-                      conn-id (async/promise-chan) {:branch :db} physical-key)]
+                      conn-id (async/promise-chan) {:branch :db} physical-key 1000 #(atom :n))]
         (is (= :existing (:state existing)))
         (is (= (:generation owner) (:generation existing)))
         (is (= (:generation owner)

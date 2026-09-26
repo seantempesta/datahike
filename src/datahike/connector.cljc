@@ -9,6 +9,7 @@
             [datahike.committed-report :as committed-report]
             [datahike.query :as query]
             [datahike.store :as ds]
+            [datahike.index.interface :as dii]
             [datahike.writing :as dsi]
             [datahike.config :as dc]
             [datahike.tools :as dt #?(:clj :refer :cljs :refer-macros) [meta-data]]
@@ -294,9 +295,11 @@
                      acquisition-key (connection-acquisition-key config)
                      physical-store-key (ds/physical-store-key store-config)
                      requested-completion (async/promise-chan)
-                     {:keys [state conn completion existing-key write-hooks generation]}
+                     threshold (:store-cache-size config)
+                     {:keys [state conn completion existing-key write-hooks generation node-cache]}
                      (reserve-connection-opening! conn-id requested-completion
-                                                  acquisition-key physical-store-key)]
+                                                  acquisition-key physical-store-key
+                                                  threshold #(dii/make-node-cache threshold))]
                  (case state
                    :existing
                    (checked-shared-connection config conn)
@@ -334,6 +337,9 @@
                          _         (when-not raw-store
                                      (log/raise "Backend does not exist." {:type   :backend-does-not-exist
                                                                            :config store-config}))
+                         ;; the node cache this opening reserved, shared with
+                         ;; every connection to the same physical store
+                         raw-store (assoc raw-store dii/node-cache-key node-cache)
                          store     (ds/add-cache-and-handlers raw-store config)
                          _         (vswap! resources assoc :store store)
                          _ (<?- (ds/ready-store (assoc store-config :opts opts) store))

@@ -1,6 +1,20 @@
 (ns datahike.index.interface
   "All the functions in this namespace must be implemented for each index type"
-  #?(:cljs (:refer-clojure :exclude [-seq -count -persistent! -flush -lookup])))
+  #?(:cljs (:refer-clojure :exclude [-seq -count -persistent! -flush -lookup]))
+  (:require #?(:clj [clojure.core.cache :as cache]
+               :cljs [cljs.cache :as cache])))
+
+(def node-cache-key
+  "Key under which a connection hands its storage the node cache it shares with
+   every other connection to the same physical store (upstream d2b9e525). Read
+   by the index implementation when it builds storage; absent on paths with no
+   connection behind them, which get a private cache."
+  ::node-cache)
+
+(defn make-node-cache
+  "A fresh LRU node cache: materialized index nodes keyed by storage address."
+  [threshold]
+  (atom (cache/lru-cache-factory {} :threshold threshold)))
 
 (defprotocol IIndex
   (-all [index] "Returns a sequence of all datoms in the index")

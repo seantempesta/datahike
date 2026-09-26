@@ -35,8 +35,11 @@
       :else {:state :retained})))
 
 (defn reserve-connection-opening!
-  "Atomically acquire an existing connection or reserve its first open."
-  [conn-id completion acquisition-key physical-store-key]
+  "Atomically acquire an existing connection or reserve its first open.
+  A first open reserves the node cache it will use: a live or opening sibling's
+  for the same physical store and threshold, else a fresh one from
+  `make-cache` (which must be pure: a swap! retry may discard it)."
+  [conn-id completion acquisition-key physical-store-key threshold make-cache]
   (let [[before after]
         (swap-vals! *connections*
                     (fn [connections]
@@ -62,7 +65,14 @@
                                                    (:physical-store-key entry))
                                             (:write-hooks entry)))
                                         connections)
-                                  (atom {}))]
+                                  (atom {}))
+                              node-cache
+                              (or (some (fn [[_ entry]]
+                                          (when (and (= physical-store-key (:physical-store-key entry))
+                                                     (= threshold (:threshold entry)))
+                                            (:node-cache entry)))
+                                        connections)
+                                  (make-cache))]
                           (assoc connections conn-id
                                  {:opening? true
                                   :completion completion
@@ -70,14 +80,17 @@
                                   :waiters 0
                                   :acquisition-key acquisition-key
                                   :physical-store-key physical-store-key
-                                  :write-hooks write-hooks})))))
+                                  :write-hooks write-hooks
+                                  :threshold threshold
+                                  :node-cache node-cache})))))
         before-entry (get before conn-id)
         after-entry (get after conn-id)]
     (cond
       (nil? before-entry) {:state :owner
                            :completion completion
                            :generation (:generation after-entry)
-                           :write-hooks (:write-hooks after-entry)}
+                           :write-hooks (:write-hooks after-entry)
+                           :node-cache (:node-cache after-entry)}
       (or (not= acquisition-key (:acquisition-key before-entry))
           (not= physical-store-key (:physical-store-key before-entry)))
       {:state :config-mismatch
@@ -105,7 +118,9 @@
                        :generation (:generation entry)
                        :acquisition-key (:acquisition-key entry)
                        :physical-store-key (:physical-store-key entry)
-                       :write-hooks (:write-hooks entry)})
+                       :write-hooks (:write-hooks entry)
+                       :threshold (:threshold entry)
+                       :node-cache (:node-cache entry)})
                (throw (ex-info "Connection opening reservation was lost."
                                {:type :connection-opening-reservation-lost
                                 :conn-id conn-id})))))))
