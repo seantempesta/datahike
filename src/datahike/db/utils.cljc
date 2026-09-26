@@ -99,9 +99,16 @@
                {:error :transact/syntax, :attribute ident})))
 
 (defn db? [x]
-  (and (satisfies? dbi/ISearch x)
-       (satisfies? dbi/IIndexAccess x)
-       (satisfies? dbi/IDB x)))
+  ;; On the JVM every database type implements these protocols inline
+  ;; (defrecord-updatable), so the protocol interfaces answer exactly and in
+  ;; constant time; `satisfies?` on a non-database value walks the class's
+  ;; supers and allocated ~42 KB per call (Seon perf profile 2026-09-26).
+  #?(:clj (and (instance? datahike.db.interface.ISearch x)
+               (instance? datahike.db.interface.IIndexAccess x)
+               (instance? datahike.db.interface.IDB x))
+     :cljs (and (satisfies? dbi/ISearch x)
+                (satisfies? dbi/IIndexAccess x)
+                (satisfies? dbi/IDB x))))
 
 (defn numeric-entid? [x]
   (and (number? x) (pos? x)))
