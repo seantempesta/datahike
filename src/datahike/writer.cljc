@@ -27,9 +27,8 @@
   "Resolve every accepted invocation still buffered in the transaction queue."
   [transaction-queue error]
   (loop []
-    (when-let [{:keys [callback applied]} (poll! transaction-queue)]
+    (when-let [{:keys [callback]} (poll! transaction-queue)]
       (put! callback error)
-      (some-> applied (put! error))
       (recur))))
 
 (defn- fail-pending-commits!
@@ -122,7 +121,7 @@
                   (while (not (:writer @(:wrapped-atom connection)))
                     (<! (timeout 10)))
                   (loop [old @(:wrapped-atom connection)]
-                    (if-let [{:keys [op args callback applied] :as invocation} (<?- transaction-queue)]
+                    (if-let [{:keys [op args callback] :as invocation} (<?- transaction-queue)]
                     (do
                       (when (> (count transaction-queue-buffer) (* 0.9 transaction-queue-size))
                         (log/warn :datahike/tx-queue-pressure "Transaction queue buffer >90% full" {:count (count transaction-queue-buffer) :size transaction-queue-size}))
@@ -146,15 +145,14 @@
                               ;; short circuit on errors
                                       #?(:cljs (put! callback e)
                                          :clj
-                                         (let [failure (if (= (type e) NullPointerException)
-                                                         (ex-info "Null pointer encountered in invocation. Connection may have been invalidated, e.g. through db deletion, and needs to be released everywhere."
-                                                                  {:type       :writer-error-during-invocation
-                                                                   :invocation invocation
-                                                                   :connection connection
-                                                                   :error      e})
-                                                         e)]
-                                           (put! callback failure)
-                                           (some-> applied (put! failure))))
+                                         (put! callback
+                                               (if (= (type e) NullPointerException)
+                                                 (ex-info "Null pointer encountered in invocation. Connection may have been invalidated, e.g. through db deletion, and needs to be released everywhere."
+                                                          {:type       :writer-error-during-invocation
+                                                           :invocation invocation
+                                                           :connection connection
+                                                           :error      e})
+                                                 e)))
                                       ;; The accepted caller must receive its failure even
                                       ;; when formatting or delivering the diagnostic throws.
                                       (log/error :datahike/write-error
@@ -196,11 +194,6 @@
                                 ;; Closing a full queue wakes a parked put with
                                 ;; false; ignoring that result strands the
                                 ;; callback forever.
-                                ;; An `:applied` port answers now, in writer
-                                ;; order, with the report on the uncommitted
-                                ;; value; the callback still answers after the
-                                ;; batch commits it.
-                                (some-> applied (put! res))
                                 (if (>! commit-queue [res callback])
                                   ;; Merge parents belong to the report that
                                   ;; set them, never to the next operation.
@@ -422,19 +415,13 @@
                       :exception exception}))))))
 
 (defn transact!
-  "Queue `arg-map` on the connection's writer; the returned promise delivers
-   the committed report. With `applied`, a port, that port first receives the
-   report the writer applied on its uncommitted value (or the invocation's
-   failure), in writer order, before the batch commits."
-  ([connection arg-map] (transact! connection arg-map nil))
-  ([connection arg-map applied]
+  [connection arg-map]
   (let [p (throwable-promise)
         writer (:writer @(:wrapped-atom connection))]
     (go
       (let [tx-report (<! (dispatch! writer
-                                     (cond-> {:op 'transact!
-                                              :args [arg-map]}
-                                       applied (assoc :applied applied))))
+                                     {:op 'transact!
+                                      :args [arg-map]}))
             listeners (some-> (:listeners (meta connection)) deref)]
         (#?(:clj deliver :cljs put!) p tx-report)
         (when (map? tx-report) ;; not error
@@ -451,7 +438,7 @@
                      (dispatch! writer {:op 'install-secondary-index!
                                         :args [build-result]}))))))
           (notify-listeners! connection listeners tx-report))))
-    p)))
+    p))
 
 (defn load-entities [connection entities]
   (let [p (throwable-promise)
