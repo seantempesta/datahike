@@ -255,9 +255,18 @@
      :clj
      (.compareTo ^Comparable a1 a2)))
 
-(defn- class-name [x]
+(defn- class-name
+  "A string naming the value's type on both platforms (cljs `(type x)` is a
+   constructor, which `compare` cannot order)."
+  [x]
   #?(:clj (.getName (class x))
-     :cljs (type x)))
+     :cljs (str (type x))))
+
+(defn- class-order
+  "Order two values of DIFFERENT types by type name, so one attribute's values
+   stay totally ordered across a type change. Port of upstream 515786f6 (#955)."
+  [a b]
+  (compare (class-name a) (class-name b)))
 
 (defn compare-value
   "Compare two values with cross-platform UUID compatibility.
@@ -268,9 +277,19 @@
   [v1 v2]
   #?(:clj (if (and (da/bytes? v1) (da/bytes? v2))
             (da/compare-arrays v1 v2)
-            (compare v1 v2))
+            ;; Two Comparables of different types throw from `compare`. One
+            ;; attribute's datoms hold both when it is reinstalled with another
+            ;; :db/valueType (history keeps the old values; a purge leaves its
+            ;; removal buffered in a Branch), or under :schema-flexibility :read.
+            ;; Only `cmp-nil` caught it, so the *-quick comparators crashed.
+            (try (compare v1 v2)
+                 (catch ClassCastException e
+                   (if (identical? (class v1) (class v2))
+                     (throw e)
+                     (class-order v1 v2)))))
      :cljs
-     (cond
+     (try
+      (cond
        (and (uuid? v1) (uuid? v2))
        ;; Match Java's signed UUID comparison where MSB is treated as signed
        ;; In signed comparison: 0x8... is negative, so 0x8... < 0x0...
@@ -289,14 +308,17 @@
        (and (da/bytes? v1) (da/bytes? v2))
        (da/compare-arrays v1 v2)
 
-       :else (compare v1 v2))))
+       :else (compare v1 v2))
+      (catch :default e
+        (if (identical? (type v1) (type v2))
+          (throw e)
+          (class-order v1 v2))))))
 
 (defn- safe-compare [a b]
   (try
     (compare-value a b)
     (catch #?(:clj Exception :cljs js/Error) _e
-      (compare (class-name a)
-               (class-name b)))))
+      (class-order a b))))
 
 (defn cmp-nil [o1 o2]
   (if (nil? o1) nil

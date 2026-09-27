@@ -147,3 +147,46 @@
         (is (= #{[30 true]}
                (find-ages (d/history @conn) name)))))
     (d/release conn)))
+
+#?(:clj
+   (defn- retype-value!
+     "Reinstall :value as :db.type/long after `clear` removed entity \"a\"'s
+      string value; return the long write's outcome and :value's history."
+     [clear]
+     (let [id (random-uuid)
+           cfg {:store {:backend :file :id id
+                        :path (str (System/getProperty "java.io.tmpdir") "/dh-retype-" id)}
+                :keep-history? true
+                :schema-flexibility :write
+                :index-config {:branching-factor 32 :diff-buf-size 8}}
+           attr (fn [t] {:db/ident :value :db/valueType t :db/cardinality :db.cardinality/one})
+           conn (do (d/create-database cfg) (d/connect cfg))]
+       (try
+         (d/transact conn [{:db/ident :id :db/valueType :db.type/string
+                            :db/unique :db.unique/identity :db/cardinality :db.cardinality/one}
+                           (attr :db.type/string)])
+         ;; Enough datoms that the stored temporal roots are Branches, whose
+         ;; diff buffer keeps the purge's removal of the string datom.
+         (d/transact conn (vec (for [i (range 300)] {:id (str "pad" i)})))
+         (d/transact conn [{:id "a" :value "one"}])
+         (let [e (:db/id (d/entity @conn [:id "a"]))]
+           (d/transact conn (clear e))
+           (d/transact conn [[:db/retractEntity :value]])
+           (d/transact conn [(attr :db.type/long)])
+           (d/transact conn [{:id "a" :value 42}])
+           [(:value (d/entity @conn [:id "a"]))
+            (d/q '[:find [?v ...] :in $ ?e :where [?e :value ?v]] (d/history @conn) e)])
+         (finally (d/release conn) (d/delete-database cfg))))))
+
+#?(:clj
+   (deftest test-retype-attribute-keeps-a-total-value-order
+     ;; An attribute reinstalled with another :db/valueType shares its index
+     ;; prefix (a, e) with old-typed datoms that history keeps (retract) or a
+     ;; stored Branch's diff buffer keeps (purge). `compare-value` orders the
+     ;; two types by class name instead of throwing ClassCastException.
+     (testing "retracted old values stay in history beside the new type"
+       (let [[v hist] (retype-value! (fn [e] [[:db/retract e :value "one"]]))]
+         (is (= 42 v))
+         (is (= #{"one" 42} (set hist)))))
+     (testing "purged old values leave a buffered removal beside the new type"
+       (is (= [42 [42]] (retype-value! (fn [e] [[:db.purge/attribute e :value]])))))))
