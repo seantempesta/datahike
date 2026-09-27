@@ -243,10 +243,13 @@
     (transient pset))
   (-persistent! [^PersistentSortedSet pset]
     (persistent! pset))
-  (-mark [^PersistentSortedSet pset]
-    (mark pset))
-  (-mark [^PersistentSortedSet pset seen]
-    (mark-unseen pset seen))
+  ;; extend-type takes a multi-arity method as ONE entry: a second `-mark`
+  ;; entry would replace the first (ArityException on `(-mark index)`).
+  (-mark
+    ([^PersistentSortedSet pset]
+     (mark pset))
+    ([^PersistentSortedSet pset seen]
+     (mark-unseen pset seen)))
   (-root-node [^PersistentSortedSet pset]
     ;; In-memory top node; populated after -flush set the root/address.
     #?(:clj  (.root pset)

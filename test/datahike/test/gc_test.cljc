@@ -164,7 +164,8 @@
   ;; One `seen` across commits: the second commit's mark answers only the nodes
   ;; it does not share with the first, and the union equals the separate marks.
   (let [cfg (-> cfg
-                (assoc :store {:backend :memory
+                (assoc :store {:backend :file
+                               :path "/tmp/dh-gc-shared-seen-test"
                                :id #uuid "9c000000-0000-0000-0000-00000000005e"})
                 (assoc :keep-history? false))
         _ (d/delete-database cfg)
