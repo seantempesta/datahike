@@ -84,7 +84,11 @@
 (def ^:const DEFAULT_COMMIT_WAIT_TIME 0) ;; in ms
 
 (defn- write-error-log
-  "Log exception structure and identities, never invocation arguments or exception data."
+  "Log exception structure and identities, never invocation arguments,
+  exception data or the stack trace. The caller receives the error itself as
+  the transaction's result; the log names each cause link and where it was
+  thrown (`:via`'s `:at`), and a whole trace here was an unbounded copy
+  printed to whatever `*out*` the writer thread inherited."
   [database invocation error]
   (let [identity-keys [:seon.cluster/name :seon.test/sym :seon.test.run/id
                        :seon.error/id]
@@ -100,11 +104,10 @@
             :branch (get-in database [:config :branch])
             :datahike/commit-id (get-in database [:meta :datahike/commit-id])
             :error #?(:clj (-> (Throwable->map error)
-                               (dissoc :data)
+                               (dissoc :data :trace)
                                (update :via #(mapv (fn [cause] (dissoc cause :data)) %)))
                       :cljs {:type (.-name error)
-                             :cause (.-message error)
-                             :trace (.-stack error)})})))
+                             :cause (.-message error)})})))
 
 (defn create-thread
   "Creates new transaction thread"
