@@ -182,6 +182,26 @@
     (psset/walk-addresses pset (fn [address] (swap! addresses conj address)))
     @addresses))
 
+(defn mark-unseen
+  "The addresses of `pset` not yet in the `seen` atom, adding them to it.
+
+  A stored node never changes at its address, so a node already in `seen`
+  had its whole subtree walked: the walk does not descend into it
+  (`walk-addresses` descends only when its consumer answers truthy). Marking
+  every commit of a history with one `seen` costs the store's distinct nodes,
+  not commits times tree size."
+  [pset seen]
+  (when-not #?(:clj (.-_address ^PersistentSortedSet pset) :cljs (.-address pset))
+    (throw (ex-info "Index needs to be properly flushed before marking."
+                    {:type :flush-before-marking})))
+  (let [addresses (volatile! (transient #{}))]
+    (psset/walk-addresses pset (fn [address]
+                                 (let [[before _] (swap-vals! seen conj address)]
+                                   (when-not (contains? before address)
+                                     (vswap! addresses conj! address)
+                                     true))))
+    (persistent! @addresses)))
+
 (extend-type #?(:clj PersistentSortedSet :cljs BTSet)
   IIndex
   (-slice [^PersistentSortedSet pset from to index-type]
@@ -225,6 +245,8 @@
     (persistent! pset))
   (-mark [^PersistentSortedSet pset]
     (mark pset))
+  (-mark [^PersistentSortedSet pset seen]
+    (mark-unseen pset seen))
   (-root-node [^PersistentSortedSet pset]
     ;; In-memory top node; populated after -flush set the root/address.
     #?(:clj  (.root pset)

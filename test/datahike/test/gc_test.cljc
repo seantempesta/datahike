@@ -159,3 +159,31 @@
         (is (= 7 (count history-after-gc)))))
     (d/release conn)
     (d/release conn-branch1)))
+
+(deftest marking-with-a-shared-seen-set-walks-each-node-once
+  ;; One `seen` across commits: the second commit's mark answers only the nodes
+  ;; it does not share with the first, and the union equals the separate marks.
+  (let [cfg (-> cfg
+                (assoc :store {:backend :memory
+                               :id #uuid "9c000000-0000-0000-0000-00000000005e"})
+                (assoc :keep-history? false))
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)]
+    (try
+      (d/transact conn schema)
+      (d/transact conn (vec (for [i (range 20000)] {:age i})))
+      (let [first-db @conn
+            _ (d/transact conn [{:age 20001}])
+            second-db @conn
+            separate (set/union (-mark (:eavt first-db)) (-mark (:eavt second-db)))
+            seen (atom #{})
+            first-marked (-mark (:eavt first-db) seen)
+            second-marked (-mark (:eavt second-db) seen)]
+        (is (< 1 (count first-marked)) "the tree has more than a root")
+        (is (< (count second-marked) (count first-marked))
+            "the second commit walks only the nodes it changed")
+        (is (= separate (set/union first-marked second-marked) @seen)))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))

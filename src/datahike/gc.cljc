@@ -19,15 +19,21 @@
 (defn get-time [d]
   (.getTime ^Date d))
 
-(defn- reachable-in-branch [store branch after-date config]
+(defn- reachable-in-branch
+  "The keys `branch` reaches from its head through commits newer than
+  `after-date`. `visited` (commit keys) and `seen` (index node addresses) are
+  atoms shared by every branch of one collection: a commit another branch
+  already claimed is walked there, and a node already marked had its whole
+  subtree marked, so the mark costs the store's distinct commits and nodes,
+  not branches times commits times tree size."
+  [store branch after-date config visited seen]
   (go-try S
           (let [head-cid (<? S (k/get-in store [branch :meta :datahike/commit-id]))]
             (loop [[to-check & r] [branch]
-                   visited        #{}
                    reachable      #{branch head-cid}]
               (if to-check
-                (if (visited to-check) ;; skip
-                  (recur r visited reachable)
+                (if (contains? (first (swap-vals! visited conj to-check)) to-check) ;; claimed: skip
+                  (recur r reachable)
                   (if-let [record (<? S (k/get store to-check))]
                     (let [{:keys                         [eavt-key avet-key aevt-key
                                                           temporal-eavt-key temporal-avet-key temporal-aevt-key
@@ -57,7 +63,8 @@
                           ;; uses it and only its children are fetched.
                             mark (fn [idx root]
                                    (-mark (cond-> (with-storage (:index config) idx (:storage store))
-                                            root (-seed-root! root))))
+                                            root (-seed-root! root))
+                                          seen))
                             new-reachable (cond-> (set/union reachable #{to-check}
                                                              (when schema-meta-key #{schema-meta-key})
                                                              (mark eavt-key eavt-root)
@@ -70,14 +77,13 @@
                                             sec-reachable
                                             (set/union sec-reachable))]
                         (recur (concat r (when in-range? parents))
-                               (conj visited to-check)
                                new-reachable)))
                     ;; Record absent: already swept by an earlier pass with a
                     ;; narrower window, or the store runs :commit-graph? false
                     ;; and never persisted it. Lineage ends here — nothing to
                     ;; mark. (Without this guard the nil destructure NPEs at
                     ;; get-time.)
-                    (recur r (conj visited to-check) reachable)))
+                    (recur r reachable)))
                 reachable)))))
 
 (defn gc-storage!
@@ -143,8 +149,10 @@
                      _ (sc/clear-write-cache (:store config))
                      branches (<? S (k/get store :branches))
                      _ (log/trace :datahike/gc-retain-branches {:branches branches})
+                     visited (atom #{})
+                     seen (atom #{})
                      native-reachable (->> branches
-                                           (map #(reachable-in-branch store % remove-before config))
+                                           (map #(reachable-in-branch store % remove-before config visited seen))
                                            async/merge
                                            (<<? S)
                                            (apply set/union))
