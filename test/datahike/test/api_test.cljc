@@ -795,6 +795,9 @@
         conn                (utils/setup-db cfg)
         schema-on-write? (= (:schema-flexibility (.-config @conn)) :write)
         attribute-refs? (:attribute-refs? (:config @conn))
+        ;; the persistent-set temporal index holds only datoms that left the
+        ;; current index (temporal-upsert); the hitchhiker tree copies each assertion
+        moves-only-what-leaves? (not= :datahike.index/hitchhiker-tree (:index cfg))
         schema-count 11                                     ;; amount of user schema datoms in temporal eavt index
         temporal-count 10                                   ;; amount of user data datoms in temporal eavt index when using schema-on-write
         temporal-avet-count 9                               ;; amount of user data datoms in temporal avet index when using schema-on write
@@ -823,21 +826,30 @@
                                                         (+ tx0 3) 1
                                                         (+ tx0 4) 1}
                                   ; 10 == 11 minus 1 parent datom that wouldn't get added unless retracted
-                                  :temporal-count      (+ schema-count
+                                  :temporal-count      (if moves-only-what-leaves?
+                                                         ;; Donald's name and age and Dinky's parent ref left the
+                                                         ;; current index: each assertion and its retraction (6);
+                                                         ;; attribute refs' system datoms are still created there
+                                                         (+ 6 (if attribute-refs? sys-attr-count 0))
+                                                         (+ schema-count
                                                           (if schema-on-write?
                                                             (if attribute-refs?
                                                               (+ temporal-count sys-attr-count)
                                                               temporal-count)
                                                             (if attribute-refs?
                                                               (+ temporal-count sys-attr-count)
-                                                              0)))
-                                  :temporal-avet-count (if schema-on-write?
+                                                              0))))
+                                  :temporal-avet-count (if moves-only-what-leaves?
+                                                         ;; name and parents are indexed: 4, schema-on-write only;
+                                                         ;; attribute refs' indexed system datoms: 52
+                                                         (+ (if schema-on-write? 4 0) (if attribute-refs? 52 0))
+                                                         (if schema-on-write?
                                                          (if attribute-refs?
                                                            sys-attr-avet-count
                                                            temporal-avet-count)
                                                          (if attribute-refs?
                                                            sys-attr-avet-count
-                                                           0))})))
+                                                           0)))})))
         update-for-attr-refs
         (fn [metrics]
           (let [update-counts (fn [coll] (reduce (fn [m counted] (update m counted #(if % (inc %) 1)))

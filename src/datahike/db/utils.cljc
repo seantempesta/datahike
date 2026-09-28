@@ -234,16 +234,12 @@
      datoms)))
 
 (defn distinct-datoms
+  "The history view: every current datom merged with the temporal index,
+  which holds only what left the current index (`temporal-upsert`); an
+  older store's temporal copies of current datoms merge away as duplicates."
   ([db index-type current-datoms history-datoms]
    (if  (dbi/-keep-history? db)
-     (merge-datoms
-      index-type
-      (filter (fn [datom]
-                (let [a (:a datom)]
-                  (or (no-history? db a)
-                      (multival? db a))))
-              current-datoms)
-      history-datoms)
+     (merge-datoms index-type current-datoms history-datoms)
      current-datoms)))
 
 (defn distinct-datoms-desc
@@ -257,14 +253,7 @@
   (if (dbi/-keep-history? db)
     (let [cmp  (index-type->cmp-quick index-type false)
           rcmp (fn [a b] (cmp b a))]
-      (merge-distinct-sorted-seqs
-       rcmp
-       (filter (fn [datom]
-                 (let [a (:a datom)]
-                   (or (no-history? db a)
-                       (multival? db a))))
-               current-datoms)
-       history-datoms))
+      (merge-distinct-sorted-seqs rcmp current-datoms history-datoms))
     current-datoms))
 
 (defn temporal-datoms [db index-type cs]

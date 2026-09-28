@@ -151,24 +151,23 @@
          :cljs (psset/replace pset old-datom datom (dd/index-type->cmp-replace index-type))))
     (psset/conj pset datom (index-type->cmp-quick index-type))))
 
-(defn temporal-upsert [pset ^Datom datom index-type old-datom]
+(defn temporal-upsert
+  "The history a card-one write leaves: when it replaces or retracts a value,
+  that value's own assertion (its original tx) and its retraction at `tx`.
+  A current assertion is never copied here: history reads merge the current
+  index with this one (`dbu/distinct-datoms`), so the datom moves in only
+  when it leaves the current index. Stores written before this rule hold
+  current assertions here as well; the merge is distinct, so they read the
+  same."
+  [pset ^Datom datom index-type old-datom]
   (let [{:keys [e a v tx added]} datom
-        old-val (:v old-datom)]
-    (if added
-      (if (some? old-datom)
-        (if (= v old-val)
-          pset
-          (-> pset
-              (psset/conj (dd/datom e a old-val tx false)
-                          (index-type->cmp-quick index-type false))
-              (psset/conj datom
-                          (index-type->cmp-quick index-type false))))
-        (psset/conj pset datom (index-type->cmp-quick index-type false)))
-      (if (some? old-datom)
-        (psset/conj pset
-                    (dd/datom e a old-val tx false)
-                    (index-type->cmp-quick index-type false))
-        pset))))
+        old-val (:v old-datom)
+        cmp (index-type->cmp-quick index-type false)]
+    (if (and (some? old-datom) (or (not added) (not= v old-val)))
+      (-> pset
+          (psset/conj old-datom cmp)
+          (psset/conj (dd/datom e a old-val tx false) cmp))
+      pset)))
 
 (defn mark [pset]
   ;; The flushed root address is `_address` on the JVM PersistentSortedSet but

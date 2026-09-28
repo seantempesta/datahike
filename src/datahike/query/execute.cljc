@@ -836,89 +836,42 @@
 
 #?(:clj
    (defn- fast-merge-scan
-     "Eagerly merge two PSS slices (current + temporal) into an ArrayList.
-      Handles nil slices (di/-slice returns nil when no datoms match).
-      For card-one history attrs with scan-attr, skips current index entirely."
+     "Eagerly merge two PSS slices (current + temporal) into an ArrayList,
+      distinct. The temporal index holds only what left the current one
+      (`temporal-upsert`), so both are read for every attribute; an older
+      store's temporal copies of current datoms merge away as duplicates.
+      Handles nil slices (di/-slice returns nil when no datoms match)."
      ^java.util.ArrayList [^PersistentSortedSet pss-a from to
                            ^PersistentSortedSet pss-b
-                           index-type db scan-attr]
-     (let [keep-history? (dbi/-keep-history? db)
-           scan-attr-current-ok? (if scan-attr
-                                   (or (not keep-history?)
-                                       (dbu/no-history? db scan-attr)
-                                       (dbu/multival? db scan-attr))
-                                   true)]
-       (if (and scan-attr (not scan-attr-current-ok?))
-         ;; Fast path: card-one history attr — skip current entirely
-         (let [slice-b (di/-slice pss-b from to index-type)]
-           (if slice-b
-             (let [^java.util.Iterator iter-b (.iterator ^Iterable slice-b)
-                   result (java.util.ArrayList. 4096)]
-               (while (.hasNext iter-b) (.add result (.next iter-b)))
-               result)
-             (java.util.ArrayList. 0)))
-         ;; General path: merge both iterators
-         (let [slice-a (di/-slice pss-a from to index-type)
-               slice-b (di/-slice pss-b from to index-type)]
-           (cond
-             (and (nil? slice-a) (nil? slice-b))
-             (java.util.ArrayList. 0)
-
-             (nil? slice-b)
-             (let [^java.util.Iterator iter-a (.iterator ^Iterable slice-a)
-                   result (java.util.ArrayList. 4096)]
-               (while (.hasNext iter-a)
-                 (let [^Datom d (.next iter-a)]
-                   (when (or (not keep-history?)
-                             scan-attr
-                             (dbu/no-history? db (.-a d))
-                             (dbu/multival? db (.-a d)))
-                     (.add result d))))
-               result)
-
-             (nil? slice-a)
-             (let [^java.util.Iterator iter-b (.iterator ^Iterable slice-b)
-                   result (java.util.ArrayList. 4096)]
-               (while (.hasNext iter-b) (.add result (.next iter-b)))
-               result)
-
-             :else
-             (let [cmp (.comparator pss-a)
-                   ^java.util.Iterator iter-a (.iterator ^Iterable slice-a)
-                   ^java.util.Iterator iter-b (.iterator ^Iterable slice-b)
-                   result (java.util.ArrayList. 4096)]
-               (letfn [(current-ok? [^Datom d]
-                         (or scan-attr
-                             (not keep-history?)
-                             (dbu/no-history? db (.-a d))
-                             (dbu/multival? db (.-a d))))
-                       (next-ok-a []
-                         (loop [d (when (.hasNext iter-a) (.next iter-a))]
-                           (cond (nil? d) nil
-                                 (current-ok? d) d
-                                 (.hasNext iter-a) (recur (.next iter-a))
-                                 :else nil)))]
-                 (loop [a (next-ok-a)
-                        b (when (.hasNext iter-b) (.next iter-b))]
-                   (cond
-                     (and (nil? a) (nil? b)) result
-                     (nil? a) (do (.add result b)
-                                  (while (.hasNext iter-b) (.add result (.next iter-b)))
-                                  result)
-                     (nil? b) (do (.add result a)
-                                  (while (.hasNext iter-a)
-                                    (let [d (.next iter-a)]
-                                      (when (current-ok? d) (.add result d))))
-                                  result)
-                     :else
-                     (let [c (.compare ^java.util.Comparator cmp a b)]
-                       (cond
-                         (< c 0) (do (.add result a) (recur (next-ok-a) b))
-                         (> c 0) (do (.add result b)
-                                     (recur a (when (.hasNext iter-b) (.next iter-b))))
-                         :else   (do (.add result a) ;; dedup: keep first
-                                     (recur (next-ok-a)
-                                            (when (.hasNext iter-b) (.next iter-b))))))))))))))))
+                           index-type _db _scan-attr]
+     (let [slice-a (di/-slice pss-a from to index-type)
+           slice-b (di/-slice pss-b from to index-type)
+           result (java.util.ArrayList. 4096)
+           drain! (fn [^java.util.Iterator iter]
+                    (while (.hasNext iter) (.add result (.next iter)))
+                    result)]
+       (cond
+         (and (nil? slice-a) (nil? slice-b)) result
+         (nil? slice-b) (drain! (.iterator ^Iterable slice-a))
+         (nil? slice-a) (drain! (.iterator ^Iterable slice-b))
+         :else
+         (let [cmp (.comparator pss-a)
+               ^java.util.Iterator iter-a (.iterator ^Iterable slice-a)
+               ^java.util.Iterator iter-b (.iterator ^Iterable slice-b)]
+           (loop [a (when (.hasNext iter-a) (.next iter-a))
+                  b (when (.hasNext iter-b) (.next iter-b))]
+             (cond
+               (and (nil? a) (nil? b)) result
+               (nil? a) (do (.add result b) (drain! iter-b))
+               (nil? b) (do (.add result a) (drain! iter-a))
+               :else
+               (let [c (.compare ^java.util.Comparator cmp a b)]
+                 (cond
+                   (< c 0) (do (.add result a) (recur (when (.hasNext iter-a) (.next iter-a)) b))
+                   (> c 0) (do (.add result b) (recur a (when (.hasNext iter-b) (.next iter-b))))
+                   :else   (do (.add result a) ;; dedup: keep first
+                               (recur (when (.hasNext iter-a) (.next iter-a))
+                                      (when (.hasNext iter-b) (.next iter-b)))))))))))))
 
 (defn- maybe-post-process
   "Pipe `slice` through `post-process-datoms` iff the wrapper `db`'s
@@ -938,35 +891,38 @@
       (db/post-process-datoms slice origin-db ctx)
       slice)))
 
+(defn- merged-eavt-slice
+  "The current and temporal EAVT datoms of one [eid attr] range, distinct and
+   sorted: an eager iterator merge over persistent-set indexes, the lazy
+   `distinct-datoms` merge otherwise."
+  [origin-db from-d to-d]
+  (let [current (:eavt origin-db)
+        temporal (:temporal-eavt origin-db)]
+    #?(:clj (if (and (instance? PersistentSortedSet current) (instance? PersistentSortedSet temporal))
+              (fast-merge-scan current from-d to-d temporal :eavt origin-db nil)
+              (dbu/distinct-datoms origin-db :eavt
+                                   (di/-slice current from-d to-d :eavt)
+                                   (di/-slice temporal from-d to-d :eavt)))
+       :cljs (dbu/distinct-datoms origin-db :eavt
+                                  (di/-slice current from-d to-d :eavt)
+                                  (di/-slice temporal from-d to-d :eavt)))))
+
 (defn- temporal-merge-slice
   "Get merged datoms for [eid attr] from current+temporal indexes.
-   For historical: merge via distinct-datoms (all versions).
+   For historical: every version (`merged-eavt-slice`).
    For as-of/since: merge + post-process-datoms (time filter + assemble).
    For regular DB: pass through `maybe-post-process` so FilteredDB
    (and `d/valid-at`, which is `(d/filter db vt-pred)` underneath)
    actually fires."
   [origin-db from-d to-d temporal-type temporal-tx-filter db]
-  (let [current-slice (di/-slice (:eavt origin-db) from-d to-d :eavt)]
-    (case temporal-type
-      :historical
-      (let [temporal-index (:temporal-eavt origin-db)
-            merged (dbu/distinct-datoms origin-db :eavt
-                                        current-slice
-                                        (di/-slice temporal-index from-d to-d :eavt))]
-        ;; Same xform-after lift as the as-of/since branch — keeps
-        ;; FilteredDB-around-HistoricalDB working.
-        (maybe-post-process merged db origin-db))
-
-      (:as-of :since)
-      (let [temporal-index (:temporal-eavt origin-db)
-            merged (dbu/distinct-datoms origin-db :eavt
-                                        current-slice
-                                        (di/-slice temporal-index from-d to-d :eavt))
-            ctx (dbi/-search-context db)]
-        (db/post-process-datoms merged origin-db ctx))
-
-      ;; regular DB
-      (maybe-post-process current-slice db origin-db))))
+  (case temporal-type
+    ;; Same xform-after lift as the as-of/since branch — keeps
+    ;; FilteredDB-around-HistoricalDB working.
+    :historical (maybe-post-process (merged-eavt-slice origin-db from-d to-d) db origin-db)
+    (:as-of :since) (db/post-process-datoms (merged-eavt-slice origin-db from-d to-d)
+                                            origin-db (dbi/-search-context db))
+    ;; regular DB
+    (maybe-post-process (di/-slice (:eavt origin-db) from-d to-d :eavt) db origin-db)))
 
 (defn- visible-eavt-datom
   "Find the visible temporal EAVT datom for one card-one merge key.
@@ -1456,39 +1412,59 @@
 
 (defn- fast-eligible?
   "True iff a temporal merge is the exact shape the cursor fast path handles:
-   a single, probe-less (fully unbound), card-many, temporal-only, NON-anti,
-   NON-optional merge with a pre-built ForwardCursor. Everything else (probe-bound
-   as-of, multi-merge, anti, get-else/optional, no cursor) delegates to the slow
-   path unchanged."
+   a single, probe-less (fully unbound), card-many, NON-anti, NON-optional
+   history merge with a pre-built current+temporal cursor pair. Everything else
+   (probe-bound as-of, multi-merge, anti, get-else/optional, no cursor)
+   delegates to the slow path unchanged."
   [n-merges temporal-ctx probe-set]
   (and (== (int n-merges) 1)
        (nil? probe-set)
        (let [^objects tc temporal-ctx
              ^objects merge-anti (aget tc 3)
              ^objects merge-card-many (aget tc 4)
-             ^objects merge-temporal-only (aget tc 8)
              ^objects temporal-cursors (aget tc 11)
              ^objects merge-optional (when (> (alength tc) 16) (aget tc 16))]
          (and (aget merge-card-many 0)
-              (aget merge-temporal-only 0)
               (not (aget merge-anti 0))
               (or (nil? merge-optional) (not (aget merge-optional 0)))
               (some? temporal-cursors)
               (some? (aget temporal-cursors 0))))))
 
 #?(:clj
-   (defn- execute-temporal-merge-fast
-     "Fast path for a single card-many temporal-only non-anti non-optional merge
-      with a forward cursor (already created by execute-group-direct). Replaces the
-      ~N root-anchored per-entity -slice calls (one per scanned datom) with ONE
-      monotonically advancing ForwardCursor: the scan emits entities in ascending
-      `e` and temporal-eavt is EAVT-sorted, so seekGE never re-seeks from root.
+   (defn- history-versions!
+     "Fill `buf` with every version of [eid ra] (v ground when `vg?`) that
+      `match?` accepts, from a [current temporal] ForwardCursor pair, distinct
+      and in temporal EAVT order. The temporal index holds only what left the
+      current one (`temporal-upsert`); an older store's copies of current
+      datoms merge away. Both cursors only move forward."
+     [^java.util.ArrayList buf ^objects pair eid ra vg? vgv match?]
+     (.clear buf)
+     (let [probe (datom eid ra (when vg? vgv) tx0)
+           in-range? (fn [^Datom d] (and d (== (.-e d) (long eid)) (= (.-a d) ra)))
+           ^PersistentSortedSet$ForwardCursor cur-c (aget pair 0)
+           ^PersistentSortedSet$ForwardCursor cur-t (aget pair 1)]
+       (loop [^Datom c (let [d (.seekGE cur-c probe)] (when (in-range? d) d))
+              ^Datom t (let [d (.seekGE cur-t probe)] (when (in-range? d) d))]
+         (when (or c t)
+           (let [o (cond (nil? c) 1 (nil? t) -1 :else (datom/cmp-temporal-datoms-eavt-quick c t))
+                 ^Datom d (if (pos? o) t c)
+                 next-c #(let [n (.next cur-c)] (when (in-range? n) n))
+                 next-t #(let [n (.next cur-t)] (when (in-range? n) n))]
+             (when (match? d) (.add buf d))
+             (cond (neg? o) (recur (next-c) t)
+                   (pos? o) (recur c (next-t))
+                   :else (recur (next-c) (next-t))))))
+       buf)))
 
-      Peek-ahead handles the history cartesian: a singleton entity (next scan datom
-      is a different eid) emits directly while walking the cursor (single touch); a
-      repeated entity (next scan datom is the same eid — multiple name × age
-      versions) materializes the matched datoms into a small replay buffer once,
-      then replays it for each repeat without moving the cursor."
+#?(:clj
+   (defn- execute-temporal-merge-fast
+     "Fast path for a single card-many non-anti non-optional history merge with
+      a current+temporal cursor pair (created by execute-group-direct). Replaces
+      the ~N root-anchored per-entity -slice calls (one per scanned datom) with
+      two monotonically advancing ForwardCursors: the scan emits entities in
+      ascending `e` and both EAVT indexes are sorted, so seekGE never re-seeks
+      from root. An entity's matched versions are collected once and replayed
+      for each repeated scan datom of that entity (the history cartesian)."
      [eavt-pss slice ground-filter strict-filter
       probe-set probe-datom-field
       collect-set collect-datom-field collect-merge-idx
@@ -1512,51 +1488,26 @@
            check-v? (aget merge-check-scan-v 0)
            check-tx? (aget merge-check-scan-tx 0)
            added-filter (aget merge-added-filter 0)
-           ^PersistentSortedSet$ForwardCursor cur (aget temporal-cursors 0)
+           ^objects pair (aget temporal-cursors 0)
            buf (java.util.ArrayList.)]
        (when-let [^java.util.Iterator it (some-> ^Iterable slice .iterator)]
          (loop [^Datom cur-d (when (.hasNext it) (.next it))
                 buffer-eid -1]
            (when (and cur-d (or (neg? max-n) (< (result-list-size result-list) max-n)))
              (check-cancel! cancel)
-             (let [^Datom nxt-d (when (.hasNext it) (.next it))
-                   next-eid (if nxt-d (.-e nxt-d) -1)]
+             (let [^Datom nxt-d (when (.hasNext it) (.next it))]
                (if (and (scan-filter-temporal cur-d ground-filter strict-filter probe-set probe-datom-field temporal-tx-filter)
                         (or (nil? scan-added-val) (= (datom/datom-added cur-d) scan-added-val)))
                  (let [eid (.-e cur-d)
                        scan-d cur-d]
-                   (if (== eid buffer-eid)
-                     ;; replay buffer (same entity, cursor already consumed)
-                     (do (dotimes [bi (.size buf)]
-                           (aset merge-datoms 0 ^Datom (.get buf bi))
-                           (emit-tuple scan-d collect-set collect-datom-field collect-merge-idx merge-datoms
-                                       n-find find-source const-vals result-list))
-                         (recur nxt-d buffer-eid))
-                     ;; advance cursor to this entity
-                     (let [probe (datom eid ra (when vg? vgv) tx0)
-                           ^Datom d0 (.seekGE cur probe)]
-                       (if (== next-eid eid)
-                         ;; repeats follow -> materialize buffer, emit
-                         (do (.clear buf)
-                             (loop [^Datom md d0]
-                               (when (and md (== (.-e md) eid) (= (.-a md) ra))
-                                 (when (temporal-merge-datom-match? md eid ra vg? vgv check-v? check-tx? scan-d temporal-tx-filter added-filter)
-                                   (.add buf md))
-                                 (recur (.next cur))))
-                             (dotimes [bi (.size buf)]
-                               (aset merge-datoms 0 ^Datom (.get buf bi))
-                               (emit-tuple scan-d collect-set collect-datom-field collect-merge-idx merge-datoms
-                                           n-find find-source const-vals result-list))
-                             (recur nxt-d eid))
-                         ;; singleton -> direct emit (single touch)
-                         (do (loop [^Datom md d0]
-                               (when (and md (== (.-e md) eid) (= (.-a md) ra))
-                                 (when (temporal-merge-datom-match? md eid ra vg? vgv check-v? check-tx? scan-d temporal-tx-filter added-filter)
-                                   (aset merge-datoms 0 md)
-                                   (emit-tuple scan-d collect-set collect-datom-field collect-merge-idx merge-datoms
-                                               n-find find-source const-vals result-list))
-                                 (recur (.next cur))))
-                             (recur nxt-d -1))))))
+                   (when-not (== eid buffer-eid)
+                     (history-versions! buf pair eid ra vg? vgv
+                                        #(temporal-merge-datom-match? % eid ra vg? vgv check-v? check-tx? scan-d temporal-tx-filter added-filter)))
+                   (dotimes [bi (.size buf)]
+                     (aset merge-datoms 0 ^Datom (.get buf bi))
+                     (emit-tuple scan-d collect-set collect-datom-field collect-merge-idx merge-datoms
+                                 n-find find-source const-vals result-list))
+                   (recur nxt-d eid))
                  ;; scan datom filtered out
                  (recur nxt-d buffer-eid)))))))))
 
@@ -1601,10 +1552,6 @@
         ^objects merge-added-filter (aget ^objects temporal-ctx 5)
         ^objects merge-check-scan-v (aget ^objects temporal-ctx 6)
         ^objects merge-check-scan-tx (aget ^objects temporal-ctx 7)
-        ^objects merge-temporal-only (aget ^objects temporal-ctx 8)
-        ^objects merge-cursor-cache (aget ^objects temporal-ctx 9)
-        temporal-eavt-pss (aget ^objects temporal-ctx 10)
-        ^objects temporal-cursors (aget ^objects temporal-ctx 11)
         temporal-type (aget ^objects temporal-ctx 12)
         temporal-tx-filter (aget ^objects temporal-ctx 13)
         scan-added-val (aget ^objects temporal-ctx 14)
@@ -1638,42 +1585,9 @@
                                    card-many? (aget merge-card-many mi)
                                    added-filter (aget merge-added-filter mi)]
                                (if card-many?
-                                 (let [temporal-only? (aget merge-temporal-only mi)]
-                                   (if (and temporal-only? temporal-cursors (aget temporal-cursors mi)
-                                            anti?)
-                                   ;; Fast path: ForwardCursor on temporal index (anti-merge only).
-                                     (let [^longs cache-eid-arr (aget merge-cursor-cache mi)
-                                           cached-eid (aget cache-eid-arr 0)]
-                                       (if (== cached-eid (long eid))
-                                         (let [cached (aget merge-datoms mi)]
-                                           (when (nil? cached) (process-merges (inc mi))))
-                                         (let [probe (datom eid ra (when vg? vgv) tx0)
-                                               ^PersistentSortedSet$ForwardCursor cur (aget temporal-cursors mi)
-                                               ^Datom d (.seekGE cur probe)
-                                               found (volatile! nil)]
-                                           (do (aset cache-eid-arr 0 (long eid))
-                                               (let [check-v? (aget merge-check-scan-v mi)
-                                                     check-tx? (aget merge-check-scan-tx mi)
-                                                     match (loop [^Datom md d]
-                                                             (cond
-                                                               (or (nil? md) (not (== (.-e md) eid)) (not (= (.-a md) ra)))
-                                                               nil
-                                                               (and (or (not vg?) (val-eq? (.-v md) vgv))
-                                                                    (or (nil? added-filter) (= (datom/datom-added md) added-filter))
-                                                                    (or (not check-v?) (val-eq? (.-v md) (.-v scan-d)))
-                                                                    (or (not check-tx?) (= (datom/datom-tx md) (datom/datom-tx scan-d))))
-                                                               md
-                                                               :else (recur (.next cur))))]
-                                                 (if match
-                                                   (aset merge-datoms mi match)
-                                                   (do (aset merge-datoms mi nil)
-                                                       (process-merges (inc mi)))))))))
-                                   ;; General path: slice-based merge
-                                     (let [from-d (datom eid ra (when vg? vgv) tx0)
+                                 (let [from-d (datom eid ra (when vg? vgv) tx0)
                                            to-d (datom eid ra (when vg? vgv) txmax)
-                                           mslice (if (aget merge-temporal-only mi)
-                                                    (di/-slice temporal-eavt-pss from-d to-d :eavt)
-                                                    (temporal-merge-slice origin-db from-d to-d temporal-type temporal-tx-filter db))
+                                           mslice (temporal-merge-slice origin-db from-d to-d temporal-type temporal-tx-filter db)
                                            check-v? (aget merge-check-scan-v mi)
                                            check-tx? (aget merge-check-scan-tx mi)]
                                        (if anti?
@@ -1691,7 +1605,7 @@
                                            ;; the valid-at :db.valid/to default) lands here.
                                            (when (and (not @matched?) merge-optional (aget merge-optional mi))
                                              (aset merge-datoms mi (datom eid ra (aget merge-defaults mi) tx0))
-                                             (process-merges (inc mi))))))))
+                                             (process-merges (inc mi))))))
                                ;; Card-one merge
                                  (if (nil? temporal-type)
                                    (let [probe (datom eid ra vgv tx0)
@@ -1780,10 +1694,7 @@
                            (if card-many?
                              (let [from-d (datom eid ra (when vg? vgv) tx0)
                                    to-d (datom eid ra (when vg? vgv) txmax)
-                                   temporal-only? (aget merge-temporal-only mi)
-                                   mslice (if temporal-only?
-                                            (di/-slice temporal-eavt-pss from-d to-d :eavt)
-                                            (temporal-merge-slice origin-db from-d to-d temporal-type temporal-tx-filter db))
+                                   mslice (temporal-merge-slice origin-db from-d to-d temporal-type temporal-tx-filter db)
                                    check-v? (aget merge-check-scan-v mi)
                                    check-tx? (aget merge-check-scan-tx mi)]
                                (if anti?
@@ -1899,31 +1810,24 @@
                                                    added)))
                                              merge-ops)))
         temporal-eavt-pss (when (= temporal-type :historical) (:temporal-eavt index-db))
-        merge-temporal-only (when temporal
-                              (to-array (mapv (fn [op]
-                                                (and (= temporal-type :historical)
-                                                     (some? temporal-eavt-pss)
-                                                     (get-in op [:schema-info :card-one?] true)
-                                                     (not (dbu/no-history? index-db
-                                                                           (let [ma (second (:clause op))]
-                                                                             (when (analyze/ground? ma)
-                                                                               (resolve-attr index-db ma)))))))
-                                              merge-ops)))
+        ;; No merge reads the temporal index alone: it holds only what left
+        ;; the current index (`temporal-upsert`), so every merge reads both.
+        ;; history merges walk a [current temporal] cursor pair (history-versions!)
         temporal-cursors
-        #?(:clj (when (and temporal-eavt-pss merge-temporal-only (some true? (seq merge-temporal-only)))
-                  (let [cursors (object-array n-merges)]
-                    (dotimes [i n-merges]
-                      (when (aget merge-temporal-only i)
+        #?(:clj (let [current-eavt (:eavt index-db)]
+                  (when (and temporal-eavt-pss
+                             (instance? PersistentSortedSet current-eavt)
+                             (instance? PersistentSortedSet temporal-eavt-pss))
+                    (let [cursors (object-array n-merges)]
+                      (dotimes [i n-merges]
                         (aset cursors i
-                              (.forwardCursor ^PersistentSortedSet temporal-eavt-pss
-                                              ^java.util.Comparator fast-cmp-ea))))
-                    cursors))
+                              (doto (object-array 2)
+                                (aset 0 (.forwardCursor ^PersistentSortedSet current-eavt
+                                                        ^java.util.Comparator fast-cmp-ea))
+                                (aset 1 (.forwardCursor ^PersistentSortedSet temporal-eavt-pss
+                                                        ^java.util.Comparator fast-cmp-ea)))))
+                      cursors)))
            :cljs nil)
-        merge-cursor-cache (when temporal
-                             #?(:clj (let [cache (object-array n-merges)]
-                                       (dotimes [i n-merges] (aset cache i (long-array 1 -1)))
-                                       cache)
-                                :cljs nil))
 
         ;; Non-temporal pipeline annotation
         _ (when-not temporal (assert pipeline "Plans must have :pipeline annotation"))
@@ -2037,7 +1941,7 @@
                                 (object-array [merge-attrs merge-v-ground merge-v-vals merge-anti
                                                merge-card-many merge-added-filter
                                                merge-check-scan-v merge-check-scan-tx
-                                               merge-temporal-only merge-cursor-cache
+                                               nil nil ; retired slots 8 and 9
                                                temporal-eavt-pss temporal-cursors
                                                temporal-type temporal-tx-filter
                                                scan-added-val origin-db

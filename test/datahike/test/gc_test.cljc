@@ -43,7 +43,9 @@
           ;; everything will fit into the root nodes of each index here
         num-roots 3
         fresh-count (+ num-roots 4) ;; :branches + :db + cid + roots + schema-meta
-        history-count 3]
+        ;; a fresh assertion copies nothing into the temporal indexes
+        ;; (temporal-upsert), so they keep their empty roots
+        history-count 0]
     (testing "Test initial store counts."
       (is (= 1 (count (-mark (:eavt @conn)))))
       (is (= fresh-count (count-store @conn)))
@@ -51,8 +53,10 @@
       (is (= 1 (count (-mark (:eavt @conn)))))
       (is (= (+ 2 history-count fresh-count num-roots) (count-store @conn))))
     (testing "Delete old db with roots."
-      (is (= (+ num-roots 2) (count (<?? S (d/gc-storage conn (Date.))))))
-      (is (= (+ history-count fresh-count) (count-store @conn))))
+      ;; the old empty current roots are still the temporal indexes' roots
+      ;; (an empty index's address is its content), so only 2 objects go
+      (is (= 2 (count (<?? S (d/gc-storage conn (Date.))))))
+      (is (= (+ history-count fresh-count num-roots) (count-store @conn))))
     (testing "Try to run on dirty index and fail."
       (is (thrown-with-msg? Throwable #"Index needs to be properly flushed before marking."
                             (-mark (:eavt

@@ -1103,7 +1103,8 @@
                   (let [history (HistoricalDB. db)]
                     (if-some [e (dbu/entid history e)]
                       (let [v (if (dbu/ref? history a) (dbu/entid-strict history v) v)
-                            old-datoms (dbi/search history [e a v])]
+                            ;; realized before the reduce mutates the indexes it reads
+                            old-datoms (vec (dbi/search history [e a v]))]
                         [(reduce transact-purge-datom report old-datoms) []])
                       (log/raise "Can't find entity with ID " e " to be purged"
                                  {:error :transact/purge, :operation op, :tx-data op-vec})))
