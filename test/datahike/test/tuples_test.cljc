@@ -62,6 +62,9 @@
       (testing "with type mismatch"
         (is (thrown-with-msg? ExceptionInfo #".*Cannot store heterogeneous tuple: there is a mismatch between values.* and their types.*"
                               (d/transact conn [{:coord [100 9]}]))))
+      (testing "with every value of the wrong type"
+        (is (thrown-with-msg? ExceptionInfo #".*Cannot store heterogeneous tuple: there is a mismatch between values.* and their types.*"
+                              (d/transact conn [{:coord ["west" 100]}]))))
       (d/release conn)))
 
   (testing "composite tuple"

@@ -1035,7 +1035,7 @@
                 (log/raise (str "Cannot store heterogeneous tuple: expecting " (count (:db/tupleTypes attr-schema)) " values, got " (count v))
                            {:error :transact/syntax, :tx-data op-vec})
 
-                (not (apply = (map s/valid? (:db/tupleTypes attr-schema) v)))
+                (not (every? true? (map s/valid? (:db/tupleTypes attr-schema) v)))
                 (log/raise (str "Cannot store heterogeneous tuple: there is a mismatch between values " v " and their types " (:db/tupleTypes attr-schema))
                            {:error :transact/syntax, :tx-data op-vec}))
           (and (:db/tupleAttrs attr-schema)
