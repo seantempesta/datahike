@@ -6,8 +6,11 @@
 
    - add-cache-and-handlers: Adds BTSet handlers and its node cache
    - store-identity: Returns store UUID from config
-   - ready-store: Tiered-specific initialization (populate cache from backend)"
+   - ready-store: Tiered-specific initialization (populate cache from backend)
+   - :datahike/overlay: a private memory frontend over a shared store"
   (:require [konserve.tiered :as kt]
+            [konserve.store :as ks]
+            [konserve.memory :as km]
             [clojure.walk :as walk]
             [datahike.index :as di]
             [konserve.utils :refer [#?(:clj async+sync) *default-sync-translation*]
@@ -41,6 +44,13 @@
   [config]
   (:id config))
 
+(defn overlay-marker
+  "The element an overlay adds to its connection ids (see `connection-id`), nil
+  for a plain store."
+  [config]
+  (when (= :datahike/overlay (get-in config [:store :backend]))
+    [:datahike/overlay (get-in config [:store :overlay])]))
+
 (defn connection-id
   "Return the process-local identity of a connection.
 
@@ -52,7 +62,10 @@
   (let [base [(store-identity (:store config)) (:branch config)]
         writer-backend (get-in config [:writer :backend] :self)]
     (cond-> base
-      (not= :self writer-backend) (conj writer-backend))))
+      (not= :self writer-backend) (conj writer-backend)
+      ;; An overlay shares its backend's store id (node addresses, GC guard)
+      ;; but never its connections: the same branch name is another world.
+      (overlay-marker config) (conj (overlay-marker config)))))
 
 (defn physical-store-key
   "Identify one physical backing location for internal resource sharing.
@@ -102,3 +115,50 @@
                (<?- (ready-store (assoc backend-config :opts opts) (:backend-store store)))
                (<?- (kt/sync-on-connect store kt/populate-missing-strategy opts))
                true)))
+
+;; =============================================================================
+;; Overlay: private writes over a shared store
+;; =============================================================================
+;;
+;; {:backend :datahike/overlay :id <backend's id> :overlay <uuid per overlay>
+;;  :backend-config <the shared store's config>}
+;;
+;; Every write — nodes, commits, branch heads, the :branches roster — lands in a
+;; memory frontend; every read falls through to the shared backend, which the
+;; overlay never mutates (konserve `:frontend-only`, `konserve/tiered.cljc:22`).
+;; All connections naming one `:overlay` uuid share its frontend (konserve's
+;; memory registry, keyed by that uuid), so a branch made through one is opened
+;; by the next. `delete-database` of the overlay config drops the frontend and
+;; never touches the backend; nothing is left to collect. Not `:tiered`:
+;; konserve requires frontend id = backend id (`konserve/store.cljc:380-393`),
+;; so every overlay of one store would share ONE frontend, and `ready-store
+;; :tiered` copies the whole backend into it (`sync-on-connect`, above).
+
+(defn- overlay-frontend [overlay]
+  (or (km/connect-mem-store overlay {:sync? true})
+      (km/new-mem-store (atom {}) {:sync? true :id overlay})))
+
+(defmethod ks/-connect-store :datahike/overlay
+  [{:keys [backend-config overlay]} opts]
+  (async+sync (:sync? opts) *default-sync-translation*
+              (go-try-
+               (let [backend (<?- (ks/connect-store backend-config opts))]
+                 (<?- (kt/connect-tiered-store
+                       (overlay-frontend overlay)
+                       backend
+                       :write-policy :frontend-only
+                       :read-policy :frontend-first
+                       :opts opts))))))
+
+(defmethod ks/-store-exists? :datahike/overlay
+  [{:keys [backend-config]} opts]
+  (ks/store-exists? backend-config opts))
+
+(defmethod ks/-release-store :datahike/overlay
+  [{:keys [backend-config]} store opts]
+  (ks/release-store backend-config (:backend-store store) opts))
+
+(defmethod ks/-delete-store :datahike/overlay
+  [{:keys [overlay]} opts]
+  (async+sync (:sync? opts) *default-sync-translation*
+              (go-try- (km/delete-mem-store overlay))))

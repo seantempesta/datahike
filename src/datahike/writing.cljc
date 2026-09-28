@@ -742,8 +742,14 @@
   (go-try-
    (let [config (dc/load-config config {})
          config-store-id (ds/store-identity (:store config))
-         active-conns (filter (fn [[store-id _branch]]
-                                (= store-id config-store-id))
+         ;; An overlay's deletion drops only its own frontend, so only its own
+         ;; connections hold it; the shared store's refuses while ANY
+         ;; connection, overlays included, still reads it.
+         overlay (ds/overlay-marker config)
+         active-conns (filter (fn [[store-id :as conn-id]]
+                                (and (= store-id config-store-id)
+                                     (or (nil? overlay)
+                                         (some #{overlay} conn-id))))
                               (keys @*connections*))]
      (when (seq active-conns)
        (log/raise "Cannot delete a database with active connections. Release them first."
