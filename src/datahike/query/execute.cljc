@@ -1,4 +1,5 @@
-(ns datahike.query.execute
+(ns ^{:clj-kondo/config '{:linters {:unresolved-symbol {:exclude [(datahike.query.execute/sorted-merge-inner-loop)]}}}}
+  datahike.query.execute
   "Execution engine for query plans.
    Supports fused scan+merge for entity groups, hash-probe value joins,
    anti-merge NOT, and direct-to-HashSet output."
@@ -3157,7 +3158,7 @@
         result-list (make-result-list 4000)]
     (execute-group-direct db scan-op merge-ops find-vars nil
                           result-list
-                          (when probe (:values probe)) (if probe (int (:field probe)) (int 0))
+                          (when probe (:values probe)) (int (or (:field probe) 0))
                           nil 0 -1 nil
                           :temporal temporal :pipeline (:pipeline op)
                           :cancel (:cancel context))

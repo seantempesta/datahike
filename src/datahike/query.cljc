@@ -1,4 +1,6 @@
-(ns ^:no-doc datahike.query
+(ns ^{:no-doc true
+      :clj-kondo/config '{:linters {:unresolved-symbol {:exclude [(datahike.tools/with-destructured-vector)]}}}}
+  datahike.query
   #?(:cljs (:require-macros [datahike.query :refer [basic-index-selector make-vec-lookup-ref-replacer some-of substitution-expansion]]))
   (:require
    [#?(:cljs cljs.reader :clj clojure.edn) :as edn]
@@ -1759,7 +1761,7 @@
         tuple (gensym)
         ex-sym# (if (get-in &env [:ns])
                   'js/Error
-                  Exception)]
+                  'Exception)]
     `(fn tree-fn# [~replacer ~inds]
        ~(dt/range-subset-tree
          range-length inds
