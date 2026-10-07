@@ -55,9 +55,9 @@
       (and e-ground? a-ground? v-ground?)
       1
 
-      ;; [?e a v] — ~1% of attribute datoms
+      ;; [?e a v] — one entity for a unique attribute, else ~1% of attribute datoms
       (and (not e-ground?) a-ground? v-ground?)
-      (max 1 (quot total 1000))
+      (if (:unique? schema-info) 1 (max 1 (quot total 1000)))
 
       ;; [?e a ?v] — assume ~20 attributes, so attribute has ~1/20 of total
       (and (not e-ground?) a-ground? (not v-ground?))
@@ -169,47 +169,39 @@
 ;; sampling distinct values from the AVET / AEVT slice.
 
 (defn- sample-distinct-v-count
-  "Estimate the number of distinct values for a ground attribute.
-   For unique attrs, returns attr-count (1:1). For others, samples up to
-   `sample-size` datoms from AVET (preferred) or AEVT and counts distinct vals,
-   extrapolating against the total slice count.
+  "Estimate the number of distinct values for a ground attribute holding about
+   `attr-count` datoms (the caller's base estimate for the pattern).
+   For unique attrs, returns attr-count (1:1). For others, reads at most
+   `sample-size` + 1 datoms from AVET (preferred) or AEVT: a slice that fits is
+   counted exactly, a larger one is extrapolated from its first `sample-size`
+   datoms. The caller's count is reused rather than recounted, because counting
+   an attribute's slice loads every index node under it.
    Returns a positive long, or nil if estimation isn't possible."
-  [db pattern-info schema-info]
+  [db pattern-info schema-info attr-count]
   (let [{:keys [a]} pattern-info]
     (when (analyze/ground? a)
       (let [resolved-a (if (and (:attribute-refs? (dbi/-config db)) (keyword? a))
                          (dbi/-ref-for db a)
                          a)
-            attr-count (di/-count-slice (:aevt db)
+            attr-count (max 1 (long attr-count))]
+        (if (:unique? schema-info)
+          attr-count
+          (let [;; Prefer AVET (already sorted by value) — distinct values appear in runs
+                index-key (if (and (:indexed? schema-info) (:avet db)) :avet :aevt)
+                datoms (into [] (take (inc sample-size))
+                             (di/-slice (get db index-key)
                                         (datom e0 resolved-a nil tx0)
                                         (datom emax resolved-a nil txmax)
-                                        cmp-attr-only)]
-        (cond
-          (zero? attr-count) 1
-          (:unique? schema-info) attr-count
-          :else
-          (let [;; Prefer AVET (already sorted by value) — distinct values appear in runs
-                index-key (if (:indexed? schema-info) :avet :aevt)
-                index (get db index-key)]
-            (if (or (not index) (<= attr-count sample-size))
-              ;; Small enough to count exactly via the full slice
-              (let [datoms (di/-slice (or index (:aevt db))
-                                      (datom e0 resolved-a nil tx0)
-                                      (datom emax resolved-a nil txmax)
-                                      (or index-key :aevt))]
-                (max 1 (count (into #{} (map (fn [^datahike.datom.Datom d] (.-v d))) datoms))))
-              ;; Sample first N datoms; count distinct, extrapolate.
-              (let [datoms (into [] (take sample-size)
-                                 (di/-slice index
-                                            (datom e0 resolved-a nil tx0)
-                                            (datom emax resolved-a nil txmax)
-                                            index-key))
-                    n-sampled (count datoms)
-                    n-distinct (count (into #{} (map (fn [^datahike.datom.Datom d] (.-v d))) datoms))]
-                (if (zero? n-sampled)
-                  attr-count
-                  (max 1 (long (* attr-count
-                                  (/ (double n-distinct) (double n-sampled))))))))))))))
+                                        index-key))
+                n (count datoms)
+                sampled (if (> n sample-size) (subvec datoms 0 sample-size) datoms)
+                n-distinct (count (into #{} (map (fn [^datahike.datom.Datom d] (.-v d))) sampled))]
+            (cond
+              (zero? n) 1
+              ;; The whole slice was read: its distinct count is exact.
+              (<= n sample-size) (max 1 n-distinct)
+              :else (max 1 (long (* attr-count
+                                    (/ (double n-distinct) (double sample-size))))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Bound-aware pattern cardinality estimation
@@ -236,6 +228,7 @@
      - Only e bound (free or ground v):
          For card-one: e-card (each entity has at most 1 match for this attr).
          For card-many: e-card × (attr-total / max-eid) approximation.
+     - Only v bound (free e), attr unique: min(v-card, base).
      - Only v bound (free e), attr indexed:
          v-card × (attr-total / distinct-v) — per-value fan-out from AVET.
      - Only v bound, attr not indexed: v-card × small-factor (capped by base).
@@ -282,10 +275,16 @@
                    fan-out (max 1 (long (/ base max-eid)))]
                (max 1 (long (min base (* e-card fan-out))))))
 
+           ;; Value bound on a unique attribute: each value names at most one
+           ;; entity, whatever the base estimate (a heuristic base has no
+           ;; per-value meaning to divide).
+           (and v-card (:unique? schema-info))
+           (max 1 (long (min v-card base)))
+
            ;; Value bound: per-value probes via AVET (or non-indexed fallback).
            v-card
            (if (:indexed? schema-info)
-             (let [distinct-v (or (sample-distinct-v-count db pattern-info schema-info)
+             (let [distinct-v (or (sample-distinct-v-count db pattern-info schema-info base)
                                   (max 1 (long (/ base 10))))
                    per-v (max 1 (long (/ base (max 1 distinct-v))))]
                (max 1 (long (min base (* v-card per-v)))))

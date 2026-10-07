@@ -307,10 +307,26 @@
   [{:keys [kind] :as source}]
   (case kind
     :pattern
-    (let [{:keys [classified db]} source
+    (let [{:keys [classified db bound-var-cards]} source
           si (analyze/pattern-schema-info db classified)
-          est (or (estimate/estimate-pattern db classified si)
-                  (di/-count (:eavt db)))
+          base (or (estimate/estimate-pattern db classified si)
+                   (di/-count (:eavt db)))
+          ;; BOUND-AWARE when the caller knows what is bound entering this
+          ;; clause. A scan cannot OUTPUT more rows than it matches, so
+          ;; advertising the unconstrained attribute extent over-states every
+          ;; var it binds — and a downstream consumer inherits that.
+          ;;
+          ;; This is where a selective probe used to evaporate. `[?c :concept/id
+          ;; ?from-id]` with `?from-id` bound to a one-element `:in` collection
+          ;; matched one row and costed itself at one, then advertised `?c` at
+          ;; the full 2000-concept extent — so `[?r :relation/concept-1 ?c]` was
+          ;; priced against 2000 and came out at the whole 8000-row relation.
+          ;; See `lower/node->output-cards` for the other half. (#973)
+          est (if (seq bound-var-cards)
+                (or (estimate/estimate-pattern-with-bindings
+                     db classified si bound-var-cards base)
+                    base)
+                base)
           free-output-vars (filter analyze/free-var? (:vars classified))]
       (when (seq free-output-vars)
         (zipmap free-output-vars (repeat (long est)))))
@@ -319,7 +335,7 @@
     (let [{:keys [classified db provenance]} source
           card (resolve-fn-output-cardinality
                 (:fn-sym classified) (:args classified) (:binding classified) db provenance)]
-      (when card
+      (when (number? card)
         (let [bvars (filter analyze/free-var? (analyze/extract-vars (:binding classified)))]
           (when (seq bvars)
             (zipmap bvars (repeat (long card)))))))
@@ -830,9 +846,24 @@
         ;; cardinalities — for now the group-level bound suffices for downstream
         ;; planning decisions (it differentiates a 4k-tuple group from a 150k one).
         group-card-final (max 1 group-card)
+        ;; The same reduction, started from the driving scan's BOUND-AWARE card.
+        ;;
+        ;; `:estimated-card` above is deliberately the unconstrained count — the
+        ;; pass-rate math needs `merge-est / total-entities` to be a ratio of full
+        ;; attribute extents, and feeding it a filtered count would double-count
+        ;; the selectivity. But that left the GROUP with no bound-aware cost at
+        ;; all, so `group-effective-card` (which prefers `:scan-card` for exactly
+        ;; this purpose) fell back to the unbound number for every group and
+        ;; ordered a probe-driven group as though nothing were bound.
+        ;;
+        ;; Only the STARTING card changes; the per-merge pass rates are untouched.
+        ;; The bound-aware bound when there is one: a group cannot OUTPUT more
+        ;; rows than it produces under the bindings entering it, and a consumer
+        ;; downstream inherits whatever this says.
+        output-card-bound (long group-card-final)
         output-var-cards (into {}
                                (comp (filter analyze/free-var?)
-                                     (map (fn [v] [v group-card-final])))
+                                     (map (fn [v] [v output-card-bound])))
                                output-vars)
         ;; Merge-ops' pushdown preds can't be applied (merge uses EAVT lookupGE,
         ;; not AVET scan). Collect them so they can be restored as standalone preds.
@@ -982,6 +1013,30 @@
       (max 1 (long (* base (Math/pow 0.33 (count preds)))))
       base)))
 
+(defn- group-start-card
+  "Cost of executing `group` FIRST, with only `seed-bound` vars bound.
+
+   `group-effective-card` is a group's OUTPUT estimate: for an entity-group it is
+   the driving scan's extent multiplied by every merge's pass rate, so a group of
+   three patterns over a large store can estimate a handful of rows. Executing
+   the group still READS its driving scan, and when it runs first nothing from
+   another group restricts that scan. Costing the start by the output let such a
+   group lead ahead of a bound unique lookup (`[?run :turn/id ?run-id]`), so the
+   join that the lookup should have driven scanned its whole ref attribute.
+
+   The driving scan's `:scan-card` assumes the bindings it was lowered under; it
+   holds at the start only when the scan's entity or value var is bound by the
+   seed. Otherwise the start reads the scan's unconstrained `:estimated-card`."
+  ^long [group seed-bound]
+  (let [card (group-effective-card group)]
+    (if (= :entity-group (:op group))
+      (let [scan (:scan-op group)
+            [e _ v] (:clause scan)
+            seeded? (some #(and (analyze/free-var? %) (contains? seed-bound %)) [e v])
+            read (long (or (if seeded? (:scan-card scan) (:estimated-card scan)) card))]
+        (max card read))
+      card)))
+
 (defn- build-group-join-graph
   "Build adjacency map for groups connected by shared variables.
    Returns {[i j] → #{shared-vars}} for all pairs with shared vars."
@@ -1008,10 +1063,12 @@
 (defn- greedy-order-groups
   "Greedy Operator Ordering (GOO) for large group counts.
    At each step, pick the cheapest group that connects to the partial plan.
-   O(n²) — equivalent to DuckDB's approximate fallback."
-  [groups]
+   O(n²) — equivalent to DuckDB's approximate fallback. The first group is
+   the cheapest to START (`group-start-card`); later picks extend the plan."
+  [groups seed-bound]
   (let [n (count groups)
         cards (long-array (map group-effective-card groups))
+        starts (long-array (map #(group-start-card % seed-bound) groups))
         edges (build-group-join-graph groups)
         adj (mapv (fn [i]
                     (into #{}
@@ -1029,7 +1086,7 @@
         order
         (if (empty? placed)
           ;; First group: pick lowest cardinality
-          (let [best (apply min-key #(aget cards (int %)) remaining)]
+          (let [best (apply min-key #(aget starts (int %)) remaining)]
             (recur (conj placed best) (conj order best) (disj remaining best)))
           ;; Pick cheapest connected group; if none connected, pick cheapest overall
           (let [connected (filterv (fn [i]
@@ -1116,13 +1173,17 @@
    When `db` is supplied, the per-step join estimate is BOUND-AWARE (see
    bound-aware-join-rows): a selective probe reduces the carried row count instead
    of the old (max rows i-card) lower bound. Passing nil db preserves the prior
-   purely-cardinality behaviour."
-  ([groups] (dp-order-groups groups nil))
-  ([groups db]
+   purely-cardinality behaviour.
+
+   A plan's first group is costed by what it reads when it starts
+   (`group-start-card` under `seed-bound`), not by its output estimate."
+  ([groups] (dp-order-groups groups nil #{}))
+  ([groups db] (dp-order-groups groups db #{}))
+  ([groups db seed-bound]
    (let [n (count groups)]
      (cond
        (<= n 1) (vec (range n))
-       (> n dp-group-threshold) (greedy-order-groups groups)
+       (> n dp-group-threshold) (greedy-order-groups groups seed-bound)
        :else
        (let [cards (long-array (map group-effective-card groups))
              edges (build-group-join-graph groups)
@@ -1144,7 +1205,7 @@
         ;; :cards map (var→card) threaded through the join estimate.
          (dotimes [i n]
            (let [mask (bit-shift-left 1 i)]
-             (aset dp mask {:cost (aget cards i)
+             (aset dp mask {:cost (group-start-card (nth groups i) seed-bound)
                             :order [i]
                             :rows (aget cards i)
                             :cards (cap-cards {} (nth groups i) (aget cards i))})))
@@ -1188,10 +1249,33 @@
                                :cljs (loop [v x c 0]
                                        (if (zero? v) c
                                            (recur (bit-and v (dec v)) (inc c))))))
+                 ;; Largest component wins, and on a TIE the CHEAPEST one — not
+                 ;; whichever happened to come first in `groups`.
+                 ;;
+                 ;; The tie is the common case, not an edge case: two groups
+                 ;; joined only THROUGH a non-group op (an `or`, a rule call, a
+                 ;; function) share no variable, so each is its own singleton
+                 ;; component. Keeping the first meant a 2000-row group could be
+                 ;; chosen as the seed over a 100-row probe scan purely by array
+                 ;; order, and everything after it multiplied against 2000 —
+                 ;; while `sorted-remaining` two lines below already sorts the
+                 ;; REST by cardinality. This makes the seed agree with the tail.
+                 ;;
+                 ;; Ordering the probe first is also what lets the interleaver
+                 ;; place the `or`/rule after it, so the rule runs with its input
+                 ;; var bound and can seek instead of materialising. (#973)
                  best-mask (reduce (fn [best mask]
-                                     (if (aget dp (int mask))
-                                       (if (> (long (popcount mask)) (long (popcount best)))
-                                         mask best)
+                                     (if-let [entry (aget dp (int mask))]
+                                       (let [bp (long (popcount best))
+                                             mp (long (popcount mask))]
+                                         (cond
+                                           (zero? (long best)) mask
+                                           (> mp bp) mask
+                                           (and (= mp bp)
+                                                (< (long (:cost entry))
+                                                   (long (:cost (aget dp (int best))))))
+                                           mask
+                                           :else best))
                                        best))
                                    0
                                    (range 1 (unchecked-inc full)))
@@ -1598,7 +1682,7 @@
                     (merge-with min var-cards (op-output-cards chosen-op))
                     (conj ordered chosen-op)))))
       ;; DP-order groups, then greedily interleave non-group ops
-       (let [dp-order (dp-order-groups groups db)
+       (let [dp-order (dp-order-groups groups db seed-bound)
              ordered-groups (mapv #(nth groups %) dp-order)]
          (if (empty? non-groups)
            ordered-groups
@@ -1756,23 +1840,18 @@
 ;; Public API
 
 (defn replan
-  "Adaptively re-plan remaining operations after observing actual cardinality."
+  "Adaptively re-plan remaining operations after observing actual cardinality.
+
+   The remaining ops keep their planned estimates: an unconstrained attribute
+   count does not change with what the executed prefix observed, and recounting
+   it loads every index node under the attribute on each execution."
   [plan executed-idx actual-card db]
   (let [remaining-ops (subvec (vec (:ops plan)) (inc executed-idx))
         executed-ops (subvec (vec (:ops plan)) 0 (inc executed-idx))
         bound-vars (into #{} (mapcat :vars) executed-ops)
-        re-estimated (mapv (fn [op]
-                             (if (= :pattern-scan (:op op))
-                               (let [new-est (estimate/estimate-pattern
-                                              db
-                                              (analyze/classify-clause (:clause op))
-                                              (:schema-info op))]
-                                 (assoc op :estimated-card (or new-est (:estimated-card op))))
-                               op))
-                           remaining-ops)
         ;; Seed re-ordering with bound-vars from the already-executed
         ;; prefix: the runnability check for the remaining ops has to
         ;; honour what's already bound or :not / :predicate / :function
         ;; ops will be wrongly marked as Insufficient.
-        re-ordered (order-plan-ops re-estimated bound-vars db)]
+        re-ordered (order-plan-ops remaining-ops bound-vars db)]
     (assoc plan :ops (into (vec executed-ops) re-ordered))))
