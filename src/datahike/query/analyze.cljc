@@ -30,6 +30,38 @@
        (not (free-var? x))
        (not (blank-var? x))))
 
+(defn- separate-repeats
+  "`xs` (a vector) with each free var repeated after index `start` replaced by a
+   fresh var, as [xs' equalities]; nil when no var repeats."
+  [xs start]
+  (let [{:keys [xs equalities]}
+        (reduce (fn [{:keys [seen] :as acc} i]
+                  (let [x (nth xs i)]
+                    (cond
+                      (not (free-var? x)) acc
+                      (contains? seen x) (let [fresh (gensym (str (name x) "__repeat"))]
+                                           (-> acc (assoc-in [:xs i] fresh)
+                                               (update :equalities conj [(list '= x fresh)])))
+                      :else (update acc :seen conj x))))
+                {:xs xs :equalities [] :seen #{}}
+                (range start (count xs)))]
+    (when (seq equalities) [xs equalities])))
+
+(defn separate-repeated-vars
+  "A data pattern naming one free var at two positions, as [pattern' equalities]:
+   each later position takes a fresh var, joined back by an [(= ?var ?fresh)]
+   predicate; nil when no var repeats."
+  [clause]
+  (when (and (vector? clause) (not (sequential? (first clause))))
+    (separate-repeats clause (if (and (symbol? (first clause)) (= \$ (first (name (first clause))))) 1 0))))
+
+(defn separate-repeated-call-args
+  "A rule call passing one free var twice, as [call' equalities] like
+   `separate-repeated-vars`; nil when no arg repeats."
+  [clause]
+  (when-let [[args equalities] (separate-repeats (vec clause) 1)]
+    [(with-meta (apply list args) (meta clause)) equalities]))
+
 (defn extract-vars
   "Extract all free variables from a clause form."
   [form]

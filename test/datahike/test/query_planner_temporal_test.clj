@@ -830,3 +830,41 @@
             (is (= (set legacy) (set planner)))))))
     (is (= #{} (binding [q/*query-result-cache?* false]
                  (set (d/q '[:find ?e ?t :where [?e :t/n 0] [?e :t/tags ?t ?tx false]] after)))))))
+
+;; ---------------------------------------------------------------------------
+;; A var repeated within one clause joins the clause with itself
+;;
+;; Both engines bound the repeated var from one position only, so [?a :p/friend ?a]
+;; answered every entity with a friend.
+
+(deftest a-repeated-variable-joins-a-clause-with-itself
+  (let [database (d/db-with (db/empty-db {:p/friend {:db/valueType :db.type/ref} :p/n {}})
+                            [{:db/id 1 :p/n 1} {:db/id 2 :p/friend 1 :p/n 2} {:db/id 3 :p/friend 2}
+                             {:db/id 4 :p/friend 4 :p/n 4}])
+        edge '[[(edge ?a ?b) [?a :p/friend ?b]]]
+        reach '[[(reach ?a ?b) [?a :p/friend ?b]] [(reach ?a ?b) [?a :p/friend ?x] (reach ?x ?b)]]]
+    (doseq [[label answer q-form args]
+            [["pattern" #{[4]} '[:find ?a :where [?a :p/friend ?a]] []]
+             ["pattern in an entity group" #{[4 4]} '[:find ?a ?n :where [?a :p/friend ?a] [?a :p/n ?n]] []]
+             ["merge in an entity group" #{[4 4]} '[:find ?a ?n :where [?a :p/n ?n] [?a :p/friend ?a]] []]
+             ["rule call" #{[4]} '[:find ?a :in $ % :where (edge ?a ?a)] [edge]]
+             ["recursive rule call" #{[4]} '[:find ?a :in $ % :where (reach ?a ?a)] [reach]]]
+            disable? [false true]]
+      (testing [label (if disable? :base :planner)]
+        (binding [q/*query-result-cache?* false q/*disable-planner* disable?]
+          (is (= answer (set (apply d/q q-form database args)))))))))
+
+;; ---------------------------------------------------------------------------
+;; A function binding a var its inputs' relation already binds joins it
+;;
+;; The base engine (the planner's fallback) appended the function's value as a
+;; second column of the same var, so the answer named a value stored nowhere.
+
+(deftest a-function-binding-a-bound-variable-joins-it
+  (let [database (d/db-with (db/empty-db {:t/tags {:db/cardinality :db.cardinality/many} :t/n {}})
+                            [{:db/id 1 :t/tags ["tag1" "x"] :t/n 1} {:db/id 2 :t/tags ["x"] :t/n 7}])]
+    (doseq [disable? [false true]]
+      (testing (if disable? :base :planner)
+        (binding [q/*query-result-cache?* false q/*disable-planner* disable?]
+          (is (= #{[1 "tag1"]}
+                 (set (d/q '[:find ?e ?v :where [?e :t/tags ?v] [?e :t/n ?n] [(str "tag" ?n) ?v]] database)))))))))

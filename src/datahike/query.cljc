@@ -75,7 +75,7 @@
    Bind to false for benchmarking raw query execution."
   true)
 
-(declare -collect -resolve-clause resolve-clause raw-q memoized-parse-query
+(declare -collect -resolve-clause resolve-clause resolve-context raw-q memoized-parse-query
          query-attribute-dependencies query-dependency-plan
          dependency-plan-attributes merge-attr-deps)
 
@@ -1200,6 +1200,7 @@
                   (log/raise "Unknown function '" f " in " clause
                              {:error :query/where, :form clause, :var f})))
         attrs (filter free-var? args)
+        context-in context
         [context production] (rel-prod-by-attrs context attrs)
         symbols-with-values (into #{}
                                   (mapcat keys)
@@ -1209,7 +1210,18 @@
       ;; Currently, we can only evaluate this clause if all variables
       ;; in the function call are bound. If not, we return nil which
       ;; is handled by `datahike.tools/resolve-clauses`.
-    (when (every? symbols-with-values attrs)
+    (cond
+      (not (every? symbols-with-values attrs)) nil
+      ;; An output var the inputs' relation already binds is a join with it:
+      ;; bind a fresh var and compare.
+      (some (:attrs production) (analyze/extract-vars out))
+      (let [renames (into {} (comp (filter (:attrs production))
+                                   (map (fn [v] [v (gensym (str (name v) "__bound"))])))
+                          (analyze/extract-vars out))]
+        (resolve-context context-in (into [[(first clause) (walk/postwalk-replace renames out)]]
+                                       (map (fn [[v fresh]] [(list '= v fresh)]))
+                                       renames)))
+      :else
       ;; Engine-level function-invocation count (atom-free): the fn is applied
       ;; once per production tuple, so invocations = (count (:tuples production)).
       ;; Accumulated into the threaded context by fn-symbol; surfaced as result
@@ -2274,13 +2286,16 @@
                                                  :branches (:stats negation-context)})))))
 
      '[*] ;; pattern
-     (let [source rel/*implicit-source*
+     (if-let [[pattern equalities] (analyze/separate-repeated-vars clause)]
+       ;; A var repeated within one pattern is a join of the pattern with itself.
+       (resolve-context context (into [pattern] equalities))
+       (let [source rel/*implicit-source*
            pattern0 (replace (:consts context) clause)
            pattern1 (resolve-pattern-lookup-refs source pattern0)
            lt (fast-lookup-type source pattern1)]
        (if lt
          (fast-ground-lookup lt source context clause pattern0 pattern1)
-         (lookup-batch-search source context clause pattern1))))))
+         (lookup-batch-search source context clause pattern1)))))))
 
 (defn -resolve-clause
   ([context clause]

@@ -86,7 +86,17 @@
   ([db where-clauses bound-vars rules]
    (build-logical-plan db where-clauses bound-vars rules nil))
   ([db where-clauses bound-vars rules guarded-rules]
-   (let [classified (mapv analyze/classify-clause where-clauses)
+   (let [;; A var repeated within one pattern or rule call is a join of that
+         ;; clause with itself.
+         where-clauses (into [] (mapcat (fn [clause]
+                                          (if-let [[separated equalities]
+                                                   (if (and (seq? clause) (contains? rules (first clause)))
+                                                     (analyze/separate-repeated-call-args clause)
+                                                     (analyze/separate-repeated-vars clause))]
+                                            (cons (with-meta separated (meta clause)) equalities)
+                                            [clause])))
+                             where-clauses)
+         classified (mapv analyze/classify-clause where-clauses)
          all-clause-vars (into bound-vars
                                (mapcat analyze/extract-vars)
                                where-clauses)
