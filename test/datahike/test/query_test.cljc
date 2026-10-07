@@ -54,8 +54,10 @@
                      (or [?e :person/email]
                          (and [?e :person/disabled?]
                               [?e :person/email]))]))))
-  (testing "find pulls contribute attributes"
-    (is (= #{:person/id :person/name :person/friend}
+  ;; Without a database a plainly pulled attribute may be a component, which
+  ;; pulls its whole entity: a pull widens to :all.
+  (testing "find pulls widen"
+    (is (= :all
            (d/query-attribute-dependencies
             '[:find (pull ?e [:person/id :person/name
                               {:person/friend [:person/id]}])
@@ -65,14 +67,14 @@
            (d/query-attribute-dependencies
             '[:find ?e
               :where [(missing? $ ?e :person/deleted?)]]))))
-  (testing "nested pulls contribute every realized attribute"
-    (is (= #{:person/id :person/friend :person/email}
+  (testing "nested pulls widen"
+    (is (= :all
            (d/query-attribute-dependencies
             '[:find (pull ?e [:person/id
                               {:person/friend [:person/email]}])
               :where [?e :person/id]]))))
-  (testing "reverse pulls use the canonical stored forward attribute"
-    (is (= #{:person/id :person/friend :person/email}
+  (testing "reverse pulls widen"
+    (is (= :all
            (d/query-attribute-dependencies
             '[:find (pull ?e [:person/id
                               {:person/_friend [:person/email]}])
@@ -148,12 +150,11 @@
                [?e :person/name]
                [?e ?attribute]]]
             :person/email))))
-  (testing "an input-bound pull pattern contributes its realized attributes"
+  (testing "an input-bound pull pattern widens: without a database :person/id may be a component"
     (is (= {:datahike.query.dependency/sources
             [{:datahike.query.source/symbol '$
               :datahike.query.source/argument-position 0
-              :datahike.query.source/attributes
-              #{:person/id :person/friend :person/email}}]}
+              :datahike.query.source/attributes :all}]}
            (d/query-dependency-plan
             '[:find (pull ?e ?selector)
               :in $ ?selector
@@ -946,7 +947,8 @@
     (is (= #{[1 :k 4] [5 :xyz 6]} (set result)))))
 
 (defn concept-id [index]
-  (let [s (format "%010d" index)]
+  (let [digits (str index)
+        s (str (apply str (repeat (- 10 (count digits)) "0")) digits)]
     (str (subs s 0 4) "_" (subs s 4 7) "_" (subs s 7 10))))
 
 (defn temp-id [x]

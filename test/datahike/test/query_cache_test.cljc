@@ -769,7 +769,7 @@
                keys-before (query-cache-keys)]
            (is (= :config-does-not-match-existing-connections
                   (try
-                    (d/connect (assoc cfg :keep-history? false))
+                    (d/connect (assoc cfg :schema-flexibility :read)) ; :keep-history? is store-fixed, refused by its own type
                     (catch Exception e (:type (ex-data e))))))
            (is (= entry-before (get @connections/*connections* conn-id)))
            (is (= metrics-before (dq/query-cache-metrics)))

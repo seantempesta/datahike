@@ -152,8 +152,8 @@
                                            (for [idx (range 2000)]
                                              [8 :aka (str "aka-" idx)]))))]
 
-    (testing "Without an explicit limit, the default is 1000"
-      (is (= 1000 (->> (d/pull db '[:aka] (+ ref-e0 8)) :aka count))))
+    (testing "Without an explicit limit, every member is returned"
+      (is (= 2000 (->> (d/pull db '[:aka] (+ ref-e0 8)) :aka count))))
 
     (testing "Explicit limit can reduce the default"
       (is (= 500 (->> (d/pull db '[(limit :aka 500)] (+ ref-e0 8)) :aka count)))

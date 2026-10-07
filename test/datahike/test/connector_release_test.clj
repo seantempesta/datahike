@@ -240,7 +240,7 @@
           (is (.await connect-entered 10 TimeUnit/SECONDS))
           (is (= :config-does-not-match-existing-connections
                  (try
-                   (d/connect (assoc cfg :keep-history? false))
+                   (d/connect (assoc cfg :schema-flexibility :read)) ; :keep-history? is store-fixed, refused by its own type
                    (catch Exception e (:type (ex-data e)))))
               "a mismatched waiter is rejected before it acquires a ref")
           (.countDown continue-connect)
@@ -261,7 +261,7 @@
     (try
       (is (= :config-does-not-match-existing-connections
              (try
-               (d/connect (assoc cfg :keep-history? false))
+               (d/connect (assoc cfg :schema-flexibility :read)) ; :keep-history? is store-fixed, refused by its own type
                (catch Exception e (:type (ex-data e))))))
       (is (= 1 (reference-count conn))
           "a rejected shared acquisition does not leak its count")
