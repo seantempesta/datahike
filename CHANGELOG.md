@@ -68,6 +68,8 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Notable fixes
 
+- **A NOT binds nothing** — a folded anti-merge's own variables were emitted as columns of its group that no datom fills (`[?a :nums ?x] [(> ?x 1)] (not [?a :likes ?e])` threw a `NullPointerException`; a `not` naming a tx threw on nil). A `not` naming a variable another clause or input binds (`[?x :score ?s] [?e :team :t0] (not [?e :score ?s])`) no longer folds into the entity group, where it read as a wildcard. ([#TODO])
+
 - **Joined groups keep what a predicate reads and join on every shared variable** — when a predicate read a variable only the producer group binds (`[?a :friend ?b] [?b :score ?c] [(<= ?c 2)]`), the producer ran collect-only and the predicate read the consumer's columns at the producer's positions: wrong rows, or an index out of bounds. Its tuples are now kept and combined. Two groups sharing more than one variable (`[?b :friend ?c] [?c :nums ?b]`) were joined on one of them; they now take the relational path, which joins on all. ([#TODO])
 
 - **A projection answers distinct tuples** — an entity group whose cardinality-many pattern's value is not found (`[:find ?e :where [?e :tags ?t]]`) took the duplicate-free fast path and returned a set holding one tuple per value (`count` 3 for 2 entities); such a group is now deduplicated. ([#TODO])

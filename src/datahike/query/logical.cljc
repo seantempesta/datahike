@@ -264,12 +264,21 @@
          blank-counter (atom 0)
          scan-groups (group-by #(entity-group-key % blank-counter) scans)
 
-         ;; Identify foldable NOTs (single-pattern NOT on a grouped entity var)
+         ;; Identify foldable NOTs (single-pattern NOT on a grouped entity var).
+         ;; An anti-merge compares only its own group's vars: a NOT naming a
+         ;; var some other clause or input binds stays a standalone negation.
+         clauses-naming (frequencies (mapcat (comp set analyze/extract-vars) where-clauses))
+         compared-in-group? (fn [sub-ci]
+                              (let [group-vars (into #{} (mapcat :vars) (get scan-groups [(:e sub-ci) nil]))]
+                                (not-any? (fn [v] (and (not (contains? group-vars v))
+                                                       (or (contains? bound-vars v) (> (get clauses-naming v 0) 1))))
+                                          (analyze/extract-vars (:clause sub-ci)))))
          foldable-nots
          (reduce
           (fn [acc not-entry]
             (if (and (nil? (:ir-node not-entry))  ;; not already an IR node from AND flattening
-                     (foldable-not? not-entry scan-groups))
+                     (foldable-not? not-entry scan-groups)
+                     (compared-in-group? (analyze/classify-clause (first (:sub-clauses (:ci not-entry))))))
               (let [sub-ci (analyze/classify-clause (first (:sub-clauses (:ci not-entry))))
                     anti-scan (make-scan sub-ci nil)]
                 (update acc [(:e sub-ci) nil] (fnil conj [])

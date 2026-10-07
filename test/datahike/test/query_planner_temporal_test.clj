@@ -920,6 +920,25 @@
   (answers-every-world "get-else binding another group's var" #{[1 1] [3 3]}
                        '[:find ?d ?c :where [?d :p/nums ?a] [?c :p/nums ?d] [(get-else $ ?d :p/score -1) ?c]]))
 
+(deftest a-not-naming-a-var-bound-outside-its-group
+  ;; A folded anti-merge compares only its group's vars, so a var another group
+  ;; or an input binds was read as a wildcard.
+  (answers-every-world "another group's var" #{[4]}
+                       '[:find ?e :in $ ?id :where [?e :p/team :t0] [?x :p/id ?id] [?x :p/score ?s] (not [?e :p/score ?s])] "c")
+  (answers-every-world "an input collection" #{[4]}
+                       '[:find ?e :in $ [?s ...] :where [?e :p/team :t0] (not [?e :p/score ?s])] [3])
+  (answers-every-world "a group of two" #{[3]}
+                       '[:find ?e :where [?x :p/id "a"] [?x :p/score ?s] [?e :p/team :t0] [?e :p/age ?a] (not [?e :p/score ?s])]))
+
+(deftest an-anti-merge-binds-nothing
+  ;; A NOT's own vars were emitted as columns of its group; no datom fills them.
+  (answers-every-world "card-many group with a predicate" #{[2] [3] [4]}
+                       '[:find ?a :where [?a :p/nums ?x] [(> ?x 1)] (not [?a :p/likes ?e])])
+  (answers-every-world "a NOT naming a tx" #{[2] [3]}
+                       '[:find ?c :where [?c :p/friend ?a] (not [?c :p/team :t2 ?tx]) [(< ?c 4)]])
+  (answers-every-world "two groups and a NOT naming a tx" #{[1] [2] [3] [4]}
+                       '[:find ?d :where [?a :p/nums ?d] [?c :p/friend ?a] (not [?c :p/team :t2 ?tx]) [(< ?c 5)]]))
+
 (deftest a-projection-answers-distinct-tuples
   (answers-every-world "card-many value not found" #{[1] [2]}
                        '[:find ?c :where [?c :p/tags ?t]]))

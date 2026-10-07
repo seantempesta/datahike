@@ -886,7 +886,8 @@
                                  (long (* card pass-rate)))))
                            scan-card
                            merge-ops)
-        output-vars (into #{} (mapcat :vars) (cons scan merge-ops))
+        ;; An anti-merge binds nothing: its other vars are local to its NOT.
+        output-vars (into #{} (mapcat :vars) (cons scan (remove :anti? merge-ops)))
         ;; Per-output-var cardinality. The group's output rel size is `group-card`,
         ;; which bounds every var the group produces. For tighter per-var bounds
         ;; we'd need to track which patterns produce which vars + their individual

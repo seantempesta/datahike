@@ -3023,7 +3023,8 @@
                                                a
                                                (assoc a var-sym (vswap! idx inc))))
                                            attrs mvar-map)))
-                            base-attrs merge-ops))
+                            ;; An anti-merge adds no column.
+                            base-attrs (remove :anti? merge-ops)))
 
         ;; Check for entity-filter from upstream secondary index searches
         entity-filter (get (:entity-filters context) e-var)
@@ -3180,9 +3181,10 @@
         ;; group's declared interface and can omit the entity var (e.g. ?c when it
         ;; is not in :find), but downstream ops — get-else / predicates / further
         ;; joins — reference those clause vars, so the fused tuples must carry them.
+        ;; An anti-merge's other vars are local to its NOT: it binds none.
         find-vars   (vec (distinct (filter #(and (symbol? %) (analyze/free-var? %))
                                            (concat scan-clause
-                                                   (mapcat :clause merge-ops)))))
+                                                   (mapcat :clause (remove :anti? merge-ops))))))
         result-list (make-result-list 4000)]
     (execute-group-direct db scan-op merge-ops find-vars nil
                           result-list
