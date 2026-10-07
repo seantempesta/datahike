@@ -1597,6 +1597,10 @@
          :function                     (if-let [f (:exec-cost-fn op)]
                                          (max 1 (long (f (function-input-rows op var-cards))))
                                          1)
+         (:or :or-join)                (if (and (:bound-card op)
+                                                (every? (fn [vs] (some #(contains? bound-vars %) vs)) (:bound-on op)))
+                                         (:bound-card op)
+                                         (or (:estimated-card op) 100))
          (or (:estimated-card op) 100))))))
 
 (defn- group-var-attr-clauses

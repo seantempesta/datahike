@@ -186,9 +186,18 @@
                                          {:error :query/where :form (:clause clause-info)})))
                        (set raw)))
          sub-plans (normalize-and-plan-branches db (:branches clause-info) bound-vars rules)
-         ;; A branch's first sized op estimates it; a pattern scan by what it reads
-         ;; given the bindings entering the union (`:scan-card`), not its attribute.
-         total-est (reduce + 0 (keep (fn [p] (some #(or (:scan-card %) (:estimated-card %)) (:ops p))) sub-plans))]
+         ;; A branch's first sized op estimates it: by its attribute, and, once
+         ;; one of the entity or value vars its scan was planned bound on is
+         ;; bound (`:bound-on`, one set per such branch), by what that scan
+         ;; reads given them (`:scan-card`, see `plan/op-cost`).
+         bound (if (map? bound-vars) (set (keys bound-vars)) (set bound-vars))
+         firsts (keep (fn [p] (some #(when (:estimated-card %) %) (:ops p))) sub-plans)
+         total-est (reduce + 0 (map :estimated-card firsts))
+         bound-est (reduce + 0 (map #(or (:scan-card %) (:estimated-card %)) firsts))
+         bound-on (into [] (keep (fn [op] (when (:scan-card op)
+                                            (let [[e _ v] (:clause op)]
+                                              (not-empty (into #{} (filter bound) [e v]))))))
+                        firsts)]
      (cond-> {:op (if join-vars? :or-join :or)
               :clause (:clause clause-info)
               :branches sub-plans
@@ -196,6 +205,7 @@
               ;; to its branches.
               :vars (if join-vars? join-vars (:vars clause-info))
               :estimated-card (max 1 total-est)}
+       (seq bound-on) (assoc :bound-card (max 1 bound-est) :bound-on bound-on)
        join-vars? (assoc :join-vars join-vars)))))
 
 (defn plan-not-op

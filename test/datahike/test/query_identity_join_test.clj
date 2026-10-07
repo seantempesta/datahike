@@ -12,6 +12,7 @@
    [clojure.string :as str]
    [clojure.test :refer [deftest is testing use-fixtures]]
    [datahike.api :as d]
+   [datahike.db :as db]
    [datahike.lru :as lru]
    [datahike.query :as q]
    [datahike.query.analyze :as analyze]
@@ -217,3 +218,21 @@
                  (set (d/q q-form @conn ["run-5"]))))
           (is (= 3 (count (d/q q-form @conn ["run-5"])))))))
     (is (<= (execution-reads q-form ["run-5"]) 16))))
+
+(deftest a-union-after-its-binding-pattern-waits-for-it
+  ;; A union's bound-aware estimate assumes the vars it was planned under and
+  ;; holds only once they are bound. Costed by it from the start, the union ran
+  ;; first with ?e unbound and scanned both attributes (60,000 entities: 7.2 ->
+  ;; 43.7 MB, 4.8 -> 80 ms).
+  (let [database (d/db-with (db/empty-db {:p/team {:db/index true}
+                                          :p/tags {:db/cardinality :db.cardinality/many}
+                                          :p/nums {:db/cardinality :db.cardinality/many}})
+                            (vec (for [i (range 2000)]
+                                   {:db/id (inc i) :p/team (if (zero? (mod i 500)) :rare :common)
+                                    :p/tags [(str "t" (mod i 7))] :p/nums [(mod i 3)]})))
+        clauses '[[?e :p/team :rare] (or [?e :p/tags ?t] [?e :p/nums ?t])]
+        plan (#'q/create-plan-via-ir database clauses #{} nil nil)]
+    (is (not= :or (:op (first (:ops plan)))))
+    (binding [q/*query-result-cache?* false]
+      (is (= (binding [q/*disable-planner* true] (set (d/q (into '[:find ?e ?t :where] clauses) database)))
+             (set (d/q (into '[:find ?e ?t :where] clauses) database)))))))

@@ -68,6 +68,8 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Notable fixes
 
+- **A union waits for the bindings its estimate assumes** — a union's estimate by what its branches read given bound variables (above) applied from the start, so a union written after the pattern binding its entity variable (`[?e :team :rare] (or [?e :tags ?t] [?e :nums ?t])`) ran first, unbound, and scanned both attributes (60,000 entities: 7.2 → 43.7 MB, 4.8 → 80 ms). The bound estimate now applies once each branch's scan has one of its planned bindings. ([#TODO])
+
 - **An `or-join` binds only its join variables** — its branch-local variables were reported as bound, so a predicate on an outer variable of the same name could run before that variable's producer (`NullPointerException`), and a cartesian component's sub-query could select a local variable for its find (`Query for unknown vars`). ([#TODO])
 
 - **A join rewrite's variables stay private** — the base engine's fresh variable for a repeated or rebound variable reached a union's relations (`(or [?a :friend ?a] [?a :score 1])` threw `Can't sum relations with different attrs`); it is dropped after its equality. A repeated call argument is separated only for a recursive rule: a non-recursive rule is expanded with its arguments, and a predicate-only body (`(same ?a ?a)` over `[(same ?x ?y) [(= ?x ?y)]]`) answered nothing. A source-prefixed pattern repeating a variable (`[$ ?a :friend ?a]`) now joins it in both engines. ([#TODO])
