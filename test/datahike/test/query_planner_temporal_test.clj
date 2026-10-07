@@ -780,3 +780,53 @@
                  (outcome q-form database args))))))
     (is (= #{[[:p/id "b"]]} (binding [q/*query-result-cache?* false]
                                (set (d/q '[:find ?x :in $ % ?v :where (idv ?v ?x)] after rules [:p/id "b"])))))))
+
+;; ---------------------------------------------------------------------------
+;; A var shared inside an entity group is a join
+;;
+;; A fused merge compared only the scan's value and tx vars at the same position:
+;; a shared added var, or a var two merges share, joined every pair of datoms.
+
+(deftest shared-vars-in-an-entity-group-are-joined
+  (let [before (d/db-with (db/empty-db {:item/a {:db/cardinality :db.cardinality/many}
+                                        :item/b {:db/cardinality :db.cardinality/many}
+                                        :item/c {:db/cardinality :db.cardinality/many}
+                                        :item/x {}}
+                                       {:keep-history? true})
+                          [{:db/id 1 :item/a [1 2] :item/b [1 4 5] :item/c [2 5 9] :item/x 0}])
+        after (d/db-with before [[:db/retract 1 :item/b 1] [:db/add 1 :item/a 4]
+                                 [:db/retract 1 :item/c 5] [:db/add 1 :item/x 3]])
+        added '[:find ?v ?w ?added :where [?e :item/a ?v ?tx ?added] [?e :item/b ?w ?tx2 ?added]]]
+    (doseq [[world database] {:current after :history (d/history after) :as-of (d/as-of after (:max-tx before))}
+            q-form [added
+                    '[:find ?v ?added :where [?e :item/a ?v ?tx ?added] [?e :item/b ?v ?tx2 ?added]]
+                    '[:find ?w ?added :where [?e :item/a ?v ?tx] [?e :item/b ?w ?tx2 ?added] [?e :item/c ?w ?tx3 ?added]]
+                    '[:find ?x ?v :where [?e :item/x ?x] [?e :item/b ?v] [?e :item/c ?v]]
+                    '[:find ?x ?v ?a :where [?e :item/x ?x ?t0 ?a0] [?e :item/b ?v ?t1 ?a] [?e :item/c ?v ?t2 ?a2]]]]
+      (testing [world q-form]
+        (binding [q/*query-result-cache?* false]
+          (let [{:keys [legacy planner]} (run-both q-form database)]
+            (is (= (set legacy) (set planner)))))))
+    (is (= (set (for [v [1 2 4] w [1 4 5]] [v w true]))
+           (binding [q/*query-result-cache?* false] (set (d/q added (d/history after))))))))
+
+;; ---------------------------------------------------------------------------
+;; A ground retraction flag matches nothing on a current db
+;;
+;; Every current datom is an assertion, but a fused merge on a current db ignored
+;; its ground added flag.
+
+(deftest a-ground-retraction-flag-matches-nothing-on-a-current-db
+  (let [before (d/db-with (db/empty-db {:t/tags {:db/cardinality :db.cardinality/many} :t/n {}} {:keep-history? true})
+                          [{:db/id 1 :t/tags ["tag1" "x"] :t/n 0} {:db/id 2 :t/tags ["x"] :t/n 7}])
+        after (d/db-with before [[:db/retract 1 :t/tags "x"]])]
+    (doseq [[world database] {:current after :history (d/history after) :as-of (d/as-of after (:max-tx before))}
+            q-form ['[:find ?e ?t :where [?e :t/tags ?t ?tx false] [?e :t/n 0]]
+                    '[:find ?e ?t :where [?e :t/n 0] [?e :t/tags ?t ?tx false]]
+                    '[:find ?e :where [?e :t/n ?n] (not [?e :t/tags "x" ?tx false])]]]
+      (testing [world q-form]
+        (binding [q/*query-result-cache?* false]
+          (let [{:keys [legacy planner]} (run-both q-form database)]
+            (is (= (set legacy) (set planner)))))))
+    (is (= #{} (binding [q/*query-result-cache?* false]
+                 (set (d/q '[:find ?e ?t :where [?e :t/n 0] [?e :t/tags ?t ?tx false]] after)))))))

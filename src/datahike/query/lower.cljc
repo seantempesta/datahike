@@ -1078,7 +1078,8 @@
         restored-preds (when (seq merge-lost-pred-clauses)
                          (let [ci-by-clause (into {} (map (fn [ci] [(:clause ci) ci])) classified)]
                            (mapv (fn [pred-clause]
-                                   (plan/plan-predicate-op (ci-by-clause pred-clause) db raw-pattern-ops))
+                                   (plan/plan-predicate-op (or (ci-by-clause pred-clause) (analyze/classify-clause pred-clause))
+                                                           db raw-pattern-ops))
                                  merge-lost-pred-clauses)))
         other-ops (if (seq restored-preds)
                     (into other-ops restored-preds)

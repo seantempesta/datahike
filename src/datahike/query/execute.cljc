@@ -335,7 +335,8 @@
        `(and (== (.-e ~d#) ~eid) (= (.-a ~d#) ~ra)
              (or (not ~vg?) (val-eq? (.-v ~d#) ~vgv))
              (or (nil? ~temporal-tx-filter) (~temporal-tx-filter ~d#))
-             (or (nil? ~added-filter) (= (datom/datom-added ~d#) ~added-filter))
+             (or (nil? ~added-filter)
+                 (= (datom/datom-added ~d#) (if (keyword? ~added-filter) (datom/datom-added ~sd#) ~added-filter)))
              (or (not ~check-v?) (val-eq? (.-v ~d#) (.-v ~sd#)))
              (or (not ~check-tx?) (= (datom/datom-tx ~d#) (datom/datom-tx ~sd#)))))))
 
@@ -346,7 +347,8 @@
      (and (== (.-e d) eid) (= (.-a d) ra)
           (or (not vg?) (val-eq? (.-v d) vgv))
           (or (nil? temporal-tx-filter) (temporal-tx-filter d))
-          (or (nil? added-filter) (= (datom/datom-added d) added-filter))
+          (or (nil? added-filter)
+              (= (datom/datom-added d) (if (keyword? added-filter) (datom/datom-added scan-d) added-filter)))
           (or (not check-v?) (val-eq? (.-v d) (.-v scan-d)))
           (or (not check-tx?) (= (datom/datom-tx d) (datom/datom-tx scan-d))))))
 
@@ -1506,11 +1508,13 @@
                    ;; scan datom; a shared v or tx var is checked per scan datom.
                    (when-not (== eid buffer-eid)
                      (history-versions! buf pair eid ra vg? vgv
-                                        #(temporal-merge-datom-match? % eid ra vg? vgv false false scan-d temporal-tx-filter added-filter)))
+                                        #(temporal-merge-datom-match? % eid ra vg? vgv false false scan-d temporal-tx-filter
+                                                                      (when-not (keyword? added-filter) added-filter))))
                    (dotimes [bi (.size buf)]
                      (let [^Datom md (.get buf bi)]
                        (when (and (or (not check-v?) (val-eq? (.-v md) (.-v scan-d)))
-                                  (or (not check-tx?) (= (datom/datom-tx md) (datom/datom-tx scan-d))))
+                                  (or (not check-tx?) (= (datom/datom-tx md) (datom/datom-tx scan-d)))
+                                  (or (not (keyword? added-filter)) (= (datom/datom-added md) (datom/datom-added scan-d))))
                          (aset merge-datoms 0 md)
                          (emit-tuple scan-d collect-set collect-datom-field collect-merge-idx merge-datoms
                                      n-find find-source const-vals result-list))))
@@ -1758,6 +1762,9 @@
    & {:keys [scan-estimate pipeline temporal cancel]}]
   (let [{:keys [clause index pushdown-preds]} scan-op
         [e a v tx] clause
+        ;; Every current datom is an assertion: an anti-merge asking for a
+        ;; retraction excludes nothing (a merge asking for one matches nothing, below).
+        merge-ops (if temporal merge-ops (filterv #(not (and (:anti? %) (false? (get (:clause %) 4)))) merge-ops))
         ;; For temporal queries, resolve against the unwrapped origin-db
         origin-db (when temporal (:origin-db temporal))
         index-db (or origin-db db)
@@ -1810,11 +1817,14 @@
         ^objects merge-defaults (to-array (mapv :default-value merge-ops))
 
         ;; Temporal-only merge arrays (nil when non-temporal)
+        ;; A ground added flag filters; an added var shared with the scan is
+        ;; :scan-added, compared with each scan datom's flag.
         merge-added-filter (when temporal
                              (to-array (mapv (fn [op]
                                                (let [added (get (:clause op) 4)]
-                                                 (when (and (some? added) (not (symbol? added)) (boolean? added))
-                                                   added)))
+                                                 (cond
+                                                   (boolean? added) added
+                                                   (and (analyze/free-var? added) (= added (get clause 4))) :scan-added)))
                                              merge-ops)))
         temporal-eavt-pss (when (= temporal-type :historical) (:temporal-eavt index-db))
         ;; No merge reads the temporal index alone: it holds only what left
@@ -1963,8 +1973,9 @@
                                                merge-optional merge-defaults])
                                 cancel))
 
-      ;; Non-temporal dispatch via fused-path keyword
-      (case fused-path
+      ;; Non-temporal dispatch via fused-path keyword.
+      (when-not (some #(false? (get (:clause %) 4)) merge-ops)
+       (case fused-path
         :scan-only
         (execute-scan-only slice ground-filter strict-filter
                            probe-set probe-datom-field
@@ -2036,7 +2047,7 @@
                                     (object-array [merge-attrs merge-v-ground merge-v-vals merge-anti merge-cursors
                                                    merge-check-scan-v merge-check-scan-tx
                                                    merge-optional merge-defaults])
-                                    cancel))))
+                                    cancel)))))
 
     result-list))
 

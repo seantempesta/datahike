@@ -803,13 +803,52 @@
 ;; a single plan node: one scan + zero or more merge lookups.
 ;; This enables fused execution (single pass over scan datoms, lookupGE per merge).
 
+(defn- separate-uncompared-vars
+  "`merges` where a merge repeats a var of `scan` or of an earlier merge at a
+   position the fused merge does not compare (it compares only the scan's value,
+   tx or added var at the same position) take a fresh var there. Returns
+   {:merges merges' :equalities [[(= ?var ?fresh)] ...]}."
+  [scan merges]
+  (let [scan-clause (:clause scan)
+        clause-vars (fn [clause] (filter analyze/free-var? clause))]
+    (reduce (fn [{:keys [seen] :as acc} op]
+              (if (or (:anti? op) (:optional? op))
+                (-> acc (update :merges conj op) (update :seen into (clause-vars (:clause op))))
+                (let [{:keys [clause equalities]}
+                      (reduce (fn [{:keys [clause] :as m} i]
+                                (let [x (get clause i)]
+                                  (if (and (analyze/free-var? x) (contains? seen x)
+                                           (not= x (get scan-clause i)))
+                                    (let [fresh (gensym (str (name x) "__repeat"))]
+                                      (-> m (assoc-in [:clause i] fresh)
+                                          (update :equalities conj [(list '= x fresh)])))
+                                    m)))
+                              {:clause (:clause op) :equalities []}
+                              [2 3 4])
+                      op' (if (seq equalities)
+                            (let [original (into {} (map (fn [[_ [_ x fresh]]] [fresh x])) equalities)
+                                  cards (:output-var-cards op)]
+                              (assoc op :clause clause
+                                     :vars (set (clause-vars clause))
+                                     :output-var-cards (into {} (keep (fn [x] (when-let [c (get cards (get original x x))] [x c])))
+                                                             (clause-vars clause))))
+                            op)]
+                  (-> acc
+                      (update :merges conj op')
+                      (update :equalities into equalities)
+                      (update :seen into (clause-vars clause))))))
+            {:merges [] :equalities [] :seen (set (clause-vars scan-clause))}
+            merges)))
+
 (defn assemble-entity-group
   "Build an :entity-group op from pattern-ops on the same entity-var.
    Applies DP merge ordering, folds anti-merges, computes pipeline annotation.
-   Returns {:op entity-group-op, :merge-lost-preds #{consumed-pred-clauses-on-merges}}."
+   Returns {:op entity-group-op, :merge-lost-preds #{consumed-pred-clauses-on-merges
+   and equality predicates of separated vars}}."
   [db entity-var source pattern-ops anti-ops total-entities]
   (let [{:keys [scan merges]}
         (dp-order-fuse-ops db pattern-ops total-entities)
+        {merges :merges equalities :equalities} (separate-uncompared-vars scan merges)
         ;; Merge ops = DP-ordered merges + anti-merges
         ;; Sort anti-merges by their filtering power (most selective first)
         all-merges (into (vec merges) anti-ops)
@@ -839,7 +878,7 @@
                                  (long (* card pass-rate)))))
                            scan-card
                            merge-ops)
-        output-vars (into #{} (mapcat :vars) (into pattern-ops anti-ops))
+        output-vars (into #{} (mapcat :vars) (cons scan merge-ops))
         ;; Per-output-var cardinality. The group's output rel size is `group-card`,
         ;; which bounds every var the group produces. For tighter per-var bounds
         ;; we'd need to track which patterns produce which vars + their individual
@@ -852,7 +891,7 @@
                                output-vars)
         ;; Merge-ops' pushdown preds can't be applied (merge uses EAVT lookupGE,
         ;; not AVET scan). Collect them so they can be restored as standalone preds.
-        merge-lost-preds (into #{} (comp (mapcat :pushdown-preds) (map :pred-clause)) merge-ops)
+        merge-lost-preds (into (set equalities) (comp (mapcat :pushdown-preds) (map :pred-clause)) merge-ops)
         final-scan (assoc scan :join-method :scan)
         final-merges (mapv #(assoc % :join-method :lookup) merge-ops)
         eg-op (cond-> {:op :entity-group
