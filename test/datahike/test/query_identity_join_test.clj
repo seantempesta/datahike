@@ -97,6 +97,9 @@
     [[:turn/id "run-9"]]]
    [:join-last '[:find ?x ?s :in $ [?id ...] :where [?x :eval/run ?run] [?x :eval/source ?s] [?run :turn/id ?id]]
     [["run-10" "run-11"]]]
+   [:with-predicate '[:find ?x ?o :in $ ?id
+                      :where [?run :turn/id ?id] [?x :eval/run ?run] [?x :eval/ordinal ?o] [(> ?o 0)]]
+    ["run-13"]]
    [:two-groups '[:find ?x ?y :in $ ?id
                   :where [?run :turn/id ?id] [?x :eval/run ?run] [?x :eval/ordinal 0]
                   [?y :eval/run ?run] [?y :eval/ordinal 2]]

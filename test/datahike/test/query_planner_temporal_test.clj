@@ -599,3 +599,43 @@
         (finally
           (when-let [conn @conn*] (d/release conn))
           (d/delete-database cfg))))))
+
+;; ---------------------------------------------------------------------------
+;; A history merge over a scan in VALUE order
+;;
+;; The history merge walks a [current temporal] EAVT cursor pair that only
+;; moves forward, which serves a scan emitting entities in ascending order
+;; (EAVT/AEVT, or entity seeks). An AVET scan — a range predicate pushed onto
+;; an indexed attribute, or per-value seeks for a bound value — emits entities
+;; in VALUE order, so the cursors skipped every entity below the last one
+;; merged and the planner silently dropped rows. Names here sort opposite to
+;; entity ids, so value order is descending entity order.
+
+(deftest test-history-merge-over-value-ordered-scan
+  (let [cfg (fresh-cfg)
+        conn* (atom nil)]
+    (try
+      (d/create-database cfg)
+      (let [conn (d/connect cfg)
+            _ (reset! conn* conn)]
+        (d/transact conn [{:db/ident :item/name :db/valueType :db.type/string
+                           :db/cardinality :db.cardinality/one :db/index true}
+                          {:db/ident :item/team :db/valueType :db.type/long
+                           :db/cardinality :db.cardinality/one}])
+        (d/transact conn (vec (for [i (range 10)] {:item/name (str "n" (- 9 i)) :item/team i})))
+        (let [hdb (d/history (d/db conn))]
+          (doseq [[label q-form args]
+                  [["range predicate on an indexed value"
+                    '[:find ?n ?t :where [?e :item/name ?n] [(> ?n "n3")] [?e :item/team ?t]] []]
+                   ["bound value collection"
+                    '[:find ?n ?t :in $ [?n ...] :where [?e :item/name ?n] [?e :item/team ?t]]
+                    [["n8" "n2" "n5"]]]]]
+            (testing label
+              (let [{:keys [legacy planner]} (apply run-both q-form hdb args)]
+                (is (= (set legacy) (set planner))))))
+          (is (= #{["n8" 1] ["n2" 7] ["n5" 4]}
+                 (set (d/q '[:find ?n ?t :in $ [?n ...] :where [?e :item/name ?n] [?e :item/team ?t]]
+                           hdb ["n8" "n2" "n5"]))))))
+      (finally
+        (when-let [conn @conn*] (d/release conn))
+        (d/delete-database cfg)))))

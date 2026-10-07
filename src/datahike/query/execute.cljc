@@ -1916,6 +1916,13 @@
                                              temporal index-db resolved-a)
                   probe-attrs #?(:clj (bound-attribute-slices index-db probe-attrs) :cljs nil)
                   :else (di/-slice db-index from-datom to-datom index)))
+        ;; The history merge's cursor pair only moves forward, so it serves a
+        ;; slice in ascending entity order: an EAVT/AEVT scan, or entity seeks
+        ;; (sorted eids). An AVET slice, or value seeks, are in value order;
+        ;; forward cursors would skip every entity below the last one seen.
+        entity-ordered-slice? (if use-probe-driven?
+                                (== 0 (int probe-datom-field))
+                                (contains? #{:eavt :aevt} index))
         ;; When probe-driven, filtering is baked into the seeks — nil out probe-set
         probe-set (if use-probe-driven? nil probe-set)
         ground-filter (let [bounds (when use-probe-driven?
@@ -1942,7 +1949,8 @@
                                                merge-card-many merge-added-filter
                                                merge-check-scan-v merge-check-scan-tx
                                                nil nil ; retired slots 8 and 9
-                                               temporal-eavt-pss temporal-cursors
+                                               temporal-eavt-pss
+                                               (when entity-ordered-slice? temporal-cursors)
                                                temporal-type temporal-tx-filter
                                                scan-added-val origin-db
                                                merge-optional merge-defaults])
@@ -2514,9 +2522,15 @@
                                               :scan-estimate (:estimated-card g)
                                               :pipeline (:pipeline g)
                                               :cancel cancel)
-                        ;; Apply consumer attached-preds (if any)
+                        ;; Apply consumer attached-preds (if any). The consumer
+                        ;; emitted wide tuples for them; they stay wide only when
+                        ;; a later step reads that layout (the probe-map combine,
+                        ;; or post-ops). Otherwise these ARE the answer tuples and
+                        ;; are projected to `emit-vars` here.
                         (when (seq c-attached)
-                          (apply-attached-preds result-list c-attached c-all-vars c-all-vars consts))
+                          (apply-attached-preds result-list c-attached c-all-vars
+                                                (if (or pmap has-post-ops?) c-all-vars emit-vars)
+                                                consts))
                         ;; Combine consumer tuples with producer values from probe-map
                         (when pmap
                           (let [probe-var (:probe-var pinfo)
