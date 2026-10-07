@@ -202,3 +202,18 @@
               (is (= 3 (count (binding [q/*query-result-cache?* false] (d/q receipts @conn ["run-5"])))))
               (is (<= (- (:reads @stats) before) 16)))))
         (finally (d/release small) (d/delete-database cfg))))))
+
+(deftest a-join-after-an-or-reads-the-nodes-of-its-answer
+  ;; A union whose branches look up bound unique values was estimated at the
+  ;; extent of its branches' attributes, so the pattern joined to it ran first
+  ;; and read its whole attribute, whatever the number of inputs.
+  (let [q-form '[:find ?x ?o :in $ [?id ...]
+                 :where (or [?run :turn/id ?id] (and [?run :turn/id ?id] [(= ?id "none")]))
+                 [?x :eval/run ?run] [?x :eval/ordinal ?o]]]
+    (with-conn
+      (fn [conn]
+        (binding [q/*query-result-cache?* false]
+          (is (= (binding [q/*disable-planner* true] (set (d/q q-form @conn ["run-5"])))
+                 (set (d/q q-form @conn ["run-5"]))))
+          (is (= 3 (count (d/q q-form @conn ["run-5"])))))))
+    (is (<= (execution-reads q-form ["run-5"]) 16))))

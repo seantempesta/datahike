@@ -186,7 +186,9 @@
                                          {:error :query/where :form (:clause clause-info)})))
                        (set raw)))
          sub-plans (normalize-and-plan-branches db (:branches clause-info) bound-vars rules)
-         total-est (reduce + 0 (keep (fn [p] (some :estimated-card (:ops p))) sub-plans))]
+         ;; A branch's first sized op estimates it; a pattern scan by what it reads
+         ;; given the bindings entering the union (`:scan-card`), not its attribute.
+         total-est (reduce + 0 (keep (fn [p] (some #(or (:scan-card %) (:estimated-card %)) (:ops p))) sub-plans))]
      (cond-> {:op (if join-vars? :or-join :or)
               :clause (:clause clause-info)
               :branches sub-plans
