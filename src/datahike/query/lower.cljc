@@ -399,6 +399,27 @@
       (when (every? some? infos)
         infos))))
 
+(defn- invariant-head-positions
+  "Positions of `rule-name`'s head that every recursive call in each branch
+   passes that branch's own head var at, and whose call arg is a free var named
+   once in `call-args`: an outer binding of such a call arg binds every tuple
+   the fixpoint derives."
+  [rule-name branches call-args]
+  (let [once? (fn [arg] (= 1 (count (filter #{arg} call-args))))
+        passes-through? (fn [i [[_ & head] & body]]
+                          (let [hv (nth (vec head) i nil)]
+                            (and (analyze/free-var? hv)
+                                 (every? #(= hv (nth (vec (rest %)) i nil))
+                                         (filter #(and (seq? %) (= rule-name (first %)))
+                                                 (tree-seq sequential? seq body))))))]
+    (into #{}
+          (filter (fn [i]
+                    (let [arg (nth call-args i)]
+                      (and (analyze/free-var? arg)
+                           (once? arg)
+                           (every? #(passes-through? i %) branches)))))
+          (range (count call-args)))))
+
 (defn plan-rule-op [db clause-info bound-vars rules scc-info]
   (let [[rule-name & call-args] (:clause clause-info)
         ;; Validate: non-var rule args must be scalars (not collections/maps)
@@ -437,11 +458,23 @@
                       (map (fn [rn]
                              (let [rn-branches (get rules rn)
                                    head-vars (vec (rest (first (first rn-branches))))
-                                   free-call-args (mapv (fn [hv]
-                                                          (if (analyze/free-var? hv)
-                                                            hv
-                                                            (symbol (str "?" (name hv)))))
-                                                        head-vars)
+                                   ;; The fixpoint keeps every outer relation sharing a var
+                                   ;; with the branch plans. A head position may take the
+                                   ;; call arg's name, so the caller's values restrict the
+                                   ;; closure, only when every recursive call passes that
+                                   ;; head var through unchanged (`invariant-head-positions`);
+                                   ;; every other head var gets a name private to this rule
+                                   ;; op. The result is joined back by call-arg position.
+                                   invariant (if (and (= rn rule-name) (= 1 (count scc-rule-names)))
+                                               (invariant-head-positions rn rn-branches call-args)
+                                               #{})
+                                   free-call-args (vec (map-indexed
+                                                        (fn [i hv]
+                                                          (if (contains? invariant i)
+                                                            (nth call-args i)
+                                                            (symbol (str (if (analyze/free-var? hv) (name hv) (str "?" (name hv)))
+                                                                         "__head__" seqid))))
+                                                        head-vars))
                                    is-base? (fn [branch]
                                               (let [[_head & body] branch]
                                                 (not (some is-scc-call? body))))

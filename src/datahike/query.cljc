@@ -3348,12 +3348,14 @@
                                 (or (number? v) (string? v) (keyword? v)
                                     (boolean? v) (nil? v) (uuid? v)
                                     (inst? v)))
+                      ;; A lookup ref, literal or input, names its entity: the
+                      ;; rule's fixpoint compares entity ids, never the ref.
                       substituted-args (map (fn [x]
-                                              (if (and (symbol? x)
-                                                       (contains? consts x)
-                                                       (scalar? (get consts x)))
-                                                (get consts x)
-                                                x))
+                                              (let [v (if (and (symbol? x) (contains? consts x)) (get consts x) x)]
+                                                (cond
+                                                  (lookup-ref? v) (dbu/entid-strict resolve-db v)
+                                                  (and (not= v x) (scalar? v)) v
+                                                  :else x)))
                                             args)]
                   (apply list rule-name substituted-args))
 

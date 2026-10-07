@@ -9,6 +9,7 @@
    [clojure.string :as str]
    [clojure.test :refer [deftest is testing]]
    [datahike.api :as d]
+   [datahike.db :as db]
    [datahike.query :as q])
   (:import [java.util Date UUID]))
 
@@ -639,3 +640,79 @@
       (finally
         (when-let [conn @conn*] (d/release conn))
         (d/delete-database cfg)))))
+
+;; ---------------------------------------------------------------------------
+;; Recursive rules answer like the base engine in every world
+;;
+;; A recursive rule's head vars kept their own spelling inside the fixpoint,
+;; and the fixpoint keeps every outer relation sharing a var with the branch
+;; plans: a head var spelled like an outer query var (`?a` below) held every
+;; recursive step to the caller's values, so the closure stopped at depth one.
+;; A lookup ref passed to a rule call (scalar input or literal) was never
+;; resolved, so the rule answered for every entity.
+
+(defn- chain-db
+  "Twenty people, each the friend of the previous one, then p4 retracted."
+  []
+  (let [base (d/db-with (db/empty-db {:p/id {:db/unique :db.unique/identity}
+                                      :p/friend {:db/valueType :db.type/ref}}
+                                     {:keep-history? true})
+                        (vec (for [i (range 20)]
+                               (cond-> {:db/id (- (inc i)) :p/id (str "p" i)}
+                                 (pos? i) (assoc :p/friend (- i))))))]
+    {:before base
+     :after (d/db-with base [[:db/retractEntity [:p/id "p4"]]])}))
+
+(defn- ring-db
+  "Eighty entities, each referring to the next and to the one three on, plus
+   one move of a unique value and one retracted ref."
+  []
+  (let [before (d/db-with (db/empty-db {:u/id {:db/unique :db.unique/identity}
+                                        :u/ref {:db/valueType :db.type/ref
+                                                :db/cardinality :db.cardinality/many}
+                                        :u/a {:db/index true}}
+                                       {:keep-history? true})
+                          (vec (for [i (range 1 81)]
+                                 {:db/id i :u/id i :u/a (mod i 7)
+                                  :u/ref (vec (distinct [(inc (mod i 80)) (inc (mod (+ i 3) 80))]))})))]
+    {:before before
+     :after (d/db-with before [[:db/retract 1 :u/id 1] [:db/add 81 :u/id 1] [:db/add 81 :u/a 3]
+                               [:db/add 81 :u/ref 3] [:db/retract 2 :u/ref 3]])}))
+
+(defn- worlds [{:keys [before after]}]
+  {:current after :history (d/history after) :as-of (d/as-of after (:max-tx before))
+   :unretracted before})
+
+(defn- outcome [q-form database args]
+  (try (set (apply d/q q-form database args))
+       (catch Exception e {:error (ex-message e)})))
+
+(deftest recursive-rules-answer-like-the-base-engine
+  (let [reach '[[(reach ?a ?b) [?a :p/friend ?b]] [(reach ?a ?b) [?a :p/friend ?x] (reach ?x ?b)]]
+        path '[[(path ?e ?x) [?e :u/ref ?x]]
+               [(path ?e ?x) [?e :u/ref ?y] [(< ?e ?y)] [(< ?y 8)] (path ?y ?x)]]
+        friend '[[(friend ?a ?b) [?a :p/friend ?b]]]
+        cases {(worlds (chain-db))
+               [["identity input" '[:find ?b :in $ % ?id :where [?a :p/id ?id] (reach ?a ?b)] [reach "p6"]]
+                ["lookup-ref input" '[:find ?b :in $ % ?a :where (reach ?a ?b)] [reach [:p/id "p6"]]]
+                ["lookup-ref input in find" '[:find ?a ?b :in $ % ?a :where (reach ?a ?b)] [reach [:p/id "p6"]]]
+                ["lookup-ref input, right" '[:find ?a :in $ % ?b :where (reach ?a ?b)] [reach [:p/id "p2"]]]
+                ["literal lookup ref" '[:find ?b :in $ % :where (reach [:p/id "p6"] ?b)] [reach]]
+                ["missing lookup ref" '[:find ?b :in $ % ?a :where (reach ?a ?b)] [reach [:p/id "none"]]]
+                ["caller-bound pass-through head var" '[:find ?a ?b :in $ % [?b ...] :where (reach ?a ?b)] [reach [3 5]]]
+                ["caller-bound pass-through var, other spelling" '[:find ?x ?y :in $ % [?y ...] :where (reach ?x ?y)] [reach [3 5]]]
+                ["lookup-ref input, plain rule" '[:find ?b :in $ % ?a :where (friend ?a ?b)] [friend [:p/id "p6"]]]]
+               (worlds (ring-db))
+               [["head vars spelled like outer vars"
+                 '[:find ?e ?x :in $ % [?id ...] :where [?e :u/id ?id] (path ?e ?x) [?x :u/a ?a]] [path [1 2]]]]}]
+    (doseq [[ws rows] cases
+            [world database] ws
+            [label q-form args] rows]
+      (testing [world label]
+        (binding [q/*query-result-cache?* false]
+          (is (= (binding [q/*disable-planner* true] (outcome q-form database args))
+                 (outcome q-form database args))))))
+    (is (= #{[1] [2] [3] [4] [5] [6]}
+           (binding [q/*query-result-cache?* false]
+             (set (d/q '[:find ?b :in $ % ?a :where (reach ?a ?b)]
+                       (d/history (:after (chain-db))) reach [:p/id "p6"])))))))
