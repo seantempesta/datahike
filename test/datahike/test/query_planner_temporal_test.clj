@@ -903,6 +903,23 @@
           (when (set? answer)
             (is (= (count answer) (count result)) "a set answer holds no duplicate tuple")))))))
 
+(deftest a-predicate-reads-every-var-of-the-joined-groups
+  ;; A producer group whose only use downstream was a predicate's var was run
+  ;; collect-only, so the predicate read the consumer's columns at the wrong
+  ;; positions: rows of the wrong var, or an index out of bounds.
+  (answers-every-world "join var read by a predicate" #{[2] [4]}
+                       '[:find ?a :where [?a :p/friend ?b] [?b :p/score ?c] [(<= ?c 2)]])
+  (answers-every-world "the producer's var found" #{[1] [2]}
+                       '[:find ?b :where [?a :p/friend ?b] [?b :p/score ?c] [(<= ?c 2)]])
+  (answers-every-world "a joined pattern repeating a var" #{[3 3]}
+                       '[:find ?a ?b :where [?a :p/friend ?b] [?b :p/friend ?b]]))
+
+(deftest groups-sharing-two-vars-join-on-both
+  (answers-every-world "two shared vars" #{[2 1] [3 3]}
+                       '[:find ?b ?c :where [?b :p/friend ?c] [?c :p/nums ?b]])
+  (answers-every-world "get-else binding another group's var" #{[1 1] [3 3]}
+                       '[:find ?d ?c :where [?d :p/nums ?a] [?c :p/nums ?d] [(get-else $ ?d :p/score -1) ?c]]))
+
 (deftest a-projection-answers-distinct-tuples
   (answers-every-world "card-many value not found" #{[1] [2]}
                        '[:find ?c :where [?c :p/tags ?t]]))

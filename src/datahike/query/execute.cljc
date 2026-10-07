@@ -2150,6 +2150,10 @@
                (let [consumer-g (nth groups gi)
                      producer-g (nth groups producer-idx)]
                  (and (some? (find-probe-info consumer-g producer-g probe-vars))
+                      ;; The probe joins on one var; groups sharing another var
+                      ;; are joined on all of them by the Relation path.
+                      (= 1 (count (filter #(group-provides-var? producer-g %)
+                                          (set (:vars consumer-g)))))
                       ;; Find-vars must be resolvable from consumer, producer, or consts
                       (every? #(or (and consts (contains? consts %))
                                    (group-provides-var? consumer-g %)
@@ -2628,7 +2632,9 @@
                                         {}
                                         downstream-consumers)))
                           ;; producer-has-find-vars? if ANY downstream consumer
-                          ;; is missing a find-var the producer supplies — we
+                          ;; is missing a var the producer supplies to the
+                          ;; emitted tuple (a find-var, or with post-ops any
+                          ;; group var a predicate or function reads) — we
                           ;; need to keep the producer's tuples to combine
                           ;; them in. If multiple probe-vars feed different
                           ;; consumers we also need the producer tuples
@@ -2640,7 +2646,7 @@
                                                (and (not (and consts (contains? consts fv)))
                                                     (group-provides-var? g fv)
                                                     (not (group-provides-var? c-g fv))))
-                                             find-vars))
+                                             emit-vars))
                                      downstream-consumers))
                           use-new-path?
                           (or producer-has-find-vars?
