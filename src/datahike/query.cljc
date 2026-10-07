@@ -1,5 +1,5 @@
 (ns ^{:no-doc true
-      :clj-kondo/config '{:linters {:unresolved-symbol {:exclude [(datahike.tools/with-destructured-vector)]}}}}
+      :clj-kondo/config '{:linters {:unresolved-symbol {:exclude [(datahike.tools/with-destructured-vector [e a v tx added])]}}}}
   datahike.query
   #?(:cljs (:require-macros [datahike.query :refer [basic-index-selector make-vec-lookup-ref-replacer some-of substitution-expansion]]))
   (:require
@@ -3524,7 +3524,7 @@
          (walk x)))))
 
 (defn- size-class
-  "The bit length of a non-negative count: equal for counts within a factor of two."
+  "The bit length of a non-negative integer; equal buckets differ by less than twofold."
   [n]
   #?(:clj (- 64 (Long/numberOfLeadingZeros (long n)))
      :cljs (- 32 (js/Math.clz32 n))))
@@ -3535,8 +3535,9 @@
    structure (index selection, merge ordering, the estimates that gate seeks
    at run time) depends on query shape, schema and the data's size: a plan
    made on a small database scans what a large one must seek. The size class of
-   `max-eid` separates databases whose entity counts differ by more than a
-   factor of two, so a plan is remade once per doubling, not per write.
+   `max-eid` separates different entity-id high-water-mark buckets. It does
+   not measure population: sparse ids, retractions and history can leave
+   very different populations in the same bucket.
    `in-cards` (shape-derived, value-independent) is in
    the key only to separate tuple from relation :in bindings (see
    get-or-create-plan body).

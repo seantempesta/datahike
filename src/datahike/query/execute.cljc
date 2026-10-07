@@ -1,4 +1,4 @@
-(ns ^{:clj-kondo/config '{:linters {:unresolved-symbol {:exclude [(datahike.query.execute/sorted-merge-inner-loop)]}}}}
+(ns ^{:clj-kondo/config '{:linters {:unresolved-symbol {:exclude [(datahike.query.execute/sorted-merge-inner-loop [first-attr cur-d si cur-a target-a])]}}}}
   datahike.query.execute
   "Execution engine for query plans.
    Supports fused scan+merge for entity groups, hash-probe value joins,
