@@ -27,6 +27,23 @@
 
 ;; mapping to storage
 
+(def ^:private last-schema-meta
+  "The schema-meta most recently keyed and its key. Commits that change no schema
+  carry the identical schema maps, so they reuse the key instead of hashing the
+  whole schema again."
+  (atom nil))
+
+(defn- schema-meta-content-key
+  "The content key of `schema-meta`: `(uuid schema-meta)`, computed once per
+  identical set of schema maps."
+  [schema-meta]
+  (let [[prior prior-key] @last-schema-meta]
+    (if (and prior (every? (fn [[k v]] (identical? v (get prior k))) schema-meta))
+      prior-key
+      (let [content-key (uuid schema-meta)]
+        (reset! last-schema-meta [schema-meta content-key])
+        content-key))))
+
 (defn stored-db? [obj]
   ;; TODO use proper schema to match?
   (let [keys-to-check [:eavt-key :aevt-key :avet-key :config
@@ -60,8 +77,8 @@
                      :system-entities system-entities
                      :ident-ref-map ident-ref-map
                      :ref-ident-map ref-ident-map}
-        schema-meta-key (uuid schema-meta)
-        backend                                           (di/konserve-backend (:index config) store)
+        schema-meta-key (schema-meta-content-key schema-meta)
+        backend                                          (di/konserve-backend (:index config) store)
         not-in-memory?                                    (not= :memory (-> config :store :backend))
         flush! (and flush? not-in-memory?)
         ;; Prepare schema meta KV pair for writing, but don't write it here.
