@@ -1188,6 +1188,18 @@
                   (assoc production :tuples []))]
     (update context :rels conj new-rel)))
 
+(defn- resolve-joined
+  "`context` with `clauses` resolved, then `fresh` (the vars a rewrite introduced
+   to express a join) dropped from its relations: they stay private to that
+   join and never reach a union, a negation or the projection."
+  [context clauses fresh]
+  (some-> (resolve-context context clauses)
+          (update :rels (fn [rels]
+                          (into [] (keep (fn [rel]
+                                           (when-some [attrs (not-empty (apply dissoc (:attrs rel) fresh))]
+                                             (assoc rel :attrs attrs))))
+                                rels)))))
+
 (defn bind-by-fn [context clause]
   (let [[[f & args] out] clause
         binding (dpi/parse-binding out)
@@ -1218,9 +1230,11 @@
       (let [renames (into {} (comp (filter (:attrs production))
                                    (map (fn [v] [v (gensym (str (name v) "__bound"))])))
                           (analyze/extract-vars out))]
-        (resolve-context context-in (into [[(first clause) (walk/postwalk-replace renames out)]]
-                                       (map (fn [[v fresh]] [(list '= v fresh)]))
-                                       renames)))
+        (resolve-joined context-in
+                        (into [[(first clause) (walk/postwalk-replace renames out)]]
+                              (map (fn [[v fresh]] [(list '= v fresh)]))
+                              renames)
+                        (vals renames)))
       :else
       ;; Engine-level function-invocation count (atom-free): the fn is applied
       ;; once per production tuple, so invocations = (count (:tuples production)).
@@ -2286,9 +2300,10 @@
                                                  :branches (:stats negation-context)})))))
 
      '[*] ;; pattern
-     (if-let [[pattern equalities] (analyze/separate-repeated-vars clause)]
-       ;; A var repeated within one pattern is a join of the pattern with itself.
-       (resolve-context context (into [pattern] equalities))
+     (if-let [[pattern equalities] (analyze/separate-repeated-vars (vec clause))]
+       ;; A var repeated within one pattern is a join of the pattern with itself
+       ;; (a source-prefixed pattern arrives here as the seq after its source).
+       (resolve-joined context (into [pattern] equalities) (map (fn [[[_ _ fresh]]] fresh) equalities))
        (let [source rel/*implicit-source*
            pattern0 (replace (:consts context) clause)
            pattern1 (resolve-pattern-lookup-refs source pattern0)
@@ -3322,7 +3337,10 @@
                       src-db (if sources (get sources src-sym resolve-db) resolve-db)
                       inner-pattern (vec (rest clause))
                       resolved-inner (resolve-clause src-db inner-pattern)]
-                  (cons src-sym resolved-inner))
+                  ;; A data pattern stays a vector, as the planner reads one.
+                  (if (vector? clause)
+                    (into [src-sym] resolved-inner)
+                    (cons src-sym resolved-inner)))
 
               ;; Data pattern: [e a v ...]
                 (and (vector? clause) (not (sequential? (first clause))))

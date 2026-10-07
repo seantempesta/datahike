@@ -12,6 +12,7 @@
   (:require
    [datahike.query.analyze :as analyze]
    [datahike.query.ir :as ir]
+   [datahike.query.plan :as plan]
    [datahike.db.interface :as dbi]))
 
 #?(:clj (set! *warn-on-reflection* true))
@@ -86,12 +87,16 @@
   ([db where-clauses bound-vars rules]
    (build-logical-plan db where-clauses bound-vars rules nil))
   ([db where-clauses bound-vars rules guarded-rules]
-   (let [;; A var repeated within one pattern or rule call is a join of that
-         ;; clause with itself.
+   (let [;; A var repeated within one pattern or recursive rule call is a join
+         ;; of that clause with itself. A non-recursive rule is expanded with
+         ;; its call args, so its body sees the repeat (a predicate-only body
+         ;; could never bind a fresh var).
          where-clauses (into [] (mapcat (fn [clause]
                                           (if-let [[separated equalities]
                                                    (if (and (seq? clause) (contains? rules (first clause)))
-                                                     (analyze/separate-repeated-call-args clause)
+                                                     (when-let [separated (analyze/separate-repeated-call-args clause)]
+                                                       (when (:recursive? (get (plan/compute-rule-sccs rules) (first clause)))
+                                                         separated))
                                                      (analyze/separate-repeated-vars clause))]
                                             (cons (with-meta separated (meta clause)) equalities)
                                             [clause])))

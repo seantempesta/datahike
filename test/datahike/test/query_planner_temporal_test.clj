@@ -920,6 +920,23 @@
   (answers-every-world "get-else binding another group's var" #{[1 1] [3 3]}
                        '[:find ?d ?c :where [?d :p/nums ?a] [?c :p/nums ?d] [(get-else $ ?d :p/score -1) ?c]]))
 
+(deftest the-vars-a-join-rewrite-adds-stay-private
+  ;; The base engine's fresh var for a repeated var reached the union's
+  ;; relations ("Can't sum relations with different attrs").
+  (answers-every-world "repeated var in a union branch" #{[1] [3]}
+                       '[:find ?a :where [?a :p/id] (or [?a :p/friend ?a] [?a :p/score 1])])
+  (answers-every-world "function binding a bound var in a union branch" #{[1] [4]}
+                       '[:find ?a :where [?a :p/score ?s] (or [(identity 1) ?s] [(identity 4) ?s])])
+  (answers-every-world "repeated var in a source-prefixed pattern" #{[3]}
+                       '[:find ?a :in $ :where [$ ?a :p/friend ?a]]))
+
+(deftest a-non-recursive-rule-sees-a-repeated-call-arg
+  ;; Separating the arg left the rule's predicate-only body with an unbound var.
+  (answers-every-world "predicate rule" #{[1] [2] [3] [4]}
+                       '[:find ?a :in $ % :where [?a :p/id] (same ?a ?a)] '[[(same ?x ?y) [(= ?x ?y)]]])
+  (answers-every-world "pattern rule" #{[3]}
+                       '[:find ?a :in $ % :where (friend-of ?a ?a)] '[[(friend-of ?x ?y) [?x :p/friend ?y]]]))
+
 (deftest get-else-binding-a-bound-var-joins-it
   ;; An optional merge compared nothing, or emitted its default on a value mismatch.
   (answers-every-world "the scan's var" #{[1] [3]}

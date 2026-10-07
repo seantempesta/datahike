@@ -68,6 +68,8 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Notable fixes
 
+- **A join rewrite's variables stay private** — the base engine's fresh variable for a repeated or rebound variable reached a union's relations (`(or [?a :friend ?a] [?a :score 1])` threw `Can't sum relations with different attrs`); it is dropped after its equality. A repeated call argument is separated only for a recursive rule: a non-recursive rule is expanded with its arguments, and a predicate-only body (`(same ?a ?a)` over `[(same ?x ?y) [(= ?x ?y)]]`) answered nothing. A source-prefixed pattern repeating a variable (`[$ ?a :friend ?a]`) now joins it in both engines. ([#TODO])
+
 - **A `get-else` into a bound variable joins it** — in the planner a `get-else` whose output variable its group already binds compared nothing, or yielded its default on a mismatch; it now takes a fresh variable joined back by equality. A group holding a `get-else` and a cardinality-many merge ran the single-lookup path and kept one value of the cardinality-many attribute; the cardinality-many path now yields `get-else` defaults. ([#TODO])
 
 - **A NOT binds nothing** — a folded anti-merge's own variables were emitted as columns of its group that no datom fills (`[?a :nums ?x] [(> ?x 1)] (not [?a :likes ?e])` threw a `NullPointerException`; a `not` naming a tx threw on nil). A `not` naming a variable another clause or input binds (`[?x :score ?s] [?e :team :t0] (not [?e :score ?s])`) no longer folds into the entity group, where it read as a wildcard. ([#TODO])
