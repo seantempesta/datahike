@@ -920,6 +920,18 @@
   (answers-every-world "get-else binding another group's var" #{[1 1] [3 3]}
                        '[:find ?d ?c :where [?d :p/nums ?a] [?c :p/nums ?d] [(get-else $ ?d :p/score -1) ?c]]))
 
+(deftest get-else-binding-a-bound-var-joins-it
+  ;; An optional merge compared nothing, or emitted its default on a value mismatch.
+  (answers-every-world "the scan's var" #{[1] [3]}
+                       '[:find ?e :where [?e :p/team ?t] [?e :p/score ?s] [(get-else $ ?e :p/age -1) ?s]])
+  (answers-every-world "a card-many var" #{[1 1] [3 3]}
+                       '[:find ?c ?d :where [?c :p/nums ?d] [?c :p/id ?i] [(get-else $ ?c :p/score -1) ?d]])
+  (answers-every-world "default compared" #{[1] [2] [3]}
+                       '[:find ?e :where [?e :p/id ?i] [(get-else $ ?e :p/age -1) ?s] [(get-else $ ?e :p/score -1) ?s2] [(get-else $ ?e :p/age ?s2) ?s]])
+  ;; The per-cursor path that served get-else kept one value of a card-many merge.
+  (answers-every-world "every card-many value beside a get-else" #{[1 "x" 1] [1 "x" 2] [2 "y" 3] [2 "z" 3]}
+                       '[:find ?c ?t ?d :where [?c :p/tags ?t] [?c :p/nums ?d] [(get-else $ ?c :p/age -1) ?a]]))
+
 (deftest a-not-naming-a-var-bound-outside-its-group
   ;; A folded anti-merge compares only its group's vars, so a var another group
   ;; or an input binds was read as a wildcard.

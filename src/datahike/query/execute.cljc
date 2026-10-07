@@ -1020,7 +1020,9 @@
 (defn- execute-card-many-merge
   "Path 2: Card-many recursive cross-product merge.
    merge-ctx is [merge-attrs merge-v-ground merge-v-vals merge-anti
-                 merge-card-many merge-check-scan-v merge-check-scan-tx merge-cursors]."
+                 merge-card-many merge-check-scan-v merge-check-scan-tx merge-cursors
+                 merge-optional merge-defaults]; an optional (`get-else`) merge that
+   finds nothing yields its default."
   [db eavt-pss slice ground-filter strict-filter
    probe-set probe-datom-field
    collect-set collect-datom-field collect-merge-idx
@@ -1034,6 +1036,8 @@
         ^objects merge-check-scan-v (aget ^objects merge-ctx 5)
         ^objects merge-check-scan-tx (aget ^objects merge-ctx 6)
         ^objects merge-cursors (aget ^objects merge-ctx 7)
+        ^objects merge-optional (aget ^objects merge-ctx 8)
+        ^objects merge-defaults (aget ^objects merge-ctx 9)
         ^objects merge-datoms merge-datoms
         ^ints find-source find-source
         ^objects const-vals const-vals]
@@ -1076,9 +1080,11 @@
                                    (if anti?
                                      (when (not found?)
                                        (process-merges (inc mi)))
-                                     (when found?
-                                       (aset merge-datoms mi d)
-                                       (process-merges (inc mi)))))))))]
+                                     (cond
+                                         found? (do (aset merge-datoms mi d)
+                                                    (process-merges (inc mi)))
+                                         (aget merge-optional mi) (do (aset merge-datoms mi (datom eid ra (aget merge-defaults mi) tx0))
+                                                                      (process-merges (inc mi))))))))))]
                    (process-merges 0)))))))
        :cljs
        (doseq [scan-d slice
@@ -1114,9 +1120,11 @@
                                (if anti?
                                  (when (not found?)
                                    (process-merges (inc mi)))
-                                 (when found?
-                                   (aset merge-datoms mi d)
-                                   (process-merges (inc mi)))))))))]
+                                 (cond
+                                     found? (do (aset merge-datoms mi d)
+                                                (process-merges (inc mi)))
+                                     (aget merge-optional mi) (do (aset merge-datoms mi (datom eid ra (aget merge-defaults mi) tx0))
+                                                                  (process-merges (inc mi))))))))))]
                (process-merges 0))))))))
 
 #?(:clj
@@ -1994,7 +2002,8 @@
                                         cursors))
                                :cljs nil)
               merge-ctx (object-array [merge-attrs merge-v-ground merge-v-vals merge-anti
-                                       merge-card-many merge-check-scan-v merge-check-scan-tx merge-cursors])]
+                                       merge-card-many merge-check-scan-v merge-check-scan-tx merge-cursors
+                                       merge-optional merge-defaults])]
           (execute-card-many-merge db eavt-pss slice ground-filter strict-filter
                                    probe-set probe-datom-field
                                    collect-set collect-datom-field collect-merge-idx

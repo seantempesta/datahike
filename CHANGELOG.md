@@ -68,6 +68,8 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Notable fixes
 
+- **A `get-else` into a bound variable joins it** — in the planner a `get-else` whose output variable its group already binds compared nothing, or yielded its default on a mismatch; it now takes a fresh variable joined back by equality. A group holding a `get-else` and a cardinality-many merge ran the single-lookup path and kept one value of the cardinality-many attribute; the cardinality-many path now yields `get-else` defaults. ([#TODO])
+
 - **A NOT binds nothing** — a folded anti-merge's own variables were emitted as columns of its group that no datom fills (`[?a :nums ?x] [(> ?x 1)] (not [?a :likes ?e])` threw a `NullPointerException`; a `not` naming a tx threw on nil). A `not` naming a variable another clause or input binds (`[?x :score ?s] [?e :team :t0] (not [?e :score ?s])`) no longer folds into the entity group, where it read as a wildcard. ([#TODO])
 
 - **Joined groups keep what a predicate reads and join on every shared variable** — when a predicate read a variable only the producer group binds (`[?a :friend ?b] [?b :score ?c] [(<= ?c 2)]`), the producer ran collect-only and the predicate read the consumer's columns at the producer's positions: wrong rows, or an index out of bounds. Its tuples are now kept and combined. Two groups sharing more than one variable (`[?b :friend ?c] [?c :nums ?b]`) were joined on one of them; they now take the relational path, which joins on all. ([#TODO])

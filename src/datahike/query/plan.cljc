@@ -664,8 +664,10 @@
         attr-refs? (:attribute-refs? (dbi/-config db))
         fused-path (cond
                      (zero? n-merges) :scan-only
-                     has-optional?    :per-cursor-merge
+                     ;; Only the card-many path emits every value of a card-many
+                     ;; merge; it yields an optional merge's default too.
                      has-card-many?   :card-many-merge
+                     has-optional?    :per-cursor-merge
                      use-sorted-scan? :sorted-merge
                      :else            :per-cursor-merge)
         steps (cond-> [(ir/->PIndexScan index clause scan-attr-ground?)
@@ -806,19 +808,20 @@
 (defn- separate-uncompared-vars
   "`merges` where a merge repeats a var of `scan` or of an earlier merge at a
    position the fused merge does not compare (it compares only the scan's value,
-   tx or added var at the same position) take a fresh var there. Returns
-   {:merges merges' :equalities [[(= ?var ?fresh)] ...]}."
+   tx or added var at the same position, and an optional `get-else` merge
+   compares none: it yields its default on a mismatch) take a fresh var there.
+   Returns {:merges merges' :equalities [[(= ?var ?fresh)] ...]}."
   [scan merges]
   (let [scan-clause (:clause scan)
         clause-vars (fn [clause] (filter analyze/free-var? clause))]
     (reduce (fn [{:keys [seen] :as acc} op]
-              (if (or (:anti? op) (:optional? op))
+              (if (:anti? op)
                 (-> acc (update :merges conj op) (update :seen into (clause-vars (:clause op))))
                 (let [{:keys [clause equalities]}
                       (reduce (fn [{:keys [clause] :as m} i]
                                 (let [x (get clause i)]
                                   (if (and (analyze/free-var? x) (contains? seen x)
-                                           (not= x (get scan-clause i)))
+                                           (or (:optional? op) (not= x (get scan-clause i))))
                                     (let [fresh (gensym (str (name x) "__repeat"))]
                                       (-> m (assoc-in [:clause i] fresh)
                                           (update :equalities conj [(list '= x fresh)])))
