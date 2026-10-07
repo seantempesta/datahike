@@ -844,11 +844,19 @@
   "Build an :entity-group op from pattern-ops on the same entity-var.
    Applies DP merge ordering, folds anti-merges, computes pipeline annotation.
    Returns {:op entity-group-op, :merge-lost-preds #{consumed-pred-clauses-on-merges
-   and equality predicates of separated vars}}."
+   and equality predicates of separated vars}, :unfolded-antis [anti-clauses left as NOTs]}."
   [db entity-var source pattern-ops anti-ops total-entities]
   (let [{:keys [scan merges]}
         (dp-order-fuse-ops db pattern-ops total-entities)
         {merges :merges equalities :equalities} (separate-uncompared-vars scan merges)
+        ;; An anti-merge compares only the scan's vars at the same position; one
+        ;; naming a merge's var elsewhere stays a standalone NOT (`:unfolded-antis`).
+        group-vars (into #{} (comp (mapcat :clause) (filter analyze/free-var?)) (cons scan merges))
+        compared? (fn [anti] (every? (fn [i] (let [x (get (:clause anti) i)]
+                                               (or (not (contains? group-vars x)) (= x (get (:clause scan) i)))))
+                                     [2 3 4]))
+        unfolded-antis (filterv (complement compared?) anti-ops)
+        anti-ops (filterv compared? anti-ops)
         ;; Merge ops = DP-ordered merges + anti-merges
         ;; Sort anti-merges by their filtering power (most selective first)
         all-merges (into (vec merges) anti-ops)
@@ -905,7 +913,8 @@
                        :pipeline (build-pipeline final-scan final-merges db)}
                 source (assoc :source source))]
     {:op eg-op
-     :merge-lost-preds merge-lost-preds}))
+     :merge-lost-preds merge-lost-preds
+     :unfolded-antis (mapv :clause unfolded-antis)}))
 
 ;; ---------------------------------------------------------------------------
 ;; Entity group partitioning

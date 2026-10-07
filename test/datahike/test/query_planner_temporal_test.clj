@@ -785,7 +785,8 @@
 ;; A var shared inside an entity group is a join
 ;;
 ;; A fused merge compared only the scan's value and tx vars at the same position:
-;; a shared added var, or a var two merges share, joined every pair of datoms.
+;; a shared added var, or a var two merges share, joined every pair of datoms, and
+;; a folded NOT naming a merge's var excluded on any datom of its attribute.
 
 (deftest shared-vars-in-an-entity-group-are-joined
   (let [before (d/db-with (db/empty-db {:item/a {:db/cardinality :db.cardinality/many}
@@ -802,7 +803,8 @@
                     '[:find ?v ?added :where [?e :item/a ?v ?tx ?added] [?e :item/b ?v ?tx2 ?added]]
                     '[:find ?w ?added :where [?e :item/a ?v ?tx] [?e :item/b ?w ?tx2 ?added] [?e :item/c ?w ?tx3 ?added]]
                     '[:find ?x ?v :where [?e :item/x ?x] [?e :item/b ?v] [?e :item/c ?v]]
-                    '[:find ?x ?v ?a :where [?e :item/x ?x ?t0 ?a0] [?e :item/b ?v ?t1 ?a] [?e :item/c ?v ?t2 ?a2]]]]
+                    '[:find ?x ?v ?a :where [?e :item/x ?x ?t0 ?a0] [?e :item/b ?v ?t1 ?a] [?e :item/c ?v ?t2 ?a2]]
+                    '[:find ?v :where [?e :item/x ?x] [?e :item/a ?v] (not [?e :item/c ?v])]]]
       (testing [world q-form]
         (binding [q/*query-result-cache?* false]
           (let [{:keys [legacy planner]} (run-both q-form database)]

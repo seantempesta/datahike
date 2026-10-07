@@ -760,12 +760,13 @@
 
         ;; Delegate DP ordering, anti-merge sorting, cardinality estimation,
         ;; and pipeline construction to the shared primitive.
-        {:keys [op merge-lost-preds]}
+        {:keys [op merge-lost-preds unfolded-antis]}
         (plan/assemble-entity-group db (.-entity_var ej) source
                                     scan-ops anti-ops total-entities)]
 
     {:op (assoc op :merge-lost-preds merge-lost-preds)
-     :consumed new-consumed}))
+     :consumed new-consumed
+     :unfolded-antis unfolded-antis}))
 
 (defn- lower-standalone-scan
   "Lower a standalone LScan or LOptionalScan to a :pattern-scan physical op."
@@ -961,11 +962,13 @@
              (cond
                ;; LEntityJoin → entity-group op
                (instance? datahike.query.ir.LEntityJoin node)
-               (let [{:keys [op consumed]}
+               (let [{:keys [op consumed unfolded-antis]}
                      (lower-entity-join node db pushdowns (:actual-consumed acc)
                                         bvc total-entities)]
                  (-> acc
                      (update :ops conj op)
+                     (update :not-ops into (map #(plan-not-op db (analyze/classify-clause (list 'not %)) all-clause-vars rules))
+                             unfolded-antis)
                      (update :actual-consumed into consumed)))
 
                ;; Standalone LScan or LOptionalScan → pattern-scan op
