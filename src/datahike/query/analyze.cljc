@@ -156,7 +156,7 @@
    - op is a range operator
    - ?var appears as the value variable of a pattern with an indexed attribute
    Returns nil if not pushable."
-  [pred-info pattern-infos bound-vars]
+  [pred-info pattern-infos _bound-vars]
   (let [args (:args pred-info)
         op (:fn-sym pred-info)]
     (when (and (contains? range-ops op)
@@ -173,19 +173,7 @@
                    (not (free-var? arg1)))
               [arg2 arg1 true]
 
-              ;; One var is bound from earlier, treat as const
-              (and (free-var? arg1)
-                   (free-var? arg2)
-                   (contains? bound-vars arg1)
-                   (not (contains? bound-vars arg2)))
-              [arg2 arg1 true]
-
-              (and (free-var? arg1)
-                   (free-var? arg2)
-                   (contains? bound-vars arg2)
-                   (not (contains? bound-vars arg1)))
-              [arg1 arg2 false]
-
+              ;; Binding membership supplies no literal value for an index bound.
               :else nil)]
         (when var-sym
           ;; Find pattern clauses where var-sym is the value variable

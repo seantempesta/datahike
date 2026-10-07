@@ -68,6 +68,8 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Notable fixes
 
+- **Range predicates keep their bound variables** — a variable supplied by an input or an earlier clause stays a runtime comparison operand instead of becoming a symbolic index bound, preventing numeric cast failures. ([#TODO])
+
 - **A bound unique lookup drives the joins hanging off it** — `[?run :turn/id ?id] [?x :eval/run ?run] ...` no longer starts from an entity group whose output estimate (its pass rates multiplied over the whole store) is tiny but whose driving scan reads the whole ref attribute: a plan's first group is costed by what it reads (`group-start-card`), a bound or ground unique value estimates one entity per value (counted and heuristic estimates alike), each scan's output cardinality carries the bindings entering it (port of upstream 314d4a4d, #974, with its disconnected-component seed), the distinct-value sample reuses the caller's count, and re-planning keeps the planned estimates instead of re-counting every remaining attribute on each execution. Store node reads for one lookup-driven join no longer grow with the store: on a 770k-datom store without subtree counts, 664 → 10 reads (188 → 4 ms) for a run's receipts and 2,908 → 56 for a namespace's functions. Answers are unchanged. ([#TODO])
 
 - **Writer refusal completion** — non-map diagnostic evidence no longer crashes refusal logging, and an accepted invocation receives its failure before diagnostic formatting or delivery can fail. ([#TODO])

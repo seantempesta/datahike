@@ -23,8 +23,7 @@
   {:store {:backend :file :path path :id (random-uuid)}
    :schema-flexibility :write
    :keep-history? false
-   ;; One cached node: every node an execution visits is read from the store,
-   ;; so the store's read count is the execution's node work.
+   ;; A small cache makes storage-read regressions observable.
    :store-cache-size 1})
 
 (def ^:private schema
@@ -139,7 +138,9 @@
   "Store reads of one execution of `query` on a fresh connection, its plan cached."
   [query & args]
   (clear-plans!)
-  (with-conn (fn [conn] (apply d/q query @conn args)))
+  (with-conn (fn [conn]
+               (binding [q/*query-result-cache?* false]
+                 (apply d/q query @conn args))))
   (with-conn
     (fn [conn]
       (let [stats (-> @conn :store :storage :stats)
@@ -154,7 +155,14 @@
   (let [lookup (execution-reads '[:find ?run :in $ ?id :where [?run :turn/id ?id]] "run-5")
         joined (execution-reads receipts ["run-5"])]
     (is (<= lookup 4))
-    (is (<= joined 16))))
+    (is (<= joined 16)))
+  (with-conn
+    (fn [conn]
+      (doseq [part (partition-all 500 (mapcat run-tx (range runs (* 4 runs))))]
+        (d/transact conn (vec part)))
+      (is (= (* 4 runs)
+             (d/q '[:find (count ?run) . :where [?run :turn/id]] @conn)))))
+  (is (<= (execution-reads receipts ["run-5"]) 16)))
 
 (deftest a-bound-unique-value-names-at-most-one-entity-per-value
   (with-conn

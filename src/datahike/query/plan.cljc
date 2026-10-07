@@ -846,24 +846,9 @@
         ;; cardinalities — for now the group-level bound suffices for downstream
         ;; planning decisions (it differentiates a 4k-tuple group from a 150k one).
         group-card-final (max 1 group-card)
-        ;; The same reduction, started from the driving scan's BOUND-AWARE card.
-        ;;
-        ;; `:estimated-card` above is deliberately the unconstrained count — the
-        ;; pass-rate math needs `merge-est / total-entities` to be a ratio of full
-        ;; attribute extents, and feeding it a filtered count would double-count
-        ;; the selectivity. But that left the GROUP with no bound-aware cost at
-        ;; all, so `group-effective-card` (which prefers `:scan-card` for exactly
-        ;; this purpose) fell back to the unbound number for every group and
-        ;; ordered a probe-driven group as though nothing were bound.
-        ;;
-        ;; Only the STARTING card changes; the per-merge pass rates are untouched.
-        ;; The bound-aware bound when there is one: a group cannot OUTPUT more
-        ;; rows than it produces under the bindings entering it, and a consumer
-        ;; downstream inherits whatever this says.
-        output-card-bound (long group-card-final)
         output-var-cards (into {}
                                (comp (filter analyze/free-var?)
-                                     (map (fn [v] [v output-card-bound])))
+                                     (map (fn [v] [v group-card-final])))
                                output-vars)
         ;; Merge-ops' pushdown preds can't be applied (merge uses EAVT lookupGE,
         ;; not AVET scan). Collect them so they can be restored as standalone preds.
