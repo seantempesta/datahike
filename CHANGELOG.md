@@ -68,6 +68,8 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Notable fixes
 
+- **A query plan is not reused across databases of very different sizes** — plans were cached by shape and schema only, so a plan made on a small database (a test, a fresh branch) ran unchanged on a large one with the same schema: a receipts join planned on 10 runs read 3,629 nodes, allocated 2.2 GB and took 1.1 s on 50,000 runs, where its own plan reads 8 nodes in 2.5 ms. The cache key now includes the size class of `max-eid`, so a plan is remade once per doubling of the entity count. ([#TODO])
+
 - **History joins sharing a value or tx var keep only their own versions** — the history cursor merge buffered an entity's versions checked against the first scan datom's value and tx and replayed them for the entity's later scan datoms, so `[?e :a ?v] [?e :b ?v]` on a history db answered values that only another datom matched (and dropped some that matched); the buffer now holds the entity's versions and each scan datom checks the shared var. ([#TODO])
 
 - **Recursive rules answer like the base engine** — a rule head var spelled like an outer query var (`[?a :p/id ?id] (reach ?a ?b)`) no longer holds every recursive step to the caller's values (the closure stopped at depth one, in current, history and as-of worlds alike); head vars are private to the rule op except where every recursive call passes them through unchanged, which keeps the caller's restriction where it is sound. A lookup ref passed to a rule call, as a scalar input or literally, now names its entity instead of leaving the argument unbound (the rule answered for every entity), and a missing one refuses like a pattern's. ([#TODO])

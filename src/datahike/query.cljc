@@ -3523,13 +3523,23 @@
                    :else       v))]
          (walk x)))))
 
+(defn- size-class
+  "The bit length of a non-negative count: equal for counts within a factor of two."
+  [n]
+  #?(:clj (- 64 (Long/numberOfLeadingZeros (long n)))
+     :cljs (- 32 (js/Math.clz32 n))))
+
 (defn- get-or-create-plan
   "Get a cached query plan or create a new one. Plans are cached by
-   [clauses bound-vars rules-keys in-cards schema-hash] since the plan structure
-   (index selection, merge ordering) depends on query shape and schema,
-   not on the actual data. `in-cards` (shape-derived, value-independent) is in
+   [clauses bound-vars rules-keys in-cards schema-hash size-class]. The plan
+   structure (index selection, merge ordering, the estimates that gate seeks
+   at run time) depends on query shape, schema and the data's size: a plan
+   made on a small database scans what a large one must seek. The size class of
+   `max-eid` separates databases whose entity counts differ by more than a
+   factor of two, so a plan is remade once per doubling, not per write.
+   `in-cards` (shape-derived, value-independent) is in
    the key only to separate tuple from relation :in bindings (see
-   get-or-create-plan body) — it does not make the plan data-dependent.
+   get-or-create-plan body).
 
    `clauses` may embed substituted constants (substitute-consts-with-lookup-refs),
    so the key is run through `scale-sensitive-key` to keep BigDecimals of
@@ -3541,7 +3551,8 @@
         ;; [?a ?b] (#{?a ?b}, card 1) from a relation [[?a ?b]] (#{?a ?b}, many)
         ;; — which would otherwise collide on identical clauses + bound-vars.
         cache-key (scale-sensitive-key [clauses bound-vars (when rules rules)
-                                        (not-empty in-cards) schema-hash])]
+                                        (not-empty in-cards) schema-hash
+                                        (size-class (dbi/-max-eid db))])]
     (if-some [cached (get @plan-cache cache-key nil)]
       cached
       (let [plan (create-plan-via-ir db clauses bound-vars rules in-cards)]

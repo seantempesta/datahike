@@ -180,3 +180,25 @@
         (is (= 100 (estimate/estimate-pattern-with-bindings db pattern info '{?id 100} 38461)))
         (is (= 1 (estimate/estimate-pattern-with-bindings db pattern info '{?id 1} 38461)))
         (is (= 7 (estimate/estimate-pattern-with-bindings db pattern info '{?id 100} 7)))))))
+
+(deftest a-plan-made-on-a-small-database-is-not-reused-on-a-large-one
+  ;; Plans are cached by shape and schema. A plan made on a database of a few
+  ;; entities scans the ref attribute, and ran unchanged on every larger
+  ;; database with the same schema.
+  (let [cfg {:store {:backend :memory :id (random-uuid)} :schema-flexibility :write :keep-history? false}]
+    (d/create-database cfg)
+    (let [small (d/connect cfg)]
+      (try
+        (d/transact small schema)
+        (d/transact small (vec (run-tx 5)))
+        (clear-plans!)
+        (binding [q/*query-result-cache?* false] (d/q receipts @small ["run-5"]))
+        ;; The first execution on the large database may plan; the second is measured.
+        (with-conn (fn [conn] (binding [q/*query-result-cache?* false] (d/q receipts @conn ["run-5"]))))
+        (with-conn
+          (fn [conn]
+            (let [stats (-> @conn :store :storage :stats)
+                  before (:reads @stats)]
+              (is (= 3 (count (binding [q/*query-result-cache?* false] (d/q receipts @conn ["run-5"])))))
+              (is (<= (- (:reads @stats) before) 16)))))
+        (finally (d/release small) (d/delete-database cfg))))))
