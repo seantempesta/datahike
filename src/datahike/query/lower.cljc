@@ -192,7 +192,9 @@
      (cond-> {:op (if join-vars? :or-join :or)
               :clause (:clause clause-info)
               :branches sub-plans
-              :vars (:vars clause-info)
+              ;; An or-join binds only its join vars; the others are local
+              ;; to its branches.
+              :vars (if join-vars? join-vars (:vars clause-info))
               :estimated-card (max 1 total-est)}
        join-vars? (assoc :join-vars join-vars)))))
 

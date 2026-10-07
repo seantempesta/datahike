@@ -968,6 +968,12 @@
   (answers-every-world "two groups and a NOT naming a tx" #{[1] [2] [3] [4]}
                        '[:find ?d :where [?a :p/nums ?d] [?c :p/friend ?a] (not [?c :p/team :t2 ?tx]) [(< ?c 5)]]))
 
+(deftest an-or-join-binds-only-its-join-vars
+  (answers-every-world "a local var shadowing an outer one" #{[3] [4]}
+                       '[:find ?d :where [?b :p/score ?d] [?c :p/friend 1] (or-join [?c] [?c :p/friend ?d] [?c :p/score 3]) [(< ?c ?d)]])
+  (answers-every-world "a local var in a cartesian component" #{[2]}
+                       '[:find ?e :where [?b :p/tags "x"] [?e :p/age 5] (or-join [?b] [?b :p/friend ?d] [?d :p/friend ?b])]))
+
 (deftest a-projection-answers-distinct-tuples
   (answers-every-world "card-many value not found" #{[1] [2]}
                        '[:find ?c :where [?c :p/tags ?t]]))

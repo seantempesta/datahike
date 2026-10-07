@@ -4078,9 +4078,12 @@
 
 (defn- clause-meaningful-vars
   "Free vars in a classified clause that participate in connectivity.
-   Excludes externally bound vars (treated as constants)."
+   Excludes externally bound vars (treated as constants). An or-join or
+   not-join connects only through its join vars; its other vars are local."
   [classified bound-vars]
-  (let [vs (:vars classified)]
+  (let [vs (if (#{:or-join :not-join} (:type classified))
+             (into #{} (filter analyze/free-var?) (flatten (seq (:join-vars classified))))
+             (:vars classified))]
     (if (seq bound-vars)
       (into #{} (remove bound-vars) vs)
       vs)))
