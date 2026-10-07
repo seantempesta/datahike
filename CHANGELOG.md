@@ -68,6 +68,8 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Notable fixes
 
+- **Lookup-shaped data stays data** — a keyword-headed two-vector passed to a rule, as a literal or an input, or bound by an input collection, is resolved to an entity only when the query uses that variable where an entity belongs (a pattern's entity or tx position, a ref attribute's value, or such a position of a called rule, closed over rule calls); elsewhere it stays the value it is. A tuple argument no longer throws `Lookup ref attribute should be marked as :db/unique`, and a lookup ref compared or bound as a value answers like the base engine instead of its entity id. ([#TODO])
+
 - **Query plans distinguish entity-id size buckets** — the cache key includes the bit length of `max-eid`, avoiding reuse between a small fresh database and one with a much larger entity-id high-water mark. This is a planning heuristic, not a population count: sparse ids, retractions, cardinality-many growth and temporal views can still share a bucket despite different data sizes. ([#TODO])
 
 - **History joins sharing a value or tx var keep only their own versions** — the history cursor merge buffered an entity's versions checked against the first scan datom's value and tx and replayed them for the entity's later scan datoms, so `[?e :a ?v] [?e :b ?v]` on a history db answered values that only another datom matched (and dropped some that matched); the buffer now holds the entity's versions and each scan datom checks the shared var. ([#TODO])

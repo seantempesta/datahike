@@ -3250,14 +3250,50 @@
               clause))
           where-clauses)))
 
+(defn- entity-vars
+  "Vars `clauses` use where a lookup ref names an entity: a data pattern's entity
+   or tx position, a ref attribute's value position, or a head position of a
+   called rule in `rule-positions` (rule name → set of such head indexes)."
+  [db clauses rule-positions]
+  (letfn [(walk [acc clause]
+            (cond
+              (and (vector? clause) (source? (first clause))) (walk acc (subvec clause 1))
+              (and (vector? clause) (not (sequential? (first clause))))
+              (let [[e a v tx] clause]
+                (cond-> acc
+                  (free-var? e) (conj e)
+                  (free-var? tx) (conj tx)
+                  (and (free-var? v) (keyword? a) (dbu/ref? db a)) (conj v)))
+              (and (seq? clause) (source? (first clause))) (walk acc (rest clause))
+              (and (seq? clause) ('#{not and or} (first clause))) (reduce walk acc (rest clause))
+              (and (seq? clause) ('#{not-join or-join} (first clause))) (reduce walk acc (drop 2 clause))
+              (and (seq? clause) (contains? rule-positions (first clause)))
+              (into acc (keep-indexed (fn [i arg] (when (and (free-var? arg) (contains? (rule-positions (first clause)) i)) arg)))
+                    (rest clause))
+              :else acc))]
+    (reduce walk #{} clauses)))
+
+(defn- rule-entity-positions
+  "Rule name → the head indexes each rule's branches use where a lookup ref names
+   an entity (see `entity-vars`), closed over rule calls."
+  [db rules]
+  (loop [positions (zipmap (keys rules) (repeat #{}))]
+    (let [next-positions (into {} (map (fn [[rule-name branches]]
+                                         [rule-name (into #{} (mapcat (fn [[[_ & head] & body]]
+                                                                        (let [used (entity-vars db body positions)]
+                                                                          (keep-indexed (fn [i hv] (when (used hv) i)) head))))
+                                                          branches)]))
+                               rules)]
+      (if (= next-positions positions) positions (recur next-positions)))))
+
 (defn- substitute-consts-with-lookup-refs
   "Like substitute-consts but also resolves lookup refs in pattern positions.
    Used by the query planner which needs patterns normalized before planning.
    Lookup refs like [:name \"Ivan\"] in e/v positions are resolved to entity IDs.
    For multi-source queries, pass sources so each source-prefixed clause resolves
    against its own db."
-  ([db where-clauses consts] (substitute-consts-with-lookup-refs db where-clauses consts nil))
-  ([db where-clauses consts sources]
+  ([db where-clauses consts] (substitute-consts-with-lookup-refs db where-clauses consts nil nil))
+  ([db where-clauses consts sources rules]
    (letfn [(resolve-clause
              ([clause] (resolve-clause db clause))
              ([resolve-db clause]
@@ -3344,19 +3380,21 @@
                                (= \$ (first (name (first clause)))))))
                 (let [rule-name (first clause)
                       args (rest clause)
-                      scalar? (fn [v]
-                                (or (number? v) (string? v) (keyword? v)
-                                    (boolean? v) (nil? v) (uuid? v)
-                                    (inst? v)))
-                      ;; A lookup ref, literal or input, names its entity: the
-                      ;; rule's fixpoint compares entity ids, never the ref.
-                      substituted-args (map (fn [x]
-                                              (let [v (if (and (symbol? x) (contains? consts x)) (get consts x) x)]
-                                                (cond
-                                                  (lookup-ref? v) (dbu/entid-strict resolve-db v)
-                                                  (and (not= v x) (scalar? v)) v
-                                                  :else x)))
-                                            args)]
+                      data? (fn [v]
+                              (or (number? v) (string? v) (keyword? v)
+                                  (boolean? v) (nil? v) (uuid? v)
+                                  (inst? v) (vector? v)))
+                      ;; A lookup ref names its entity only at a head position the
+                      ;; rule uses as one (`rule-entity-positions`); elsewhere it is
+                      ;; data, like a tuple, passed as the literal it is.
+                      entity-positions (delay (get (rule-entity-positions resolve-db rules) rule-name #{}))
+                      substituted-args (map-indexed (fn [i x]
+                                                      (let [v (if (and (symbol? x) (contains? consts x)) (get consts x) x)]
+                                                        (cond
+                                                          (and (lookup-ref? v) (contains? @entity-positions i)) (dbu/entid-strict resolve-db v)
+                                                          (and (not= v x) (data? v)) v
+                                                          :else x)))
+                                                    args)]
                   (apply list rule-name substituted-args))
 
               ;; Anything else (predicates, functions): substitute consts in data args only.
@@ -3404,14 +3442,18 @@
         (:rels context-in)))
 
 (defn- resolve-lookup-ref-bindings
-  "Resolve lookup-ref values in :in binding relations to entity IDs for joining.
+  "Resolve lookup-ref values in :in binding relations to entity IDs for joining,
+   for the vars `where-clauses` use at an entity position (`entity-vars`); any
+   other lookup-shaped value is data and stays as it is.
    Returns [context-in' reverse-map] where reverse-map is
    {var-sym {entity-id original-lookup-ref, ...}} for restoring output.
    Returns [context-in nil] when no lookup-refs are present (common fast path)."
-  [db context-in]
+  [db context-in where-clauses]
   (if-not (has-lookup-ref-bindings? context-in)
     [context-in nil]
-    (let [reverse-map (volatile! {})
+    (let [rules (:rules context-in)
+          entity-var? (entity-vars db where-clauses (rule-entity-positions db rules))
+          reverse-map (volatile! {})
           context-in'
           (update context-in :rels
                   (fn [rels]
@@ -3426,7 +3468,8 @@
                                                   (let [v (if (da/array? t)
                                                             (aget ^objects t idx)
                                                             (get t idx))]
-                                                    (if (and (sequential? v)
+                                                    (if (and (entity-var? sym)
+                                                             (sequential? v)
                                                              (= 2 (count v))
                                                              (keyword? (first v)))
                                                       (let [eid (dbu/entid db v)]
@@ -3678,7 +3721,7 @@
                              (if (instance? DB o) o db)))
            bound-vars (context-bound-vars context-in)
            clauses (if db
-                     (substitute-consts-with-lookup-refs db (:where query) (:consts context-in))
+                     (substitute-consts-with-lookup-refs db (:where query) (:consts context-in) nil (:rules context-in))
                      (:where query))
            rules (not-empty (:rules context-in))
            plan (create-plan-via-ir plan-db clauses bound-vars rules (in-card-seed qin))
@@ -4414,7 +4457,7 @@
           ;; lookup-batch-search handles per-source resolution at match time.
           (if multi-source?
             [context-in nil]
-            (resolve-lookup-ref-bindings primary-db context-in))
+            (resolve-lookup-ref-bindings primary-db context-in (:where query)))
           [context-in nil])]
 
     (if (and limit (zero? limit))
@@ -4538,7 +4581,8 @@
               ;; DBs (history) can resolve retracted entities that origin-db can't.
               ;; For multi-source, pass sources so each clause resolves against its source db.
                 clauses (substitute-consts-with-lookup-refs db (:where query) (:consts context-in)
-                                                            (when multi-source? (:sources context-in)))
+                                                            (when multi-source? (:sources context-in))
+                                                            (:rules context-in))
                 rules (not-empty (:rules context-in))
                 plan (get-or-create-plan plan-db clauses bound-vars rules (in-card-seed qin))]
 

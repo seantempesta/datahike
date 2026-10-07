@@ -741,3 +741,42 @@
             (is (= (set legacy) (set planner)))))))
     (is (= #{[1]} (binding [q/*query-result-cache?* false]
                     (set (d/q '[:find ?v :where [?e :item/a ?v] [?e :item/b ?v]] (d/history before))))))))
+
+;; ---------------------------------------------------------------------------
+;; Lookup-shaped data passed to a rule or an input stays data
+;;
+;; A two-vector headed by a keyword names an entity only where it is used as one:
+;; a pattern's entity or tx position, or a ref attribute's value. Rule arguments
+;; and input relations were resolved as lookup refs whatever their use, so a tuple
+;; argument threw and a lookup ref compared as a value answered its entity id.
+
+(deftest rule-arguments-preserve-lookup-shaped-data
+  (let [schema {:p/id {:db/unique :db.unique/identity}
+                :p/friend {:db/valueType :db.type/ref}
+                :p/pair {:db/valueType :db.type/tuple :db/tupleTypes [:db.type/keyword :db.type/long]}}
+        before (d/db-with (db/empty-db schema {:keep-history? true})
+                          [{:db/id 1 :p/id "a" :p/pair [:k1 1]} {:db/id 2 :p/id "b" :p/pair [:k2 2] :p/friend 1}
+                           {:db/id 3 :p/id "c" :p/friend 2}])
+        after (d/db-with before [[:db/retract 2 :p/id "b"] [:db/add 4 :p/id "b"] [:db/add 4 :p/friend 1]])
+        rules '[[(has-pair ?e ?p) [?e :p/pair ?p]] [(same ?x ?y) [(= ?x ?y)]] [(idv ?v ?x) [(identity ?v) ?x]]
+                [(friend ?e ?x) [?e :p/friend ?x]] [(friend-of ?e ?x) [?x :p/friend ?e]]]
+        rows [["tuple literal" '[:find ?e :in $ % :where (has-pair ?e [:k1 1])] [rules]]
+              ["tuple input" '[:find ?e :in $ % ?p :where (has-pair ?e ?p)] [rules [:k1 1]]]
+              ["tuple collection to a rule" '[:find ?e :in $ % [?p ...] :where (has-pair ?e ?p)] [rules [[:k1 1] [:k2 2]]]]
+              ["tuple collection" '[:find ?e :in $ [?p ...] :where [?e :p/pair ?p]] [[[:k1 1]]]]
+              ["lookup ref compared as a value" '[:find ?e :in $ % :where [?e :p/id "a"] (same ?e [:p/id "a"])] [rules]]
+              ["lookup ref bound as a value" '[:find ?x :in $ % ?v :where (idv ?v ?x)] [rules [:p/id "b"]]]
+              ["lookup-shaped data naming no attribute" '[:find ?x :in $ % ?v :where (idv ?v ?x)] [rules [:not/attr 2]]]
+              ["lookup refs bound as values" '[:find ?x :in $ % [?v ...] :where (idv ?v ?x)] [rules [[:p/id "b"]]]]
+              ["lookup ref at an entity position" '[:find ?x :in $ % ?e :where (friend ?e ?x)] [rules [:p/id "c"]]]
+              ["literal lookup ref at an entity position" '[:find ?x :in $ % :where (friend [:p/id "c"] ?x)] [rules]]
+              ["lookup refs at an entity position" '[:find ?e ?x :in $ % [?e ...] :where (friend ?e ?x)] [rules [[:p/id "c"] [:p/id "b"]]]]
+              ["lookup ref at a ref value" '[:find ?x :in $ % ?e :where (friend-of ?e ?x)] [rules [:p/id "a"]]]]]
+    (doseq [[world database] {:current after :history (d/history after) :as-of (d/as-of after (:max-tx before))}
+            [label q-form args] rows]
+      (testing [world label]
+        (binding [q/*query-result-cache?* false]
+          (is (= (binding [q/*disable-planner* true] (outcome q-form database args))
+                 (outcome q-form database args))))))
+    (is (= #{[[:p/id "b"]]} (binding [q/*query-result-cache?* false]
+                               (set (d/q '[:find ?x :in $ % ?v :where (idv ?v ?x)] after rules [:p/id "b"])))))))
