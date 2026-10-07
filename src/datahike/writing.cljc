@@ -28,20 +28,29 @@
 ;; mapping to storage
 
 (def ^:private last-schema-meta
-  "The schema-meta most recently keyed and its key. Commits that change no schema
-  carry the identical schema maps, so they reuse the key instead of hashing the
-  whole schema again."
+  "The last schema-meta, its content key and whether identity proves unchanged content."
   (atom nil))
 
+(defn- immutable-schema-value?
+  "Whether identity suffices to reuse this schema value's content hash."
+  {:malli/schema [:=> [:cat :any] :boolean]}
+  [value]
+  (or (nil? value) (boolean? value) (string? value) (keyword? value)
+      (symbol? value) (char? value) (uuid? value)
+      #?(:clj (or (int? value) (float? value)) :cljs (number? value))
+      (and (coll? value) (every? immutable-schema-value? value))))
+
 (defn- schema-meta-content-key
-  "The content key of `schema-meta`: `(uuid schema-meta)`, computed once per
-  identical set of schema maps."
+  "The content UUID, reused only for identical, immutable schema values."
+  {:malli/schema [:=> [:cat [:map [:schema [:maybe :map]] [:rschema [:maybe :map]] [:system-entities [:maybe [:set :int]]] [:ident-ref-map [:maybe :map]] [:ref-ident-map [:maybe :map]]]] :uuid]}
   [schema-meta]
-  (let [[prior prior-key] @last-schema-meta]
-    (if (and prior (every? (fn [[k v]] (identical? v (get prior k))) schema-meta))
+  (let [[prior prior-key immutable?] @last-schema-meta
+        same? (and prior (every? (fn [[k v]] (identical? v (get prior k))) schema-meta))]
+    (if (and same? immutable?)
       prior-key
       (let [content-key (uuid schema-meta)]
-        (reset! last-schema-meta [schema-meta content-key])
+        (reset! last-schema-meta [schema-meta content-key
+                                 (if same? immutable? (immutable-schema-value? schema-meta))])
         content-key))))
 
 (defn stored-db? [obj]
