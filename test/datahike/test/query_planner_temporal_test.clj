@@ -716,3 +716,28 @@
            (binding [q/*query-result-cache?* false]
              (set (d/q '[:find ?b :in $ % ?a :where (reach ?a ?b)]
                        (d/history (:after (chain-db))) reach [:p/id "p6"])))))))
+
+;; ---------------------------------------------------------------------------
+;; History merge versions belong to the scan datom they join
+;;
+;; The history cursor merge buffered an entity's matching versions once, checked
+;; against the FIRST scan datom's v and tx, and replayed them for every later
+;; scan datom of that entity: a shared v or tx var then joined versions that
+;; matched a different scan datom.
+
+(deftest history-merge-matches-belong-to-the-scan-version
+  (let [before (d/db-with (db/empty-db {:item/a {:db/cardinality :db.cardinality/many}
+                                        :item/b {:db/cardinality :db.cardinality/many}}
+                                       {:keep-history? true})
+                          [{:db/id 1 :item/a [1 2] :item/b [1 4 5]}])
+        after (d/db-with before [[:db/retract 1 :item/b 1] [:db/add 1 :item/a 4]])]
+    (doseq [[label q-form database]
+            [["shared value" '[:find ?v :where [?e :item/a ?v] [?e :item/b ?v]] (d/history before)]
+             ["shared value and tx" '[:find ?v ?tx :where [?e :item/a ?v ?tx] [?e :item/b ?v]] (d/history after)]
+             ["shared tx" '[:find ?v ?w :where [?e :item/a ?v ?tx] [?e :item/b ?w ?tx]] (d/history after)]]]
+      (testing label
+        (binding [q/*query-result-cache?* false]
+          (let [{:keys [legacy planner]} (run-both q-form database)]
+            (is (= (set legacy) (set planner)))))))
+    (is (= #{[1]} (binding [q/*query-result-cache?* false]
+                    (set (d/q '[:find ?v :where [?e :item/a ?v] [?e :item/b ?v]] (d/history before))))))))

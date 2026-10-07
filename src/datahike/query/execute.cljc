@@ -1465,7 +1465,8 @@
       two monotonically advancing ForwardCursors: the scan emits entities in
       ascending `e` and both EAVT indexes are sorted, so seekGE never re-seeks
       from root. An entity's matched versions are collected once and replayed
-      for each repeated scan datom of that entity (the history cartesian)."
+      for each repeated scan datom of that entity (the history cartesian),
+      filtered per scan datom when the merge shares its v or tx var."
      [eavt-pss slice ground-filter strict-filter
       probe-set probe-datom-field
       collect-set collect-datom-field collect-merge-idx
@@ -1501,13 +1502,18 @@
                         (or (nil? scan-added-val) (= (datom/datom-added cur-d) scan-added-val)))
                  (let [eid (.-e cur-d)
                        scan-d cur-d]
+                   ;; The buffer holds the entity's versions independent of the
+                   ;; scan datom; a shared v or tx var is checked per scan datom.
                    (when-not (== eid buffer-eid)
                      (history-versions! buf pair eid ra vg? vgv
-                                        #(temporal-merge-datom-match? % eid ra vg? vgv check-v? check-tx? scan-d temporal-tx-filter added-filter)))
+                                        #(temporal-merge-datom-match? % eid ra vg? vgv false false scan-d temporal-tx-filter added-filter)))
                    (dotimes [bi (.size buf)]
-                     (aset merge-datoms 0 ^Datom (.get buf bi))
-                     (emit-tuple scan-d collect-set collect-datom-field collect-merge-idx merge-datoms
-                                 n-find find-source const-vals result-list))
+                     (let [^Datom md (.get buf bi)]
+                       (when (and (or (not check-v?) (val-eq? (.-v md) (.-v scan-d)))
+                                  (or (not check-tx?) (= (datom/datom-tx md) (datom/datom-tx scan-d))))
+                         (aset merge-datoms 0 md)
+                         (emit-tuple scan-d collect-set collect-datom-field collect-merge-idx merge-datoms
+                                     n-find find-source const-vals result-list))))
                    (recur nxt-d eid))
                  ;; scan datom filtered out
                  (recur nxt-d buffer-eid)))))))))
