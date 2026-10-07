@@ -2825,11 +2825,16 @@
         ;; Convert result-list → final result with appropriate dedup strategy
         (let [has-card-many-dupes?
               (some (fn [g]
-                      (let [mops (entity-group-merge-ops g)]
-                        (or (some (fn [op] (not (get-in op [:schema-info :card-one?] true))) mops)
-                            ;; Entity var not in find-vars → different entities can produce same tuple
-                            (let [e-var (first (:clause (entity-group-scan-op g)))]
-                              (not (some #{e-var} find-vars))))))
+                      (let [find-var? (set find-vars)
+                            dropped? (fn [x] (and (symbol? x) (not (find-var? x))))]
+                        (or ;; Entity var not in find-vars → different entities can produce same tuple
+                            (dropped? (first (:clause (entity-group-scan-op g))))
+                            ;; A card-many pattern (scan or merge) whose value is not
+                            ;; found repeats its entity's tuple once per value.
+                            (some (fn [op] (and (not (:anti? op))
+                                                (not (get-in op [:schema-info :card-one?] true))
+                                                (dropped? (get (:clause op) 2))))
+                                  (cons (entity-group-scan-op g) (entity-group-merge-ops g))))))
                     groups)
               is-historical? (= :historical (when temporal (:type temporal)))
               dedup-strategy (cond

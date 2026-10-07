@@ -870,3 +870,39 @@
         (binding [q/*query-result-cache?* false q/*disable-planner* disable?]
           (is (= #{[1 "tag1"]}
                  (set (d/q '[:find ?e ?v :where [?e :t/tags ?v] [?e :t/n ?n] [(str "tag" ?n) ?v]] database)))))))))
+
+;; ---------------------------------------------------------------------------
+;; Second review of the planner's answers
+;;
+;; Each case is answered by hand; both engines must give it on the current,
+;; history and as-of views of one small database.
+
+(def ^:private review-schema
+  {:p/id {:db/unique :db.unique/identity}
+   :p/friend {:db/valueType :db.type/ref}
+   :p/likes {:db/valueType :db.type/ref :db/cardinality :db.cardinality/many}
+   :p/nums {:db/cardinality :db.cardinality/many}
+   :p/tags {:db/cardinality :db.cardinality/many}})
+
+(defn- review-worlds []
+  (let [before (d/db-with (db/empty-db review-schema {:keep-history? true})
+                          [{:db/id 1 :p/id "a" :p/team :t1 :p/score 1 :p/age 1 :p/nums [1 2] :p/tags ["x"]}
+                           {:db/id 2 :p/id "b" :p/team :t1 :p/score 2 :p/age 5 :p/nums [3] :p/friend 1 :p/tags ["y" "z"]}
+                           {:db/id 3 :p/id "c" :p/team :t0 :p/score 3 :p/age 3 :p/nums [3 4] :p/friend 3}
+                           {:db/id 4 :p/id "d" :p/team :t0 :p/score 4 :p/friend 2 :p/nums [9]}])
+        after (d/db-with before [[:db/add 1 :p/likes 2]])]
+    {:current after :history (d/history after) :as-of (d/as-of after (:max-tx after))}))
+
+(defn- answers-every-world [label answer q-form & args]
+  (doseq [[world database] (review-worlds)
+          disable? [false true]]
+    (testing [label world (if disable? :base :planner)]
+      (binding [q/*query-result-cache?* false q/*disable-planner* disable?]
+        (let [result (apply d/q q-form database args)]
+          (is (= answer (into #{} result)))
+          (when (set? answer)
+            (is (= (count answer) (count result)) "a set answer holds no duplicate tuple")))))))
+
+(deftest a-projection-answers-distinct-tuples
+  (answers-every-world "card-many value not found" #{[1] [2]}
+                       '[:find ?c :where [?c :p/tags ?t]]))

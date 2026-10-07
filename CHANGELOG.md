@@ -68,6 +68,8 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Notable fixes
 
+- **A projection answers distinct tuples** — an entity group whose cardinality-many pattern's value is not found (`[:find ?e :where [?e :tags ?t]]`) took the duplicate-free fast path and returned a set holding one tuple per value (`count` 3 for 2 entities); such a group is now deduplicated. ([#TODO])
+
 - **A union of bound lookups is costed by its inputs** — an `or`/`or-join` was estimated at the sum of its branches' attribute extents, so a pattern joined to it (`(or [?e :fn/sym ?s] [?e :test/sym ?s]) [?e :digest ?d]` with `?s` bound) was scanned first over its whole attribute: about 1 KB per datom whatever the input count (11 MB at 60,000 digests). A branch's pattern now estimates what it reads given the bindings entering the union, the union runs first and the join probes per entity (0.13 MB, 7.7 → 0.7 ms; 126 → 16 store reads on the fixture). ([#TODO])
 
 - **A repeated variable is a join, in both engines** — a variable named twice in one pattern (`[?a :friend ?a]`) or passed twice to a rule (`(reach ?a ?a)`) was bound from one position only and answered every entity with a friend; the later position now takes a fresh variable joined back by an equality predicate. In the base engine (the planner's fallback for nested temporal wrappers), a function whose output variable the inputs' relation already binds (`[?e :tags ?v] [?e :n ?n] [(str "tag" ?n) ?v]`) now joins it instead of answering a value stored nowhere. ([#TODO])
