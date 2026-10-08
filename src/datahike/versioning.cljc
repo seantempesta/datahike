@@ -10,7 +10,8 @@
             [datahike.writing :refer [stored->db db->stored stored-db?
                                       #?@(:clj [release-db])
                                       commit! create-commit-id get-and-clear-pending-kvs!
-                                      write-pending-kvs! branch-heads-as-commits]]
+                                      write-pending-kvs! branch-heads-as-commits
+                                      read-head]]
             [datahike.writer]
             [datahike.index.secondary :as sec]
             ;; cljs: S is a VAR (the supervisor) → :refer; go-try-/<?-/<?/go-loop-try
@@ -200,7 +201,7 @@
                  (if to-check
                    (if (visited to-check) ;; skip
                      (recur r visited reachable)
-                     (if-let [raw-db (<? S (k/get store to-check))]
+                     (if-let [raw-db (<? S (read-head store to-check {:sync? false}))]
                        (let [{{:keys [datahike/parents]} :meta
                               :as db} (stored->db raw-db store)]
                          (recur (concat r parents)
@@ -248,7 +249,7 @@
                             _ (when (and existing-branches (existing-branches new-branch))
                                 (log/raise "Branch already exists." {:type :branch-already-exists
                                                                      :new-branch new-branch}))
-                            stored-db (<?- (k/get store from nil store-opts))]
+                            stored-db (<?- (read-head store from store-opts))]
                         (when-not (stored-db? stored-db)
                           (log/raise (if commit-source?
                                        "Commit record does not exist."
@@ -367,7 +368,7 @@
                         store-opts (dissoc opts :datahike.gc-guard/reachability-permit)]
                     (try
                       (let [store (:store db)
-                            current-stored (<?- (k/get store branch nil store-opts))
+                            current-stored (<?- (read-head store branch store-opts))
                             current-commit (get-in current-stored [:meta :datahike/commit-id])
                             resolved-parents (branch-heads-as-commits store parents)
                             _ (when (and guard? (not= expected-current-commit current-commit))
@@ -510,7 +511,7 @@
          opts (select-keys opts [:sync?])]
      (async+sync (:sync? opts) *default-sync-translation*
                  (go-try-
-                  (when-let [raw-db (<?- (k/get store branch nil opts))]
+                  (when-let [raw-db (<?- (read-head store branch opts))]
                     (stored->db raw-db store)))))))
 
 (def ^:private fork-semantic-keys
@@ -622,7 +623,7 @@
                             {:type :db-does-not-exist :config source-config}))
              src-raw (<?- (ks/connect-store src-store-config opts))
              src-store* (add-cache-and-handlers src-raw source-config)
-             src-head* (<?- (k/get src-store* :db nil opts))
+             src-head* (<?- (read-head src-store* :db opts))
              _ (when-not src-head*
                  (ks/release-store src-store-config src-store*)
                  (log/raise "Source database does not exist."
@@ -634,7 +635,7 @@
                [source-config src-store* src-head*]
                (let [source-config (assoc source-config :index (:index stored-config))
                      s (add-cache-and-handlers src-raw source-config)]
-                 [source-config s (<?- (k/get s :db nil opts))]))
+                 [source-config s (<?- (read-head s :db opts))]))
              ;; Semantic keys are data properties — the target may not disagree.
              _ (doseq [sk fork-semantic-keys]
                  (when (and (contains? target-config-as-arg sk)

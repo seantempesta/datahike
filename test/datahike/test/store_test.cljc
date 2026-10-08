@@ -2,7 +2,12 @@
   (:require
    #?(:cljs [cljs.test    :as t :refer-macros [is deftest testing]]
       :clj  [clojure.test :as t :refer        [is deftest testing]])
-   [datahike.api :as d])
+   [datahike.api :as d]
+   #?@(:clj [[clojure.core.async :as async]
+             [datahike.versioning :as v]
+             [datahike.writing :as dw]
+             [konserve.core :as k]
+             [superv.async :refer [<?? S]]]))
   (:import [java.lang System]))
 
 (defn test-store [cfg]
@@ -183,4 +188,123 @@
              (is (= (count (filter #(= :id (:a %)) (d/datoms db :eavt)))
                     (d/q '[:find (count ?e) . :where [?e :id _]] db))))
            (d/release @conn))
+         (d/delete-database cfg)))))
+
+#?(:clj
+   (do
+     (def ^:private compact-cfg
+       {:store {:backend :file
+                :path (str (System/getProperty "java.io.tmpdir") "/dh-compact-head")
+                :id #uuid "c0c0a000-0000-0000-0000-0000000c0c0a"
+                :config {:defer-immutable-sync? true :compressor {:type :lz4}}}
+        :schema-flexibility :write :keep-history? true :fuse-index-roots? true
+        :index-config {:branching-factor 16 :diff-buf-size 4}})
+
+     (defn- datom-set [db index]
+       (into #{} (map (juxt :e :a :v :tx :added)) (d/datoms db index)))
+
+     (defn- observe-branch
+       "What every branch-head reader gives for `branch`: connect, branch-as-db,
+       branch-history, as-of and history."
+       [cfg branch]
+       (let [conn (d/connect (assoc cfg :branch branch))]
+         (try
+           (let [db @conn
+                 as-db (v/branch-as-db conn branch)
+                 history (async/<!! (v/branch-history conn))
+                 first-tx (apply min (map :tx (d/datoms db :eavt :item/name)))]
+             {:datoms (datom-set db :eavt)
+              :commit-id (v/commit-id db)
+              :as-db-datoms (datom-set as-db :eavt)
+              :as-db-commit-id (v/commit-id as-db)
+              :as-db-branch (get-in as-db [:config :branch])
+              :history-commits (mapv v/commit-id history)
+              :as-of (datom-set (d/as-of db first-tx) :eavt)
+              :history-count (count (d/datoms (d/history db) :eavt))})
+           (finally (d/release conn)))))
+
+     (defn- with-raw-store
+       "Calls `f` with the store of a connection to `branch`, then releases it."
+       [cfg branch f]
+       (let [conn (d/connect (assoc cfg :branch branch))]
+         (try (f (:store @conn)) (finally (d/release conn)))))
+
+     (defn- compact-heads!
+       "Rewrites each branch key as the compact head naming its commit."
+       [cfg branches]
+       (with-raw-store cfg :db
+         (fn [store]
+           (doseq [b branches]
+             (let [cid (get-in (k/get store b nil {:sync? true}) [:meta :datahike/commit-id])]
+               (k/assoc store b (dw/compact-head cid) {:sync? true}))))))
+
+     (defn- full-heads!
+       "Rewrites each branch key as the full record of its commit: the head
+       format written before compact heads."
+       [cfg branches]
+       (with-raw-store cfg :db
+         (fn [store]
+           (doseq [b branches]
+             (let [cid (get-in (k/get store b nil {:sync? true}) [:meta :datahike/commit-id])]
+               (k/assoc store b (assoc-in (k/get store cid nil {:sync? true}) [:config :branch] b)
+                        {:sync? true}))))))
+
+     (defn- seeded-store! [cfg]
+       (d/delete-database cfg)
+       (d/create-database cfg)
+       (let [conn (d/connect cfg)]
+         (d/transact conn [{:db/ident :item/name :db/valueType :db.type/string
+                            :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+                           {:db/ident :item/n :db/valueType :db.type/long
+                            :db/cardinality :db.cardinality/one}])
+         (doseq [i (range 40)] (d/transact conn [{:item/name (str "i" i) :item/n i}]))
+         (doseq [i (range 0 40 3)] (d/transact conn [{:item/name (str "i" i) :item/n (- i)}]))
+         (v/branch! conn :db :feat)
+         (d/release conn))
+       (let [conn (d/connect (assoc cfg :branch :feat))]
+         (d/transact conn [{:item/name "feat-only" :item/n 1000}])
+         (d/release conn)))
+
+     (deftest a-compact-head-reads-as-its-commit
+       (let [cfg compact-cfg]
+         (seeded-store! cfg)
+         (full-heads! cfg [:db :feat])
+         (with-raw-store cfg :db
+           (fn [store] (is (dw/stored-db? (k/get store :feat nil {:sync? true})))))
+         (let [full {:db (observe-branch cfg :db) :feat (observe-branch cfg :feat)}]
+           (compact-heads! cfg [:db :feat])
+           (with-raw-store cfg :db
+             (fn [store]
+               (is (dw/compact-head? (k/get store :feat nil {:sync? true}))
+                   "the branch key holds only the commit it names")))
+           (testing "connect, branch-as-db, branch-history, as-of and history read the named commit"
+             (is (= full {:db (observe-branch cfg :db) :feat (observe-branch cfg :feat)})))
+           (testing "branch! from a compact head"
+             (let [conn (d/connect (assoc cfg :branch :feat))]
+               (v/branch! conn :feat :feat2)
+               (d/release conn))
+             (let [feat2 (observe-branch cfg :feat2)]
+               (is (= (:datoms (:feat full)) (:datoms feat2)))
+               (is (= (:commit-id (:feat full)) (:commit-id feat2)))
+               (is (= :feat2 (:as-db-branch feat2)))))
+           (testing "merge! of a compact-head branch names its commit as parent"
+             (let [conn (d/connect cfg)
+                   report (v/merge! conn #{:feat} [{:item/name "feat-only" :item/n 1000}])]
+               (is (contains? (v/parent-commit-ids (:db-after report))
+                              (:commit-id (:feat full))))
+               (d/release conn)))
+           (testing "gc marks through compact heads: nothing reachable is swept"
+             (compact-heads! cfg [:db :feat :feat2])
+             (let [before {:db (observe-branch cfg :db) :feat (observe-branch cfg :feat)}
+                   conn (d/connect cfg)]
+               (<?? S (d/gc-storage conn))
+               (d/release conn)
+               (is (= before {:db (observe-branch cfg :db) :feat (observe-branch cfg :feat)}))))
+           (testing "a compact head naming a missing record fails loudly"
+             (with-raw-store cfg :db
+               (fn [store] (k/assoc store :feat2 (dw/compact-head (java.util.UUID/randomUUID)) {:sync? true})))
+             (let [thrown (try (observe-branch cfg :feat2) nil
+                               (catch Throwable e e))]
+               (is (= :head-commit-missing
+                      (some (comp :type ex-data) (take-while some? (iterate ex-cause thrown))))))))
          (d/delete-database cfg)))))

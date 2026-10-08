@@ -5,6 +5,7 @@
    stored->db at connect). On S3-class backends that read was 3 sequential
    requests (~150 ms at 40 ms RTT) — the dominant cost of a fused commit."
   (:require [datahike.api :as d]
+            [datahike.writing :as dw]
             [konserve.core :as k]
             [clojure.test :refer [deftest is testing]]))
 
@@ -32,7 +33,7 @@
         ;; parent chain stays correct without the read
         (let [db @conn
               store (:store db)
-              head (k/get store :db nil {:sync? true})
+              head (dw/read-head store :db)
               parent (first (get-in head [:meta :datahike/parents]))
               parent-rec (k/get store parent nil {:sync? true})]
           (is (some? parent-rec) "parent cid recorded from memory resolves in the commit graph")

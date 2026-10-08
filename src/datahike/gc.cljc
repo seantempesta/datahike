@@ -3,6 +3,7 @@
             [datahike.gc-guard :as guard]
             [datahike.index.interface :refer [-mark -seed-root! with-storage]]
             [datahike.index.secondary :as sec]
+            [datahike.writing :refer [read-head]]
             [konserve.core :as k]
             [konserve.gc :refer [sweep!]]
             [replikativ.logging :as log]
@@ -34,7 +35,7 @@
               (if to-check
                 (if (contains? (first (swap-vals! visited conj to-check)) to-check) ;; claimed: skip
                   (recur r reachable)
-                  (if-let [record (<? S (k/get store to-check))]
+                  (if-let [record (<? S (read-head store to-check {:sync? false}))]
                     (let [{:keys                         [eavt-key avet-key aevt-key
                                                           temporal-eavt-key temporal-avet-key temporal-aevt-key
                                                           eavt-root aevt-root avet-root

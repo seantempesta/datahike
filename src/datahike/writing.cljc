@@ -60,6 +60,55 @@
     (= (count (select-keys obj keys-to-check))
        (count keys-to-check))))
 
+(defn compact-head
+  "The branch-head value that only names commit `cid`. Its shape keeps
+  `[:meta :datahike/commit-id]`, so readers that need only the head's commit
+  id read it unchanged; readers that need the record go through
+  `resolve-head`."
+  [cid]
+  {:meta {:datahike/commit-id cid}})
+
+(defn compact-head?
+  "True for a head written by `compact-head`. A full stored record always
+  carries `:config`; a compact head never does."
+  [stored]
+  (and (map? stored)
+       (not (contains? stored :config))
+       (some? (get-in stored [:meta :datahike/commit-id]))))
+
+(defn resolve-head
+  "The full stored record that `stored`, the value read at store key `head-key`,
+  stands for: `stored` itself when it is a full record or nil, else the
+  commit record its compact head names, with `head-key` as its branch (as the full
+  head at that key carried). A compact head whose record is missing raises
+  `:head-commit-missing`."
+  ([store head-key stored] (resolve-head store head-key stored {:sync? true}))
+  ([store head-key stored opts]
+   (let [opts (select-keys opts [:sync?])]
+     (async+sync (:sync? opts) *default-sync-translation*
+                 (go-try-
+                  (if-not (compact-head? stored)
+                    stored
+                    (let [cid (get-in stored [:meta :datahike/commit-id])
+                          record (<?- (k/get store cid nil opts))]
+                      (when-not (stored-db? record)
+                        (log/raise "Branch head names a commit record the store does not hold."
+                                   {:type :head-commit-missing
+                                    :branch head-key
+                                    :commit-id cid}))
+                      (cond-> record
+                        (keyword? head-key) (assoc-in [:config :branch] head-key)))))))))
+
+(defn read-head
+  "The full stored record at branch `head-key` (or commit id), resolving a compact
+  head; nil when the key is absent."
+  ([store head-key] (read-head store head-key {:sync? true}))
+  ([store head-key opts]
+   (let [opts (select-keys opts [:sync?])]
+     (async+sync (:sync? opts) *default-sync-translation*
+                 (go-try-
+                  (<?- (resolve-head store head-key (<?- (k/get store head-key nil opts)) opts)))))))
+
 (defn get-and-clear-pending-kvs!
   "Retrieves and clears pending key-value pairs from the store's pending-writes atom.
   Assumes :pending-writes in store's storage holds an atom of a collection of [key value] pairs."

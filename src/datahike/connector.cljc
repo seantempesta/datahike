@@ -87,7 +87,7 @@
                       {:type :connection-has-been-released})))
     (if (not (w/streaming? (get @wrapped-atom :writer)))
       (let [store  (:store @wrapped-atom)
-            stored (k/get store (:branch (:config @wrapped-atom)) nil {:sync? true})]
+            stored (dsi/read-head store (:branch (:config @wrapped-atom)) {:sync? true})]
         (log/trace :datahike/db-deref {:config (:config stored)})
         (let [fresh-db (dsi/stored->db stored store)
               commit-id (get-in fresh-db [:meta :datahike/commit-id])]
@@ -349,7 +349,7 @@
                          store     (ds/add-cache-and-handlers raw-store config)
                          _         (vswap! resources assoc :store store)
                          _ (<?- (ds/ready-store (assoc store-config :opts opts) store))
-                         stored-db (<?- (k/get store (:branch config) nil opts))
+                         stored-db (<?- (dsi/read-head store (:branch config) opts))
                          _         (when-not stored-db
                                      (log/raise "Database does not exist." {:type   :db-does-not-exist
                                                                             :config config}))
@@ -362,7 +362,7 @@
                                (let [config    (assoc config :index stored-index)
                                      store     (ds/add-cache-and-handlers raw-store config)
                                      _ (<?- (ds/ready-store (assoc store-config :opts opts) store))
-                                     stored-db (<?- (k/get store (:branch config) nil opts))]
+                                     stored-db (<?- (dsi/read-head store (:branch config) opts))]
                                  [config store stored-db]))
                              [config store stored-db]))
                          ;; Adopt create-time-fixed index settings (:index-config
@@ -377,7 +377,7 @@
                              [config store stored-db]
                              (let [store     (ds/add-cache-and-handlers raw-store config')
                                    _ (<?- (ds/ready-store (assoc store-config :opts opts) store))
-                                   stored-db (<?- (k/get store (:branch config') nil opts))]
+                                   stored-db (<?- (dsi/read-head store (:branch config') opts))]
                                [config' store stored-db])))
                          store (kp/-set-write-hooks! store write-hooks)
                          _ (vswap! resources assoc :store store)

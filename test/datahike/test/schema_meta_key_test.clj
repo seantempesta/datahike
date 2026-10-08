@@ -67,7 +67,7 @@
           (is (not= original (hasch/uuid (schema-meta @conn))))
           (is (= (hasch/uuid (schema-meta @conn)) (stored-key @conn)))
           (is (= (hasch/uuid (schema-meta @conn))
-                 (:schema-meta-key (k/get (:store @conn) :db nil {:sync? true})))))
+                 (:schema-meta-key (dw/read-head (:store @conn) :db)))))
         (finally
           (d/release conn)
           (d/delete-database cfg))))))

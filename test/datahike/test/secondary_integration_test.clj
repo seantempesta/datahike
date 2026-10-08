@@ -10,6 +10,7 @@
    [datahike.index.secondary.scriptum]
    [datahike.index.secondary.stratum]
    [datahike.versioning :as dv]
+   [datahike.writing :as dw]
    [konserve.core :as k]))
 
 ;; Proximum requires Java 22+ (class file version 66.0).
@@ -225,9 +226,9 @@
             (is (= #{2} (nearest-proximum-eids @main [1.0 0.0 0.0 0.0])))
             (let [store (:store @main)
                   expected-main (dv/commit-id @main)
-                  prepared-key-map (get-in (k/get store :prepared nil {:sync? true})
+                  prepared-key-map (get-in (dw/read-head store :prepared)
                                            [:secondary-index-keys :idx/vectors])
-                  current-key-map (get-in (k/get store :db nil {:sync? true})
+                  current-key-map (get-in (dw/read-head store :db)
                                           [:secondary-index-keys :idx/vectors])
                   force-secondary sec/force-from-key-map]
               (testing "mismatched native storage fails preflight"
@@ -265,7 +266,7 @@
                 (dv/force-branch! @prepared :db #{(dv/commit-id @prepared)}
                                   {:expected-current-commit expected-main})
                 (let [forced-db (dv/branch-as-db main :db)
-                      forced-key-map (get-in (k/get store :db nil {:sync? true})
+                      forced-key-map (get-in (dw/read-head store :db)
                                              [:secondary-index-keys :idx/vectors])]
                   (is (= (:commit-id prepared-key-map)
                          (:commit-id forced-key-map))
@@ -277,7 +278,7 @@
 
               (testing "a stale native destination fails before primary mutation"
                 (let [forced-primary (dv/commit-id (dv/branch-as-db main :db))
-                      forced-key-map (get-in (k/get store :db nil {:sync? true})
+                      forced-key-map (get-in (dw/read-head store :db)
                                              [:secondary-index-keys :idx/vectors])
                       destination-owner
                       (prox-call 'proximum.writing/load-commit
@@ -375,7 +376,7 @@
         (d/transact initial [{:db/id 1
                               :person/embedding [1.0 0.0 0.0 0.0]}])
         (let [datahike-store (:store @initial)
-              key-map (get-in (k/get datahike-store :db nil {:sync? true})
+              key-map (get-in (dw/read-head datahike-store :db)
                               [:secondary-index-keys :idx/vectors])
               proximum-store (prox-call 'proximum.writing/connect-store-sync prox-store)
               legacy-snapshot #(dissoc % :mmap-generation
@@ -399,7 +400,7 @@
                   (is (= #{1}
                          (nearest-proximum-eids @prepared [1.0 0.0 0.0 0.0])))
                   (let [prepared-key-map
-                        (get-in (k/get (:store @main) :legacy-prepared nil {:sync? true})
+                        (get-in (dw/read-head (:store @main) :legacy-prepared)
                                 [:secondary-index-keys :idx/vectors])
                         snapshot (k/get (prox-call 'proximum.writing/connect-store-sync
                                                    prox-store)
@@ -411,13 +412,12 @@
                                   {:db/id 2
                                    :person/embedding [1.0 0.0 0.0 0.0]}])
                 (let [expected-main (dv/commit-id @main)
-                      source-root (get-in (k/get (:store @main) :legacy-prepared nil
-                                                 {:sync? true})
+                      source-root (get-in (dw/read-head (:store @main) :legacy-prepared)
                                           [:secondary-index-keys :idx/vectors :commit-id])]
                   (dv/force-branch! @prepared :db #{(dv/commit-id @prepared)}
                                     {:expected-current-commit expected-main})
                   (let [forced-key-map
-                        (get-in (k/get (:store @main) :db nil {:sync? true})
+                        (get-in (dw/read-head (:store @main) :db)
                                 [:secondary-index-keys :idx/vectors])]
                     (is (= source-root (:commit-id forced-key-map)))
                     (is (= "main" (:branch forced-key-map)))))
