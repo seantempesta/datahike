@@ -11,7 +11,7 @@
                                       #?@(:clj [release-db])
                                       commit! create-commit-id get-and-clear-pending-kvs!
                                       write-pending-kvs! branch-heads-as-commits
-                                      read-head]]
+                                      read-head compact-head]]
             [datahike.writer]
             [datahike.index.secondary :as sec]
             ;; cljs: S is a VAR (the supervisor) → :refer; go-try-/<?-/<?/go-loop-try
@@ -436,7 +436,7 @@
                                                 :branch branch
                                                 :expected-current-commit expected-current-commit
                                                 :current-commit stored-commit}))
-                                  db-to-store))
+                                  (if commit-graph? (compact-head cid) db-to-store)))
                               store-opts))
 
                         ;; Publish the GC discovery pointer only after its head exists.

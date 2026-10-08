@@ -307,4 +307,56 @@
                                (catch Throwable e e))]
                (is (= :head-commit-missing
                       (some (comp :type ex-data) (take-while some? (iterate ex-cause thrown))))))))
-         (d/delete-database cfg)))))
+         (d/delete-database cfg)))
+
+     (deftest a-commit-writes-a-compact-head
+       (let [cfg (assoc-in compact-cfg [:store :path]
+                           (str (System/getProperty "java.io.tmpdir") "/dh-compact-head-write"))
+             head-of (fn [store b] (k/get store b nil {:sync? true}))]
+         (seeded-store! cfg)
+         (testing "every commit's branch key names its commit record and holds nothing else"
+           (with-raw-store cfg :db
+             (fn [store]
+               (doseq [b [:db :feat]]
+                 (let [head (head-of store b)
+                       record (k/get store (get-in head [:meta :datahike/commit-id]) nil {:sync? true})]
+                   (is (= #{:meta} (set (keys head))))
+                   (is (dw/compact-head? head))
+                   (is (dw/stored-db? record)))))))
+         (testing "a head write lost after its record leaves the previous head naming a complete commit"
+           (let [before (observe-branch cfg :db)
+                 previous (with-raw-store cfg :db #(head-of % :db))
+                 conn (d/connect cfg)]
+             (d/transact conn [{:item/name "lost" :item/n -1}])
+             (d/release conn)
+             ;; the commit's record and nodes are written; its head write is not
+             (with-raw-store cfg :db #(k/assoc % :db previous {:sync? true}))
+             (is (= before (observe-branch cfg :db)))))
+         (testing "a store whose heads are full records (written before compact heads) reads and continues"
+           (full-heads! cfg [:db :feat])
+           (let [full (observe-branch cfg :feat)
+                 conn (d/connect (assoc cfg :branch :feat))]
+             (is (= (:datoms full) (into #{} (map (juxt :e :a :v :tx :added)) (d/datoms @conn :eavt))))
+             (d/transact conn [{:item/name "after" :item/n 7}])
+             (let [expected (datom-set @conn :eavt)
+                   cid (v/commit-id @conn)]
+               (d/release conn)
+               (is (dw/compact-head? (with-raw-store cfg :db #(head-of % :feat))))
+               (let [reopened (observe-branch cfg :feat)]
+                 (is (= expected (:datoms reopened)))
+                 (is (= cid (:commit-id reopened)))
+                 (is (= (:commit-id full) (second (:history-commits reopened))))))))
+         (d/delete-database cfg))
+       (testing "without a commit graph the branch key keeps the full record"
+         (let [cfg (-> compact-cfg
+                       (assoc-in [:store :path] (str (System/getProperty "java.io.tmpdir") "/dh-compact-head-nograph"))
+                       (assoc :commit-graph? false))]
+           (d/delete-database cfg)
+           (d/create-database cfg)
+           (let [conn (d/connect cfg)]
+             (d/transact conn [{:db/ident :item/name :db/valueType :db.type/string
+                                :db/cardinality :db.cardinality/one}])
+             (d/transact conn [{:item/name "x"}])
+             (is (dw/stored-db? (k/get (:store @conn) :db nil {:sync? true})))
+             (d/release conn))
+           (d/delete-database cfg))))))

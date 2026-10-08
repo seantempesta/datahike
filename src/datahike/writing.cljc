@@ -587,7 +587,12 @@
                         ;; head is written — the cid is still computed and
                         ;; stamped in :meta, so identity, sync dedup and the
                         ;; writer's head-cid threading are unaffected.
-                          commit-graph? (get config :commit-graph? true)]
+                          commit-graph? (get config :commit-graph? true)
+                        ;; The branch head names the commit record written just
+                        ;; before it (`compact-head`; readers `resolve-head`),
+                        ;; so the fused record is encoded and written once.
+                        ;; Without a commit graph there is no record to name.
+                          head          (if commit-graph? (compact-head cid) db-to-store)]
 
                       (if (multi-key-capable? store)
                         (let [[meta-key meta-val] schema-meta-kv-to-write
@@ -612,7 +617,7 @@
                               writes (cond-> (vec pending-kvs)
                                        schema-meta-kv-to-write (conj [meta-key meta-val])
                                        commit-graph?           (conj [cid db-to-store])
-                                       true                    (conj [branch-key db-to-store]))
+                                       true                    (conj [branch-key head]))
                             ;; nodes + schema-meta (uuid) + commit (cid) are content-addressed →
                             ;; immutable; the branch-head pointer stays mutable (unmarked).
                               metas  (into {}
@@ -642,7 +647,7 @@
                             ;; :sync? true k/assoc blocks, so the order already holds.)
                               _                  (when (and commit-log-written (not sync?))
                                                    (<?- commit-log-written))
-                              branch-written     (k/assoc store (:branch config) db-to-store {:sync? sync?})]
+                              branch-written     (k/assoc store (:branch config) head {:sync? sync?})]
                           (when-not sync?
                             (<?- branch-written))))
 
