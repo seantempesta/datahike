@@ -425,18 +425,18 @@
 
    Only the revisions of `modified-attrs` change. An unknown attribute set
    (nil), an `unsafe?` change or a schema attribute advances the
-   conservative revision instead, which every revision-keyed reader compares."
+   conservative revision instead and clears the attribute revisions, so an
+   attribute's revision, or else the conservative one, always names a commit
+   whose datoms of that attribute (any but `:db/txInstant`) equal this value's."
   [context revision modified-attrs unsafe?]
-  (let [user-attrs (some-> modified-attrs (disj :db/txInstant))]
+  (let [user-attrs (some-> modified-attrs (disj :db/txInstant))
+        conservative? (or unsafe? (nil? user-attrs) (some ds/schema-attr? user-attrs))]
     (cond-> context
-      (or unsafe? (nil? user-attrs))
-      (assoc :datahike.cache/conservative-revision revision)
+      conservative?
+      (-> (assoc :datahike.cache/conservative-revision revision)
+          (dissoc :datahike.cache/attribute-revisions))
 
-      (some ds/schema-attr? user-attrs)
-      (assoc :datahike.cache/conservative-revision revision)
-
-      (and (seq user-attrs)
-           (not-any? ds/schema-attr? user-attrs))
+      (and (not conservative?) (seq user-attrs))
       (update :datahike.cache/attribute-revisions
               (fn [revisions]
                 (reduce #(assoc %1 %2 revision) (or revisions {}) user-attrs))))))
