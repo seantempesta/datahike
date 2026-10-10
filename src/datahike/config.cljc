@@ -33,6 +33,7 @@
 (s/def ::attribute-refs? boolean?)
 (s/def ::search-cache-size nat-int?)
 (s/def ::store-cache-size pos-int?)
+(s/def ::store-cache-bytes pos-int?)
 (s/def ::crypto-hash? boolean?)
 ;; Root fusion (EXPERIMENTAL, opt-in): inline each index's root node into the
 ;; db-record so commit! skips writing those roots as separate objects.
@@ -67,6 +68,7 @@
                                          ::attribute-refs?
                                          ::search-cache-size
                                          ::store-cache-size
+                                         ::store-cache-bytes
                                          ::crypto-hash?
                                          ::fuse-index-roots?
                                          ::commit-graph?

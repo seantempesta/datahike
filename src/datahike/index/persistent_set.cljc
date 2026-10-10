@@ -6,10 +6,6 @@
             #?(:cljs [org.replikativ.persistent-sorted-set.leaf :refer [Leaf]])
             #?(:cljs [org.replikativ.persistent-sorted-set.impl.storage :refer [IStorage]])
             [org.replikativ.persistent-sorted-set.arrays :as arrays]
-            #?@(:clj  [[clojure.core.cache :as cache]
-                       [clojure.core.cache.wrapped :as wrapped]]
-                :cljs [[cljs.cache :as cache]
-                       [cljs.cache.wrapped :as wrapped]])
             [datahike.datom :as dd :refer [index-type->cmp-quick]]
             [org.replikativ.persistent-sorted-set.fressian :as pss-fress]
             [datahike.constants :refer [tx0 txmax]]
@@ -443,20 +439,20 @@
           _ (log/trace :datahike/index-write {:address address :reused (boolean reused) :crypto-hash (:crypto-hash? config)})]
       ;; Evict old cached value when reusing an address
       (when reused
-        (wrapped/evict cache address))
+        (di/cache-evict! cache address))
       (swap! pending-writes conj [address node])
-      (wrapped/miss cache address node)
+      (di/cache-put! cache address node)
       address))
   (accessed [_ address]
     (@cost-center-fn :accessed)
     (log/trace :datahike/index-access {:address address})
     (swap! stats update :accessed inc)
-    (wrapped/hit cache address)
+    (di/cache-hit! cache address)
     nil)
   (restore [_ address #?(:cljs opts)]
     (@cost-center-fn :restore)
     (log/trace :datahike/index-read {:address address})
-    (if-let [cached (wrapped/lookup cache address)]
+    (if-let [cached (di/cache-get cache address)]
       cached
       (let [node (k/get store address nil {:sync? true})]
         (when (nil? node)
@@ -464,7 +460,7 @@
                                                    :address address
                                                    :store store}))
         (swap! stats update :reads inc)
-        (wrapped/miss cache address node)
+        (di/cache-put! cache address node)
         node)))
   (markFreed [_ address]
     (when address
@@ -487,7 +483,7 @@
                   ;; nodes are immutable by address: every connection to one
                   ;; physical store shares the cache its connection reserved
                   (or (get store di/node-cache-key)
-                      (di/make-node-cache (:store-cache-size config)))
+                      (di/make-node-cache config))
                   (atom init-stats)
                   (atom [])
                   (atom [])  ;; freed-addresses: vector of [address timestamp] pairs
@@ -507,6 +503,7 @@
 (defmethod di/empty-index :datahike.index/persistent-set [_index-name store index-type _]
   (let [^PersistentSortedSet pset (psset/sorted-set* {:comparator (index-type->cmp-quick index-type false)
                                                       :storage (:storage store)
+                                                      :ref-type (:datahike/ref-type store)
                                                       :branching-factor (:datahike/branching-factor store DEFAULT_BRANCHING_FACTOR)
                                                       :diff-buf-size (:datahike/diff-buf-size store 0)})]
     (with-meta pset (root-meta store index-type))))
@@ -529,7 +526,8 @@
         ^PersistentSortedSet pset (psset/from-sorted-array (index-type->cmp-quick index-type false)
                                                            arr
                                                            (arrays/alength arr)
-                                                           #?(:clj  {:branching-factor (:datahike/branching-factor store DEFAULT_BRANCHING_FACTOR)
+                                                           #?(:clj  {:ref-type (:datahike/ref-type store)
+                                                                     :branching-factor (:datahike/branching-factor store DEFAULT_BRANCHING_FACTOR)
                                                                      :diff-buf-size (:datahike/diff-buf-size store 0)}
                                                               :cljs {:branching-factor (:datahike/branching-factor store DEFAULT_BRANCHING_FACTOR)
                                                                      :diff-buf-size (:datahike/diff-buf-size store 0)
@@ -557,13 +555,14 @@
         ;; create-time-fixed per-store setting consumed when fresh sets are built
         ;; (empty-index/init-index); restore needs nothing — node and root blobs
         ;; self-describe their :diff-buf-size via the canonical handlers.
-        dbs      (get-in config [:index-config :diff-buf-size] 0)]
+        dbs      (get-in config [:index-config :diff-buf-size] 0)
+        ref-type (when (:store-cache-bytes config) :weak)]
     (if-let [storage-atom (:storage-atom store)]
       ;; Pre-configured (e.g. LMDB) store — handlers already attached; just create the storage.
       (let [storage (or (:storage store) (create-storage store config))]
         (reset! storage-atom storage)
         (assoc store :storage storage :datahike/store-id store-id
-               :datahike/branching-factor bf :datahike/diff-buf-size dbs))
+               :datahike/branching-factor bf :datahike/diff-buf-size dbs :datahike/ref-type ref-type))
 
       ;; Standard fressian store — attach the CANONICAL PSS serializer with LEXICAL in-store
       ;; resolvers. The circular storage↔store reference is broken by a write-once cell LOCAL to THIS
@@ -574,11 +573,11 @@
       ;; write-once cell (cljs has no promise). comparator = per-index via :index-type; no measure; bf
       ;; self-describes from the blob. (The global pss-fress/storage-registry is for the WIRE peer.)
       (let [storage-cell (atom nil)
-            node-rh (pss-fress/read-handlers {:default-bf bf})
+            node-rh (pss-fress/read-handlers {:default-bf bf :ref-type ref-type})
             root-rh (pss-fress/root-read-handler
                      {:resolve-storage (fn [_] @storage-cell)
                       :resolve-cmp     (fn [m] (index-type->cmp-quick (:index-type m) false))
-                      :default-bf      bf})
+                      :default-bf      bf :ref-type ref-type})
             read-handlers*  (merge node-rh
                                    {pss-fress/set-tag root-rh}
                                    datom-read-handler
@@ -594,7 +593,7 @@
             storage (or (:storage store) (create-storage store config))]
         (reset! storage-cell storage)
         (assoc store :storage storage :datahike/store-id store-id
-               :datahike/branching-factor bf :datahike/diff-buf-size dbs)))))
+               :datahike/branching-factor bf :datahike/diff-buf-size dbs :datahike/ref-type ref-type)))))
 
 (defmethod di/with-storage :datahike.index/persistent-set [_index-name pset storage]
   ;; A PSS root carries its IStorage in the `_storage` field — connection-

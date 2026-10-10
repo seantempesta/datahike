@@ -150,8 +150,8 @@
 
 (defn ensure-stored-config-consistency [config stored-config]
   (let [;; Remove runtime parameters and creation-time parameters
-        config (dissoc config :name :search-cache-size :store-cache-size)
-        stored-config (dissoc stored-config :initial-tx :name :search-cache-size :store-cache-size)
+        config (dissoc config :name :search-cache-size :store-cache-size :store-cache-bytes)
+        stored-config (dissoc stored-config :initial-tx :name :search-cache-size :store-cache-size :store-cache-bytes)
         stored-config (merge {:writer dc/self-writer} stored-config)
         stored-config (if (empty? (:index-config stored-config))
                         (dissoc stored-config :index-config)
@@ -259,7 +259,7 @@
          ;; adopted on a fresh connect (adopt-create-time-fixed), so an existing
          ;; connection may carry adopted keys the caller's config omits;
          ;; conflicts are guarded on the fresh-connect path, not here.
-         (dissoc :writer :store :store-cache-size :search-cache-size
+         (dissoc :writer :store :store-cache-size :store-cache-bytes :search-cache-size
                  :index-config :fuse-index-roots? :commit-graph? :keep-history?))
       writer-key (assoc :writer writer-key))))
 
@@ -301,7 +301,8 @@
                      acquisition-key (connection-acquisition-key config)
                      physical-store-key (ds/physical-store-key store-config)
                      requested-completion (async/promise-chan)
-                     threshold (:store-cache-size config)
+                     threshold (select-keys config (if (:store-cache-bytes config)
+                                                     [:store-cache-bytes] [:store-cache-size]))
                      {:keys [state conn completion existing-key write-hooks generation node-cache]}
                      (reserve-connection-opening! conn-id requested-completion
                                                   acquisition-key physical-store-key

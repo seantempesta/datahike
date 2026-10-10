@@ -2,7 +2,8 @@
   "All the functions in this namespace must be implemented for each index type"
   #?(:cljs (:refer-clojure :exclude [-seq -count -persistent! -flush -lookup]))
   (:require #?(:clj [clojure.core.cache :as cache]
-               :cljs [cljs.cache :as cache])))
+               :cljs [cljs.cache :as cache])
+            #?(:clj [datahike.index.node-cache :as nodes])))
 
 (def node-cache-key
   "Key under which a connection hands its storage the node cache it shares with
@@ -12,9 +13,39 @@
   ::node-cache)
 
 (defn make-node-cache
-  "A fresh LRU node cache: materialized index nodes keyed by storage address."
-  [threshold]
-  (atom (cache/lru-cache-factory {} :threshold threshold)))
+  "A shared node cache; a byte budget takes precedence over the legacy node count."
+  [configuration]
+  (let [config (if (map? configuration) configuration {:store-cache-size configuration})]
+    (if-let [max-bytes (:store-cache-bytes config)]
+      #?(:clj (nodes/create max-bytes)
+         :cljs (throw (ex-info "Byte-bounded node caching requires the JVM." {:store-cache-bytes max-bytes})))
+      (atom (cache/lru-cache-factory {} :threshold (:store-cache-size config))))))
+
+(defn cache-get [held address]
+  #?(:clj (if (nodes/cache? held) (nodes/lookup held address)
+              (cache/lookup @held address))
+     :cljs (cache/lookup @held address)))
+
+(defn cache-put! [held address node]
+  #?(:clj (if (nodes/cache? held) (nodes/put! held address node)
+              (swap! held cache/miss address node))
+     :cljs (swap! held cache/miss address node))
+  nil)
+
+(defn cache-hit! [held address]
+  #?(:clj (if (nodes/cache? held) (nodes/lookup held address) (swap! held cache/hit address))
+     :cljs (swap! held cache/hit address))
+  nil)
+
+(defn cache-evict! [held address]
+  #?(:clj (if (nodes/cache? held) (nodes/evict! held address)
+              (swap! held cache/evict address))
+     :cljs (swap! held cache/evict address))
+  nil)
+
+(defn node-cache-stats [held]
+  #?(:clj (if (nodes/cache? held) (nodes/stats held) {:nodes (count @held)})
+     :cljs {:nodes (count @held)}))
 
 (defprotocol IIndex
   (-all [index] "Returns a sequence of all datoms in the index")

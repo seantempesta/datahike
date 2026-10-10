@@ -1,6 +1,6 @@
 # Datahike Database Configuration
 
-Datahike is highly configurable to support different deployment models and use cases. Configuration is set at database creation and cannot be changed afterward (though data can be migrated to a new configuration).
+Datahike supports creation settings for database semantics and runtime settings for connections. Creation settings are adopted from the stored database; runtime cache budgets may change when reopening it.
 
 ## Configuration Methods
 
@@ -415,3 +415,23 @@ Existing URI configurations continue to work—no migration required unless you 
 - [Versioning](./versioning.md) - Git-like branching and merging
 - [Distributed Architecture](./distributed.md) - DIS, writers, and RPC
 - [JavaScript API](./javascript-api.md) - Node.js and browser usage
+
+### JVM index-node byte budget
+
+`:store-cache-bytes` optionally bounds the shared decoded index-node cache by
+estimated heap bytes, using Caffeine weighted eviction. It takes precedence
+over the legacy `:store-cache-size` node count. Connections to the same physical
+store with the same byte budget share one cache. For example,
+`{:store-cache-bytes 512000000}` retains at most 512 MB of estimated node content
+after cache maintenance. The estimate includes datom payloads and buffered
+changes, never follows child nodes, and counts shared payloads per entry; it is
+not an exact retained-heap measurement.
+
+With a byte budget, persistent-set uses weak references for tree children, for
+both new and restored nodes. The weighted cache therefore controls strong
+retention; soft references do not add a second retention policy. This is a
+runtime setting and may change when reopening a store. Stored node and root
+formats are unchanged. `datahike.index.interface/node-cache-stats` returns node
+count, maximum bytes, estimated retained bytes, hits, misses and evictions for
+the cache at `[:store :storage :cache]` in a database value. The option is JVM-only;
+ClojureScript refuses it explicitly and keeps the existing node-count cache.
