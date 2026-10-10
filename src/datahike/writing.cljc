@@ -120,6 +120,14 @@
       (swap! pending-writes-atom (fn [old-kvs] (reset! kvs-to-write old-kvs) [])))
     @kvs-to-write))
 
+(defn stored-config
+  "The part of `config` that lives in storage. A writer's `:write-fn-map`
+  holds the connection's own runtime operations (functions), which storage
+  cannot encode and a later connection supplies for itself."
+  [config]
+  (cond-> config
+    (get-in config [:writer :write-fn-map]) (update :writer dissoc :write-fn-map)))
+
 (defn db->stored
   "Maps memory db to storage layout. Index flushes will add [k v] pairs to pending-writes."
   [db flush?]
@@ -249,7 +257,7 @@
       [schema-meta-kv-to-write
        (merge
         {:schema-meta-key  schema-meta-key
-         :config          config
+         :config          (stored-config config)
          :meta            meta
          :hash            hash
          :max-tx          max-tx
@@ -779,7 +787,7 @@
                  :hash            hash
                  :merkle-roots    merkle-roots
                  :schema-meta-key schema-meta-key
-                 :config          (update config :initial-tx (comp not empty?))
+                 :config          (update (stored-config config) :initial-tx (comp not empty?))
                  :meta            meta
                  :eavt-key        (detach eavt')
                  :aevt-key        (detach aevt')

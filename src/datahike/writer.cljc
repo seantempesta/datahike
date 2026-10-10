@@ -7,9 +7,10 @@
             [datahike.committed-report :as committed-report]
             [datahike.gc :as gc]
             [datahike.tools :as dt :refer [throwable-promise get-time-ms]]
-            [clojure.core.async :refer [chan close! promise-chan put! go go-loop <! >! poll! buffer timeout]]
+            [clojure.core.async :refer [chan close! promise-chan put! go go-loop <! >! poll! buffer timeout #?(:clj thread)]]
             #?(:cljs [cljs.core.async.impl.channels :refer [ManyToManyChannel]]))
-  #?(:clj (:import [clojure.core.async.impl.channels ManyToManyChannel])))
+  #?(:clj (:import [clojure.core.async.impl.channels ManyToManyChannel]
+                   [java.lang.management ManagementFactory])))
 
 (defn chan? [x]
   (instance? ManyToManyChannel x))
@@ -108,6 +109,29 @@
                                (update :via #(mapv (fn [cause] (dissoc cause :data)) %)))
                       :cljs {:type (.-name error)
                              :cause (.-message error)})})))
+
+#?(:clj
+   (defn- thread-counters
+     "This thread's allocated bytes (-1 where the JVM keeps no count) and CPU
+     nanoseconds."
+     []
+     (let [threads (ManagementFactory/getThreadMXBean)]
+       [(if (instance? com.sun.management.ThreadMXBean threads)
+          (.getCurrentThreadAllocatedBytes ^com.sun.management.ThreadMXBean threads)
+          -1)
+        (.getCurrentThreadCpuTime threads)])))
+
+#?(:clj
+   (defn- measured-commit!
+     "Commit `db` synchronously on the calling platform thread. Returns
+     `[committed-db cost]`: every storage write the commit makes runs on this
+     thread, so its counters are the commit's exact allocation and CPU."
+     [db merge-parents last-cid]
+     (let [[allocated cpu] (thread-counters)
+           committed (w/commit! db merge-parents true last-cid)
+           [allocated' cpu'] (thread-counters)]
+       [committed (cond-> {:cpu-ns (- cpu' cpu)}
+                    (<= 0 allocated allocated') (assoc :alloc-bytes (- allocated' allocated)))])))
 
 (defn create-thread
   "Creates new transaction thread"
@@ -251,8 +275,15 @@
                                  db)]
                         (try
                           (let [start-ts (get-time-ms)
-                                {{:keys [datahike/commit-id]} :meta
-                                 :as stored-commit-db} (<?- (w/commit! db merge-parents false last-cid))
+                                ;; One platform thread runs the whole commit,
+                                ;; so its cost is exact (on the go dispatcher
+                                ;; konserve's writes would scatter over the pool).
+                                [{{:keys [datahike/commit-id]} :meta
+                                  :as stored-commit-db}
+                                 commit-cost]
+                                #?(:clj (<?- (thread (try (measured-commit! db merge-parents last-cid)
+                                                          (catch Throwable e e))))
+                                   :cljs [(<?- (w/commit! db merge-parents false last-cid)) nil])
                                 modified-attrs
                                 (w/batch-cache-revision-attributes
                                  (mapv first txs))
@@ -266,10 +297,18 @@
                             (log/trace :datahike/commit-time {:duration-ms commit-time})
                             (reset! connection commit-db)
                     ;; notify all processes that transaction is complete
+                            ;; Every report of the batch carries the one
+                            ;; commit that made it durable: the batch's
+                            ;; transactions share its cost.
                             (doseq [[tx-report callback] txs]
                               (let [tx-report (-> tx-report
                                                   (assoc-in [:tx-meta :db/commitId] commit-id)
-                                                  (assoc :db-after commit-db))]
+                                                  (assoc :db-after commit-db)
+                                                  (assoc :datahike/commit
+                                                         (merge commit-cost
+                                                                {:commit-id commit-id
+                                                                 :tx-count (count txs)
+                                                                 :duration-ms commit-time})))]
                                 (committed-report/offer-committed! commit-db tx-report)
                                 (>! callback tx-report))))
                           (catch #?(:clj Throwable :cljs js/Error) e
