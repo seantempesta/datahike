@@ -126,28 +126,36 @@
 (defn with
   "Same as [[transact!]], but applies to an immutable database value. Returns transaction report (see [[transact!]])."
   ([db tx-data] (with db tx-data nil))
-  ([db tx-data tx-meta]
+  ([db tx-data tx-meta] (with db tx-data tx-meta nil))
+  ;; `eid-floor`: the last entity id the store issued on any branch, handed only
+  ;; by the writer (`datahike.writing/with-store-eids`), so a speculation
+  ;; reserves no entity ids.
+  ([db tx-data tx-meta eid-floor]
    {:pre [(dbu/db? db)]}
    (if (is-filtered db)
      (throw (ex-info "Filtered DB cannot be modified" {:error :transaction/filtered}))
      (dbt/transact-tx-data
-      (db/map->TxReport
-       {:db-before db
-        :db-after  (db/clear-cache-context db)
-        :tx-data   []
-        :tempids   {}
-        :tx-meta   tx-meta})
+      (cond-> (db/map->TxReport
+               {:db-before db
+                :db-after  (db/clear-cache-context db)
+                :tx-data   []
+                :tempids   {}
+                :tx-meta   tx-meta})
+        eid-floor (assoc ::dbt/eid-floor eid-floor))
       tx-data))))
 
-(defn load-entities-with [db entities tx-meta]
-  (update (dbt/transact-entities-directly
-           (db/map->TxReport {:db-before db
-                              :db-after  db
-                              :tx-data   []
-                              :tempids   {}
-                              :tx-meta   tx-meta})
-           entities)
-          :db-after assoc :cache-context nil))
+(defn load-entities-with
+  ([db entities tx-meta] (load-entities-with db entities tx-meta nil))
+  ([db entities tx-meta eid-floor]
+   (update (dbt/transact-entities-directly
+            (cond-> (db/map->TxReport {:db-before db
+                                       :db-after  db
+                                       :tx-data   []
+                                       :tempids   {}
+                                       :tx-meta   tx-meta})
+              eid-floor (assoc ::dbt/eid-floor eid-floor))
+            entities)
+           :db-after assoc :cache-context nil)))
 
 (defn db-with
   "Applies transaction to an immutable db value, returning new immutable db value. Same as `(:db-after (with db tx-data))`."

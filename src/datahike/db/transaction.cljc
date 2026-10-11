@@ -55,8 +55,17 @@
 (defn- current-tx [report]
   (inc (get-in report [:db-before :max-tx])))
 
-(defn next-eid [db]
-  (inc (:max-eid db)))
+(defn next-eid
+  "The next fresh entity id: one past `db`'s max-eid and past `::eid-floor` on
+  `report`, the last id the store's eid allocator reserved on any branch when the
+  writer began this transaction (speculation and a db with no store have none),
+  so the branches of one store never mint one id. Entity ids stay below `tx0`."
+  [report db]
+  (let [eid (inc (max (:max-eid db) (::eid-floor report 0)))]
+    (when (>= eid tx0)
+      (log/raise "Entity ids are exhausted: the next would reach tx0."
+                 {:error :entity-id/range :entity-id eid}))
+    eid))
 
 (defn- #?@(:clj [^Boolean tx-id?]
            :cljs [^boolean tx-id?])
@@ -944,6 +953,16 @@
               (log/raise "Incomplete schema transaction attributes, expected :db/ident, :db/valueType, :db/cardinality"
                          {:error :transact/schema :entity entity}))))))))
 
+(defn- entity-id
+  "`e`, an explicit entity id: one below `tx0` (an entity) or naming this or an
+  earlier transaction (its metadata). Any other is refused: a transaction id not
+  yet issued, or one above `emax`, which no index scan reaches."
+  [report e entity]
+  (when (> e (current-tx report))
+    (log/raise "Entity id " e " names neither an entity nor an issued transaction."
+               {:error :entity-id/range :entity-id e :entity entity}))
+  e)
+
 (defn entity-map->op-vec [db {:keys [tempids] :as report} entity]
   (let [old-eid (:db/id entity)
         tx? (tx-id? old-eid) ;; :db/current-tx / "datomic.tx"
@@ -962,9 +981,9 @@
       {:retry? true :old-eid resolved-eid :upserted-eid upserted-eid}
       (let [new-eid (cond
                       (some? upserted-eid)   upserted-eid
-                      (nil? resolved-eid)    (next-eid db)
-                      (tempid? resolved-eid) (or resolved-tempid (next-eid db))
-                      (number? resolved-eid) resolved-eid
+                      (nil? resolved-eid)    (next-eid report db)
+                      (tempid? resolved-eid) (or resolved-tempid (next-eid report db))
+                      (number? resolved-eid) (entity-id report resolved-eid entity)
                       :else (log/raise "Expected number, string, keyword or lookup ref for :db/id, got " old-eid
                                        {:error :entity-id/syntax, :entity updated-entity}))
             new-entity (assoc updated-entity :db/id new-eid)]
@@ -1285,7 +1304,7 @@
             ;; discipline.
             (validate-cross-tx-vt-windows! report)
             (-> report
-                (dissoc ::pending-vt-validation ::report-validator)
+                (dissoc ::pending-vt-validation ::report-validator ::eid-floor)
                 (assoc :tx-data (vec (::effective-tx-data report)))
                 (dissoc ::effective-tx-data)
                 (assoc-in [:tempids :db/current-tx] (current-tx report))
@@ -1332,16 +1351,18 @@
                       allocated-eid (get tempids e)]
                   (if (and upserted-eid allocated-eid (not= upserted-eid allocated-eid))
                     (retry-with-tempid initial-report report initial-es e upserted-eid)
-                    (let [eid (or upserted-eid allocated-eid (next-eid db))]
+                    (let [eid (or upserted-eid allocated-eid (next-eid report db))]
                       (recur (allocate-eid report e eid) (cons [op eid a v] entities))))))
 
               (and (dbu/ref? db a) (tempid? v))
               (if-let [vid (get tempids v)]
                 (recur report (cons [op e a vid] entities))
-                (recur (allocate-eid report v (next-eid db)) es))
+                (recur (allocate-eid report v (next-eid report db)) es))
 
               :else
-              (let [[new-report new-entities] (apply-db-op db report entity)]
+              (let [_ (when (and (number? e) (#{:db/add :db/retract} op))
+                        (entity-id report e entity))
+                    [new-report new-entities] (apply-db-op db report entity)]
                 (recur new-report (concat new-entities entities)))))
 
           (datom? entity)
@@ -1360,6 +1381,7 @@
          migration-state (get-in initial-report [:db-before :migration] {})]
     (if (empty? es)
       (-> report
+          (dissoc ::eid-floor)
           (assoc :tx-data (vec (::effective-tx-data report)))
           (dissoc ::effective-tx-data)
           (update-in [:db-after :max-tx] inc)
@@ -1380,7 +1402,7 @@
                   (log/raise "Configuration mismatch: import data with attribute references can not be imported into a database with no attribute references."
                              {:error :import/mismatch :data entity})
                   a-ident))
-            max-eid (next-eid db)
+            max-eid (next-eid report db)
             max-tid (inc (get-in report [:db-after :max-tx]))]
         (cond
           (= :db.install/attribute a-ident)

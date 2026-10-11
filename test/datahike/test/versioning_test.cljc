@@ -482,3 +482,48 @@
            (is (map? merged))
            (is (= 2 (carrying)) "a merge batched with a transaction keeps its parents"))
          (finally (d/release foo) (d/release conn) (d/delete-database cfg))))))
+
+#?(:clj
+   (deftest branches-of-one-store-allocate-distinct-entity-ids
+     (let [cfg {:store {:backend :file
+                        :path (str "target/eid-allocator-" (random-uuid))
+                        :id (random-uuid)}
+                :keep-history? true
+                :schema-flexibility :read}
+           _ (d/create-database cfg)
+           base (d/connect cfg)
+           born (fn [conn k]
+                  (d/transact conn [{:name k}])
+                  (d/q '[:find ?e . :in $ ?k :where [?e :name ?k]] @conn k))]
+       (try
+         (born base "before")
+         (branch! base :db :left)
+         (branch! base :db :right)
+         (let [left (d/connect (assoc cfg :branch :left))
+               right (d/connect (assoc cfg :branch :right))]
+           (try
+             (testing "two branches of one commit mint different ids"
+               (let [a (born left "left") b (born right "right")]
+                 (is (not= a b))
+                 (is (every? #(< % const/tx0) [a b]))))
+             (testing "a speculation spends no id"
+               (let [issued (:max-eid @right)
+                     speculative (:max-eid (:db-after (d/with @left [{:name "speculation"}])))]
+                 (is (= (inc (:max-eid @left)) speculative))
+                 (is (< issued (born right "after-speculation")))))
+             (testing "an explicit id below tx0 is observed; an unissued transaction id or one above emax is refused"
+               (let [explicit (+ 1000 (:max-eid @right))]
+                 (d/transact left [[:db/add explicit :name "explicit"]])
+                 (is (< explicit (born right "after-explicit")))
+                 (doseq [e [(+ const/tx0 7) (bit-or (bit-shift-left 7 32) 1)]]
+                   (is (= :entity-id/range
+                          (try (d/transact left [[:db/add e :name "out-of-range"]]) nil
+                               (catch Exception error
+                                 (some (comp :error ex-data) (take-while some? (iterate ex-cause error))))))))))
+             (testing "a reopened store allocates above every head's max-eid"
+               (let [highest (max (:max-eid @left) (:max-eid @right) (:max-eid @base))]
+                 (.remove ^java.util.concurrent.ConcurrentHashMap @#'writing/eid-allocators
+                          (get-in cfg [:store :id]))
+                 (is (< highest (born base "after-reopen")))))
+             (finally (d/release left) (d/release right))))
+         (finally (d/release base) (d/delete-database cfg))))))

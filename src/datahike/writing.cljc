@@ -743,6 +743,53 @@
   (-delete-database [config])
   (-database-exists? [config]))
 
+#?(:clj
+   (defonce ^{:private true
+              :doc "The store's eid allocator: store id -> the AtomicLong holding the
+  last entity id any branch of that store reserved in this process, so two
+  branches never mint one id. A mutable cell for the reason the writer's own
+  state is: one process holds a store's writers (`datahike.gc-guard`). Rederived
+  from the committed heads when first used, dropped by `delete-database`;
+  advanced only by `with-store-eids`."}
+     eid-allocators
+     (java.util.concurrent.ConcurrentHashMap.)))
+
+(defn- roster-max-eid
+  "The highest max-eid over the heads of every branch of `store`: O(branches)
+  small record reads, no index loaded."
+  [store]
+  (transduce (map #(:max-eid (read-head store %) 0))
+             max 0 (k/get store :branches nil {:sync? true})))
+
+(defn eid-allocator
+  "The eid allocator of `db`'s store, seeded on first use in this process past
+  every branch head's max-eid and `db`'s own; nil without a store id or in cljs."
+  [db]
+  #?(:clj (when-some [store-id (get-in db [:config :store :id])]
+            (.computeIfAbsent ^java.util.concurrent.ConcurrentHashMap eid-allocators store-id
+                              (reify java.util.function.Function
+                                (apply [_ _]
+                                  (java.util.concurrent.atomic.AtomicLong.
+                                   (max (:max-eid db) (roster-max-eid (:store db))))))))
+     :cljs nil))
+
+(defn- with-store-eids
+  "`(transact eid-floor)`, the report of one transaction above the last id the
+  store's allocator reserved, which then reserves what the report's db-after
+  observed. A concurrent reservation by another branch reruns the transaction
+  (a pure function of `old`) above the new floor, so a refused or speculative
+  transaction reserves nothing and a single-branch store numbers as max-eid."
+  [old transact]
+  (if-some [^java.util.concurrent.atomic.AtomicLong allocator (eid-allocator old)]
+    (loop []
+      (let [floor (.get allocator)
+            report (transact floor)
+            reached (get-in report [:db-after :max-eid])]
+        (if (or (<= reached floor) (.compareAndSet allocator floor reached))
+          report
+          (recur))))
+    (transact nil)))
+
 (defn -database-exists?* [config]
   (let [p (dt/throwable-promise)]
     (go
@@ -870,6 +917,7 @@
                   {:type :database-has-active-connections
                    :connections (vec active-conns)}))
      (sc/clear-write-cache (:store config))
+     #?(:clj (when (nil? overlay) (.remove ^java.util.concurrent.ConcurrentHashMap eid-allocators config-store-id)))
      ;; Await the backend deletion. Konserve >= 0.9.357 makes every backend
      ;; honour the async delete-store contract, including tiered stores.
      (<?- (ks/delete-store (:store config))))))
@@ -1011,7 +1059,7 @@
               {:error :transaction/stale-basis
                :datahike/expected-basis-t expected-basis-t
                :datahike/current-basis-t (:max-tx old)})))
-  (complete-db-update old (core/with old tx-data tx-meta)))
+  (complete-db-update old (with-store-eids old #(core/with old tx-data tx-meta %))))
 
 (defn merge-writer!
   "Writer operation for merge: the ordinary `transact!` (so its
@@ -1026,4 +1074,4 @@
 
 (defn load-entities [old entities]
   (log/debug :datahike/load-entities {:entity-count (count entities)})
-  (complete-db-update old (core/load-entities-with old entities nil)))
+  (complete-db-update old (with-store-eids old #(core/load-entities-with old entities nil %))))
