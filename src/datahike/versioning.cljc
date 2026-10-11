@@ -7,7 +7,7 @@
             [datahike.connections :refer [*connections*]]
             [datahike.gc-guard :as guard]
             [datahike.store :refer [store-identity add-cache-and-handlers]]
-            [datahike.writing :refer [stored->db db->stored stored-db?
+            [datahike.writing :refer [stored->db db->stored stored-db? stored-revisions
                                       #?@(:clj [release-db])
                                       commit! create-commit-id get-and-clear-pending-kvs!
                                       write-pending-kvs! branch-heads-as-commits
@@ -71,12 +71,10 @@
   "Derive committed cache ownership for a value loaded through an attached
    connection or committed DB. Raw stores and detached values return nil.
 
-   The attached source owns exact attribute revisions only for its own commit.
-   A different materialized commit keeps the same connection generation but
-   uses its own commit ID as the conservative revision: stored commits do not
-   retain the process-local attribute revision map, so cross-commit promotion
-   would otherwise compare two absent revisions as unchanged."
-  [conn-or-db commit-id]
+   The attached source owns exact attribute revisions for its own commit. A
+   different materialized commit keeps the same connection generation and
+   takes the revisions its stored record carries (`stored-revisions`)."
+  [conn-or-db commit-id stored-db]
   (let [source
         (cond
           #?(:clj (instance? clojure.lang.IDeref conn-or-db)
@@ -94,11 +92,11 @@
     (when (and committed? connection-id generation)
       (if (= source-commit-id commit-id)
         source-context
-        {:datahike.cache/connection-id connection-id
-         :datahike.cache/generation generation
-         :datahike.cache/commit-id commit-id
-         :datahike.cache/committed? true
-         :datahike.cache/conservative-revision commit-id}))))
+        (merge {:datahike.cache/connection-id connection-id
+                :datahike.cache/generation generation
+                :datahike.cache/commit-id commit-id
+                :datahike.cache/committed? true}
+               (stored-revisions stored-db))))))
 
 #?(:clj
    (defn- branch-secondary-indices
@@ -487,7 +485,7 @@
                  (go-try-
                   (when-let [raw-db (<?- (k/get store cid nil opts))]
                     (let [cache-context
-                          (attached-cache-context conn-or-store cid)]
+                          (attached-cache-context conn-or-store cid raw-db)]
                       (cond-> (stored->db raw-db store opts)
                         cache-context
                         (assoc :cache-context cache-context)))))))))

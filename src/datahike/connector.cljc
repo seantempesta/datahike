@@ -92,15 +92,14 @@
         (let [fresh-db (dsi/stored->db stored store)
               commit-id (get-in fresh-db [:meta :datahike/commit-id])]
           (assoc fresh-db :cache-context
-                 ;; Another process's commit: its revisions are unknown here,
-                 ;; so the fetched commit becomes the conservative revision.
+                 ;; Another process's commit carries its stored revisions.
                  (let [context (:cache-context @wrapped-atom)]
                    (cond-> context
                      context (assoc :datahike.cache/commit-id commit-id
                                     :datahike.cache/committed? (some? commit-id))
                      (and context commit-id (not= commit-id (:datahike.cache/commit-id context)))
-                     (-> (assoc :datahike.cache/conservative-revision commit-id)
-                         (dissoc :datahike.cache/attribute-revisions)))))))
+                     (-> (dissoc :datahike.cache/attribute-revisions)
+                         (merge (dsi/stored-revisions stored))))))))
       @wrapped-atom)))
 
 (defn conn-from-db
@@ -387,15 +386,16 @@
                              (ensure-stored-config-consistency config (:config stored-db)))
                          committed-db (dsi/stored->db (assoc stored-db :config config) store)
                          commit-id (get-in committed-db [:meta :datahike/commit-id])
-                         ;; The opening commit is the conservative revision, so
-                         ;; every revision names a commit whose content the
-                         ;; attribute equals, comparable across connections.
+                         ;; The opening commit's stored revisions (else the
+                         ;; commit itself as the conservative revision) name, per
+                         ;; attribute, a commit whose content the attribute
+                         ;; equals, comparable across connections.
                          committed-db (assoc committed-db :cache-context
-                                             (cond-> {:datahike.cache/connection-id conn-id
-                                                      :datahike.cache/generation generation
-                                                      :datahike.cache/commit-id commit-id
-                                                      :datahike.cache/committed? (some? commit-id)}
-                                               commit-id (assoc :datahike.cache/conservative-revision commit-id)))
+                                             (merge {:datahike.cache/connection-id conn-id
+                                                     :datahike.cache/generation generation
+                                                     :datahike.cache/commit-id commit-id
+                                                     :datahike.cache/committed? (some? commit-id)}
+                                                    (dsi/stored-revisions stored-db)))
                          _         (query/open-query-cache-generation! conn-id generation)
                          conn      (conn-from-db committed-db)
                          _         (vswap! resources assoc :conn conn)]

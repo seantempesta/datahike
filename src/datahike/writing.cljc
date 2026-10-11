@@ -516,12 +516,36 @@
     (let [pending-ops (mapv (fn [[k v]] (k/assoc store k v {:immutable? true} {:sync? false})) kvs)]
       (go-try- (doseq [op pending-ops] (<?- op))))))
 
+(defn commit-revisions
+  "The cache revisions of the commit `cid` that advances `prior` by
+   `modified-attrs` (`datahike.db/advance-cache-context`), else nil when
+   `prior` names no conservative revision. Stored with the commit so a
+   later load knows which commits its attributes' datoms equal."
+  [prior cid modified-attrs unsafe?]
+  (when (:datahike.cache/conservative-revision prior)
+    (-> (select-keys prior [:datahike.cache/conservative-revision
+                            :datahike.cache/attribute-revisions])
+        (db/advance-cache-context cid modified-attrs unsafe?))))
+
+(defn stored-revisions
+  "The cache revisions a stored commit record carries; a record written
+   without them names its own commit as the conservative revision. Nil for
+   a record without a commit id."
+  [stored-db]
+  (or (:cache-revisions stored-db)
+      (when-let [cid (get-in stored-db [:meta :datahike/commit-id])]
+        {:datahike.cache/conservative-revision cid})))
+
 (defn commit!
   ([db parents]
    (commit! db parents true))
   ([db parents sync?]
    (commit! db parents sync? nil))
   ([db parents sync? known-head-cid]
+   (commit! db parents sync? known-head-cid nil))
+  ;; `revision-change` is `{:prior context :modified-attrs set :unsafe? bool}`:
+  ;; the writer's committed context before this commit and what it changes.
+  ([db parents sync? known-head-cid {:keys [prior modified-attrs unsafe?]}]
    (async+sync sync? *default-sync-translation*
                (go-try-
                 ;; Contain fatal ERRORS (AssertionError, OOM, ...): go-try- catches
@@ -581,8 +605,10 @@
                           (db->stored db true)
                           cid           (create-commit-id db db-to-store-pre)
                           db            (assoc-in db [:meta :datahike/commit-id] cid)
-                          db-to-store   (assoc-in db-to-store-pre
-                                                  [:meta :datahike/commit-id] cid)
+                          revisions     (commit-revisions prior cid modified-attrs unsafe?)
+                          db-to-store   (cond-> (assoc-in db-to-store-pre
+                                                          [:meta :datahike/commit-id] cid)
+                                          revisions (assoc :cache-revisions revisions))
                       ;; Root fusion: roots are inlined in db-to-store, so drop
                       ;; them from the separate-object writes.
                           fused-addrs   (fused-root-addresses config db-to-store)

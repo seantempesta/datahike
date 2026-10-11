@@ -38,9 +38,11 @@
         (d/branch! conn :db :lane)
         (let [lane (d/connect (assoc cfg :branch :lane))]
           (try
-            (is (= (d/commit-id head) (:datahike.cache/conservative-revision (context @lane)))
-                "a connection opens with its commit as the conservative revision")
-            (is (empty? (:datahike.cache/attribute-revisions (context @lane))))
+            (is (= (select-keys (context head) [:datahike.cache/conservative-revision
+                                                 :datahike.cache/attribute-revisions])
+                   (select-keys (context @lane) [:datahike.cache/conservative-revision
+                                                 :datahike.cache/attribute-revisions]))
+                "a connection opens with the revisions its commit stored")
             (is (= (revision head :s/a) (d/commit-id head)))
             (d/transact lane [{:s/id "x" :s/b 3}])
             (is (= (d/commit-id head) (revision @lane :s/a)) "an untouched attribute still names the opening commit")
@@ -55,3 +57,40 @@
       (d/transact conn [{:db/ident :s/c :db/valueType :db.type/long :db/cardinality :db.cardinality/one}])
       (is (= (d/commit-id @conn) (:datahike.cache/conservative-revision (context @conn))))
       (is (empty? (:datahike.cache/attribute-revisions (context @conn)))))))
+
+(defn- revisions [database]
+  (select-keys (context database) [:datahike.cache/conservative-revision
+                                   :datahike.cache/attribute-revisions]))
+
+(deftest a-reopened-commit-carries-its-revisions
+  (with-store
+    (fn [cfg conn]
+      (d/transact conn [{:s/id "x" :s/a 2}])
+      (let [first-head @conn
+            _ (d/transact conn [{:s/id "x" :s/b 2}])
+            head @conn]
+        (d/release conn)
+        (let [reopened (d/connect cfg)]
+          (try
+            (is (= (revisions head) (revisions @reopened))
+                "a new connection reads the revisions its head commit stored")
+            (is (= (d/commit-id first-head) (revision @reopened :s/a)))
+            (is (= (d/commit-id head) (revision @reopened :s/b)))
+            (is (= (revisions first-head)
+                   (revisions (d/commit-as-db reopened (d/commit-id first-head))))
+                "an older commit loaded through the connection carries its own revisions")
+            (is (nil? (:cache-context (d/commit-as-db (:store @reopened) (d/commit-id head))))
+                "a raw store's value stays detached")
+            (finally (d/release reopened))))))))
+
+(deftest a-schema-commit-stores-only-its-conservative-revision
+  (with-store
+    (fn [cfg conn]
+      (d/transact conn [{:db/ident :s/c :db/valueType :db.type/long :db/cardinality :db.cardinality/one}])
+      (let [head @conn]
+        (d/release conn)
+        (let [reopened (d/connect cfg)]
+          (try
+            (is (= {:datahike.cache/conservative-revision (d/commit-id head)}
+                   (revisions @reopened)))
+            (finally (d/release reopened))))))))

@@ -126,9 +126,9 @@
      "Commit `db` synchronously on the calling platform thread. Returns
      `[committed-db cost]`: every storage write the commit makes runs on this
      thread, so its counters are the commit's exact allocation and CPU."
-     [db merge-parents last-cid]
+     [db merge-parents last-cid revision-change]
      (let [[allocated cpu] (thread-counters)
-           committed (w/commit! db merge-parents true last-cid)
+           committed (w/commit! db merge-parents true last-cid revision-change)
            [allocated' cpu'] (thread-counters)]
        [committed (cond-> {:cpu-ns (- cpu' cpu)}
                     (<= 0 allocated allocated') (assoc :alloc-bytes (- allocated' allocated)))])))
@@ -275,18 +275,23 @@
                                  db)]
                         (try
                           (let [start-ts (get-time-ms)
+                                modified-attrs
+                                (w/batch-cache-revision-attributes
+                                 (mapv first txs))
+                                ;; The commit stores its revisions, so a later
+                                ;; load of it knows them without this connection.
+                                revision-change {:prior (:cache-context parent-db)
+                                                 :modified-attrs modified-attrs
+                                                 :unsafe? (boolean merge-parents)}
                                 ;; One platform thread runs the whole commit,
                                 ;; so its cost is exact (on the go dispatcher
                                 ;; konserve's writes would scatter over the pool).
                                 [{{:keys [datahike/commit-id]} :meta
                                   :as stored-commit-db}
                                  commit-cost]
-                                #?(:clj (<?- (thread (try (measured-commit! db merge-parents last-cid)
+                                #?(:clj (<?- (thread (try (measured-commit! db merge-parents last-cid revision-change)
                                                           (catch Throwable e e))))
-                                   :cljs [(<?- (w/commit! db merge-parents false last-cid)) nil])
-                                modified-attrs
-                                (w/batch-cache-revision-attributes
-                                 (mapv first txs))
+                                   :cljs [(<?- (w/commit! db merge-parents false last-cid revision-change)) nil])
                                 commit-db
                                 (assoc stored-commit-db :cache-context
                                        (some-> (:cache-context parent-db)
