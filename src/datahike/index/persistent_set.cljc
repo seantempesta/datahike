@@ -19,6 +19,7 @@
             [replikativ.logging :as log])
   #?(:cljs (:require-macros [datahike.index.persistent-set :refer [generate-slice-comparator-constructor]]))
   #?(:clj (:import [datahike.datom Datom]
+                   [org.fressian Writer StreamingWriter]
                    [org.fressian.handlers WriteHandler ReadHandler]
                    [org.replikativ.persistent_sorted_set PersistentSortedSet IStorage Leaf Branch ANode Settings]
                    [java.util List])))
@@ -543,8 +544,18 @@
       :cljs (fn [rdr _ _] (dd/datom-from-reader (fress/read-object rdr))))})
 (def ^:private datom-write-handler
   #?(:clj  {datahike.datom.Datom {"datahike.datom.Datom"
-                                  (reify WriteHandler (write [_ w d] (.writeTag w "datahike.datom.Datom" 1)
-                                                        (.writeObject w (vec (seq ^Datom d)))))}}
+                                  (reify WriteHandler
+                                    (write [_ w d]
+                                      (let [^Writer w w
+                                            ^Datom d d]
+                                        (.writeTag w "datahike.datom.Datom" 1)
+                                        (.beginClosedList ^StreamingWriter w)
+                                        (.writeInt w (.-e d))
+                                        (.writeObject w (.-a d))
+                                        (.writeObject w (.-v d))
+                                        (.writeInt w (long (dd/datom-tx d)))
+                                        (.writeBoolean w (boolean (dd/datom-added d)))
+                                        (.endList ^StreamingWriter w))))}}
      :cljs {datahike.datom.Datom (fn [w d] (fress/write-tag w "datahike.datom.Datom" 1)
                                    (fress/write-object w (vec (seq d))))}))
 
