@@ -551,7 +551,7 @@
                                         (.writeTag w "datahike.datom.Datom" 1)
                                         (.beginClosedList ^StreamingWriter w)
                                         (.writeInt w (.-e d))
-                                        (.writeObject w (.-a d))
+                                        (.writeObject w (.-a d) true)
                                         (.writeObject w (.-v d))
                                         (.writeInt w (long (dd/datom-tx d)))
                                         (.writeBoolean w (boolean (dd/datom-added d)))
