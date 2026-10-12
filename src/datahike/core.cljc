@@ -127,10 +127,10 @@
   "Same as [[transact!]], but applies to an immutable database value. Returns transaction report (see [[transact!]])."
   ([db tx-data] (with db tx-data nil))
   ([db tx-data tx-meta] (with db tx-data tx-meta nil))
-  ;; `eid-floor`: the last entity id the store issued on any branch, handed only
+  ;; `eid-allocator`: the store counter, handed only
   ;; by the writer (`datahike.writing/with-store-eids`), so a speculation
   ;; reserves no entity ids.
-  ([db tx-data tx-meta eid-floor]
+  ([db tx-data tx-meta eid-allocator]
    {:pre [(dbu/db? db)]}
    (if (is-filtered db)
      (throw (ex-info "Filtered DB cannot be modified" {:error :transaction/filtered}))
@@ -141,19 +141,19 @@
                 :tx-data   []
                 :tempids   {}
                 :tx-meta   tx-meta})
-        eid-floor (assoc ::dbt/eid-floor eid-floor))
+        eid-allocator (assoc ::dbt/eid-allocator eid-allocator))
       tx-data))))
 
 (defn load-entities-with
   ([db entities tx-meta] (load-entities-with db entities tx-meta nil))
-  ([db entities tx-meta eid-floor]
+  ([db entities tx-meta eid-allocator]
    (update (dbt/transact-entities-directly
             (cond-> (db/map->TxReport {:db-before db
                                        :db-after  db
                                        :tx-data   []
                                        :tempids   {}
                                        :tx-meta   tx-meta})
-              eid-floor (assoc ::dbt/eid-floor eid-floor))
+              eid-allocator (assoc ::dbt/eid-allocator eid-allocator))
             entities)
            :db-after assoc :cache-context nil)))
 

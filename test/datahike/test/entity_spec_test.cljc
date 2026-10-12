@@ -50,11 +50,11 @@
                   "db.ensure still sees attempted attributes while the public report omits no-ops")))
           (testing "assert invalid account"
             (is (thrown-with-msg? Throwable
-                                  #"Entity 5 missing attributes #\{:account/balance\} of spec :account/guard"
+                                  #"Entity [0-9]+ missing attributes #\{:account/balance\} of spec :account/guard"
                                   (tx-with-ensure conn invalid-account))))
           (testing "assert empty entity"
             (is (thrown-with-msg? Throwable
-                                  #"Entity 5 missing attributes #\{:account/balance :account/email\} of spec :account/guard"
+                                  #"Entity [0-9]+ missing attributes #\{:account/balance :account/email\} of spec :account/guard"
                                   (tx-with-ensure conn empty-account))))
           (d/release conn)))
       (testing "with read schema flexibility"
@@ -72,11 +72,11 @@
                   "db.ensure still sees attempted attributes while the public report omits no-ops")))
           (testing "assert invalid account"
             (is (thrown-with-msg? Throwable
-                                  #"Entity 5 missing attributes #\{:account/balance\} of spec :account/guard"
+                                  #"Entity [0-9]+ missing attributes #\{:account/balance\} of spec :account/guard"
                                   (tx-with-ensure conn invalid-account))))
           (testing "assert empty entity"
             (is (thrown-with-msg? Throwable
-                                  #"Entity 5 missing attributes #\{:account/balance :account/email\} of spec :account/guard"
+                                  #"Entity [0-9]+ missing attributes #\{:account/balance :account/email\} of spec :account/guard"
                                   (tx-with-ensure conn empty-account))))
           (d/release conn))))))
 
@@ -114,15 +114,15 @@
           (is (= valid-account (d/pull db-after '[:account/email :account/balance] [:account/email (:account/email valid-account)])))))
       (testing "assert invalid account with one invalid predicate"
         (is (thrown-with-msg? Throwable
-                              #"Entity 5 failed predicates #\{datahike.test.entity-spec-test/is-email\?\} of spec :account/guard"
+                              #"Entity [0-9]+ failed predicates #\{datahike.test.entity-spec-test/is-email\?\} of spec :account/guard"
                               (tx-with-ensure invalid-account))))
       (testing "assert invalid account with mulitple invalid predicates"
         (is (thrown-with-msg? Throwable
-                              #"Entity 5 failed predicates #\{datahike.test.entity-spec-test/positive-balance\? datahike.test.entity-spec-test/is-email\?\} of spec :account/guard"
+                              #"Entity [0-9]+ failed predicates #\{datahike.test.entity-spec-test/positive-balance\? datahike.test.entity-spec-test/is-email\?\} of spec :account/guard"
                               (tx-with-ensure invalid-account-multiple))))
       (testing "assert empty account"
         (is (thrown-with-msg? Throwable
-                              #"Entity 5 failed predicates #\{datahike.test.entity-spec-test/positive-balance\? datahike.test.entity-spec-test/is-email\?\} of spec :account/guard"
+                              #"Entity [0-9]+ failed predicates #\{datahike.test.entity-spec-test/positive-balance\? datahike.test.entity-spec-test/is-email\?\} of spec :account/guard"
                               (tx-with-ensure empty-account)))))
     (d/release conn)))
 
@@ -150,18 +150,18 @@
           (is (= valid-account (d/pull db-after '[:account/email :account/balance] [:account/email (:account/email valid-account)])))))
       (testing "assert invalid account with missing attributes"
         (is (thrown-with-msg? Throwable
-                              #"Entity 5 missing attributes #\{:account/balance\} of spec :account/guard"
+                              #"Entity [0-9]+ missing attributes #\{:account/balance\} of spec :account/guard"
                               (tx-with-ensure invalid-account-attr))))
       (testing "assert invalid account with one invalid predicate"
         (is (thrown-with-msg? Throwable
-                              #"Entity 5 failed predicates #\{datahike.test.entity-spec-test/is-email\?\} of spec :account/guard"
+                              #"Entity [0-9]+ failed predicates #\{datahike.test.entity-spec-test/is-email\?\} of spec :account/guard"
                               (tx-with-ensure invalid-account-pred))))
       (testing "assert invalid account with mulitple invalid predicates"
         (is (thrown-with-msg? Throwable
-                              #"Entity 5 failed predicates #\{datahike.test.entity-spec-test/positive-balance\? datahike.test.entity-spec-test/is-email\?\} of spec :account/guard"
+                              #"Entity [0-9]+ failed predicates #\{datahike.test.entity-spec-test/positive-balance\? datahike.test.entity-spec-test/is-email\?\} of spec :account/guard"
                               (tx-with-ensure invalid-account-pred-multiple))))
       (testing "assert empty account with required attributes precidenting over predicates"
         (is (thrown-with-msg? Throwable
-                              #"Entity 5 missing attributes #\{:account/balance :account/email\} of spec :account/guard"
+                              #"Entity [0-9]+ missing attributes #\{:account/balance :account/email\} of spec :account/guard"
                               (tx-with-ensure empty-account)))))
     (d/release conn)))

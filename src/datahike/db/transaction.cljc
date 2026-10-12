@@ -56,12 +56,15 @@
   (inc (get-in report [:db-before :max-tx])))
 
 (defn next-eid
-  "The next fresh entity id: one past `db`'s max-eid and past `::eid-floor` on
-  `report`, the last id the store's eid allocator reserved on any branch when the
-  writer began this transaction (speculation and a db with no store have none),
-  so the branches of one store never mint one id. Entity ids stay below `tx0`."
+  "Assign a fresh entity id once from the store counter, or locally for speculation.
+  A failed transaction may leave gaps; entity ids stay below `tx0`."
   [report db]
-  (let [eid (inc (max (:max-eid db) (::eid-floor report 0)))]
+  (let [eid #?(:clj (if-some [allocator (::eid-allocator report)]
+                      (.updateAndGet ^java.util.concurrent.atomic.AtomicLong allocator
+                                     (reify java.util.function.LongUnaryOperator
+                                       (applyAsLong [_ issued] (inc (max issued (:max-eid db))))))
+                      (inc (:max-eid db)))
+               :cljs (inc (:max-eid db)))]
     (when (>= eid tx0)
       (log/raise "Entity ids are exhausted: the next would reach tx0."
                  {:error :entity-id/range :entity-id eid}))
@@ -1304,7 +1307,7 @@
             ;; discipline.
             (validate-cross-tx-vt-windows! report)
             (-> report
-                (dissoc ::pending-vt-validation ::report-validator ::eid-floor)
+                (dissoc ::pending-vt-validation ::report-validator ::eid-allocator)
                 (assoc :tx-data (vec (::effective-tx-data report)))
                 (dissoc ::effective-tx-data)
                 (assoc-in [:tempids :db/current-tx] (current-tx report))
@@ -1381,7 +1384,7 @@
          migration-state (get-in initial-report [:db-before :migration] {})]
     (if (empty? es)
       (-> report
-          (dissoc ::eid-floor)
+          (dissoc ::eid-allocator)
           (assoc :tx-data (vec (::effective-tx-data report)))
           (dissoc ::effective-tx-data)
           (update-in [:db-after :max-tx] inc)
@@ -1402,7 +1405,6 @@
                   (log/raise "Configuration mismatch: import data with attribute references can not be imported into a database with no attribute references."
                              {:error :import/mismatch :data entity})
                   a-ident))
-            max-eid (next-eid report db)
             max-tid (inc (get-in report [:db-after :max-tx]))]
         (cond
           (= :db.install/attribute a-ident)
@@ -1427,11 +1429,12 @@
 
           ;; ref not added yet
           (and (dbu/ref? db a) (nil? (get-in migration-state [:eids v])))
-          (recur (allocate-eid report max-eid) es (assoc-in migration-state [:eids v] max-eid))
+          (let [eid (next-eid report db)]
+            (recur (allocate-eid report eid) es (assoc-in migration-state [:eids v] eid)))
 
           :else
           (let [new-datom ^Datom (dd/datom
-                                  (or (get-in migration-state [:eids e]) max-eid)
+                                  (or (get-in migration-state [:eids e]) (next-eid report db))
                                   a
                                   (if (dbu/ref? db a)
                                     (get-in migration-state [:eids v])

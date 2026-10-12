@@ -59,7 +59,7 @@
                     {:name     #:db{:ident       :name
                                     :valueType   :db.type/string
                                     :cardinality :db.cardinality/one}
-                     1         :name})
+                     (d/q '[:find ?e . :where [?e :db/ident :name]] (d/db conn)) :name})
              (dbi/-schema (d/db conn)))))
 
     (testing "transacting data with schema present"
@@ -69,12 +69,12 @@
 
     (testing "insert new data with wrong data type"
       (is (thrown-with-msg? Throwable
-                            #"Bad entity value 42 at \[:db/add 3 :name 42\], value does not match schema definition. Must be conform to: string\?"
+                            #"Bad entity value 42 at \[:db/add [0-9]+ :name 42\], value does not match schema definition. Must be conform to: string\?"
                             (d/transact conn [{:name 42}]))))
 
     (testing "insert new data with additional attributes not in schema"
       (is (thrown-with-msg? Throwable
-                            #"Bad entity attribute :age at \{:db/id 3, :age 42\}, not defined in current schema"
+                            #"Bad entity attribute :age at \{:db/id [0-9]+, :age 42\}, not defined in current schema"
                             (d/transact conn [{:name "Bob" :age 42}]))))
 
     (testing "insert incomplete schema :db/valueType"
@@ -94,7 +94,7 @@
 
     (testing "insert schema with incorrect value type"
       (is (thrown-with-msg? Throwable
-                            (re-pattern (str "Bad entity value " :string " at \\[:db/add 3 :db/valueType :string\\], "
+                            (re-pattern (str "Bad entity value " :string " at \\[:db/add [0-9]+ :db/valueType :string\\], "
                                              "value does not match schema definition. "
                                              "Must be conform to: "
                                              "#\\{:db.type/number :db.type/unique :db.type/instant :db.type/cardinality "
@@ -169,7 +169,7 @@
                (d/q find-schema-q db)))))
     (d/release conn)))
 
-(defn testing-type [conn type-name tx-val tx-id wrong-val]
+(defn testing-type [conn type-name tx-val wrong-val]
   (testing type-name
     (let [schema-name (keyword "value" type-name)]
       (d/transact conn [{schema-name tx-val}])
@@ -179,7 +179,7 @@
                             (re-pattern (str "Bad entity value "
                                              wrong-val
                                              " at \\[:db/add "
-                                             tx-id
+                                             "[0-9]+"
                                              " "
                                              schema-name
                                              " "
@@ -228,17 +228,17 @@
         _ (d/create-database cfg)
         conn (d/connect cfg)]
 
-    (testing-type conn "bigdec" (bigdec 1) 13 1)
-    (testing-type conn "bigint" (biginteger 1) 14 1.0)
-    (testing-type conn "boolean" true 15 0)
-    (testing-type conn "double" (double 1) 16 1)
-    (testing-type conn "float" (float 1) 17 1)
-    (testing-type conn "instant" (java.util.Date.) 18 1)
-    (testing-type conn "keyword" :one 19 1)
-    (testing-type conn "long" (long 2) 20 :2)
-    (testing-type conn "string" "one" 21 :one)
-    (testing-type conn "symbol" 'one 22 :one)
-    (testing-type conn "uuid" (random-uuid) 23 1)
+    (testing-type conn "bigdec" (bigdec 1) 1)
+    (testing-type conn "bigint" (biginteger 1) 1.0)
+    (testing-type conn "boolean" true 0)
+    (testing-type conn "double" (double 1) 1)
+    (testing-type conn "float" (float 1) 1)
+    (testing-type conn "instant" (java.util.Date.) 1)
+    (testing-type conn "keyword" :one 1)
+    (testing-type conn "long" (long 2) :2)
+    (testing-type conn "string" "one" :one)
+    (testing-type conn "symbol" 'one :one)
+    (testing-type conn "uuid" (random-uuid) 1)
     (d/release conn)))
 
 (deftest test-schema-cardinality

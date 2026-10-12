@@ -750,7 +750,7 @@
   branches never mint one id. A mutable cell for the reason the writer's own
   state is: one process holds a store's writers (`datahike.gc-guard`). Rederived
   from the committed heads when first used, dropped by `delete-database`;
-  advanced only by `with-store-eids`."}
+  advanced when `datahike.db.transaction/next-eid` assigns an id."}
      eid-allocators
      (java.util.concurrent.ConcurrentHashMap.)))
 
@@ -774,21 +774,17 @@
      :cljs nil))
 
 (defn- with-store-eids
-  "`(transact eid-floor)`, the report of one transaction above the last id the
-  store's allocator reserved, which then reserves what the report's db-after
-  observed. A concurrent reservation by another branch reruns the transaction
-  (a pure function of `old`) above the new floor, so a refused or speculative
-  transaction reserves nothing and a single-branch store numbers as max-eid."
+  "Apply the transaction once, allocating each fresh eid from the store counter.
+  Reservations survive a refused transaction; speculation has no counter."
   [old transact]
-  (if-some [^java.util.concurrent.atomic.AtomicLong allocator (eid-allocator old)]
-    (loop []
-      (let [floor (.get allocator)
-            report (transact floor)
-            reached (get-in report [:db-after :max-eid])]
-        (if (or (<= reached floor) (.compareAndSet allocator floor reached))
-          report
-          (recur))))
-    (transact nil)))
+  (let [allocator (eid-allocator old)
+        report (transact allocator)]
+    #?(:clj (when allocator
+              (.accumulateAndGet ^java.util.concurrent.atomic.AtomicLong allocator
+                                 (get-in report [:db-after :max-eid])
+                                 (reify java.util.function.LongBinaryOperator
+                                   (applyAsLong [_ current reached] (max current reached))))))
+    report))
 
 (defn -database-exists?* [config]
   (let [p (dt/throwable-promise)]

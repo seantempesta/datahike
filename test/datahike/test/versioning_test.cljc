@@ -527,3 +527,35 @@
                  (is (< highest (born base "after-reopen")))))
              (finally (d/release left) (d/release right))))
          (finally (d/release base) (d/delete-database cfg))))))
+
+#?(:clj
+   (deftest concurrent-branches-allocate-without-reexecuting-transaction-functions
+     (let [cfg {:store {:backend :memory :id (random-uuid)}
+                :keep-history? true :schema-flexibility :read}
+           _ (d/create-database cfg)
+           base (d/connect cfg)
+           entered (java.util.concurrent.CountDownLatch. 2)
+           calls (java.util.concurrent.atomic.AtomicInteger.)
+           allocate (fn [_ name]
+                      (.incrementAndGet calls)
+                      (.countDown entered)
+                      (when-not (.await entered 5 java.util.concurrent.TimeUnit/SECONDS)
+                        (throw (ex-info "Both branch transaction functions did not enter." {})))
+                      [{:name name}])]
+       (try
+         (branch! base :db :left)
+         (branch! base :db :right)
+         (let [left (d/connect (assoc cfg :branch :left))
+               right (d/connect (assoc cfg :branch :right))]
+           (try
+             (let [a (d/transact! left [[:db.fn/call allocate "left"]])
+                   b (d/transact! right [[:db.fn/call allocate "right"]])
+                   ra (deref a 10000 ::timeout)
+                   rb (deref b 10000 ::timeout)]
+               (is (map? ra))
+               (is (map? rb))
+               (is (= 2 (.get calls)))
+               (is (not= (d/q '[:find ?e . :where [?e :name "left"]] @left)
+                         (d/q '[:find ?e . :where [?e :name "right"]] @right))))
+             (finally (d/release left) (d/release right))))
+         (finally (d/release base) (d/delete-database cfg))))))

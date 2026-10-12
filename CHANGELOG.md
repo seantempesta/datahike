@@ -10,6 +10,10 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 - **Query planner promoted to the default engine** — the compiled query planner ([#795]) now runs by default; the relational (base) engine remains a permanent fallback for the query shapes the planner declines (multi-source disjoint joins, nested temporal wrappers, stats). The selector dynamic var was renamed `datahike.query/*force-legacy*` → **`*disable-planner*`** (same polarity), and the opt-*in* env `DATAHIKE_QUERY_PLANNER=true` became an opt-*out* `DATAHIKE_QUERY_PLANNER=false`. CI now runs the full suite under both engines on every build. **Beta — newly the default**, so if a query returns wrong or surprising results please [open an issue](https://github.com/replikativ/datahike/issues); you can fall back any time with `DATAHIKE_QUERY_PLANNER=false` (or `(binding [datahike.query/*disable-planner* true] …)`). ([#844])
 
+### Notable fixes
+
+- **Branch contention no longer re-executes transaction functions to allocate ids** — fresh entity ids are reserved at assignment from the process-owned store counter. Failed transactions may leave id gaps; speculative `with` reserves no store ids. Existing tempid conflict resolution is unchanged. ([#TODO])
+
 ### Features
 
 - **Each transaction report carries the cost of its commit** — the writer runs `commit!` synchronously on one platform thread (`clojure.core.async/thread`) and puts `:datahike/commit {:commit-id :tx-count :duration-ms :alloc-bytes :cpu-ns}` on every report the commit made durable: that thread's exact allocation and CPU, shared by `:tx-count` transactions of a group commit. A `:writer :write-fn-map` is now kept out of the stored configuration, so a file store can be opened with wrapped writer operations (e.g. to measure processing). *Experimental.* ([#TODO])
