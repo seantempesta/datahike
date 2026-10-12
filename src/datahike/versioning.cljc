@@ -264,8 +264,10 @@
                                  (when (or (seq sec-keys) (seq (:secondary-indices @conn)))
                                    (branch-secondary-indices conn stored-db from new-branch store))
                                  :cljs nil)
-                              updated-db (cond-> (assoc-in stored-db [:config :branch] new-branch)
-                                           (seq branched-sec-keys) (assoc :secondary-index-keys branched-sec-keys))]
+                              updated-db (if (and commit-graph? (empty? branched-sec-keys))
+                                           (compact-head (get-in stored-db [:meta :datahike/commit-id]))
+                                           (cond-> (assoc-in stored-db [:config :branch] new-branch)
+                                             (seq branched-sec-keys) (assoc :secondary-index-keys branched-sec-keys)))]
                           (<?- (k/assoc store new-branch updated-db store-opts))
                           ;; :branches is the GC discovery pointer and is published last.
                           (<?- (update-branches-held! gc-sid roster-permit store

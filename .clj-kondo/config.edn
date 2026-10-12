@@ -3,6 +3,7 @@
 ;; To regenerate: bb codegen-clj-kondo
 
 {:config-paths ["datahike/datahike"],
+ :hooks {:analyze-call {superv.async/go-loop-try hooks.superv/go-loop-try}},
  :lint-as
  {datahike.db/defrecord-updatable clojure.core/deftype,
   datahike.lru/defcache clojure.core/deftype,
