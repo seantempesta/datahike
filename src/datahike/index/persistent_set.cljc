@@ -459,7 +459,7 @@
         (when (nil? node)
           (log/raise "Node not found in storage." {:type :node-not-found
                                                    :address address
-                                                   :store store}))
+                                                   :store (get-in config [:store :id])}))
         (swap! stats update :reads inc)
         (di/cache-put! cache address node)
         node)))
