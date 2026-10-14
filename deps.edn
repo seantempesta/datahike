@@ -3,7 +3,7 @@
         org.replikativ/hasch                        {:mvn/version "0.4.100"
                                                      :exclusions [org.clojure/clojurescript]}
         org.replikativ/konserve                     {:git/url "https://github.com/seantempesta/konserve"
-                                                     :git/sha "5b39fddd6ae58bae7d08880daecd1ad7242ea273"
+                                                     :git/sha "b4b896f24317d90f955405b950efefbb8b303512"
                                                      :exclusions [org.clojure/clojurescript
                                                                   org.clojars.mmb90/cljs-cache]}
 

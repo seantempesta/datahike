@@ -93,6 +93,10 @@
   erased (defaults to beginning of time [no erasure]). The branch heads will
   always be retained.
 
+  The sweep result is passed through unchanged. In `:datahike.gc/sweep-opts`,
+  `:konserve.gc/report? true` requests the candidate and pre-sweep observed
+  key sets; without it the result remains the candidate set.
+
   The sweep deletes an unreachable object only if it was written before this
   store's SAFE POINT (`datahike.gc-guard/safe-point`) — NOT before `now`.
 

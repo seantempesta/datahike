@@ -192,3 +192,29 @@
       (finally
         (d/release conn)
         (d/delete-database cfg)))))
+
+(deftest collection-passes-through-the-sweep-inventory
+  (let [cfg (assoc cfg :store {:backend :file
+                              :path (str "target/gc-inventory-" (random-uuid))
+                              :id (random-uuid)})
+        _ (d/create-database cfg)
+        conn (d/connect cfg)]
+    (try
+      (let [store (:store @conn)
+            _ (k/assoc store :orphan :present {:sync? true})
+            before (into #{} (map :key) (k/keys store {:sync? true}))
+            report @(d/gc-storage conn (Date. 0)
+                                  {:datahike.gc/sweep-opts
+                                   {:konserve.gc/dry-run? true :konserve.gc/report? true}})]
+        (is (= before (:konserve.gc/observed-keys report)))
+        (is (= #{:orphan} (:konserve.gc/candidates report)))
+        (is (= before (into #{} (map :key) (k/keys store {:sync? true}))))
+        (is (= (:konserve.gc/candidates report)
+               @(d/gc-storage conn (Date. 0)
+                              {:datahike.gc/sweep-opts {:konserve.gc/dry-run? true}})))
+        (is (= report @(d/gc-storage conn (Date. 0)
+                                     {:datahike.gc/sweep-opts {:konserve.gc/report? true}})))
+        (is (not (k/exists? store :orphan {:sync? true}))))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))

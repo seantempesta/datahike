@@ -1221,7 +1221,7 @@
      :stability :stable
      :supports-remote? true
      :referentially-transparent? false
-     :doc "Invokes garbage collection on connection's store. Removes old snapshots before given time point. The optional map supports :datahike.gc/reachable-extension, :datahike.gc/maintenance-receipt, :datahike.gc/batch-size, and :datahike.gc/sweep-opts. The reachability callback runs after exclusive acquisition and receives the locked roster plus native reachable set."
+     :doc "Invokes garbage collection on connection's store. Removes old snapshots before given time point. The optional map supports :datahike.gc/reachable-extension, :datahike.gc/maintenance-receipt, :datahike.gc/batch-size, and :datahike.gc/sweep-opts. The reachability callback runs after exclusive acquisition and receives the locked roster plus native reachable set. The result of Konserve sweep is passed through unchanged: :datahike.gc/sweep-opts {:konserve.gc/report? true} returns :konserve.gc/candidates and :konserve.gc/observed-keys from its one enumeration, including in dry-run mode."
      :examples [{:desc "GC all old snapshots"
                  :code "(gc-storage conn)"}
                 {:desc "GC snapshots before date"
