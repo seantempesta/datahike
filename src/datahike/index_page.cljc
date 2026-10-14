@@ -42,15 +42,16 @@
 (defn- index-comparator [db index]
   (dd/index-type->cmp-quick index (not (temporal-index? db))))
 
-(defn- restore-temporal-index-order
-  "Restores native order after an as-of or since reconstruction."
-  [db comparator direction candidates]
-  (if (dbi/context-time-pred (dbi/-search-context db))
-    (sort (if (= :forward direction)
-            comparator
-            (fn [left right] (comparator right left)))
-          candidates)
-    candidates))
+(defn- time-filtered? [db]
+  (some? (dbi/context-time-pred (dbi/-search-context db))))
+
+(defn- native-order
+  "Sorts datoms into the index's native order for the page direction."
+  [comparator direction datoms]
+  (sort (if (= :forward direction)
+          comparator
+          (fn [left right] (comparator right left)))
+        datoms))
 
 (defn- with-added [datom added?]
   (dd/datom (:e datom) (:a datom) (:v datom) (dd/datom-tx datom) added?))
@@ -127,17 +128,25 @@
         seek-components (if resolved-cursor
                           (cursor-components index resolved-cursor)
                           (prefix-seek-components components direction))
-        candidates ((if (= :forward direction)
-                      dbi/seek-datoms
-                      dbi/rseek-datoms)
-                    db index seek-components)
-        ;; Time-filtered temporal reads reconstruct cardinality-one state by
-        ;; entity/attribute. That grouping is eager and does not retain AVET
-        ;; (or another requested index's) order. Restore dependency-native
-        ;; comparator order before a foreign datom can terminate this prefix.
-        candidates (restore-temporal-index-order db comparator direction
-                                                  candidates)
-        candidates (take-while #(within-prefix? index prefix %) candidates)
+        before? (fn [datom]
+                  (neg? (if (= :forward direction)
+                          (comparator datom resolved-cursor)
+                          (comparator resolved-cursor datom))))
+        candidates
+        (if (time-filtered? db)
+          ;; A time filter (as-of, since) reconstructs cardinality-one state
+          ;; by entity and attribute, eagerly over every datom it reads, and
+          ;; loses the requested index's order. An open seek would hand it
+          ;; the whole index tail on every page, so read the prefix alone,
+          ;; restore native order and resume after the cursor.
+          (cond->> (native-order comparator direction
+                                 (dbi/datoms db index components))
+            resolved-cursor (drop-while before?))
+          (take-while #(within-prefix? index prefix %)
+                      ((if (= :forward direction)
+                         dbi/seek-datoms
+                         dbi/rseek-datoms)
+                       db index seek-components)))
         candidates
         (if resolved-cursor
           (let [candidate (first candidates)]

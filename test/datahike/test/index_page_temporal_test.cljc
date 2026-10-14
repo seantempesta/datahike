@@ -17,16 +17,15 @@
 (defn- page-values [page]
   (mapv :v (:datahike.index-page/datoms page)))
 
-(deftest time-filtered-reverse-page-restores-order-before-prefix
+(deftest time-filtered-reverse-page-restores-native-order
   (let [as-of (db/->AsOfDB test-db tx0)
         rank-one (dd/datom 1 :item/rank 1 tx0 true)
         rank-two (dd/datom 2 :item/rank 2 tx0 true)
-        outside (dd/datom 3 :aaa/outside 3 tx0 true)
         request {:index :avet :components [:item/rank]
                  :direction :reverse :limit 1}]
-    (with-redefs [dbi/rseek-datoms
+    (with-redefs [dbi/datoms
                   (fn [_db _index _components]
-                    [rank-two outside rank-one])]
+                    [rank-two rank-one])]
       (let [first-page (d/index-page as-of request)
             second-page
             (d/index-page as-of
@@ -41,12 +40,11 @@
   (let [history (db/->HistoricalDB (db/->AsOfDB test-db tx0))
         retracted (dd/datom 2 :item/rank 2 tx0 false)
         asserted (dd/datom 2 :item/rank 2 tx0 true)
-        outside (dd/datom 3 :aaa/outside 3 tx0 true)
         request {:index :avet :components [:item/rank]
                  :direction :reverse :limit 1}]
-    (with-redefs [dbi/rseek-datoms
+    (with-redefs [dbi/datoms
                   (fn [_db _index _components]
-                    [asserted outside retracted])]
+                    [asserted retracted])]
       (let [first-page (d/index-page history request)
             second-page
             (d/index-page history

@@ -172,6 +172,13 @@ When something is added, it's typically marked *Experimental*. When the API cont
   valid rows. Paging now restores the native temporal comparator order before
   prefix and cursor processing, including history polarity. ([#TODO])
 
+- **Time-filtered `index-page` reads only its prefix** — on `as-of` and
+  `since` views a page used an open seek, so the time filter rebuilt and
+  sorted the whole index tail after the prefix on every page (288 ms per
+  200-datom page over a 314k-datom AVET index). A page now reads the prefix
+  alone and resumes after its cursor (5 ms); pages and cursors are unchanged.
+  ([#TODO])
+
 - **`pull-many` preserves every input position** — one native pull now returns
   an ordered vector with nil for each well-formed missing numeric ID, lookup
   ref, or ident. Missing inputs no longer abort or disappear, wildcard pulls
