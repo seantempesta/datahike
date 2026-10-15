@@ -44,9 +44,18 @@
       (let [initial (d/commit-id @main)
             root (first (d/parent-commit-ids @main))
             c1 (tx! main 1)]
-        (is (= {:datahike/parents #{} :datahike/generation 1} (graph-record main root)))
-        (is (= {:datahike/parents #{root} :datahike/generation 2} (graph-record main initial)))
-        (is (= {:datahike/parents #{initial} :datahike/generation 3} (graph-record main c1)))))))
+        (is (= {:datahike/parents #{} :datahike/generation 1 :datahike/branch :db} (graph-record main root)))
+        (is (= {:datahike/parents #{root} :datahike/generation 2 :datahike/branch :db} (graph-record main initial)))
+        (is (= {:datahike/parents #{initial} :datahike/generation 3 :datahike/branch :db} (graph-record main c1)))
+        (testing "a commit on another branch, and a forward merge, record the branch they were written on"
+          (v/branch! main :db :chain)
+          (on-branch main :chain
+            (fn [chain]
+              (let [c (tx! chain 2)
+                    m (forward-merge! chain main 3)]
+                (is (= :chain (:datahike/branch (graph-record main c))))
+                (is (= :chain (:datahike/branch (graph-record main m))))
+                (is (= #{c c1} (:datahike/parents (graph-record main m))))))))))))
 
 (deftest the-merge-base-follows-the-chain-lifecycle
   (with-store (cfg)
@@ -234,6 +243,10 @@
                   (is (= before (d/merge-base main (first heads) (second heads) shared)))
                   (is (= before (d/merge-base main :relaunch :db shared))))
                 (is (= before (d/merge-base main :relaunch :db))))
+              (testing "records written before :datahike/branch existed are completed by the next run"
+                (doseq [[gk r] records] (k/assoc store gk (dissoc r :datahike/branch) {:sync? true}))
+                (is (= (count records) (:datahike/written (d/backfill-commit-graph! main))))
+                (is (= records (into {} (map (fn [gk] [gk (k/get store gk nil {:sync? true})])) (graph-keys store)))))
               (testing "a second run writes nothing"
                 (is (= {:datahike/branches 3 :datahike/written 0} (d/backfill-commit-graph! (:store @main))))))))))))
 

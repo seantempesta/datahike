@@ -404,7 +404,7 @@
                             ;; commit-graph store means no separate cid record.
                             commit-graph? (get (:config db) :commit-graph? true)
                             graph-writes (when commit-graph?
-                                           (commit-graph-writes store cid resolved-parents))]
+                                           (commit-graph-writes store cid resolved-parents branch))]
                         ;; Write every immutable value before the mutable head.
                         (if (multi-key-capable? store)
                           (let [[meta-key meta-val] schema-meta-kv-to-write
@@ -490,7 +490,9 @@
           (get @seen cid))))))
 
 (defn commit-graph-record
-  "Commit `cid`'s graph record, {:datahike/parents #{cid} :datahike/generation n}:
+  "Commit `cid`'s graph record, {:datahike/parents #{cid} :datahike/generation n
+   :datahike/branch kw} (the branch it was written on, so a first-parent walk
+   needs no full commit record):
    the stored one, else derived from the commit records (nothing written);
    nil when the store holds no commit `cid`. A pure function of an immutable
    commit id, so a caller may cache it forever and hand it to `merge-base`.
@@ -611,7 +613,8 @@
 
 (defn backfill-commit-graph!
   "Writes the commit graph record of every commit a branch head reaches
-   that has none: the commits written before graph records existed.
+   that has no complete one: the commits written before graph records
+   existed, and records written before `:datahike/branch` was added.
 
    One derivation for the whole store (`commit-graph-records` over every
    branch head), written parents first in batches of `:batch-size` (default

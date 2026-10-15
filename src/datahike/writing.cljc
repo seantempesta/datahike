@@ -448,19 +448,29 @@
   [cid]
   [:datahike/commit-graph cid])
 
+(defn commit-branch
+  "The branch a stored commit record was written on: its `[:config :branch]`,
+   `:db` (Datahike's default branch) when absent."
+  [commit]
+  (get-in commit [:config :branch] :db))
+
 (defn commit-graph-records
   "Commit graph records of `cids`, as {:stored {cid r} :derived {cid r}}.
 
-   A record is {:datahike/parents #{cid} :datahike/generation n}. `:derived`
-   also holds every ancestor reached through a commit without a record.
+   A record is {:datahike/parents #{cid} :datahike/generation n
+   :datahike/branch kw}. `:derived` also holds every ancestor reached through
+   a commit without a complete record.
 
    A commit's generation is its topological level: 1 + the greatest
-   generation among its parents, 1 for a root. Commits written before graph
-   records existed have none; their generation is derived from the parents
-   in their full commit records, down to commits that have a record, and
-   returned under `:derived` for a writer to store. A commit whose full
-   record is absent too (swept, or never written) ends its lineage: it is in
-   neither map and adds nothing to its children's generation."
+   generation among its parents, 1 for a root. Its branch is the branch it
+   was written on (`commit-branch`), so a first-parent walk reads it from the
+   small record. Commits written before graph records existed have none, and
+   records written before the branch was added lack it; both are derived from
+   the parents and branch in their full commit records, down to commits that
+   have a complete record, and returned under `:derived` for a writer to
+   store. A commit whose full record is absent too (swept, or never written)
+   ends its lineage: it is in neither map and adds nothing to its children's
+   generation."
   [store cids]
   (loop [stack (vec cids) stored {} derived {} absent #{} pending {}]
     (if-let [c (peek stack)]
@@ -469,34 +479,39 @@
           (known? c) (recur (pop stack) stored derived absent pending)
 
           (contains? pending c)
-          (let [ps (get pending c)
+          (let [{ps :parents branch :branch} (get pending c)
                 todo (remove known? ps)]
             (if (seq todo)
               (recur (into stack todo) stored derived absent pending)
               (let [gen (fn [p] (:datahike/generation (or (get stored p) (get derived p))))
                     record {:datahike/parents ps
-                            :datahike/generation (inc (reduce max 0 (keep gen ps)))}]
+                            :datahike/generation (inc (reduce max 0 (keep gen ps)))
+                            :datahike/branch branch}]
                 (recur (pop stack) stored (assoc derived c record) absent (dissoc pending c)))))
 
           :else
-          (if-let [record (k/get store (commit-graph-key c) nil {:sync? true})]
+          (if-let [record (let [r (k/get store (commit-graph-key c) nil {:sync? true})]
+                            (when (:datahike/branch r) r))]
             (recur (pop stack) (assoc stored c record) derived absent pending)
             (if-let [commit (k/get store c nil {:sync? true})]
               (recur stack stored derived absent
-                     (assoc pending c (set (get-in commit [:meta :datahike/parents]))))
+                     (assoc pending c {:parents (set (get-in commit [:meta :datahike/parents]))
+                                       :branch (commit-branch commit)}))
               (recur (pop stack) stored derived (conj absent c) pending)))))
       {:stored stored :derived derived})))
 
 (defn commit-graph-writes
-  "The [key record] writes that give commit `cid` its graph record.
+  "The [key record] writes that give commit `cid`, written on `branch`, its
+   graph record.
 
-   They hold the records derived for ancestors written before records
-   existed, then the record of `cid` with `parents`."
-  [store cid parents]
+   They hold the records derived for ancestors without a complete record,
+   parents first, then the record of `cid` with `parents`."
+  [store cid parents branch]
   (let [{:keys [stored derived]} (commit-graph-records store parents)
         gen (fn [p] (:datahike/generation (or (get stored p) (get derived p))))
         record {:datahike/parents (set parents)
-                :datahike/generation (inc (reduce max 0 (keep gen parents)))}]
+                :datahike/generation (inc (reduce max 0 (keep gen parents)))
+                :datahike/branch branch}]
     ;; parents first: a torn batch never leaves a record whose ancestors lack theirs
     (conj (mapv (fn [[c r]] [(commit-graph-key c) r]) (sort-by (comp :datahike/generation val) derived))
           [(commit-graph-key cid) record])))
@@ -689,7 +704,7 @@
                         ;; written in the same ordered batch, before the
                         ;; commit record, so no commit exists without it.
                           graph-writes  (when commit-graph?
-                                          (commit-graph-writes store cid parents))]
+                                          (commit-graph-writes store cid parents (commit-branch db-to-store)))]
 
                       (if (multi-key-capable? store)
                         (let [[meta-key meta-val] schema-meta-kv-to-write
@@ -953,7 +968,7 @@
          (<?- (write-pending-kvs! store pending-kvs false)))
 
        (when (get config :commit-graph? true)
-         (doseq [[gk gv] (commit-graph-writes store cid #{})]
+         (doseq [[gk gv] (commit-graph-writes store cid #{} (commit-branch db-to-store))]
            (<?- (k/assoc store gk gv {:immutable? true} opts))))
        (<?- (k/assoc store cid db-to-store {:immutable? true} opts)) ; content-addressed commit
        (<?- (k/assoc store :db db-to-store opts))             ; mutable: branch head
