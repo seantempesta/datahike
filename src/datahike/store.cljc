@@ -83,6 +83,16 @@
                    (if (map? value) (dissoc value :opts) value))
                  config))
 
+(defn node-store-key
+  "Identify the store whose index nodes a connection reads, for sharing the
+   decoded-node cache: an overlay reads every node it did not write from its
+   backend at the same address, and the nodes it writes get fresh addresses,
+   so it shares its backend's cache; any other store is its physical store."
+  [config]
+  (if (= :datahike/overlay (:backend config))
+    (node-store-key (:backend-config config))
+    (physical-store-key config)))
+
 ;; =============================================================================
 ;; Ready Store (Tiered-Specific)
 ;; =============================================================================
@@ -124,8 +134,9 @@
 ;;  :backend-config <the shared store's config>}
 ;;
 ;; Every write — nodes, commits, branch heads, the :branches roster — lands in a
-;; memory frontend; every read falls through to the shared backend, which the
-;; overlay never mutates (konserve `:frontend-only`, `konserve/tiered.cljc:22`).
+;; memory frontend; every read falls through to the shared backend, uncopied, and
+;; decoded nodes come from the backend's node cache (`node-store-key`); the
+;; overlay never mutates the backend (konserve `:frontend-only`, `konserve/tiered.cljc:22`).
 ;; All connections naming one `:overlay` uuid share its frontend (konserve's
 ;; memory registry, keyed by that uuid), so a branch made through one is opened
 ;; by the next. `delete-database` of the overlay config drops the frontend and
@@ -148,6 +159,8 @@
                        backend
                        :write-policy :frontend-only
                        :read-policy :frontend-first
+                       ;; reads are never copied: the frontend holds only writes
+                       :populate-frontend? false
                        :opts opts))))))
 
 (defmethod ks/-store-exists? :datahike/overlay

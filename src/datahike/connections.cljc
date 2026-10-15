@@ -37,9 +37,10 @@
 (defn reserve-connection-opening!
   "Atomically acquire an existing connection or reserve its first open.
   A first open reserves the node cache it will use: a live or opening sibling's
-  for the same physical store and threshold, else a fresh one from
-  `make-cache` (which must be pure: a swap! retry may discard it)."
-  [conn-id completion acquisition-key physical-store-key threshold make-cache]
+  for the same node store (`datahike.store/node-store-key`) and threshold, else
+  a fresh one from `make-cache` (which must be pure: a swap! retry may discard
+  it). Write hooks are shared only within one physical store."
+  [conn-id completion acquisition-key physical-store-key node-store-key threshold make-cache]
   (let [[before after]
         (swap-vals! *connections*
                     (fn [connections]
@@ -68,7 +69,7 @@
                                   (atom {}))
                               node-cache
                               (or (some (fn [[_ entry]]
-                                          (when (and (= physical-store-key (:physical-store-key entry))
+                                          (when (and (= node-store-key (:node-store-key entry))
                                                      (= threshold (:threshold entry)))
                                             (:node-cache entry)))
                                         connections)
@@ -80,6 +81,7 @@
                                   :waiters 0
                                   :acquisition-key acquisition-key
                                   :physical-store-key physical-store-key
+                                  :node-store-key node-store-key
                                   :write-hooks write-hooks
                                   :threshold threshold
                                   :node-cache node-cache})))))
@@ -118,6 +120,7 @@
                        :generation (:generation entry)
                        :acquisition-key (:acquisition-key entry)
                        :physical-store-key (:physical-store-key entry)
+                       :node-store-key (:node-store-key entry)
                        :write-hooks (:write-hooks entry)
                        :threshold (:threshold entry)
                        :node-cache (:node-cache entry)})
