@@ -11,6 +11,7 @@
    [datahike.db.search :as dbs]
    [datahike.db.utils :as dbu]
    [datahike.index :as di]
+   #?(:clj [datahike.index.persistent-set :as psi])
    [datahike.index.secondary :as sec]
    [datahike.schema :as ds]
    [datahike.store :as store]
@@ -252,6 +253,18 @@
                (dbu/components->pattern db index-type cs emax txmax)
                index-type))
       (post-process-datoms db context)))
+
+#?(:clj
+   (defn datoms-diff
+     "The current datoms of `index-type` matching `components` (as `datoms` takes
+     them) held by exactly one of two database values: `[only-a only-b]`, each in
+     index order; a datom is compared whole (e, a, v and tx). A pure function of the
+     two values: the stored subtrees both share are skipped, so the work follows
+     what differs between them, on any two branches or commits of one store."
+     [db-a db-b index-type components]
+     (psi/diff (get db-a index-type) (get db-b index-type) index-type
+               (dbu/components->pattern db-a index-type components e0 tx0)
+               (dbu/components->pattern db-a index-type components emax txmax))))
 
 (defn contextual-seek-datoms [db index-type cs context]
   (-> (case (dbi/context-temporal? context)
