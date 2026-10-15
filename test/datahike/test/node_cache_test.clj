@@ -1,6 +1,7 @@
 (ns datahike.test.node-cache-test
   (:require [clojure.test :refer [deftest is]]
             [datahike.index.interface :as index]
+            [datahike.index.node-cache]
             [datahike.index.persistent-set]
             [datahike.datom :as datom]
             [datahike.api :as d]
@@ -58,3 +59,47 @@
       (finally
         (d/delete-database cfg)
         (doseq [file (reverse (file-seq directory))] (.delete file))))))
+
+(defn- live-bytes []
+  (dotimes [_ 4] (System/gc) (Thread/sleep 100))
+  (let [r (Runtime/getRuntime)] (- (.totalMemory r) (.freeMemory r))))
+
+(defn- generated-leaf [^java.util.Random rnd settings value-kind]
+  (Leaf. (vec (for [e (range 100)]
+                (datom/datom e :value
+                             (let [n (.nextInt rnd 1000000)]
+                               (case value-kind
+                                 :string (apply str (repeat (+ 1 (.nextInt rnd 300)) (char (+ 97 (.nextInt rnd 26)))))
+                                 :wide-string (apply str (repeat (+ 1 (.nextInt rnd 300)) (char (+ 1000 (.nextInt rnd 26)))))
+                                 :symbol (symbol (str "ns" (.nextInt rnd 1000)) (str "name-" n))
+                                 :long (+ n 1000000000)
+                                 :uuid (java.util.UUID. (.nextLong rnd) (.nextLong rnd))
+                                 :date (java.util.Date. (.nextLong rnd))
+                                 :vector [(str "s" n) (+ n 1000000000) (symbol (str "v" n))]))
+                             1)))
+         settings))
+
+(defn- held-bytes
+  "Heap bytes retained by exactly the nodes `make` builds: live heap with them held minus live
+   heap right after releasing them, so unrelated garbage of earlier tests cancels. Median of 5."
+  [make]
+  (let [holder (atom nil)
+        one (fn []
+              (reset! holder (make))
+              (let [held (live-bytes)]
+                (reset! holder nil)
+                (- held (live-bytes))))
+        xs (sort (repeatedly 5 one))]
+    (nth xs 2)))
+
+(deftest weighed-bytes-cover-real-retained-bytes-and-track-them
+  (let [settings (Settings. 128 RefType/WEAK)]
+    (doseq [kind [:string :wide-string :symbol :long :uuid :date :vector]]
+      (let [weighed (atom 0)
+            real (held-bytes (fn []
+                               (let [rnd (java.util.Random. 7)
+                                     nodes (vec (repeatedly 300 #(generated-leaf rnd settings kind)))]
+                                 (reset! weighed (reduce + (map @#'datahike.index.node-cache/node-bytes nodes)))
+                                 nodes)))]
+        (is (<= real @weighed) (str kind " weighed under real"))
+        (is (<= @weighed (* 3 real)) (str kind " weighed loosely"))))))
