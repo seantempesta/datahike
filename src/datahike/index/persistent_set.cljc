@@ -262,11 +262,13 @@
 
 #?(:clj
    (defn- slot-datoms
-     "The datoms buffered in child `i`'s slot of `branch`: edits not yet pushed into the child."
+     "The datoms buffered in child `i`'s slot of `branch`: edits not yet pushed into the child.
+     A branch holding no buffer (`slots` is nil: restored without one, or built whole) has none."
      [^Branch branch i]
-     (when-let [^Slot slot (aget ^objects (.slots branch) (int i))]
-       (filter #(instance? Datom %)
-               (tree-seq #(and (coll? %) (not (instance? Datom %))) seq (.-diff slot))))))
+     (when-let [^objects slots (.slots branch)]
+       (when-let [^Slot slot (aget slots (int i))]
+         (filter #(instance? Datom %)
+                 (tree-seq #(and (coll? %) (not (instance? Datom %))) seq (.-diff slot)))))))
 
 #?(:clj
    (defn diff
@@ -296,10 +298,11 @@
                                                  :let [_ (run! take! (slot-datoms branch i))]]
                                              [(.address branch (int i)) branch i storage]))))
                             level))
+           ;; the entries at an address the other side does not hold; an unstored node (nil address) is never shared
            unshared (fn [as bs]
                       (let [shared (java.util.HashSet. ^java.util.Collection (keep first as))]
-                        (.retainAll shared ^java.util.Collection (keep first bs))
-                        [(remove #(.contains shared (first %)) as) (remove #(.contains shared (first %)) bs)]))
+                        (.retainAll shared (java.util.HashSet. ^java.util.Collection (keep first bs)))
+                        [(into [] (remove #(.contains shared (first %))) as) (into [] (remove #(.contains shared (first %))) bs)]))
            open (fn [entries] (mapv (fn [[address ^Branch branch i ^IStorage storage]] [address (.child branch storage (int i))]) entries))
            ra (.root a) rb (.root b)
            la (.level ^ANode ra) lb (.level ^ANode rb)]
