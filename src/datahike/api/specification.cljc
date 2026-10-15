@@ -117,7 +117,17 @@
    These descriptions are consumed only by the Clojure API. They are not part
    of generated JavaScript, Java, native, Python, pod, CLI, HTTP, or capability
    surfaces."
-  '{merge-base
+  '{datoms-diff
+    {:args [:=> [:cat :any :any [:enum :eavt :aevt :avet] [:sequential :any]] [:tuple [:vector :any] [:vector :any]]]
+     :ret [:tuple [:vector :any] [:vector :any]]
+     :categories [:query :host]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? true
+     :doc "Returns [only-a only-b]: the current datoms of an index matching components (as datoms takes them) held by exactly one of two database values, each in index order. Stored subtrees both values share are skipped, so the work follows what differs between them, on any two branches or commits of one store. A datom is compared whole (e, a, v and tx)."
+     :impl datahike.db/datoms-diff}
+
+    merge-base
     {:args [:function
             [:=> [:cat :any [:or :uuid :keyword] [:or :uuid :keyword]] [:maybe :uuid]]
             [:=> [:cat :any [:or :uuid :keyword] [:or :uuid :keyword] [:maybe ifn?]] [:maybe :uuid]]]

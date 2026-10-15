@@ -21,7 +21,7 @@
   #?(:clj (:import [datahike.datom Datom]
                    [org.fressian Writer StreamingWriter]
                    [org.fressian.handlers WriteHandler ReadHandler]
-                   [org.replikativ.persistent_sorted_set PersistentSortedSet IStorage Leaf Branch ANode Settings]
+                   [org.replikativ.persistent_sorted_set PersistentSortedSet IStorage Leaf Branch ANode Settings Slot]
                    [java.util List])))
 
 (def index-type->kwseq
@@ -256,6 +256,86 @@
     #?(:clj  (set! (.-_root pset) root-node)
        :cljs (set! (.-root pset) root-node))
     pset))
+
+;; ---------------------------------------------------------------------------
+;; Diff of two sets that share stored subtrees
+
+#?(:clj
+   (defn- slot-datoms
+     "The datoms buffered in child `i`'s slot of `branch`: edits not yet pushed into the child."
+     [^Branch branch i]
+     (when-let [^Slot slot (aget ^objects (.slots branch) (int i))]
+       (filter #(instance? Datom %)
+               (tree-seq #(and (coll? %) (not (instance? Datom %))) seq (.-diff slot))))))
+
+#?(:clj
+   (defn diff
+     "The datoms within the slice bounds `from` and `to` (as `-slice` takes them for
+     `index-type`) held by exactly one of two persistent sorted sets: `[only-a only-b]`,
+     each a vector in index order. A datom differs by the set's own comparator.
+
+     Both trees are walked level by level and every child stored at an address both
+     sides hold is skipped, so the work follows the nodes that differ between the two
+     values (one branch's new commits against another's), never the range. The
+     candidates are the datoms the two sides' unshared leaves do not both hold, plus
+     every buffered edit of an expanded branch; each is decided by membership in the
+     two whole sets."
+     [^PersistentSortedSet a ^PersistentSortedSet b index-type from to]
+     (let [in-range (slice-comparator-constructor index-type from to)
+           ^java.util.Comparator cmp (.comparator a)
+           candidates (java.util.TreeSet. ^java.util.Comparator cmp)
+           take! (fn [d] (when (and (not (neg? (in-range d from))) (not (pos? (in-range d to))))
+                           (.add candidates d)))
+           ;; the in-range children of every branch in `level`; a child's buffered edits lie in its own range
+           children (fn [^IStorage storage level]
+                      (into [] (mapcat (fn [[_ ^Branch branch]]
+                                         (let [ks (.keys branch)]
+                                           (for [i (range (.len branch))
+                                                 :when (and (not (neg? (in-range (.get ks (int i)) from)))
+                                                            (or (zero? i) (not (pos? (in-range (.get ks (int (dec i))) to)))))
+                                                 :let [_ (run! take! (slot-datoms branch i))]]
+                                             [(.address branch (int i)) branch i storage]))))
+                            level))
+           unshared (fn [as bs]
+                      (let [shared (java.util.HashSet. ^java.util.Collection (keep first as))]
+                        (.retainAll shared ^java.util.Collection (keep first bs))
+                        [(remove #(.contains shared (first %)) as) (remove #(.contains shared (first %)) bs)]))
+           open (fn [entries] (mapv (fn [[address ^Branch branch i ^IStorage storage]] [address (.child branch storage (int i))]) entries))
+           ra (.root a) rb (.root b)
+           la (.level ^ANode ra) lb (.level ^ANode rb)]
+       (when-not (and (some? (.-_address a)) (= (.-_address a) (.-_address b)))
+         (loop [level (max la lb)
+                as (if (== la level) [[(.-_address a) ra]] [])
+                bs (if (== lb level) [[(.-_address b) rb]] [])]
+           (let [[as bs] (unshared as bs)]
+             (if (zero? level)
+               ;; a datom both sides' unshared leaves hold is no candidate; buffered edits already are
+               (let [leaf-datoms (fn [leaves] (let [out (java.util.ArrayList.)]
+                                                (doseq [[_ ^Leaf leaf] leaves, d (.keys leaf)]
+                                                  (when (and (not (neg? (in-range d from))) (not (pos? (in-range d to))))
+                                                    (.add out d)))
+                                                out))
+                     ^java.util.ArrayList xs (leaf-datoms as) ^java.util.ArrayList ys (leaf-datoms bs)
+                     nx (.size xs) ny (.size ys)]
+                 (loop [i 0 j 0]
+                   (cond (and (< i nx) (< j ny))
+                         (let [c (.compare cmp (.get xs i) (.get ys j))]
+                           (cond (zero? c) (recur (inc i) (inc j))
+                                 (neg? c) (do (.add candidates (.get xs i)) (recur (inc i) j))
+                                 :else (do (.add candidates (.get ys j)) (recur i (inc j)))))
+                         (< i nx) (do (.add candidates (.get xs i)) (recur (inc i) j))
+                         (< j ny) (do (.add candidates (.get ys j)) (recur i (inc j))))))
+               (let [[ea eb] (unshared (children (.-_storage a) as) (children (.-_storage b) bs))
+                     below (dec level)]
+                 (recur below
+                        (into (if (== la below) [[(.-_address a) ra]] []) (open ea))
+                        (into (if (== lb below) [[(.-_address b) rb]] []) (open eb))))))))
+       (reduce (fn [[only-a only-b] d]
+                 (let [in-a (.contains a d) in-b (.contains b d)]
+                   (cond (and in-a (not in-b)) [(conj only-a d) only-b]
+                         (and in-b (not in-a)) [only-a (conj only-b d)]
+                         :else [only-a only-b])))
+               [[] []] candidates))))
 
 (defn- canon
   "Normalize a value for content hashing: Datoms become [e a v tx added] vectors,
