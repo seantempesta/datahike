@@ -55,8 +55,9 @@
       (is (< g-on g-off)
           (str "fusion writes fewer objects (" g-on " vs " g-off ")"))
       ;; at the default branching-factor every index is a single leaf root, so
-      ;; fusion inlines the whole index: net growth = the commit-id record only
-      (is (= 20 g-on) "single-leaf indexes fully inline: 1 object (the cid) per commit"))))
+      ;; fusion inlines the whole index: net growth = the commit-id record and
+      ;; its commit graph record
+      (is (= 40 g-on) "single-leaf indexes fully inline: 2 objects (the cid and its graph record) per commit"))))
 
 (deftest fusion-gc-and-crypto-audit
   (testing "GC walks fused records; crypto deep audit verifies the inlined root"

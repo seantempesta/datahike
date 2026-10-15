@@ -117,7 +117,17 @@
    These descriptions are consumed only by the Clojure API. They are not part
    of generated JavaScript, Java, native, Python, pod, CLI, HTTP, or capability
    surfaces."
-  '{shallow-weight-within
+  '{merge-base
+    {:args [:=> [:cat :any [:or :uuid :keyword] [:or :uuid :keyword]] [:maybe :uuid]]
+     :ret [:maybe :uuid]
+     :categories [:versioning :query :host]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? true
+     :doc "Returns the merge base of two commit ids or branch keywords: their best common ancestor commit id, nil when they share none. Raises :merge-base-criss-cross when there is more than one."
+     :impl datahike.versioning/merge-base}
+
+    shallow-weight-within
     {:args [:=> [:cat :any [:int {:min 0}]]
             [:maybe [:int {:min 0}]]]
      :ret [:maybe [:int {:min 0}]]

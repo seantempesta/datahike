@@ -11,7 +11,8 @@
                                       #?@(:clj [release-db])
                                       commit! create-commit-id get-and-clear-pending-kvs!
                                       write-pending-kvs! branch-heads-as-commits
-                                      read-head compact-head]]
+                                      read-head compact-head commit-graph-writes
+                                      commit-graph-records]]
             [datahike.writer]
             [datahike.index.secondary :as sec]
             ;; cljs: S is a VAR (the supervisor) → :refer; go-try-/<?-/<?/go-loop-try
@@ -401,12 +402,15 @@
                             pending-kvs (get-and-clear-pending-kvs! store)
                             ;; Same opt-out as datahike.writing/commit!: no
                             ;; commit-graph store means no separate cid record.
-                            commit-graph? (get (:config db) :commit-graph? true)]
+                            commit-graph? (get (:config db) :commit-graph? true)
+                            graph-writes (when commit-graph?
+                                           (commit-graph-writes store cid resolved-parents))]
                         ;; Write every immutable value before the mutable head.
                         (if (multi-key-capable? store)
                           (let [[meta-key meta-val] schema-meta-kv-to-write
                                 writes (cond-> (vec pending-kvs)
                                          schema-meta-kv-to-write (conj [meta-key meta-val])
+                                         commit-graph?           (into graph-writes)
                                          commit-graph?           (conj [cid db-to-store]))
                                 metas (into {} (map (fn [[key _]] [key {:immutable? true}])) writes)]
                             (<?- (k/multi-assoc store writes metas store-opts)))
@@ -418,6 +422,8 @@
                                             (second schema-meta-kv-to-write)
                                             {:immutable? true}
                                             store-opts)))
+                            (doseq [[gk gv] graph-writes]
+                              (<?- (k/assoc store gk gv {:immutable? true} store-opts)))
                             (when commit-graph?
                               (<?- (k/assoc store cid db-to-store {:immutable? true}
                                            store-opts)))))
@@ -470,6 +476,121 @@
   [db]
   (db-check db)
   (get-in db [:meta :datahike/parents]))
+
+(defn- graph-reader
+  "A per-call reader of commit graph records: (read cid) is cid's record or
+   nil when the store holds no commit `cid`."
+  [store]
+  (let [seen (volatile! {})]
+    (fn [cid]
+      (if-let [record (get @seen cid)]
+        record
+        (let [{:keys [stored derived]} (commit-graph-records store [cid])]
+          (vswap! seen into (concat stored derived))
+          (get @seen cid))))))
+
+(defn- reaches?
+  "Whether `x` is an ancestor of `y` (or `y` itself). Commits below `x`'s
+   generation cannot reach it, so the walk stops there."
+  [node x y]
+  (let [gx (:datahike/generation (node x))]
+    (loop [todo [y] seen #{}]
+      (if-let [c (peek todo)]
+        (cond
+          (= c x) true
+          (contains? seen c) (recur (pop todo) seen)
+          :else (let [n (node c)]
+                  (recur (into (pop todo)
+                               (when (and n (> (:datahike/generation n) gx))
+                                 (:datahike/parents n)))
+                         (conj seen c))))
+        false))))
+
+(defn- paint-down-to-common
+  "git's paint_down_to_common over `node` (cid -> graph record): every commit
+   reached from both `a` and `b` that no other such commit descends from
+   through the walk, highest generation first. Flags: 1 reached from `a`, 2
+   from `b`, 4 stale. It stops when only stale entries remain."
+  [node a b]
+  (let [entry (fn [c] [(:datahike/generation (node c)) c])
+        queue0 (sorted-set-by (fn [[g1 c1] [g2 c2]]
+                                (let [g (compare g2 g1)] (if (zero? g) (compare c1 c2) g)))
+                              (entry a) (entry b))
+        stale? (fn [f] (pos? (bit-and f 4)))]
+    (loop [queue queue0
+           flags (merge-with bit-or {a 1} {b 2})
+           nonstale (count queue0)
+           result #{}]
+      (if (zero? nonstale)
+        result
+        (let [[_ c :as e] (first queue)
+              queue (disj queue e)
+              f (get flags c)
+              nonstale (if (stale? f) nonstale (dec nonstale))
+              both? (= 3 (bit-and f 7))
+              fl (cond-> (bit-and f 7) both? (bit-or 4))
+              [queue flags nonstale]
+              (reduce (fn [[queue flags nonstale] p]
+                        (let [pf (get flags p 0)]
+                          (if (or (= fl (bit-and pf fl)) (nil? (node p)))
+                            [queue flags nonstale]
+                            (let [pf' (bit-or pf fl)
+                                  queued? (contains? queue (entry p))
+                                  nonstale (cond
+                                             (not queued?) (cond-> nonstale (not (stale? pf')) inc)
+                                             (and (not (stale? pf)) (stale? pf')) (dec nonstale)
+                                             :else nonstale)]
+                              [(conj queue (entry p)) (assoc flags p pf') nonstale]))))
+                      [queue (assoc flags c fl) nonstale]
+                      (:datahike/parents (node c)))]
+          (recur queue flags nonstale (cond-> result both? (conj c))))))))
+
+(defn merge-base
+  "The merge base of `a` and `b`: their best common ancestor commit id.
+
+   `a` and `b` are commit ids or branch keywords. Answers nil when they share
+   no ancestor. This is git's merge-base, walked over the commit graph
+   records by generation. Raises :merge-base-criss-cross naming every best
+   common ancestor when there is more than one, :commit-not-found or
+   :branch-does-not-exist for an unknown input, and :commit-graph-disabled
+   on a store created with :commit-graph? false.
+
+   A pure function of two commit ids: callers may cache it forever."
+  [conn-or-store a b]
+  (let [config (cond
+                 #?(:clj (instance? clojure.lang.IDeref conn-or-store)
+                    :cljs (satisfies? IDeref conn-or-store)) (:config @conn-or-store)
+                 (db? conn-or-store) (:config conn-or-store))
+        store (extract-store conn-or-store)
+        cid-of (fn [x]
+                 (cond
+                   (uuid? x) x
+                   (keyword? x)
+                   (let [head (read-head store x {:sync? true})]
+                     (when-not head
+                       (log/raise "Branch does not exist."
+                                  {:type :branch-does-not-exist :branch x}))
+                     (when (false? (get-in head [:config :commit-graph?]))
+                       (log/raise "This store was created with :commit-graph? false, so it has no merge base."
+                                  {:type :commit-graph-disabled :commit-graph? false}))
+                     (get-in head [:meta :datahike/commit-id]))
+                   :else (log/raise "A merge base is computed for commit ids or branch keywords."
+                                    {:type :invalid-merge-base-input :input x})))]
+    (when (false? (:commit-graph? config))
+      (log/raise "This store was created with :commit-graph? false, so it has no merge base."
+                 {:type :commit-graph-disabled :commit-graph? false}))
+    (let [a (cid-of a)
+          b (cid-of b)
+          node (graph-reader store)]
+      (doseq [c [a b]]
+        (when-not (node c)
+          (log/raise "Commit record does not exist." {:type :commit-not-found :commit-id c})))
+      (let [found (paint-down-to-common node a b)
+            best (into #{} (remove (fn [x] (some #(and (not= x %) (reaches? node x %)) found))) found)]
+        (when (< 1 (count best))
+          (log/raise "More than one best common ancestor (criss-cross merge)."
+                     {:type :merge-base-criss-cross :merge-bases best}))
+        (first best)))))
 
 (defn commit-as-db
   "Loads the database stored at this commit id.

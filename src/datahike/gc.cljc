@@ -3,7 +3,7 @@
             [datahike.gc-guard :as guard]
             [datahike.index.interface :refer [-mark -seed-root! with-storage]]
             [datahike.index.secondary :as sec]
-            [datahike.writing :refer [read-head]]
+            [datahike.writing :refer [read-head commit-graph-key]]
             [konserve.core :as k]
             [konserve.gc :refer [sweep!]]
             [replikativ.logging :as log]
@@ -66,7 +66,10 @@
                                    (-mark (cond-> (with-storage (:index config) idx (:storage store))
                                             root (-seed-root! root))
                                           seen))
+                            cid (get-in record [:meta :datahike/commit-id])
                             new-reachable (cond-> (set/union reachable #{to-check}
+                                                             ;; the commit's graph record lives and dies with it
+                                                             (when cid #{(commit-graph-key cid)})
                                                              (when schema-meta-key #{schema-meta-key})
                                                              (mark eavt-key eavt-root)
                                                              (mark aevt-key aevt-root)
