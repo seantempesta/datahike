@@ -305,6 +305,7 @@
                      {:keys [state conn completion existing-key write-hooks generation node-cache]}
                      (reserve-connection-opening! conn-id requested-completion
                                                   acquisition-key physical-store-key
+                                                  (ds/node-store-key store-config)
                                                   threshold #(dii/make-node-cache threshold))]
                  (case state
                    :existing
