@@ -12,7 +12,7 @@
                                       commit! create-commit-id get-and-clear-pending-kvs!
                                       write-pending-kvs! branch-heads-as-commits
                                       read-head compact-head commit-graph-writes
-                                      commit-graph-records]]
+                                      commit-graph-records commit-graph-key]]
             [datahike.writer]
             [datahike.index.secondary :as sec]
             ;; cljs: S is a VAR (the supervisor) → :refer; go-try-/<?-/<?/go-loop-try
@@ -489,6 +489,18 @@
           (vswap! seen into (concat stored derived))
           (get @seen cid))))))
 
+(defn commit-graph-record
+  "Commit `cid`'s graph record, {:datahike/parents #{cid} :datahike/generation n}:
+   the stored one, else derived from the commit records (nothing written);
+   nil when the store holds no commit `cid`. A pure function of an immutable
+   commit id, so a caller may cache it forever and hand it to `merge-base`.
+   A commit without a stored record is derived through its whole unrecorded
+   lineage on each call: run `backfill-commit-graph!` once before caching
+   many of them."
+  [conn-or-store cid]
+  (let [{:keys [stored derived]} (commit-graph-records (extract-store conn-or-store) [cid])]
+    (or (get stored cid) (get derived cid))))
+
 (defn- reaches?
   "Whether `x` is an ancestor of `y` (or `y` itself). Commits below `x`'s
    generation cannot reach it, so the walk stops there."
@@ -555,42 +567,79 @@
    :branch-does-not-exist for an unknown input, and :commit-graph-disabled
    on a store created with :commit-graph? false.
 
-   A pure function of two commit ids: callers may cache it forever."
-  [conn-or-store a b]
-  (let [config (cond
-                 #?(:clj (instance? clojure.lang.IDeref conn-or-store)
-                    :cljs (satisfies? IDeref conn-or-store)) (:config @conn-or-store)
-                 (db? conn-or-store) (:config conn-or-store))
-        store (extract-store conn-or-store)
-        cid-of (fn [x]
-                 (cond
-                   (uuid? x) x
-                   (keyword? x)
-                   (let [head (read-head store x {:sync? true})]
-                     (when-not head
-                       (log/raise "Branch does not exist."
-                                  {:type :branch-does-not-exist :branch x}))
-                     (when (false? (get-in head [:config :commit-graph?]))
-                       (log/raise "This store was created with :commit-graph? false, so it has no merge base."
-                                  {:type :commit-graph-disabled :commit-graph? false}))
-                     (get-in head [:meta :datahike/commit-id]))
-                   :else (log/raise "A merge base is computed for commit ids or branch keywords."
-                                    {:type :invalid-merge-base-input :input x})))]
-    (when (false? (:commit-graph? config))
-      (log/raise "This store was created with :commit-graph? false, so it has no merge base."
-                 {:type :commit-graph-disabled :commit-graph? false}))
-    (let [a (cid-of a)
-          b (cid-of b)
-          node (graph-reader store)]
-      (doseq [c [a b]]
-        (when-not (node c)
-          (log/raise "Commit record does not exist." {:type :commit-not-found :commit-id c})))
-      (let [found (paint-down-to-common node a b)
-            best (into #{} (remove (fn [x] (some #(and (not= x %) (reaches? node x %)) found))) found)]
-        (when (< 1 (count best))
-          (log/raise "More than one best common ancestor (criss-cross merge)."
-                     {:type :merge-base-criss-cross :merge-bases best}))
-        (first best)))))
+   A pure function of two commit ids: callers may cache it forever.
+
+   `read-record` (cid -> graph record or nil, default a reader of this call
+   alone) lets callers that ask for many merge bases share the record reads:
+   back it with a cache of `commit-graph-record` keyed by commit id."
+  ([conn-or-store a b] (merge-base conn-or-store a b nil))
+  ([conn-or-store a b read-record]
+   (let [config (cond
+                  #?(:clj (instance? clojure.lang.IDeref conn-or-store)
+                     :cljs (satisfies? IDeref conn-or-store)) (:config @conn-or-store)
+                  (db? conn-or-store) (:config conn-or-store))
+         store (extract-store conn-or-store)
+         cid-of (fn [x]
+                  (cond
+                    (uuid? x) x
+                    (keyword? x)
+                    (let [head (read-head store x {:sync? true})]
+                      (when-not head
+                        (log/raise "Branch does not exist."
+                                   {:type :branch-does-not-exist :branch x}))
+                      (when (false? (get-in head [:config :commit-graph?]))
+                        (log/raise "This store was created with :commit-graph? false, so it has no merge base."
+                                   {:type :commit-graph-disabled :commit-graph? false}))
+                      (get-in head [:meta :datahike/commit-id]))
+                    :else (log/raise "A merge base is computed for commit ids or branch keywords."
+                                     {:type :invalid-merge-base-input :input x})))]
+     (when (false? (:commit-graph? config))
+       (log/raise "This store was created with :commit-graph? false, so it has no merge base."
+                  {:type :commit-graph-disabled :commit-graph? false}))
+     (let [a (cid-of a)
+           b (cid-of b)
+           node (or read-record (graph-reader store))]
+       (doseq [c [a b]]
+         (when-not (node c)
+           (log/raise "Commit record does not exist." {:type :commit-not-found :commit-id c})))
+       (let [found (paint-down-to-common node a b)
+             best (into #{} (remove (fn [x] (some #(and (not= x %) (reaches? node x %)) found))) found)]
+         (when (< 1 (count best))
+           (log/raise "More than one best common ancestor (criss-cross merge)."
+                      {:type :merge-base-criss-cross :merge-bases best}))
+         (first best))))))
+
+(defn backfill-commit-graph!
+  "Writes the commit graph record of every commit a branch head reaches
+   that has none: the commits written before graph records existed.
+
+   One derivation for the whole store (`commit-graph-records` over every
+   branch head), written parents first in batches of `:batch-size` (default
+   1000), so a stored record always has its ancestors' records and a torn
+   run resumes where it stopped. Records are derived from immutable commits,
+   so the write is idempotent and needs no writer: a concurrent commit
+   writing the same record writes the same value, and a record whose commit
+   gc sweeps meanwhile is an orphan the next gc takes. Once done, a run reads
+   one record per branch head and writes nothing.
+
+   Returns {:datahike/branches n :datahike/written n}. Raises
+   :commit-graph-disabled on a store created with :commit-graph? false."
+  ([conn-or-store] (backfill-commit-graph! conn-or-store {}))
+  ([conn-or-store {:keys [batch-size] :or {batch-size 1000}}]
+   (let [store (extract-store conn-or-store)
+         branches (k/get store :branches nil {:sync? true})
+         heads (keep #(read-head store % {:sync? true}) branches)]
+     (when (some #(false? (get-in % [:config :commit-graph?])) heads)
+       (log/raise "This store was created with :commit-graph? false, so it has no commit graph records."
+                  {:type :commit-graph-disabled :commit-graph? false}))
+     (let [{:keys [derived]} (commit-graph-records store (into #{} (keep #(get-in % [:meta :datahike/commit-id])) heads))
+           writes (into [] (map (fn [[c r]] [(commit-graph-key c) r]))
+                        (sort-by (comp :datahike/generation val) derived))]
+       (doseq [batch (partition-all batch-size writes)]
+         (if (multi-key-capable? store)
+           (k/multi-assoc store (vec batch) (into {} (map (fn [[gk _]] [gk {:immutable? true}])) batch) {:sync? true})
+           (doseq [[gk gv] batch] (k/assoc store gk gv {:immutable? true} {:sync? true}))))
+       {:datahike/branches (count branches) :datahike/written (count writes)}))))
 
 (defn commit-as-db
   "Loads the database stored at this commit id.

@@ -497,7 +497,8 @@
         gen (fn [p] (:datahike/generation (or (get stored p) (get derived p))))
         record {:datahike/parents (set parents)
                 :datahike/generation (inc (reduce max 0 (keep gen parents)))}]
-    (conj (mapv (fn [[c r]] [(commit-graph-key c) r]) derived)
+    ;; parents first: a torn batch never leaves a record whose ancestors lack theirs
+    (conj (mapv (fn [[c r]] [(commit-graph-key c) r]) (sort-by (comp :datahike/generation val) derived))
           [(commit-graph-key cid) record])))
 
 (defn- audit-grade?

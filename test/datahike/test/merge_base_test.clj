@@ -203,3 +203,51 @@
           (try
             (is (empty? wrong) (str "seed " seed))
             (finally (doseq [[b c] conns :when (not= b :db)] (d/release c)))))))))
+
+(deftest the-backfill-writes-every-missing-record-once
+  (with-store (cfg)
+    (fn [main]
+      (tx! main 0)
+      (v/branch! main :db :chain)
+      (on-branch main :chain
+        (fn [chain]
+          (let [store (:store @main)]
+            (dotimes [i 3] (tx! main i) (tx! chain i))
+            (forward-merge! chain main 5)
+            (tx! main 6) (tx! chain 7)
+            (v/branch! main (d/commit-id @chain) :relaunch)
+            (let [heads [(d/commit-id @chain) (d/commit-id @main)]
+                  before (apply d/merge-base main heads)
+                  records (into {} (map (fn [gk] [gk (k/get store gk nil {:sync? true})])) (graph-keys store))]
+              ;; the store as it was before graph records existed
+              (doseq [gk (keys records)] (k/dissoc store gk {:sync? true}))
+              (testing "a legacy commit's record is derived on read and nothing is written"
+                (is (= (get records (w/commit-graph-key (first heads))) (d/commit-graph-record main (first heads))))
+                (is (empty? (graph-keys store))))
+              (testing "one run writes every reachable commit's record, equal to what the writer wrote"
+                (is (= {:datahike/branches 3 :datahike/written (count records)}
+                       (d/backfill-commit-graph! main {:batch-size 2})))
+                (is (= records (into {} (map (fn [gk] [gk (k/get store gk nil {:sync? true})])) (graph-keys store)))))
+              (testing "merge-base answers are unchanged, also through a record reader shared across calls"
+                (is (= before (apply d/merge-base main heads)))
+                (let [shared (memoize #(d/commit-graph-record main %))]
+                  (is (= before (d/merge-base main (first heads) (second heads) shared)))
+                  (is (= before (d/merge-base main :relaunch :db shared))))
+                (is (= before (d/merge-base main :relaunch :db))))
+              (testing "a second run writes nothing"
+                (is (= {:datahike/branches 3 :datahike/written 0} (d/backfill-commit-graph! (:store @main))))))))))))
+
+(deftest the-backfill-writes-parents-first
+  (with-store (cfg)
+    (fn [main]
+      (dotimes [i 4] (tx! main i))
+      (let [store (:store @main)
+            gks (graph-keys store)
+            records (into {} (map (fn [gk] [gk (k/get store gk nil {:sync? true})])) gks)]
+        (doseq [gk gks] (k/dissoc store gk {:sync? true}))
+        (testing "a torn run that wrote only the oldest records resumes to the full set"
+          (d/backfill-commit-graph! main {:batch-size 2})
+          (let [by-gen (sort-by (comp :datahike/generation val) records)]
+            (doseq [[gk _] (drop 2 by-gen)] (k/dissoc store gk {:sync? true}))
+            (is (= (- (count records) 2) (:datahike/written (d/backfill-commit-graph! main))))
+            (is (= records (into {} (map (fn [gk] [gk (k/get store gk nil {:sync? true})])) (graph-keys store))))))))))

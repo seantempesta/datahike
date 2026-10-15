@@ -118,14 +118,38 @@
    of generated JavaScript, Java, native, Python, pod, CLI, HTTP, or capability
    surfaces."
   '{merge-base
-    {:args [:=> [:cat :any [:or :uuid :keyword] [:or :uuid :keyword]] [:maybe :uuid]]
+    {:args [:function
+            [:=> [:cat :any [:or :uuid :keyword] [:or :uuid :keyword]] [:maybe :uuid]]
+            [:=> [:cat :any [:or :uuid :keyword] [:or :uuid :keyword] [:maybe ifn?]] [:maybe :uuid]]]
      :ret [:maybe :uuid]
      :categories [:versioning :query :host]
      :stability :experimental
      :supports-remote? false
      :referentially-transparent? true
-     :doc "Returns the merge base of two commit ids or branch keywords: their best common ancestor commit id, nil when they share none. Raises :merge-base-criss-cross when there is more than one."
+     :doc "Returns the merge base of two commit ids or branch keywords: their best common ancestor commit id, nil when they share none. Raises :merge-base-criss-cross when there is more than one. The optional fourth argument reads a commit's graph record (cid -> record or nil), so many calls can share one cache of commit-graph-record."
      :impl datahike.versioning/merge-base}
+
+    commit-graph-record
+    {:args [:=> [:cat :any :uuid] [:maybe :map]]
+     :ret [:maybe :map]
+     :categories [:versioning :query :host]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? true
+     :doc "Returns a commit's graph record {:datahike/parents #{cid} :datahike/generation n}: stored, else derived without writing; nil for an unknown commit. Cacheable forever by commit id."
+     :impl datahike.versioning/commit-graph-record}
+
+    backfill-commit-graph!
+    {:args [:function
+            [:=> [:cat :any] :map]
+            [:=> [:cat :any [:map [:batch-size {:optional true} pos-int?]]] :map]]
+     :ret [:map [:datahike/branches nat-int?] [:datahike/written nat-int?]]
+     :categories [:versioning :maintenance :host]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? false
+     :doc "Writes the commit graph record of every commit a branch head reaches that has none (commits written before graph records existed), parents first, in batches. Idempotent: once done it reads one record per branch head and writes nothing. Returns {:datahike/branches n :datahike/written n}."
+     :impl datahike.versioning/backfill-commit-graph!}
 
     shallow-weight-within
     {:args [:=> [:cat :any [:int {:min 0}]]
