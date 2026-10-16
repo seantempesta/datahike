@@ -22,8 +22,9 @@
 
 (defn- reachable-in-branch
   "The keys `branch` reaches from its head through commits newer than
-  `after-date`. `visited` (commit keys) and `seen` (index node addresses) are
-  atoms shared by every branch of one collection: a commit another branch
+  `after-date`, and the secondary-index key maps those commits record:
+  `{:reachable keys :key-maps key-maps}`. `visited` (commit keys) and `seen`
+  (index node addresses) are atoms shared by every branch of one collection: a commit another branch
   already claimed is walked there, and a node already marked had its whole
   subtree marked, so the mark costs the store's distinct commits and nodes,
   not branches times commits times tree size."
@@ -31,10 +32,11 @@
   (go-try S
           (let [head-cid (<? S (k/get-in store [branch :meta :datahike/commit-id]))]
             (loop [[to-check & r] [branch]
-                   reachable      #{branch head-cid}]
+                   reachable      #{branch head-cid}
+                   key-maps       #{}]
               (if to-check
                 (if (contains? (first (swap-vals! visited conj to-check)) to-check) ;; claimed: skip
-                  (recur r reachable)
+                  (recur r reachable key-maps)
                   (if-let [record (<? S (read-head store to-check {:sync? false}))]
                     (let [{:keys                         [eavt-key avet-key aevt-key
                                                           temporal-eavt-key temporal-avet-key temporal-aevt-key
@@ -81,14 +83,15 @@
                                             sec-reachable
                                             (set/union sec-reachable))]
                         (recur (concat r (when in-range? parents))
-                               new-reachable)))
+                               new-reachable
+                               (into key-maps (vals secondary-index-keys)))))
                     ;; Record absent: already swept by an earlier pass with a
                     ;; narrower window, or the store runs :commit-graph? false
                     ;; and never persisted it. Lineage ends here — nothing to
                     ;; mark. (Without this guard the nil destructure NPEs at
                     ;; get-time.)
-                    (recur r reachable)))
-                reachable)))))
+                    (recur r reachable key-maps)))
+                {:reachable reachable :key-maps key-maps})))))
 
 (defn gc-storage!
   "Invokes garbage collection on the database by whitelisting currently known branches.
@@ -159,11 +162,12 @@
                      _ (log/trace :datahike/gc-retain-branches {:branches branches})
                      visited (atom #{})
                      seen (atom #{})
-                     native-reachable (->> branches
-                                           (map #(reachable-in-branch store % remove-before config visited seen))
-                                           async/merge
-                                           (<<? S)
-                                           (apply set/union))
+                     marked (->> branches
+                                 (map #(reachable-in-branch store % remove-before config visited seen))
+                                 async/merge
+                                 (<<? S))
+                     native-reachable (into #{} (mapcat :reachable) marked)
+                     retained-key-maps (into #{} (mapcat :key-maps) marked)
                      extension
                      (if-let [extend-reachable (:datahike.gc/reachable-extension opts)]
                        (or (extend-reachable
@@ -180,6 +184,12 @@
                      sweep-opts (or (:datahike.gc/sweep-opts opts) {})]
                  (log/trace :datahike/gc-reachable {:reachable-count (count reachable)
                                                     :cutoff cutoff})
+                 ;; Datahike decides reachability for secondary storage too:
+                 ;; each index type collects its own store from the key maps
+                 ;; of exactly the commits this collection retains, so a
+                 ;; deleted branch's secondary state goes with its commits.
+                 (doseq [[index-type key-maps] (group-by :type retained-key-maps)]
+                   (sec/sweep-from-key-maps! index-type key-maps cutoff))
                  (<? S (sweep! store reachable cutoff batch-size sweep-opts)))
                (finally
                  (guard/release-reachability-permit! sweep-permit)))))))

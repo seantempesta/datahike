@@ -105,11 +105,13 @@
             (is (not (es/entity-bitset-contains? results 2)))
             (is (= 2 (es/entity-bitset-cardinality results))))
 
-        ;; Non-vector value is silently skipped
-          (let [d-str (datahike.datom/datom 4 :person/embedding "not-a-vector")
-                idx2 (sec/-transact idx {:datom d-str :added? true})
-                results (sec/-search idx2 {:vector (float-array [1.0 0.0 0.0 0.0]) :k 10} nil)]
-            (is (= 3 (es/entity-bitset-cardinality results)))))))))
+        ;; A non-vector value is refused, never dropped
+          (let [d-str (datahike.datom/datom 4 :person/embedding "not-a-vector")]
+            (is (= :proximum/non-vector-value
+                   (try (sec/-transact idx {:datom d-str :added? true})
+                        nil
+                        (catch clojure.lang.ExceptionInfo e
+                          (:type (ex-data e))))))))))))
 
 (deftest historical-branch-restores-selected-proximum-commit
   (when-not proximum-available?
@@ -396,17 +398,17 @@
             (dv/branch! main :db :legacy-prepared)
             (let [prepared (d/connect (assoc cfg :branch :legacy-prepared))]
               (try
-                (testing "branching alone upgrades the selected legacy source"
+                (testing "a branch of the legacy source shares its commit"
                   (is (= #{1}
                          (nearest-proximum-eids @prepared [1.0 0.0 0.0 0.0])))
-                  (let [prepared-key-map
-                        (get-in (dw/read-head (:store @main) :legacy-prepared)
+                  (let [source-key-map
+                        (get-in (dw/read-head (:store @main) :db)
                                 [:secondary-index-keys :idx/vectors])
-                        snapshot (k/get (prox-call 'proximum.writing/connect-store-sync
-                                                   prox-store)
-                                        (:commit-id prepared-key-map) nil {:sync? true})]
-                    (is (= "legacy-prepared" (:branch prepared-key-map)))
-                    (is (uuid? (:mmap-generation snapshot)))))
+                        prepared-key-map
+                        (get-in (dw/read-head (:store @main) :legacy-prepared)
+                                [:secondary-index-keys :idx/vectors])]
+                    (is (= (:commit-id source-key-map) (:commit-id prepared-key-map)))
+                    (is (:fork-on-write prepared-key-map))))
                 (d/transact main [{:db/id 1
                                    :person/embedding [0.0 1.0 0.0 0.0]}
                                   {:db/id 2
@@ -420,7 +422,8 @@
                         (get-in (dw/read-head (:store @main) :db)
                                 [:secondary-index-keys :idx/vectors])]
                     (is (= source-root (:commit-id forced-key-map)))
-                    (is (= "main" (:branch forced-key-map)))))
+                    (is (:fork-on-write forced-key-map)
+                        "forcing to a branch that shares a commit writes nothing native")))
                 (d/release main)
                 (let [reopened (d/connect cfg)]
                   (try
@@ -437,6 +440,183 @@
           (d/delete-database cfg)
           (delete-tree! prox-path)
           (delete-tree! (str prox-path "-mmap")))))))
+
+;; ---------------------------------------------------------------------------
+;; Proximum in a vector database: :db.secondary/only values, Datalog kNN,
+;; storage per commit and per branch, collection.
+
+(defn- with-vector-db
+  "Call `f` with a connection to a fresh database whose `:doc/vec` values live
+   only in the :proximum index `:idx/vectors`, holding \"a\" at [1 0 0 0] and
+   \"b\" at [0 1 0 0], and with the stores' paths and configuration."
+  [f]
+  (let [prox-path (str (System/getProperty "java.io.tmpdir")
+                       "/datahike-proximum-vdb-" (random-uuid))
+        prox-store {:backend :file :path prox-path :id (random-uuid)}
+        cfg {:store {:backend :file :path (str prox-path "-dh") :id (random-uuid)}
+             :schema-flexibility :read
+             :keep-history? true}
+        _ (d/create-database cfg)
+        conn (d/connect cfg)]
+    (try
+      (d/transact conn [{:db/ident :doc/vec
+                         :db/cardinality :db.cardinality/one
+                         :db.secondary/only true}
+                        {:db/ident :doc/name
+                         :db/cardinality :db.cardinality/one
+                         :db/unique :db.unique/identity}])
+      (d/transact conn [{:db/ident :idx/vectors
+                         :db.secondary/type :proximum
+                         :db.secondary/attrs [:doc/vec]
+                         :db.secondary/config {:dim 4 :distance :cosine :capacity 64
+                                               :store-config prox-store}
+                         :db.secondary/status :ready}])
+      (d/transact conn [{:doc/name "a" :doc/vec [1.0 0.0 0.0 0.0]}
+                        {:doc/name "b" :doc/vec [0.0 1.0 0.0 0.0]}])
+      (f {:conn conn :cfg cfg :prox-store prox-store
+          :mmap-dir (str prox-path "-mmap")})
+      (finally
+        (try (d/release conn) (catch Exception _ nil))
+        (d/delete-database cfg)
+        (delete-tree! prox-path)
+        (delete-tree! (str prox-path "-dh"))
+        (delete-tree! (str prox-path "-mmap"))))))
+
+(defn- nearest-names
+  "Names of the `k` documents nearest `v`, through the Datalog clause."
+  [db v k]
+  (set (d/q '[:find [?n ...]
+              :in $ ?q ?k
+              :where
+              [(datahike.index.secondary.proximum/nearest :idx/vectors ?q ?k) [[?e ?d]]]
+              [?e :doc/name ?n]]
+            db v k)))
+
+(defn- vector-key-map
+  [db]
+  (get-in (dw/read-head (:store db) (get-in db [:config :branch]))
+          [:secondary-index-keys :idx/vectors]))
+
+(deftest proximum-nearest-is-a-datalog-clause
+  (when proximum-available?
+    (with-vector-db
+      (fn [{:keys [conn]}]
+        (is (= #{"a"} (nearest-names @conn [1.0 0.1 0.0 0.0] 1)))
+        (is (= #{"a" "b"} (nearest-names @conn [1.0 0.1 0.0 0.0] 2)))
+        (testing "the distance column binds, nearest first"
+          (let [[[n1 d1] [n2 d2]]
+                (sort-by second
+                         (d/q '[:find ?n ?d
+                                :in $ ?q
+                                :where
+                                [(datahike.index.secondary.proximum/nearest :idx/vectors ?q 2) [[?e ?d]]]
+                                [?e :doc/name ?n]]
+                              @conn [1.0 0.1 0.0 0.0]))]
+            (is (= ["a" "b"] [n1 n2]))
+            (is (< d1 d2))))))))
+
+(deftest proximum-datom-merge-carries-the-vector
+  (when proximum-available?
+    (with-vector-db
+      (fn [{:keys [conn cfg]}]
+        (dv/branch! conn :db :feature)
+        (let [feature (d/connect (assoc cfg :branch :feature))]
+          (try
+            (d/transact feature [{:doc/name "c" :doc/vec [0.0 0.0 1.0 0.0]}])
+            (let [source @feature
+                  [_ only-feature] (db/datoms-diff @conn source :eavt [])
+                  tx-data (mapv (fn [datom]
+                                  [:db/add (str (:e datom)) (:a datom)
+                                   (sec/datom-value source datom)])
+                                (remove #(= :db/txInstant (:a %)) only-feature))]
+              (testing "a datom of a :db.secondary/only attribute reads back its vector"
+                (is (some #(= [0.0 0.0 1.0 0.0] %) (map last tx-data))))
+              (dv/merge! conn #{:feature} tx-data)
+              (is (= #{"c"} (nearest-names @conn [0.0 0.0 1.0 0.0] 1))))
+            (finally
+              (d/release feature))))))))
+
+(deftest proximum-unrelated-commit-reads-nothing-from-proximum
+  (when proximum-available?
+    (with-vector-db
+      (fn [{:keys [conn prox-store]}]
+        (let [before (vector-key-map @conn)
+              store (prox-call 'proximum.writing/connect-store-sync prox-store)]
+          ;; Remove the committed snapshot the key map names: a flush that
+          ;; consults it would now sync a new commit.
+          (k/dissoc store (:commit-id before) {:sync? true})
+          (d/transact conn [{:doc/name "z"}])
+          (is (= (:commit-id before) (:commit-id (vector-key-map @conn)))
+              "a commit that touches no vector re-exports the clean owner's commit"))))))
+
+(defn- native-branches
+  [prox-store]
+  (k/get (prox-call 'proximum.writing/connect-store-sync prox-store)
+         :branches nil {:sync? true}))
+
+(defn- file-names
+  [dir]
+  (set (map #(.getName ^java.io.File %) (.listFiles (java.io.File. ^String dir)))))
+
+(deftest proximum-branch-forks-on-its-first-vector-write
+  (when proximum-available?
+    (with-vector-db
+      (fn [{:keys [conn cfg prox-store mmap-dir]}]
+        (let [branches-before (native-branches prox-store)
+              files-before (file-names mmap-dir)
+              main-key-map (vector-key-map @conn)]
+          (dv/branch! conn :db :feature)
+          (testing "branch! writes nothing to Proximum"
+            (is (= branches-before (native-branches prox-store)))
+            (is (= files-before (file-names mmap-dir))))
+          (let [feature (d/connect (assoc cfg :branch :feature))]
+            (try
+              (is (= (:commit-id main-key-map)
+                     (:commit-id (vector-key-map @feature))))
+              (testing "a commit that writes no vector still shares the commit"
+                (d/transact feature [{:doc/name "no-vector"}])
+                (is (= branches-before (native-branches prox-store)))
+                (is (= (:commit-id main-key-map)
+                       (:commit-id (vector-key-map @feature))))
+                (is (= #{"a"} (nearest-names @feature [1.0 0.0 0.0 0.0] 1))))
+              (testing "the first vector write forks a native branch of its own"
+                (d/transact feature [{:doc/name "c" :doc/vec [0.0 0.0 1.0 0.0]}])
+                (is (= 1 (count (remove branches-before (native-branches prox-store)))))
+                (is (= #{"c"} (nearest-names @feature [0.1 0.0 1.0 0.0] 1)))
+                (is (= #{"a"} (nearest-names @conn [0.1 0.0 1.0 0.0] 1)) "main is untouched")
+                (is (= (:commit-id main-key-map) (:commit-id (vector-key-map @conn)))))
+              (testing "both branches restore their own vectors"
+                (d/release feature)
+                (let [cold (d/connect (assoc cfg :branch :feature))]
+                  (try
+                    (is (= #{"c"} (nearest-names @cold [0.0 0.0 1.0 0.0] 1)))
+                    (finally (d/release cold)))))
+              (finally
+                (try (d/release feature) (catch Exception _ nil))))))))))
+
+(deftest proximum-gc-sweeps-a-deleted-branch
+  (when proximum-available?
+    (with-vector-db
+      (fn [{:keys [conn cfg prox-store]}]
+        (let [branches-before (native-branches prox-store)]
+          (dv/branch! conn :db :feature)
+          (let [feature (d/connect (assoc cfg :branch :feature))]
+            (d/transact feature [{:doc/name "c" :doc/vec [0.0 0.0 1.0 0.0]}])
+            (d/release feature))
+          (let [forked (remove branches-before (native-branches prox-store))]
+            (is (= 1 (count forked)) "the branch wrote a native branch of its own")
+            (dv/delete-branch! conn :feature)
+            (Thread/sleep 10)
+            @(d/gc-storage conn (java.util.Date.))
+            (is (= branches-before (native-branches prox-store))
+                "the deleted branch's native branch is collected")
+            (testing "main's vectors survive collection and a cold restore"
+              (d/release conn)
+              (let [cold (d/connect cfg)]
+                (try
+                  (is (= #{"a"} (nearest-names @cold [1.0 0.0 0.0 0.0] 1)))
+                  (is (= #{"a" "b"} (nearest-names @cold [1.0 0.0 0.0 0.0] 2)))
+                  (finally (d/release cold)))))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Scriptum (Full-Text Search) Tests

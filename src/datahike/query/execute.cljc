@@ -3978,6 +3978,29 @@
        (into {} (map (fn [v] [v (keyword (subs (name v) 1))]) binding-vars)))))
 
 #?(:clj
+   (defn- engine-query-spec
+     "The query an external engine op sends its index: the engine's
+      `:query-spec` builder applied to the clause arguments (index ident
+      first, scalar inputs already substituted), else the text-search shape
+      `{:query :field}` over the arguments after the ident."
+     [op]
+     (let [args (vec (:args op))]
+       (if-let [build (get-in op [:engine-meta :query-spec])]
+         (build args)
+         {:query (nth args 1 nil) :field (nth args 2 nil)}))))
+
+#?(:clj
+   (defn- engine-binding-columns
+     "The result key each binding var reads: the engine's declared
+      `:binding-columns` by position, else `:entity-id` for the first var and
+      the var's own name for the rest."
+     [op binding-vars]
+     (let [declared (get-in op [:engine-meta :binding-columns])]
+       (if (sequential? declared)
+         (vec (take (count binding-vars) declared))
+         (into [:entity-id] (map #(keyword (subs (name %) 1))) (rest binding-vars))))))
+
+#?(:clj
    (defn- execute-external-engine
      "Execute an external engine op and merge results into context.
       Dispatches on :mode — :filter, :retrieval, or :solver."
@@ -3997,22 +4020,13 @@
          ;; Also stores the bitmap in :entity-filters for downstream entity-group optimization.
          :filter
          (if idx
-           (let [;; Build query-spec from args (skip the index ident arg)
-                 query-args (vec (drop 1 args))
-                 resolved-args query-args
-                 ;; Build query-spec — the engine function knows its own format
-                 ;; For now, call the resolved function with args to get query-spec
-                 resolved-fn (when (and (symbol? fn-sym) (namespace fn-sym))
+           (let [resolved-fn (when (and (symbol? fn-sym) (namespace fn-sym))
                                (some-> (resolve fn-sym) deref))
                  result-bs (if resolved-fn
-                             ;; Call the function which should return results.
                              ;; `search-with-vt` reads the db's `:datahike/valid-at`
                              ;; marker (set by `d/valid-at`) and routes through
                              ;; `-search-at-vt` for vt-aware indices.
-                             (sec/search-with-vt db idx
-                                                 {:query (first resolved-args)
-                                                  :field (second resolved-args)}
-                                                 nil)
+                             (sec/search-with-vt db idx (engine-query-spec op) nil)
                              (es/entity-bitset))
                  ;; Create relation from entity IDs
                  entity-var (first binding-vars)
@@ -4031,21 +4045,13 @@
          ;; Retrieval: EntityBitSet + extra columns (score, distance)
          :retrieval
          (if idx
-           (let [query-args (vec (drop 1 args))
-                 results (sec/slice-ordered-with-vt db idx
-                                                    {:query (first query-args)
-                                                     :field (second query-args)}
+           (let [results (sec/slice-ordered-with-vt db idx (engine-query-spec op)
                                                     nil nil nil nil)
                  ;; Map binding vars to column indices
                  attrs (into {} (map-indexed (fn [i v] [v i]) binding-vars))
-                 ;; Build tuples from results
-                 tuples (set (mapv (fn [r]
-                                     (mapv (fn [v]
-                                             (cond
-                                               (= v (first binding-vars)) (:entity-id r)
-                                               :else (get r (keyword (name v)))))
-                                           binding-vars))
-                                   results))
+                 ;; The i-th binding var takes the engine's i-th declared column.
+                 columns (engine-binding-columns op binding-vars)
+                 tuples (set (mapv (fn [r] (mapv #(get r %) columns)) results))
                  rel (rel/->Relation attrs tuples)]
              (update ctx :rels rel/collapse-rels rel))
            (#?(:clj legacy/bind-by-fn :cljs (rel/get-legacy-fn :bind-by-fn)) ctx (:clause op)))

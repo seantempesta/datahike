@@ -16,11 +16,11 @@
    [konserve.core :as k]
    [proximum.core :as prox]
    [proximum.crypto :as pcrypto]
+   [proximum.gc :as pgc]
    [proximum.protocols :as pproto]
    [proximum.writing :as pwr]
    [proximum.versioning :as pver]
    [proximum.hnsw.internal :as phi]
-   [replikativ.logging :as log]
    [clojure.core.async :as async]
    [clojure.java.io :as io]))
 
@@ -41,14 +41,16 @@
   "Coerce an embedding value to a Java float[] for Proximum. Datahike validates
    a :db.type/tuple value as a Clojure vector, so the value reaching -transact
    is a (vector? ...) of numbers — but Proximum's insert/search want a float[].
-   Accept either form; nil if it is neither (e.g. a non-vector value on the
-   indexed attr, which we then skip)."
-  [v]
+   Any other value is refused: a non-vector on a vector attribute is its
+   producer's defect, and dropping it would lose the value silently."
+  [v eid]
   (cond
-    (nil? v)                       nil
     (instance? float-array-class v) v
     (sequential? v)                (float-array v)
-    :else                          nil))
+    :else (throw (ex-info "A :proximum attribute's value is not a vector."
+                          {:type :proximum/non-vector-value
+                           :eid eid
+                           :value-type (type v)}))))
 
 (defn- await-owner!
   "Await a Proximum owner channel and surface asynchronous failures."
@@ -59,24 +61,25 @@
       result)))
 
 (defn- owner->key-map
-  "Describe one already-durable Proximum owner without syncing it."
+  "Describe one already-durable Proximum owner without syncing it. A branch
+   that still shares its source's commit carries `:fork-on-write true`."
   [owner config]
   (let [commit-id (pproto/current-commit owner)]
-    {:type :proximum
-     :branch (name (pproto/current-branch owner))
-     :commit-id commit-id
-     :merkle-root commit-id
-     :mmap-dir (effective-mmap-dir config)
-     :store-config (:store-config config)}))
+    (cond-> {:type :proximum
+             :branch (name (pproto/current-branch owner))
+             :commit-id commit-id
+             :merkle-root commit-id
+             :mmap-dir (effective-mmap-dir config)
+             :store-config (:store-config config)}
+      (:fork-on-write config) (assoc :fork-on-write true))))
 
-(defn- generation-addressed-owner?
-  "True when an owner's immutable commit carries mmap generation evidence."
+(defn- fork-owner
+  "A writable owner for a branch that shared its source's commit: a native
+   Proximum branch of its own, forked from that commit. Its name is fresh, so
+   a recreated Datahike branch or a fork left by a failed transaction never
+   collides; collection removes native branches no commit names."
   [owner]
-  (when-let [commit-id (pproto/current-commit owner)]
-    (let [snapshot (k/get (pproto/raw-storage owner) commit-id nil {:sync? true})]
-      (and (:mmap-generation snapshot)
-           (:mmap-generation-bytes snapshot)
-           (:mmap-generation-sha256 snapshot)))))
+  (pver/branch! owner (keyword (str "fork-" (random-uuid)))))
 
 (defn- native-destination-branch
   "Resolve a destination attachment, including the legacy `db`/`main` lie."
@@ -127,6 +130,12 @@
      an empty edge graph, leaving only the entrypoint reachable (KNN returns 1
      hit) until a full re-embed.
 
+   A branch shares its source's commit read-only until its first vector
+   write (`:fork-on-write` in `config`): `-transact` then forks a native
+   branch, so `d/branch!` costs no Proximum write. `:borrowed? true` marks a
+   reify sharing another reify's live owner, which it must not close;
+   `:fork-source` is the restored owner a fork was taken from, which it does.
+
    Fix: `-sec-flush` resets `!idx` to the synced value, so the subsequent
    `-transact` on this same reify forks from the post-sync index (carrying the
    populated edge `:address-map`), and the address-map accumulates across
@@ -148,14 +157,16 @@
         ;; Proximum close! is asynchronous.  A Datahike connection release is
         ;; synchronous from the caller's perspective, so do not return while
         ;; the mmap index can still hold file descriptors or locks.
-        (await-owner! (pproto/close! @!idx)))
+        (when-not (:borrowed? config)
+          (await-owner! (pproto/close! @!idx)))
+        (some-> (:fork-source config) pproto/close! await-owner!))
 
       sec/ISecondaryIndex
       (-search [_ query-spec entity-filter]
         ;; query-spec: {:vector float-array, :k int}
         ;; Returns EntityBitSet of matching entity IDs
         (let [{:keys [vector k]} query-spec
-              qv (->float-array vector)
+              qv (->float-array vector nil)
               cur @!idx
               results (if entity-filter
                         (prox/search-filtered cur qv k
@@ -175,7 +186,7 @@
       (-slice-ordered [_ query-spec entity-filter _attr _direction limit]
         ;; KNN results are already distance-ordered; limit is just k
         (let [{:keys [vector k]} query-spec
-              qv (->float-array vector)
+              qv (->float-array vector nil)
               effective-k (if limit (min k limit) k)
               cur @!idx
               results (if entity-filter
@@ -189,6 +200,12 @@
                 results)))
 
       (-indexed-attrs [_] attrs)
+
+      sec/ISecondaryValue
+      (-value [_ eid _attr]
+        ;; The vector as the index holds it: float precision, and unit length
+        ;; under :cosine (Proximum normalizes on insert).
+        (some->> (prox/get-vector @!idx eid) (mapv double)))
 
       sec/IVersionedSecondaryIndex
       (-sec-flush [_ _store _branch]
@@ -235,10 +252,12 @@
         ;; whole HNSW edge graph on reopen. Resetting !idx makes the address-map
         ;; accumulate across commits.
         (let [current @!idx
-              ;; A restored or previously flushed owner already names an exact
-              ;; durable generation. Re-export it; syncing would create a new
-              ;; root and mutate the source during a guarded Datahike force.
-              synced (if (generation-addressed-owner? current)
+              ;; A clean owner (restored, branched or flushed, and unchanged
+              ;; since: every mutation clears its commit) already names its
+              ;; durable commit. Re-export it without touching storage;
+              ;; syncing would create a new root and mutate the source during
+              ;; a guarded Datahike force.
+              synced (if (pproto/current-commit current)
                        current
                        (await-owner! (pproto/sync! current)))]
           (reset! !idx synced)
@@ -249,12 +268,14 @@
         (let [restored (load-key-map-owner
                         key-map (or (:mmap-dir key-map)
                                     (effective-mmap-dir config)))]
-          (make-proximum-index restored config)))
+          (make-proximum-index restored
+                               (cond-> (dissoc config :fork-on-write :borrowed? :fork-source)
+                                 (:fork-on-write key-map) (assoc :fork-on-write true)))))
 
-      (-sec-branch [_ _store _from-branch new-branch]
-        ;; Fork via proximum's native branching (reflink mmap + konserve COW)
-        (let [branched (pver/branch! @!idx (keyword new-branch))]
-          (make-proximum-index branched config)))
+      (-sec-branch [_ _store _from-branch _new-branch]
+        ;; Share this owner's commit; the new branch forks on its first write.
+        (make-proximum-index @!idx (-> (dissoc config :fork-source)
+                                       (assoc :fork-on-write true :borrowed? true))))
 
       (-sec-mark [_]
         ;; Proximum uses its own konserve store, not datahike's
@@ -294,16 +315,19 @@
         (let [{:keys [datom added?]} tx-report
               eid (.-e datom)
               val (.-v datom)
-              cur @!idx]
+              shared @!idx
+              fork? (:fork-on-write config)
+              cur (cond-> shared fork? fork-owner)
+              ;; The restored owner this branch forked from is now this
+              ;; reify's to close; a borrowed one stays its lender's.
+              config (cond-> (dissoc config :fork-on-write :borrowed?)
+                       (and fork? (not (:borrowed? config))) (assoc :fork-source shared))]
           (if added?
             ;; Insert: coerce the datahike value (a Clojure vector after tuple
             ;; validation, or a raw float[]) to float[] for Proximum.
-            (if-let [fa (->float-array val)]
-              (make-proximum-index
-               (prox/insert cur fa eid)
-               config)
-              (do (log/warn :datahike/non-vector-embedding {:eid eid :type (type val)})
-                  (make-proximum-index cur config)))
+            (make-proximum-index
+             (prox/insert cur (->float-array val eid) eid)
+             config)
             ;; Retract: delete by external entity ID
             (make-proximum-index
              (prox/delete cur eid)
@@ -351,7 +375,9 @@
         (let [restored (load-key-map-owner
                         key-map (or (:mmap-dir key-map)
                                     (effective-mmap-dir config)))]
-          (make-proximum-index restored config)))
+          (make-proximum-index restored
+                               (cond-> config
+                                 (:fork-on-write key-map) (assoc :fork-on-write true)))))
       (-sec-branch [_ _store _from _new] (bug! "-sec-branch"))
       (-sec-mark [_] #{}))))
 
@@ -382,8 +408,34 @@
              prox-idx (prox/create-index prox-config)]
          (make-proximum-index prox-idx config))))))
 
-;; GC: proximum uses its own store, not datahike's konserve
+;; Datalog: k nearest neighbours as a :retrieval clause
+
+(defn nearest
+  "The `k` vectors in the :proximum index `ident` nearest to `v`, as a Datalog
+   clause binding entity ids and distances, nearest first:
+     [(datahike.index.secondary.proximum/nearest :idx/vectors ?q 10) [[?e ?d]]]
+   The query planner runs it against the index (`:datahike/external-engine`);
+   it has no meaning as a plain function call."
+  {:datahike/external-engine {:index-key 0
+                              :binding-columns [:entity-id :distance]
+                              :query-spec (fn [[_ident v k]] {:vector v :k k})}}
+  [ident _v _k]
+  (throw (ex-info "nearest runs as a Datalog clause over a :proximum index."
+                  {:type :proximum/nearest-without-index :index ident})))
+
+;; GC: proximum uses its own store, not datahike's konserve. Datahike's
+;; collection names the commits it retains; Proximum keeps exactly what their
+;; key maps reach, so a deleted Datahike branch's vectors go with its commits.
 (defmethod sec/mark-from-key-map :proximum [_ _] #{})
+
+(defmethod sec/sweep-from-key-maps! :proximum [_ key-maps cutoff]
+  (doseq [[[store-config mmap-dir] same-store]
+          (group-by (juxt :store-config effective-mmap-dir) key-maps)]
+    (pgc/gc-from-roots! store-config
+                        {:commits (into #{} (map :commit-id) same-store)
+                         :branches (into #{} (map (comp keyword :branch)) same-store)
+                         :mmap-dir mmap-dir}
+                        cutoff)))
 
 (defmethod sec/check-force-from-key-map :proximum
   [source-key-map current-key-map _store branch]
@@ -414,67 +466,56 @@
                      :current-store-config (:store-config current-key-map)
                      :source-mmap-dir (effective-mmap-dir source-key-map)
                      :current-mmap-dir (effective-mmap-dir current-key-map)})))
-  (let [store (pwr/connect-store-sync (:store-config source-key-map))
-        source-snapshot (k/get store (:commit-id source-key-map) nil {:sync? true})
-        current-snapshot (k/get store (:commit-id current-key-map) nil {:sync? true})
-        destination (native-destination-branch store current-key-map)
-        destination-head (k/get store destination nil {:sync? true})
-        destination-commit (:commit-id destination-head)]
-    (when-not (and source-snapshot current-snapshot)
-      (throw (ex-info "Proximum force key maps do not resolve to native commits."
-                      {:type :secondary-force/destination-attachment-mismatch
-                       :branch branch
-                       :source-commit (:commit-id source-key-map)
-                       :current-commit (:commit-id current-key-map)})))
-    (when-not (or (= (:commit-id current-key-map) destination-commit)
-                  (= (:commit-id source-key-map) destination-commit))
-      (throw (ex-info "Proximum destination branch moved before guarded force."
-                      {:type :force-branch/stale-destination
-                       :branch branch
-                       :native-branch destination
-                       :expected-current-commit (:commit-id current-key-map)
-                       :source-commit (:commit-id source-key-map)
-                       :current-commit destination-commit}))))
+  ;; A side that still shares another branch's commit owns no native branch:
+  ;; the force writes nothing native, so there is no native head to be stale.
+  (when-not (or (:fork-on-write source-key-map) (:fork-on-write current-key-map))
+    (let [store (pwr/connect-store-sync (:store-config source-key-map))
+          source-snapshot (k/get store (:commit-id source-key-map) nil {:sync? true})
+          current-snapshot (k/get store (:commit-id current-key-map) nil {:sync? true})
+          destination (native-destination-branch store current-key-map)
+          destination-head (k/get store destination nil {:sync? true})
+          destination-commit (:commit-id destination-head)]
+      (when-not (and source-snapshot current-snapshot)
+        (throw (ex-info "Proximum force key maps do not resolve to native commits."
+                        {:type :secondary-force/destination-attachment-mismatch
+                         :branch branch
+                         :source-commit (:commit-id source-key-map)
+                         :current-commit (:commit-id current-key-map)})))
+      (when-not (or (= (:commit-id current-key-map) destination-commit)
+                    (= (:commit-id source-key-map) destination-commit))
+        (throw (ex-info "Proximum destination branch moved before guarded force."
+                        {:type :force-branch/stale-destination
+                         :branch branch
+                         :native-branch destination
+                         :expected-current-commit (:commit-id current-key-map)
+                         :source-commit (:commit-id source-key-map)
+                         :current-commit destination-commit})))))
   nil)
 
 (defmethod sec/force-from-key-map :proximum
   [source-key-map current-key-map _store _branch]
-  (let [source-owner
-        (load-key-map-owner source-key-map
-                            (effective-mmap-dir source-key-map))
-        destination (native-destination-branch (pproto/raw-storage source-owner)
-                                               current-key-map)
-        forced-owner (volatile! nil)]
-    (try
-      (let [forced (pver/force-branch!
-                    source-owner
-                    destination
-                    (:commit-id current-key-map))]
-        (vreset! forced-owner forced)
-        (assoc (owner->key-map forced source-key-map)
-               :store-config (:store-config source-key-map)))
-      (finally
-        (when-let [owner @forced-owner]
-          (await-owner! (pproto/close! owner)))
-        (await-owner! (pproto/close! source-owner))))))
+  (if (or (:fork-on-write source-key-map) (:fork-on-write current-key-map))
+    ;; The destination shares the source's commit and forks on its first write.
+    (assoc source-key-map :fork-on-write true)
+    (let [source-owner
+          (load-key-map-owner source-key-map
+                              (effective-mmap-dir source-key-map))
+          destination (native-destination-branch (pproto/raw-storage source-owner)
+                                                 current-key-map)
+          forced-owner (volatile! nil)]
+      (try
+        (let [forced (pver/force-branch!
+                      source-owner
+                      destination
+                      (:commit-id current-key-map))]
+          (vreset! forced-owner forced)
+          (assoc (owner->key-map forced source-key-map)
+                 :store-config (:store-config source-key-map)))
+        (finally
+          (when-let [owner @forced-owner]
+            (await-owner! (pproto/close! owner)))
+          (await-owner! (pproto/close! source-owner)))))))
 
-;; Branch: load from stored commit, branch via proximum native
-(defmethod sec/branch-from-key-map :proximum [key-map _store _from-branch new-branch]
-  (let [idx (load-key-map-owner key-map (effective-mmap-dir key-map))
-        fork-owner (volatile! nil)]
-    (try
-      (let [branched (pver/branch! idx (keyword new-branch))
-            _ (vreset! fork-owner branched)
-            synced (await-owner! (pproto/sync! branched))
-            _ (vreset! fork-owner synced)
-            new-commit-id (phi/commit-id synced)]
-        (assoc key-map
-               :branch (name new-branch)
-               :commit-id new-commit-id
-               :merkle-root new-commit-id))
-      (finally
-        ;; sync! returns the new resource owner. Close exactly that value (or
-        ;; the pre-sync fork when sync failed), plus the independent source.
-        (when-let [owner @fork-owner]
-          (await-owner! (pproto/close! owner)))
-        (await-owner! (pproto/close! idx))))))
+;; Branch: share the stored commit; the branch forks on its first vector write
+(defmethod sec/branch-from-key-map :proximum [key-map _store _from-branch _new-branch]
+  (assoc key-map :fork-on-write true))
