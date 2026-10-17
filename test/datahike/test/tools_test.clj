@@ -132,3 +132,26 @@
           odds (iterate #(+ 2 %) 1)
           result (dt/merge-distinct-sorted-seqs compare odds evens)]
       (is (= (range 1000) (take 1000 result))))))
+
+(deftest a-delivered-failure-is-read-with-its-own-message-and-data
+  (let [data {:big (vec (range 100000))}
+        promise (dt/throwable-promise)
+        bean (java.lang.management.ManagementFactory/getThreadMXBean)
+        allocated #(.getThreadAllocatedBytes ^com.sun.management.ThreadMXBean bean
+                                             (.getId (Thread/currentThread)))]
+    (promise (ex-info "short failure" data))
+    (doseq [read [#(deref promise) #(deref promise 1000 ::timeout)]]
+      (let [before (allocated)
+            thrown (try (read) (catch Exception e e))
+            after (allocated)]
+        (is (= "short failure" (ex-message thrown)) "The message is the failure's own, not its data printed.")
+        (is (= data (ex-data thrown)) "The failure's data reaches the reader.")
+        (is (= "short failure" (ex-message (ex-cause thrown))))
+        (is (< (- after before) 1000000) "Reading a failure never prints its data.")))))
+
+(deftest a-delivered-error-is-thrown-as-it-is
+  (let [promise (dt/throwable-promise)
+        error (AssertionError. "fatal")]
+    (promise error)
+    (is (identical? error (try @promise (catch Throwable t t))))
+    (is (identical? error (try (deref promise 1000 ::timeout) (catch Throwable t t))))))

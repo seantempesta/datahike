@@ -90,37 +90,49 @@
 
 ;; adapted from https://clojure.atlassian.net/browse/CLJ-2766
 #?(:clj
+   (defn- delivered
+     "The delivered value `v`, thrown when it is a throwable: an Exception
+     wrapped once by `throw-if-exception-`, an Error as it is."
+     [v]
+     (if (and (instance? Throwable v) (not (instance? Exception v)))
+       (throw v)
+       (throw-if-exception- v))))
+
+#?(:clj
    (defn throwable-promise
      "Returns a promise object that can be read with deref/@, and set, once only, with deliver. Calls to deref/@ prior to delivery will block, unless the variant of deref with timeout is used. All subsequent derefs will return the same delivered value without blocking. Exceptions delivered to the promise will throw on deref. 
    
-      Also supports core.async take! to optionally consume values without blocking the reader thread."
+      Also supports core.async take! to optionally consume values without blocking the reader thread.
+
+      A delivered Throwable is held as the future's VALUE, never completed
+      exceptionally: `CompletableFuture/get` wraps an exceptional completion in
+      an ExecutionException whose message is the cause's `toString`, and an
+      ExceptionInfo's `toString` prints its whole ex-data, so a failed write
+      printed its error data unbounded. The reader receives the delivered throwable
+      wrapped once by `throw-if-exception-`, its message and ex-data intact."
      []
      (let [cf (CompletableFuture.)
            p (async/promise-chan)]
        (reify
          clojure.lang.IDeref
-         (deref [_] (throw-if-exception- (try (.get cf) (catch Throwable t t))))
+         (deref [_] (delivered (try (.get cf) (catch Throwable t t))))
          clojure.lang.IBlockingDeref
          (deref [_ timeout-ms timeout-val]
            (if-let [v (try (.get cf timeout-ms java.util.concurrent.TimeUnit/MILLISECONDS) (catch Throwable t t))]
-             (throw-if-exception- v)
+             (delivered v)
              timeout-val))
          clojure.lang.IPending
          (isRealized [_] (.isDone cf))
          clojure.lang.IFn
          (invoke [this x]
-           (if (instance? Throwable x)
-             (.completeExceptionally cf x)
-             (.complete cf x))
+           (.complete cf x)
            (if-not (nil? x) (async/put! p x) (async/close! p))
            this)
          async-impl/ReadPort
          (take! [_this handler] (async-impl/take! p handler))
          async-impl/WritePort
          (put! [_ val handler]
-           (if (instance? Throwable val)
-             (.completeExceptionally cf val)
-             (.complete cf val))
+           (.complete cf val)
            (async-impl/put! p val handler)))))
    :cljs (def throwable-promise async/promise-chan))
 

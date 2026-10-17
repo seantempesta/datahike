@@ -512,3 +512,23 @@
           (try (d/release conn) (catch Throwable _))
           (when (d/database-exists? cfg)
             (d/delete-database cfg)))))))
+
+(deftest a-null-pointer-in-an-invocation-names-the-operation-never-the-connection
+  (let [cfg {:store {:backend :memory :id (random-uuid)}
+             :schema-flexibility :read
+             :writer {:backend :self
+                      :write-fn-map {'npe (fn [_] (throw (NullPointerException. "invalidated")))}}}]
+    (d/create-database cfg)
+    (let [conn (d/connect cfg)]
+      (try
+        (let [database @conn
+              failure (take-with-timeout (writer/dispatch! (:writer database) {:op 'npe :args []}))]
+          (is (= :writer-error-during-invocation (:type (ex-data failure))))
+          (is (= 'npe (:op (ex-data failure))))
+          (is (= (get-in database [:config :branch]) (:branch (ex-data failure))))
+          (is (instance? NullPointerException (ex-cause failure)) "The cause is the exception's cause.")
+          (is (empty? (select-keys (ex-data failure) [:connection :invocation :error]))
+              "The data holds references, never the live connection or invocation."))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))

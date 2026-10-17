@@ -175,10 +175,11 @@
                                          :clj
                                          (let [failure (if (= (type e) NullPointerException)
                                                          (ex-info "Null pointer encountered in invocation. Connection may have been invalidated, e.g. through db deletion, and needs to be released everywhere."
-                                                                  {:type       :writer-error-during-invocation
-                                                                   :invocation invocation
-                                                                   :connection connection
-                                                                   :error      e})
+                                                                  {:type   :writer-error-during-invocation
+                                                                   :op     op
+                                                                   :branch (get-in old [:config :branch])
+                                                                   :datahike/commit-id (get-in old [:meta :datahike/commit-id])}
+                                                                  e)
                                                          e)]
                                            (put! callback failure)
                                            (some-> applied (put! failure))))
