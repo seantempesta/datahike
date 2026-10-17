@@ -92,20 +92,25 @@
                          (not= 0 (reference-count conn)))
                 (Thread/sleep 10)
                 (recur (dec attempts))))
-            (let [concurrent-release (future (d/release conn))]
+            (let [concurrent-release (future (d/release conn))
+                  concurrent-connect (future (d/connect cfg))]
               (testing "release remains blocked while an accepted write is committing"
                 (is (= ::waiting (deref release-result 100 ::waiting)))
                 (is (= ::waiting (deref concurrent-release 100 ::waiting))
                     "a concurrent release awaits the same drain"))
-              (testing "connect cannot resurrect a zero-reference closing connection"
-                (is (= :connection-is-being-released
-                       (try
-                         (d/connect cfg)
-                         (catch Exception e (:type (ex-data e)))))))
+              (testing "connect awaits a zero-reference closing connection's exit, never resurrecting it"
+                (is (= ::waiting (deref concurrent-connect 100 ::waiting))))
             (.countDown continue-commit)
             (is (map? (deref write-result 10000 ::write-timeout)))
             (is (nil? (deref release-result 10000 ::release-timeout)))
               (is (nil? (deref concurrent-release 10000 ::release-timeout)))
+              (testing "the awaiting connect opens afresh after the release completes"
+                (let [reopened (deref concurrent-connect 10000 ::connect-timeout)]
+                  (is (connector/connection? reopened))
+                  (is (not (identical? conn reopened)))
+                  (is (= #{:accepted}
+                         (set (d/q '[:find [?v ...] :where [_ :value ?v]] @reopened))))
+                  (d/release reopened)))
             (testing "release returns only after the durable branch head includes the write"
               (let [reconnected (d/connect cfg)]
                 (try

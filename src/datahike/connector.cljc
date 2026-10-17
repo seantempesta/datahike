@@ -331,10 +331,19 @@
                                :existing-connections-config existing-key
                                :diff (diff acquisition-key existing-key)})
 
+                   ;; A final release is draining this connection: the zero
+                   ;; reference count is never resurrected. Its completion is
+                   ;; delivered after `delete-connection!`, whatever the
+                   ;; release's outcome (its releaser receives any failure), so
+                   ;; this caller awaits that exit and then acquires afresh: an
+                   ;; opening of its own, or another caller's opening or
+                   ;; connection, by the same reservation as every connect.
                    :releasing
-                   (log/raise "Connection is being released."
-                              {:type :connection-is-being-released
-                               :conn-id conn-id})
+                   (do #?(:clj (if (:sync? opts)
+                                 (blocking-take completion)
+                                 (<! completion))
+                          :cljs (<! completion))
+                       (<?- (-connect-impl* config opts)))
 
                    :owner
                    (let [resources (volatile! {})]

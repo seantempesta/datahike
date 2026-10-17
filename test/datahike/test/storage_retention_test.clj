@@ -28,7 +28,7 @@
                  (get-in failure [:conflicts :keep-history?]))))
         (finally (d/delete-database cfg))))))
 
-(deftest shared-holder-survives-and-draining-open-refuses
+(deftest shared-holder-survives-and-draining-open-awaits-exit
   (let [cfg {:store {:backend :memory :id (random-uuid)}}
         _ (d/create-database cfg)
         a (d/connect cfg)
@@ -51,12 +51,16 @@
         (let [released (future (d/release b))]
           (try
             (is (.await entered 2 TimeUnit/SECONDS))
-            (is (= :connection-is-being-released
-                   (try (d/connect cfg) (catch Exception e (:type (ex-data e))))))
-            (finally (async/>!! proceed true)))
-          (is (nil? (deref released 2000 ::timeout)))))
-      (let [c (d/connect cfg)]
-        (try (is (map? @c)) (finally (d/release c))))
+            (let [opened (future (d/connect cfg))]
+              (is (= ::waiting (deref opened 100 ::waiting))
+                  "an open during the final release's drain awaits its exit")
+              (async/>!! proceed true)
+              (is (nil? (deref released 2000 ::timeout)))
+              (let [c (deref opened 2000 ::timeout)]
+                (try (is (not (identical? b c)) "never the draining connection, resurrected")
+                     (is (map? @c))
+                     (finally (d/release c)))))
+            (finally (async/put! proceed true)))))
       (finally
         (async/put! proceed true)
         (d/delete-database cfg)))))
