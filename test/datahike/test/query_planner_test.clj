@@ -1325,3 +1325,49 @@
           (is (= #{[receipt 1]}
                  (set (seq (d/q '[:find ?r ?n :where [?r :rcpt/run ?run] [?run :run/n ?n] [(< ?n 5)]]
                                 value))))))))))
+
+(deftest test-empty-input-relation-reads-nothing
+  ;; A conjunction with an empty relation is empty: an empty collection or
+  ;; relation binding, or a join that leaves no rows, answers without scanning
+  ;; the remaining clauses' attributes. Each case would otherwise scan 200 datoms of an attribute.
+  (let [cfg {:store {:backend :memory :id (random-uuid)}
+             :schema-flexibility :write :keep-history? false}
+        _ (d/create-database cfg)
+        conn (d/connect cfg)
+        _ (d/transact conn [{:db/ident :fn/sym :db/valueType :db.type/symbol
+                             :db/cardinality :db.cardinality/one :db/unique :db.unique/identity}
+                            {:db/ident :fn/arglists :db/valueType :db.type/string
+                             :db/cardinality :db.cardinality/one}
+                            {:db/ident :fn/macro? :db/valueType :db.type/boolean
+                             :db/cardinality :db.cardinality/one}
+                            {:db/ident :fn/calls :db/valueType :db.type/ref
+                             :db/cardinality :db.cardinality/one}])
+        _ (d/transact conn (vec (for [i (range 200)]
+                                  {:fn/sym (symbol "a" (str "f" i)) :fn/arglists "([x])"})))
+        _ (d/transact conn (vec (for [i (range 1 200)]
+                                  {:fn/sym (symbol "a" (str "f" i)) :fn/calls [:fn/sym 'a/f0]})))
+        db @conn
+        run (fn [query args]
+              (binding [q/*query-result-cache?* false]
+                (d/q {:query query :args (into [db] args) :max-work 20})))]
+    (try
+      (are [query args] (= #{} (set (run query args)))
+        '[:find ?f :in $ [?sym ...] :where [?f :fn/sym ?sym] [?f :fn/arglists ?a]]
+        [[]]
+
+        '[:find [?sym ...] :in $ [?sym ...]
+          :where [?f :fn/sym ?sym] [?f :fn/arglists ?a]
+          [(not= "()" ?a)] (not [?f :fn/macro? true])]
+        [[]]
+
+        '[:find ?f :in $ [[?sym ?n]] :where [?f :fn/sym ?sym] [?f :fn/arglists ?a]]
+        [[]]
+
+        '[:find ?a :in $ [?f ...] :where [?f :fn/arglists ?a]]
+        [[]]
+
+        ;; the first join leaves no rows; the ref and value joins after it read nothing
+        '[:find ?g ?a :in $ [?sym ...]
+          :where [?f :fn/sym ?sym] [?f :fn/arglists "([y])"] [?g :fn/calls ?f] [?g :fn/arglists ?a]]
+        [['a/f0]])
+      (finally (d/release conn) (d/delete-database cfg)))))

@@ -434,34 +434,31 @@
       value-var, when restricting the scan by it would help (the bound set is
       smaller than the scan slice `scan-n`). Returns
       {:field 0|2 :values HashSet :seekable? bool} or nil — :field 0 = entity
-      (EAVT-seekable), 2 = value (AVET-seekable only if the attr is indexed)."
+      (EAVT-seekable), 2 = value (AVET-seekable only if the attr is indexed).
+      A bound relation with no rows is the most selective probe: an empty set."
      [db clause resolved-a rels scan-n]
      (when (seq rels)
        (let [scan-n (long scan-n)
              [e _ v] clause
              extract (fn [rel col-idx]
-                       (let [tuples (:tuples rel)
-                             n (if (instance? java.util.Collection tuples)
-                                 (.size ^java.util.Collection tuples)
-                                 (count tuples))]
-                         (when (pos? n)
-                           ;; Gate on the DISTINCT value count, not the raw tuple
-                           ;; count: a large intermediate rel from a deep join can
-                           ;; have many rows but few distinct values for this var
-                           ;; (e.g. ?b across a 219k-row hop result). Build the set
-                           ;; with an early-exit once it reaches scan-n — at that
-                           ;; point it isn't selective, so fall back to a full scan.
-                           ;; Bounds build cost to O(min(n, until scan-n distinct)).
-                           (let [hs (java.util.HashSet.)]
-                             (reduce (fn [_ t]
-                                       (let [val (cond
-                                                   (instance? clojure.lang.Indexed t) (.nth ^clojure.lang.Indexed t col-idx)
-                                                   (sequential? t) (nth t col-idx)
-                                                   :else (get t col-idx))]
-                                         (when (some? val) (.add hs val)))
-                                       (if (>= (.size hs) scan-n) (reduced nil) nil))
-                                     nil tuples)
-                             (when (and (pos? (.size hs)) (< (.size hs) scan-n)) hs)))))
+                       ;; Gate on the DISTINCT value count, not the raw tuple
+                       ;; count: a large intermediate rel from a deep join can
+                       ;; have many rows but few distinct values for this var
+                       ;; (e.g. ?b across a 219k-row hop result). Build the set
+                       ;; with an early-exit once it reaches scan-n — at that
+                       ;; point it isn't selective, so fall back to a full scan.
+                       ;; Bounds build cost to O(min(n, until scan-n distinct)).
+                       ;; No rows bind no values: the empty set, which reads nothing.
+                       (let [hs (java.util.HashSet.)]
+                         (reduce (fn [_ t]
+                                   (let [val (cond
+                                               (instance? clojure.lang.Indexed t) (.nth ^clojure.lang.Indexed t col-idx)
+                                               (sequential? t) (nth t col-idx)
+                                               :else (get t col-idx))]
+                                     (when (some? val) (.add hs val)))
+                                   (if (>= (.size hs) scan-n) (reduced nil) nil))
+                                 nil (:tuples rel))
+                         (when (< (.size hs) scan-n) hs)))
              e-probe (when (and (symbol? e) (analyze/free-var? e))
                        (some (fn [rel]
                                (when-let [ci (get (:attrs rel) e)]
@@ -556,6 +553,7 @@
    every scan site. Three regimes, chosen from K=#bound-values vs N=scan slice
    size (`scan-n`, the pattern's estimated attribute cardinality):
 
+     none   nothing to read                      (K = 0: the bound relation is empty)
      seek   index point-seeks per bound value   (K*threshold < N, and seekable)
      filter full slice, drop non-matching datoms (K < N)            [semi-join]
      scan   full index slice                     (no useful probe)
@@ -603,14 +601,19 @@
            ;; pattern [?e ?a ?v] has resolved-a=nil, which would feed nil into
            ;; the no-nil-check attr comparator (cmp-attr-quick → NPE). In both
            ;; cases the index-agnostic filter regime below is correct instead.
-             (if (and (:seekable? probe)
-                      (some? resolved-a)
-                      (pss-instance? seek-index)
-                      (< (* (long k) (long probe-driven-threshold)) scan-n))
+             (cond
+               (zero? k) ()
+
+               (and (:seekable? probe)
+                    (some? resolved-a)
+                    (pss-instance? seek-index)
+                    (< (* (long k) (long probe-driven-threshold)) scan-n))
                (let [seeks (probe-driven-iterable seek-index resolved-a (:values probe) field)]
                  (if-let [bounds (slice-bounds-filter clause index pushdown-preds)]
                    (filter bounds seeks)
                    seeks))
+
+               :else
                (let [^java.util.HashSet hs (:values probe)]
                  (filter (fn [^Datom d]
                            (.contains hs (if (== field 0) (.-e d) (.-v d))))
