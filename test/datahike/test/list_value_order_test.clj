@@ -50,3 +50,28 @@
             "a vector retracts the stored list it equals and adds beside it")
         (finally (d/release conn))))
       (finally (d/delete-database config)))))
+
+(deftest a-tuple-read-back-from-storage-is-the-vector-it-stored
+  ;; Fressian writes a vector as a list and reads it back as Arrays$ArrayList, so a
+  ;; tuple attribute's value changed class across a release: a reader holding a
+  ;; vector contract refused every value written before a restart.
+  (let [path (str (System/getProperty "java.io.tmpdir") "/datahike-tuple-read-" (random-uuid))
+        config {:store {:backend :file :path path :id (random-uuid)}
+                :schema-flexibility :write
+                :keep-history? true
+                :fuse-index-roots? true
+                :index-config {:branching-factor 128 :diff-buf-size 32}
+                :initial-tx [{:db/ident :pair :db/cardinality :db.cardinality/many
+                              :db/valueType :db.type/tuple :db/tupleTypes [:db.type/keyword :db.type/long]}]}]
+    (d/create-database config)
+    (try
+      (let [conn (d/connect config)]
+        (doseq [e (range 1 31)] (d/transact conn [{:db/id e :pair (counts "c" 20)}]))
+        (d/release conn))
+      (let [conn (d/connect config)]
+        (try
+          (is (= #{clojure.lang.PersistentVector} (into #{} (map (comp class :v)) (d/datoms @conn :aevt :pair)))
+              "every stored tuple reads back as a vector")
+          (is (vector? (first (:pair (d/pull @conn [:pair] 1)))))
+          (finally (d/release conn))))
+      (finally (d/delete-database config)))))

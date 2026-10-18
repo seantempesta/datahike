@@ -621,9 +621,17 @@
 
 ;; Datom — datahike's domain ELEMENT type, nested inside node :keys. Its handler recurses through
 ;; the canonical node codec. (vector form `[e a v tx added]`, read back via datom-from-reader.)
+#?(:clj
+   (defn- stored-datom
+     "The datom a stored `[e a v tx added]` list holds. Fressian writes a vector
+      value (a tuple) as a list and reads it back as a java.util.List, so `v`
+      becomes the vector it was written as."
+     [[e a v tx added]]
+     (dd/datom e a (if (instance? java.util.List v) (vec v) v) tx added)))
+
 (def ^:private datom-read-handler
   {"datahike.datom.Datom"
-   #?(:clj  (reify ReadHandler (read [_ rdr _ _] (dd/datom-from-reader (.readObject rdr))))
+   #?(:clj  (reify ReadHandler (read [_ rdr _ _] (stored-datom (.readObject rdr))))
       :cljs (fn [rdr _ _] (dd/datom-from-reader (fress/read-object rdr))))})
 (def ^:private datom-write-handler
   #?(:clj  {datahike.datom.Datom {"datahike.datom.Datom"
