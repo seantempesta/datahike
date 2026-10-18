@@ -268,15 +268,42 @@
   [a b]
   (compare (class-name a) (class-name b)))
 
+(declare compare-value)
+
+#?(:clj
+   (defn- compare-lists
+     "Order two lists the way Clojure orders vectors: the shorter first, then
+      element by element. Storage reads a stored vector or map entry back as a
+      java.util.List (Fressian's Arrays$ArrayList), which is not Comparable, so
+      a value keeps its place in an index across a round trip only if every
+      list orders by its elements."
+     [^java.util.List l1 ^java.util.List l2]
+     (let [n1 (.size l1) n2 (.size l2)]
+       (if (== n1 n2)
+         (loop [i 0]
+           (if (== i n1)
+             0
+             (let [c (compare-value (.get l1 i) (.get l2 i))]
+               (if (zero? c) (recur (inc i)) c))))
+         (if (< n1 n2) -1 1)))))
+
 (defn compare-value
   "Compare two values with cross-platform UUID compatibility.
    CLJS UUID comparison is adjusted to match CLJ's signed comparison,
    ensuring consistent ordering when indices are built on CLJ and queried on CLJS.
    Byte arrays are compared element-wise via datahike.array/compare-arrays,
-   since byte[] does not implement Comparable."
+   since byte[] does not implement Comparable. Two lists (vectors, map entries
+   and the java.util.List storage reads them back as) order element-wise
+   (`compare-lists`)."
   [v1 v2]
-  #?(:clj (if (and (da/bytes? v1) (da/bytes? v2))
+  #?(:clj (cond
+            (and (da/bytes? v1) (da/bytes? v2))
             (da/compare-arrays v1 v2)
+
+            (and (instance? java.util.List v1) (instance? java.util.List v2))
+            (compare-lists v1 v2)
+
+            :else
             ;; Two Comparables of different types throw from `compare`. One
             ;; attribute's datoms hold both when it is reinstalled with another
             ;; :db/valueType (history keeps the old values; a purge leaves its
