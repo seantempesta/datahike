@@ -1,0 +1,88 @@
+/target
+/bench/target
+/libdatahike/target
+/target-http-server
+/classes
+/checkouts
+pom.xml.asc
+replikativ-datahike.jar
+*.class
+/.lein-*
+/.nrepl-port
+/.repl*
+web/out
+web/*.js
+release-js/datahike*.js
+release-js/npm-*
+web/target-cljs
+
+# npm-package compiled output (keep source files: test.js, typescript-test.ts, package.template.json, *.md)
+npm-package/*.js
+npm-package/*.js.map
+npm-package/*.d.ts
+npm-package/package.json
+npm-package/browser/
+npm-package/karma.conf.js
+!npm-package/test.js
+!npm-package/test-browser.js
+!npm-package/typescript-test.ts
+!npm-package/test-isomorphic.ts
+
+.idea
+*.iml
+.vscode
+.#*
+/.gitold/COMMIT_EDITMSG
+.cpcache
+lsp/
+.calva/
+out/
+.lsp
+/.cache
+/.settings
+.classpath
+.project
+.cache
+/datahike
+tests.user.edn
+libdatahike.zip
+dthk
+libdatahike*.zip
+trace.edn
+tmp.edn
+.shadow-cljs
+.claude
+repl-mcp.log
+/node_modules
+npm-package/output.txt
+/.internal/
+resources/DATAHIKE_VERSION
+
+# Auto-generated code (regenerate with bb codegen-*)
+# NOTE: java/src-generated/ is intentionally tracked on this branch so
+# that consumers via :git/url succeed at deps/prep-lib cold. See
+# build.clj for the regen recipe.
+#java/src-generated/
+libdatahike/src/datahike/impl/LibDatahike.java
+pydatahike/src/datahike/generated.py
+.clj-kondo/datahike/
+
+# clj-kondo: ignore external library imports (keep config.edn and babashka)
+.clj-kondo/*
+!.clj-kondo/config.edn
+!.clj-kondo/babashka/
+
+# Development symlinks (not needed in repo)
+distributed-scope
+fress
+kabel
+konserve
+konserve-sync
+persistent-sorted-set
+/.agent-shell/
+
+# Local-only tooling/scratch artefacts
+.codex
+**/.settings/
+/plugins/
+/test/integration/

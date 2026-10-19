@@ -1,0 +1,438 @@
+version: 2.1
+
+setup: true
+
+orbs:
+  tools: replikativ/clj-tools@0
+  continuation: circleci/continuation@2.0
+
+jobs:
+  setup:
+    executor: tools/clojurecli
+    parameters:
+      setup_cljs:
+        type: boolean
+        default: true
+    steps:
+      - restore_cache:
+          keys:
+            - source-{{ .Branch }}-{{ .Revision }}
+            - source-{{ .Branch }}
+            - source-
+      - checkout
+      - save_cache:
+          key: source-{{ .Branch }}-{{ .Revision }}
+          paths:
+            - .git
+      - restore_cache:
+          keys:
+            - deps-{{ checksum "deps.edn" }}
+            - deps-
+      - run:
+          name: resolve deps
+          command: clojure -A:dev:test:build -P
+      - save_cache:
+          key: deps-{{ checksum "deps.edn" }}
+          paths:
+            - /home/circleci/.m2
+      - when:
+          condition: <<parameters.setup_cljs>>
+          steps:
+            - restore_cache:
+                keys:
+                  - npm-{{ checksum "package-lock.json" }}
+                  - npm-
+            - run: npm ci
+            - save_cache:
+                key: npm-{{ checksum "package-lock.json" }}
+                paths:
+                  - /home/circleci/.npm
+      - persist_to_workspace:
+          root: /home/circleci/
+          paths:
+            - .m2
+            - .npm
+            - replikativ
+  format:
+    executor: tools/clojurecli
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Check format
+          command: bb format
+          no_output_timeout: 5m
+      - save_cache:
+          key: deps-{{ checksum "deps.edn" }}
+          paths:
+            - /home/circleci/.m2
+            - /home/circleci/.deps.clj
+  native-image:
+    executor: tools/clojurecli
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Add GitHub to known hosts
+          command: mkdir -p ~/.ssh && ssh-keyscan github.com >> ~/.ssh/known_hosts
+          no_output_timeout: 1m
+      - run:
+          name: Generate config
+          command: |
+            bb --version
+            bb .circleci/scripts/gen_ci.clj > generated_config.yml
+      - continuation/continue:
+          configuration_path: generated_config.yml
+      - save_cache:
+          key: deps-{{ checksum "deps.edn" }}
+          paths:
+            - /home/circleci/.m2
+            - /home/circleci/.deps.clj
+  persistent-set-test:
+    executor: tools/clojurecli
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Run unittests for persistent sorted set index
+          command: bb test clj-pss
+          no_output_timeout: 5m
+      - save_cache:
+          key: deps-{{ checksum "deps.edn" }}
+          paths:
+            - /home/circleci/.m2
+            - /home/circleci/.deps.clj
+
+  # Same suite with the query planner OFF (base/relational engine). The planner is
+  # the DEFAULT now, so the other test jobs exercise it; this one guards the base
+  # engine + the planner↔base parity that the legacy-vs-planner tests assert.
+  persistent-set-test-base-engine:
+    executor: tools/clojurecli
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Run unittests for persistent sorted set index (query planner OFF)
+          command: bb test clj-pss
+          no_output_timeout: 5m
+          environment:
+            DATAHIKE_QUERY_PLANNER: "false"
+      - save_cache:
+          key: deps-{{ checksum "deps.edn" }}
+          paths:
+            - /home/circleci/.m2
+            - /home/circleci/.deps.clj
+  planner-regression:
+    executor: tools/clojurecli
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Planner regression (compiled-vs-base ratio gate)
+          command: clojure -M:bench -m benchmark.planner-regression --assert
+          no_output_timeout: 10m
+  hitchhiker-tree-test:
+    executor: tools/clojurecli
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Run unittests for hitchhiker-tree index
+          command: bb test clj-hht
+          no_output_timeout: 5m
+      - save_cache:
+          key: deps-{{ checksum "deps.edn" }}
+          paths:
+            - /home/circleci/.m2
+            - /home/circleci/.deps.clj
+  spec-test:
+    executor: tools/clojurecli
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Run unittests for hitchhiker-tree index
+          command: bb test specs
+          no_output_timeout: 5m
+      - save_cache:
+          key: deps-{{ checksum "deps.edn" }}
+          paths:
+            - /home/circleci/.m2
+            - /home/circleci/.deps.clj
+  backward-compatibility-test:
+    executor: tools/clojurecli
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Run backward compatibility test
+          command: bb test back-compat
+          no_output_timeout: 5m
+      - save_cache:
+          key: deps-{{ checksum "deps.edn" }}
+          paths:
+            - /home/circleci/.m2
+            - /home/circleci/.deps.clj
+  integration-test:
+    executor: tools/clojurecli
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Run integration test
+          command: bb test integration
+          no_output_timeout: 5m
+      - save_cache:
+          key: deps-{{ checksum "deps.edn" }}
+          paths:
+            - /home/circleci/.m2
+            - /home/circleci/.deps.clj
+  kabel-test:
+    executor: tools/clojurecli
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Run kabel tests
+          command: bb test kabel
+          no_output_timeout: 5m
+      - save_cache:
+          key: deps-{{ checksum "deps.edn" }}
+          paths:
+            - /home/circleci/.m2
+            - /home/circleci/.deps.clj
+  browser-test:
+    executor: tools/clojurecli
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Prepare dependencies
+          command: clojure -X:deps prep
+      - run:
+          name: Start test server
+          command: clojure -M:test -e "(require 'datahike.kabel.browser-test-server) (datahike.kabel.browser-test-server/start-test-server!) (Thread/sleep Long/MAX_VALUE)"
+          background: true
+      - run:
+          name: Wait for server startup
+          command: sleep 20
+      - run:
+          name: Compile ClojureScript for browser tests
+          command: npx shadow-cljs compile :browser-ci
+          no_output_timeout: 5m
+      - run:
+          name: Run Karma browser tests
+          command: npx karma start --single-run
+          no_output_timeout: 5m
+  node-cljs-test:
+    executor: tools/clojurecli
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Run CLJS node tests
+          command: bb node-cljs-test
+          no_output_timeout: 5m
+      - save_cache:
+          key: deps-{{ checksum "deps.edn" }}
+          paths:
+            - /home/circleci/.m2
+            - /home/circleci/.deps.clj
+  npm-test:
+    executor: tools/clojurecli
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Build npm package
+          command: bb npm-build
+          no_output_timeout: 5m
+      - run:
+          name: Run npm JS tests
+          command: bb npm-test
+      - save_cache:
+          key: deps-{{ checksum "deps.edn" }}
+          paths:
+            - /home/circleci/.m2
+            - /home/circleci/.deps.clj
+  java-examples-test:
+    executor: tools/clojurecli
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Update examples pom.xml to current version
+          command: bb java-examples-version
+      - run:
+          name: Verify local Datahike jar exists
+          command: |
+            echo "Checking .m2 directory structure:"
+            ls -la /home/circleci/.m2/repository/org/replikativ/ || echo ".m2/repository/org/replikativ not found"
+            echo ""
+            echo "Checking datahike versions:"
+            ls -la /home/circleci/.m2/repository/org/replikativ/datahike/ || echo "datahike directory not found"
+            echo ""
+            echo "Current version directory:"
+            CURRENT_VERSION=$(grep -oP '<datahike.version>\K[^<]+' examples/java/pom.xml)
+            echo "Looking for version: $CURRENT_VERSION"
+            ls -la /home/circleci/.m2/repository/org/replikativ/datahike/$CURRENT_VERSION/ || echo "$CURRENT_VERSION directory not found"
+      - run:
+          name: Download Maven dependencies
+          command: cd examples/java && mvn dependency:resolve dependency:resolve-plugins
+      - run:
+          name: Run QuickStart example
+          command: cd examples/java && mvn compile exec:java -Dexec.mainClass="examples.QuickStart"
+          no_output_timeout: 3m
+      - run:
+          name: Run SchemaExample
+          command: cd examples/java && mvn compile exec:java -Dexec.mainClass="examples.SchemaExample"
+          no_output_timeout: 3m
+      - run:
+          name: Run TimeTravelExample
+          command: cd examples/java && mvn compile exec:java -Dexec.mainClass="examples.TimeTravelExample"
+          no_output_timeout: 3m
+      - save_cache:
+          key: deps-{{ checksum "deps.edn" }}
+          paths:
+            - /home/circleci/.m2
+            - /home/circleci/.deps.clj
+  build:
+    executor: tools/clojurecli
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Build jar
+          command: bb jar
+      - run:
+          name: Install jar to local Maven repository
+          command: bb install
+      - persist_to_workspace:
+          root: /home/circleci/
+          paths:
+            - .m2
+            - .npm
+            - replikativ
+  deploy:
+    executor: tools/clojurecli
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Deploy to clojars
+          command: bb clojars
+  release-jar:
+    executor: tools/clojurecli
+    steps:
+      - attach_workspace:
+          at: /home/circleci
+      - run:
+          name: Release jar on GitHub
+          command: bb release jar
+
+workflows:
+  build-test-and-deploy:
+    jobs:
+      - setup:
+          context: ghcr-read-package
+          setup_cljs: true
+      - build:
+          context: ghcr-read-package
+          requires:
+            - setup
+      - native-image:
+          context:
+            - ghcr-read-package
+            - github-token
+          filters:
+            branches:
+              only: main
+          requires:
+            - setup
+      - format:
+          context: ghcr-read-package
+          requires:
+            - setup
+      - persistent-set-test:
+          context: ghcr-read-package
+          requires:
+            - build
+      - persistent-set-test-base-engine:
+          context: ghcr-read-package
+          requires:
+            - build
+      - planner-regression:
+          context: ghcr-read-package
+          requires:
+            - build
+      - hitchhiker-tree-test:
+          context: ghcr-read-package
+          requires:
+            - build
+      - backward-compatibility-test:
+          context: ghcr-read-package
+          requires:
+            - build
+      - integration-test:
+          context: ghcr-read-package
+          requires:
+            - build
+      - kabel-test:
+          context: ghcr-read-package
+          requires:
+            - build
+      - browser-test:
+          context: ghcr-read-package
+          requires:
+            - build
+      - node-cljs-test:
+          context: ghcr-read-package
+          requires:
+            - build
+      - npm-test:
+          context: ghcr-read-package
+          requires:
+            - build
+      - java-examples-test:
+          context: ghcr-read-package
+          requires:
+            - build
+      - deploy:
+          context:
+            - ghcr-read-package
+            - clojars-deploy
+            - github-token
+          filters:
+            branches:
+              only: main
+          requires:
+            - format
+            - persistent-set-test
+            - hitchhiker-tree-test
+            - backward-compatibility-test
+            - integration-test
+            - kabel-test
+            - browser-test
+            - node-cljs-test
+            - npm-test
+            - java-examples-test
+            - native-image
+      - release-jar:
+          context:
+            - ghcr-read-package
+            - github-token
+          filters:
+            branches:
+              only: main
+          requires:
+            - format
+            - persistent-set-test
+            - hitchhiker-tree-test
+            - backward-compatibility-test
+            - integration-test
+            - kabel-test
+            - browser-test
+            - node-cljs-test
+            - npm-test
+            - java-examples-test
+            - native-image

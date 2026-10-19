@@ -1,0 +1,6 @@
+{:paths ["src"]
+ :deps  {org.clojure/clojure         {:mvn/version "1.11.1"}
+         org.replikativ/datahike     {:local/root "../.."}
+         ;; For released versions, use:
+         ;; org.replikativ/datahike   {:mvn/version "0.7.1620"}
+         }}

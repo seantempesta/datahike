@@ -1,0 +1,177 @@
+(ns ^:no-doc datahike.store
+  "Datahike-specific store utilities.
+
+   Most store lifecycle operations (create, connect, delete, release) are now
+   handled by konserve.store directly. This namespace provides:
+
+   - add-cache-and-handlers: Adds BTSet handlers and its node cache
+   - store-identity: Returns store UUID from config
+   - ready-store: Tiered-specific initialization (populate cache from backend)
+   - :datahike/overlay: a private memory frontend over a shared store"
+  (:require [konserve.tiered :as kt]
+            [konserve.store :as ks]
+            [konserve.memory :as km]
+            [clojure.walk :as walk]
+            [datahike.index :as di]
+            [konserve.utils :refer [#?(:clj async+sync) *default-sync-translation*]
+             #?@(:cljs [:refer-macros [async+sync]])]
+            [superv.async #?(:clj :refer :cljs :refer-macros) [go-try- <?-]]
+            #?(:cljs [clojure.core.async :refer-macros [go]])))
+
+;; =============================================================================
+;; Cache and Handlers
+;; =============================================================================
+
+(defn add-cache-and-handlers
+  "Add Datahike BTSet handlers and their node cache to a raw konserve store.
+
+   The persistent-set handler owns the one read cache in CachedStorage. The
+   generic Konserve API does not read through a wrapper cache, so allocating a
+   second one here retained an empty LRU for every connection."
+  [raw-store config]
+  (di/add-konserve-handlers config raw-store))
+
+;; =============================================================================
+;; Store Identity
+;; =============================================================================
+
+(defn store-identity
+  "Returns the UUID that identifies the store.
+
+   All konserve stores require an :id field containing a UUID.
+   This is the stable identifier used for connection tracking,
+   distributed coordination, and store matching."
+  [config]
+  (:id config))
+
+(defn overlay-marker
+  "The element an overlay adds to its connection ids (see `connection-id`), nil
+  for a plain store."
+  [config]
+  (when (= :datahike/overlay (get-in config [:store :backend]))
+    [:datahike/overlay (get-in config [:store :overlay])]))
+
+(defn connection-id
+  "Return the process-local identity of a connection.
+
+   Self-writer connections retain the historical `[store-id branch]` shape.
+   Remote writer backends append their backend so a server and a synced client
+   for the same logical store can coexist in one process without sharing or
+   overwriting each other's connection resources."
+  [config]
+  (let [base [(store-identity (:store config)) (:branch config)]
+        writer-backend (get-in config [:writer :backend] :self)]
+    (cond-> base
+      (not= :self writer-backend) (conj writer-backend)
+      ;; An overlay shares its backend's store id (node addresses, GC guard)
+      ;; but never its connections: the same branch name is another world.
+      (overlay-marker config) (conj (overlay-marker config)))))
+
+(defn physical-store-key
+  "Identify one physical backing location for internal resource sharing.
+
+   A logical store id can intentionally exist in several replicas (for
+   example a Kabel server and a client cache), so runtime resources such as
+   write hooks may only be shared by handles for the same backing location."
+  [config]
+  ;; Keep the complete pure store config so unfamiliar backends (JDBC, S3,
+  ;; GCS, plugins) never false-collide merely because they do not use :path.
+  ;; Strip only per-call runtime opts, recursively for tiered configs. Values
+  ;; that are runtime objects compare by identity and therefore yield a safe
+  ;; false negative rather than unsafe resource sharing.
+  (walk/postwalk (fn [value]
+                   (if (map? value) (dissoc value :opts) value))
+                 config))
+
+(defn node-store-key
+  "Identify the store whose index nodes a connection reads, for sharing the
+   decoded-node cache: an overlay reads every node it did not write from its
+   backend at the same address, and the nodes it writes get fresh addresses,
+   so it shares its backend's cache; any other store is its physical store."
+  [config]
+  (if (= :datahike/overlay (:backend config))
+    (node-store-key (:backend-config config))
+    (physical-store-key config)))
+
+;; =============================================================================
+;; Ready Store (Tiered-Specific)
+;; =============================================================================
+
+(defmulti ready-store
+  "Notify when the store is ready to use.
+
+   Most backends are ready immediately after connection. The :tiered backend
+   needs special handling to populate the memory frontend from the backend
+   before use."
+  {:arglists '([config store])}
+  (fn [{:keys [backend]} _store]
+    backend))
+
+(defmethod ready-store :default [{:keys [opts]} _]
+  (async+sync (:sync? opts) *default-sync-translation*
+              (go-try- true)))
+
+(defmethod ready-store :tiered [{:keys [opts frontend-config backend-config]} store]
+  "Populate tiered store frontend from backend and sync on connect.
+
+   This ensures:
+   1. Memory frontend has cached data for immediate queries
+   2. Subsequent sync handshakes send accurate timestamps (only fetch newer keys)"
+  (async+sync (:sync? (or opts {:sync? true})) *default-sync-translation*
+              (go-try-
+               ;; Config uses :frontend-config/:backend-config (avoids collision with :backend :tiered)
+               ;; Store record uses :frontend-store/:backend-store (field names in TieredStore)
+               (<?- (ready-store (assoc frontend-config :opts opts) (:frontend-store store)))
+               (<?- (ready-store (assoc backend-config :opts opts) (:backend-store store)))
+               (<?- (kt/sync-on-connect store kt/populate-missing-strategy opts))
+               true)))
+
+;; =============================================================================
+;; Overlay: private writes over a shared store
+;; =============================================================================
+;;
+;; {:backend :datahike/overlay :id <backend's id> :overlay <uuid per overlay>
+;;  :backend-config <the shared store's config>}
+;;
+;; Every write — nodes, commits, branch heads, the :branches roster — lands in a
+;; memory frontend; every read falls through to the shared backend, uncopied, and
+;; decoded nodes come from the backend's node cache (`node-store-key`); the
+;; overlay never mutates the backend (konserve `:frontend-only`, `konserve/tiered.cljc:22`).
+;; All connections naming one `:overlay` uuid share its frontend (konserve's
+;; memory registry, keyed by that uuid), so a branch made through one is opened
+;; by the next. `delete-database` of the overlay config drops the frontend and
+;; never touches the backend; nothing is left to collect. Not `:tiered`:
+;; konserve requires frontend id = backend id (`konserve/store.cljc:380-393`),
+;; so every overlay of one store would share ONE frontend, and `ready-store
+;; :tiered` copies the whole backend into it (`sync-on-connect`, above).
+
+(defn- overlay-frontend [overlay]
+  (or (km/connect-mem-store overlay {:sync? true})
+      (km/new-mem-store (atom {}) {:sync? true :id overlay})))
+
+(defmethod ks/-connect-store :datahike/overlay
+  [{:keys [backend-config overlay]} opts]
+  (async+sync (:sync? opts) *default-sync-translation*
+              (go-try-
+               (let [backend (<?- (ks/connect-store backend-config opts))]
+                 (<?- (kt/connect-tiered-store
+                       (overlay-frontend overlay)
+                       backend
+                       :write-policy :frontend-only
+                       :read-policy :frontend-first
+                       ;; reads are never copied: the frontend holds only writes
+                       :populate-frontend? false
+                       :opts opts))))))
+
+(defmethod ks/-store-exists? :datahike/overlay
+  [{:keys [backend-config]} opts]
+  (ks/store-exists? backend-config opts))
+
+(defmethod ks/-release-store :datahike/overlay
+  [{:keys [backend-config]} store opts]
+  (ks/release-store backend-config (:backend-store store) opts))
+
+(defmethod ks/-delete-store :datahike/overlay
+  [{:keys [overlay]} opts]
+  (async+sync (:sync? opts) *default-sync-translation*
+              (go-try- (km/delete-mem-store overlay))))

@@ -1,0 +1,84 @@
+name: Building native images
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - '**/README.md'
+      - 'doc/**'
+      - '.circleci/**'
+      - 'bb/**'
+      - 'dev/**'
+      - 'examples/**'
+      - 'test/**'
+
+jobs:
+  native:
+    if: "!contains(github.event.head_commit.message, 'skip ci')"
+    strategy:
+      matrix:
+        include:
+          - os: macos-15-intel
+            name: macos
+    runs-on: ${{ matrix.os }}
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GRAALVM_VERSION: 25.0.0
+      DTHK_PLATFORM: macos
+      DTHK_ARCH: amd64
+    steps:
+      - name: Git checkout
+        uses: actions/checkout@v2
+        with:
+          fetch-depth: 0
+          submodules: 'true'
+
+      - name: Restore cache
+        uses: actions/cache/restore@v4
+        id: restore-cache
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('deps.edn') }}
+
+      - name: Setup GraalVM
+        uses: graalvm/setup-graalvm@v1
+        with:
+          java-version: '25'
+          distribution: 'graalvm-community'
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          set-java-home: true
+
+      - name: Install clojure tools
+        uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: 1.12.2.1565
+          bb: 1.12.208
+
+      - name: Build native image
+        run: bb ni-cli
+
+      - name: Build libdatahike
+        run: bb ni-compile
+
+      - name: Test native image
+        run: bb test native-image
+
+      - name: Test babashka pod
+        run:  bb test bb-pod
+
+      - name: Test libdatahike
+        run: bb test libdatahike
+
+      - name: Release native-image
+        run: bb release native-image
+
+      - name: Release libdatahike
+        run: bb release libdatahike
+
+      - name: Save cache
+        uses: actions/cache/save@v4
+        id: save-cache
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ hashFiles('deps.edn') }}

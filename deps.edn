@@ -1,0 +1,207 @@
+{:deps {com.github.ben-manes.caffeine/caffeine {:mvn/version "3.2.4"}
+        org.clojure/clojure                         {:mvn/version "1.12.4"}
+        org.replikativ/hasch                        {:mvn/version "0.4.100"
+                                                     :exclusions [org.clojure/clojurescript]}
+        org.replikativ/konserve                     {:git/url "https://github.com/seantempesta/konserve"
+                                                     :git/sha "24be381bf655ce4f0a2bbe54eaba3a463c9288f5"
+                                                     :exclusions [org.clojure/clojurescript
+                                                                  org.clojars.mmb90/cljs-cache]}
+
+        ;; Our fork: go-try-/<?- carry every Throwable (an Error used to close
+        ;; the channel and read as a successful write).
+        org.replikativ/superv.async                 {:git/url "https://github.com/seantempesta/superv.async"
+                                                     :git/sha "501b42945693804fd3e57276cc2a07ed4fe1d602"
+                                                     :exclusions [org.clojure/clojurescript]}
+        org.replikativ/datalog-parser               {:mvn/version "0.2.37"}
+        ;; canonical fressian node+root handlers + MST boundary (0.4.126); diff-buf write-buffering
+        ;; (opt-in, Settings diffBufSize); 0.4.132 serializes the CACHED root count (may be -1) so
+        ;; writing a storage-detached root never forces a recompute (cures the cljs side too);
+        ;; 0.4.133 makes the diff-buf {slots, entries} pair atomically published (BufState);
+        ;; 0.4.136 folds ALL per-child state {addresses, children, buf} into one atomically
+        ;; published NodeState — a pipelining writer's copies can never observe a torn settle;
+        ;; 0.4.137 projects diff-buf diffs onto a COPY of the restored node, so tree versions
+        ;; sharing a durable anchor through the node cache can't clobber each other's reads
+        org.replikativ/persistent-sorted-set        {:mvn/version "0.4.137"}
+        environ/environ                             {:mvn/version "1.2.0"}
+        nrepl/bencode                               {:mvn/version "1.2.0"}
+        org.replikativ/logging                      {:mvn/version "0.1.3"}
+        junit/junit                                 {:mvn/version "4.13.2"}
+        medley/medley                               {:mvn/version "1.4.0"}
+        metosin/spec-tools                          {:mvn/version "0.10.8"}
+        metosin/malli                               {:mvn/version "0.20.1"}
+        mvxcvi/clj-cbor                             {:mvn/version "1.1.1"}
+        org.babashka/http-client                    {:mvn/version "0.4.23"}
+        metosin/jsonista                            {:mvn/version "0.3.14"}
+        com.github.pkpkpk/cljs-cache                {:mvn/version "1.0.21"}
+        org.roaringbitmap/RoaringBitmap             {:mvn/version "1.3.0"}}
+
+ :paths ["src" "src-secondary" "target/classes" "resources"]
+
+ :deps/prep-lib {:ensure "target/classes"
+                 :alias :build
+                 :fn compile-java}
+
+ :aliases {;; Development
+
+           :1.9 {:override-deps {org.clojure/clojure {:mvn/version "1.9.0"}}}
+
+           :1.10 {:override-deps {org.clojure/clojure {:mvn/version "1.10.0"}}}
+
+           :cljs {:extra-deps {org.clojure/clojurescript {:mvn/version "1.12.145"}
+                               thheller/shadow-cljs      {:mvn/version "3.4.10"}
+                               org.clojure/core.async    {:mvn/version "1.10.870-alpha2"}}
+                  ;; The new tests use ^:async deftest + (await ...) from
+                  ;; CLJS 1.12.145 (CLJS-3470 / CLJS-3476). partial-cps
+                  ;; upstream now carries the two fixes this needs:
+                  ;;   fded4224 — treat cljs.core/await (cljs >= 1.12) as a
+                  ;;     terminal CPS breakpoint (supersedes the old
+                  ;;     seantempesta/partial-cps defensive-probe fork);
+                  ;;   57c79e6a — guard symbol? in the cljs macro-check so a
+                  ;;     keyword-fn over await no longer throws
+                  ;;     ClassCastException (hit by persistent-sorted-set
+                  ;;     0.4.137's diff-buf node.cljc under this CLJS).
+                  ;; Pinned by sha until a release ships; then switch to
+                  ;; :mvn/version and drop this block.
+                  :override-deps
+                  {is.simm/partial-cps
+                   {:git/url "https://github.com/simm-is/partial-cps"
+                    :git/sha "1e119b03ea908ad925b98f9ba0a26371c65441e3"}}
+                  :extra-paths ["test"]}
+
+           :dev {:extra-paths ["dev" "benchmark/src"]
+                 :extra-deps {org.clojure/tools.namespace {:mvn/version "1.5.0"}
+                              org.clojure/clojurescript   {:mvn/version "1.12.42"}
+                              thheller/shadow-cljs        {:mvn/version "3.3.6"}
+                              clj-http/clj-http           {:mvn/version "3.13.1"}
+                              com.gfredericks/user.clj    {:mvn/version "0.1.0"}
+                              org.clojure/tools.cli       {:mvn/version "1.1.230"}
+                              incanter/incanter-core      {:mvn/version "1.9.3"}
+                              incanter/incanter-charts    {:mvn/version "1.9.3"}
+                              hashp/hashp                 {:mvn/version "0.2.2"}
+                              orchestra/orchestra         {:mvn/version "2021.01.01-1"}}}
+
+           :test {:extra-paths ["test" "bechmark/src" "benchmark/test" "http-server" "src-hitchhiker-tree" "src-kabel" "src-secondary"]
+                  :jvm-opts ["-ea" "--add-modules" "jdk.incubator.vector"]
+                  :extra-deps {lambdaisland/kaocha         {:mvn/version "1.91.1392"}
+                               lambdaisland/kaocha-cljs    {:mvn/version "1.9.181"}
+                               org.clojure/test.check      {:mvn/version "1.1.1"}
+                               orchestra/orchestra         {:mvn/version "2021.01.01-1"}
+
+                               ;; hitchhiker-tree index (optional, for testing)
+                               io.replikativ/hitchhiker-tree {:mvn/version "0.2.222"
+                                                              :exclusions [org.clojure/clojurescript
+                                                                           io.replikativ/konserve]}
+
+                               ;; http server
+                               buddy/buddy-auth              {:mvn/version "3.0.323"}
+                               ring/ring-core                {:mvn/version "1.15.3"}
+                               ring/ring-jetty-adapter       {:mvn/version "1.15.3"}
+                               metosin/reitit                {:mvn/version "0.10.1"}
+                               ring-cors/ring-cors           {:mvn/version "0.1.13"}
+
+                               ;; secondary index integrations (for testing)
+                               org.replikativ/proximum       {:git/url "https://github.com/seantempesta/proximum"
+                                                              :git/sha "9a4edc0d5b07ea37d5059135fbb72c660348bcc9"}
+                               org.replikativ/scriptum       {:mvn/version "0.1.27"}
+                               org.replikativ/stratum        {:mvn/version "0.3.69"}
+
+                               ;; kabel integration for distributed datahike
+                               org.replikativ/kabel          {:mvn/version "0.3.100"}
+                               is.simm/distributed-scope     {:mvn/version "0.1.6"}
+                               org.replikativ/konserve-sync  {:mvn/version "0.1.35"}
+                               http-kit/http-kit             {:mvn/version "2.8.1"}}}
+
+           :datomic {:extra-deps {com.datomic/datomic-free {:mvn/version "0.9.5703"}}}
+
+           :ffix {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
+                  :main-opts ["-m" "cljfmt.main" "fix"]}
+
+           ;; Build
+
+           :build {:deps {io.github.clojure/tools.build {:mvn/version "0.9.5"}}
+                   :ns-default build}
+
+           :deploy {:extra-deps {slipset/deps-deploy {:mvn/version "0.2.2"}}}
+
+           :http-server {:extra-paths ["http-server"]
+                         :extra-deps {buddy/buddy-auth        {:mvn/version "3.0.323"}
+                                      ring/ring-core          {:mvn/version "1.15.3"}
+                                      ring/ring-jetty-adapter {:mvn/version "1.15.3"}
+                                      metosin/reitit          {:mvn/version "0.10.1"}
+                                      ring-cors/ring-cors     {:mvn/version "0.1.13"}
+                                      nrepl/bencode           {:mvn/version "1.2.0"}
+                                      org.slf4j/slf4j-simple  {:mvn/version "2.0.17"}}
+                         :main-opts ["-m" "datahike.http.server"]}
+
+           :libdatahike {:main-opts ["-e" "(set! *warn-on-reflection* true)"]
+                         :extra-paths ["libdatahike/src"]}
+
+           :native-cli {:main-opts ["-e" "(set! *warn-on-reflection* true)"
+                                    "-m" "clj.native-image" "datahike.cli"
+                                    "--initialize-at-build-time"
+                                    "--no-fallback"
+                                    "-H:IncludeResources=DATAHIKE_VERSION"
+                                    ; "--future-defaults=all"
+                                    "-J-Xmx4g"
+                                    "-o dthk"]
+                        :jvm-opts  ["-Dclojure.compiler.direct-linking=true"]
+                        :extra-deps
+                        {clj.native-image/clj.native-image
+                         {:git/url "https://github.com/taylorwood/clj.native-image.git"
+                          :sha     "7708e7fd4572459c81f6a6b8e44c96f41cdd92d4"}
+                         com.cognitect/transit-clj {:mvn/version "1.0.333"}
+                         babashka/pods             {:git/url "https://github.com/babashka/pods"
+                                                    :git/sha "ed5e1f3390b9dfca564f66b6e79c739c3cd82d78"}}}
+
+           :pod {:extra-deps {com.cognitect/transit-clj {:mvn/version "1.0.333"}
+                              babashka/pods             {:git/url "https://github.com/babashka/pods"
+                                                         :git/sha "ed5e1f3390b9dfca564f66b6e79c739c3cd82d78"}}}
+
+;; Checks
+
+           :benchmark {:extra-paths ["benchmark/src"]
+                       :extra-deps {clj-http/clj-http {:mvn/version "3.13.1"}
+                                    org.clojure/tools.cli {:mvn/version "1.1.230"}
+                                    incanter/incanter-core {:mvn/version "1.9.3"}
+                                    incanter/incanter-charts {:mvn/version "1.9.3"}}
+                       :main-opts ["-m" "benchmark.cli"]}
+
+           ;; Benchmark deps (no :main-opts so it composes with -e / nREPL).
+           ;; Lightweight bench alias for the planner-regression gate: it needs only
+           ;; datahike + benchmark/src. The datalevin/datomic comparators in
+           ;; benchmark.datascript-bench are dynamically required, so they (and
+           ;; stratum's native libs from :bench-compare) stay off the classpath —
+           ;; keeping the CI job fast to load. Run: clj -M:bench -m benchmark.planner-regression --assert
+           :bench {:extra-paths ["benchmark/src"]}
+
+           ;; Run via: clj -M:bench-compare -m benchmark.datascript-bench all
+           :bench-compare {:extra-paths ["benchmark/src" "src-secondary"]
+                           :jvm-opts ["--add-modules" "jdk.incubator.vector"]
+                           :extra-deps {datalevin/datalevin {:mvn/version "0.10.18"}
+                                        com.datomic/peer {:mvn/version "1.0.7387"}
+                                        ;; stratum columnar secondary index — lets the
+                                        ;; aggregate suite measure the DH+stratum column
+                                        ;; instead of reporting N/A (ns datahike.index.secondary.stratum
+                                        ;; lives on src-secondary above). Exclude its
+                                        ;; slf4j-reload4j binding: with datomic's log4j-over-slf4j
+                                        ;; on the same classpath the two form an org.apache.log4j.MDC
+                                        ;; bridge loop (StackOverflowError on Datomic init).
+                                        org.replikativ/stratum {:mvn/version "0.3.69"
+                                                                :exclusions [org.slf4j/slf4j-reload4j
+                                                                             ch.qos.reload4j/reload4j]}
+                                        com.clojure-goes-fast/clj-async-profiler {:mvn/version "1.6.1"}}}
+
+           :bench-sql {:extra-paths ["benchmark/src"]
+                       :extra-deps {org.postgresql/postgresql {:mvn/version "42.7.3"}
+                                    org.xerial/sqlite-jdbc {:mvn/version "3.46.1.0"}
+                                    com.clojure-goes-fast/clj-async-profiler {:mvn/version "1.6.1"}}
+                       :main-opts ["-m" "benchmark.sql-bench"]}
+
+           :bench-profile {:extra-paths ["benchmark/src"]
+                           :extra-deps {com.clojure-goes-fast/clj-async-profiler {:mvn/version "1.6.1"}}}
+
+           :format {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
+                    :main-opts ["-m" "cljfmt.main" "check"]}
+
+           :outdated {:extra-deps {com.github.liquidz/antq {:mvn/version "2.11.1276"}}
+                      :main-opts ["-m" "antq.core"]}}}

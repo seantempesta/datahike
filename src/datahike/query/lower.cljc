@@ -1,0 +1,1199 @@
+(ns datahike.query.lower
+  "Lowering pass: transforms a LogicalPlan into a physical plan map.
+
+   Makes all physical decisions:
+   - Predicate pushdown detection
+   - Index selection per pattern
+   - DP-optimal merge ordering within entity groups
+   - Anti-merge selectivity sorting
+   - Greedy cost-based operation ordering
+   - Inter-group hash-probe join detection
+   - NOT/NOT-JOIN binding validation
+
+   The output is a physical plan map:
+   {:ops, :consumed-preds, :classified, :group-joins, :has-passthrough?}
+   consumed by execute.cljc."
+  (:require
+   [clojure.set]
+   [clojure.walk]
+   [datahike.db.interface :as dbi]
+   [datahike.index.interface :as di]
+   [datahike.query.analyze :as analyze]
+   [datahike.query.estimate :as estimate]
+   [datahike.query.ir :as ir]
+   [datahike.query.logical :as logical]
+   [datahike.query.plan :as plan]))
+
+#?(:clj (set! *warn-on-reflection* true))
+
+;; ---------------------------------------------------------------------------
+;; IR node → classified clause-info reconstruction
+;;
+;; plan.cljc helpers expect classified clause maps. These converters
+;; reconstruct them from IR record fields.
+
+(defn- scan->classified
+  "Convert an LScan or LOptionalScan back to a classified clause map for
+   plan helpers. Shared pattern fields are read via keyword access; the
+   optional-only extras (`:optional?` / `:default-value`) are attached
+   only when the input is an LOptionalScan."
+  [scan]
+  (cond-> {:type :pattern
+           :clause (:clause scan)
+           :pattern (vec (:clause scan))
+           :vars (:vars scan)
+           :e (:e scan)
+           :a (:a scan)
+           :v (:v scan)
+           :tx (:tx scan)}
+    (instance? datahike.query.ir.LOptionalScan scan)
+    (assoc :optional? true
+           :default-value (:default-value scan))))
+
+(defn- filter->classified
+  "Convert an LFilter back to a classified clause map."
+  [^datahike.query.ir.LFilter f]
+  {:type :predicate
+   :clause (.-clause f)
+   :fn-sym (.-fn_sym f)
+   :args (.-args f)
+   :vars (.-vars f)})
+
+(defn- bind->classified
+  "Convert an LBind back to a classified clause map."
+  [^datahike.query.ir.LBind b]
+  {:type :function
+   :clause (.-clause b)
+   :fn-sym (.-fn_sym b)
+   :args (.-args b)
+   :binding (.-binding b)
+   :vars (.-vars b)})
+
+(defn- anti-join->classified
+  "Convert an LAntiJoin back to a classified clause map."
+  [^datahike.query.ir.LAntiJoin aj]
+  (let [t (.-type aj)]
+    (cond-> {:type t
+             :clause (.-clause aj)
+             :vars (.-vars aj)
+             :sub-clauses (.-sub_nodes aj)}
+      (= t :not-join) (assoc :join-vars (.-join_vars aj)))))
+
+(defn- union->classified
+  "Convert an LUnion back to a classified clause map."
+  [^datahike.query.ir.LUnion u]
+  (let [t (.-type u)
+        clause (.-clause u)]
+    (cond-> {:type t
+             :clause clause
+             :vars (.-vars u)
+             :branches (case t
+                         :or (rest clause)
+                         :or-join (drop 2 clause))}
+      (= t :or-join) (assoc :join-vars (.-join_vars u)))))
+
+(defn- rule-call->classified
+  "Convert an LRuleCall back to a classified clause map."
+  [^datahike.query.ir.LRuleCall rc]
+  {:type :rule-call
+   :clause (.-clause rc)
+   :vars (.-vars rc)
+   :e (.-rule_name rc)})
+
+(defn- rule-lookup->classified
+  "Convert an LRuleLookup to args for plan/plan-rule-lookup-op."
+  [^datahike.query.ir.LRuleLookup rl]
+  {:type :rule-call
+   :clause (.-clause rl)
+   :vars (.-vars rl)
+   :e (.-rule_name rl)})
+
+(defn- passthrough->classified
+  "Convert an LPassthrough back to a classified clause map."
+  [^datahike.query.ir.LPassthrough p]
+  {:type (.-type p)
+   :clause (.-clause p)
+   :vars (.-vars p)})
+;; ---------------------------------------------------------------------------
+;; Sub-plan factories (OR / NOT / rule expansion)
+;;
+;; These factories used to live in plan.cljc, but they need to call the
+;; lowering pipeline recursively (for each OR branch, NOT body, or rule
+;; branch the planner sees, we re-run build-logical-plan → lower so the
+;; sub-plan gets the same logical recognition top-level queries get).
+;; Putting them here keeps the dependency one-way (lower → plan, never
+;; the reverse) and lets the sub-plan calls go straight to `lower`
+;; without the `requiring-resolve` dance the previous layout required.
+
+(declare lower)
+
+(defn- plan-via-ir
+  "Lower a sub-plan via the full IR pipeline (`build-logical-plan →
+   lower`). The single point where the sub-plan factories below enter
+   the lowering pipeline.
+
+   `bound-vars` may arrive as a Set (legacy interface) or a Map
+   (`{var → cardinality}` — the form lower threads through as `bvc`).
+   `build-logical-plan` wants a Set; lower itself accepts either."
+  ([db clauses bound-vars rules]
+   (plan-via-ir db clauses bound-vars rules nil))
+  ([db clauses bound-vars rules guarded-rules]
+   (let [bound-set (cond (map? bound-vars) (set (keys bound-vars))
+                         (set? bound-vars) bound-vars
+                         :else (set bound-vars))
+         logical-plan (logical/build-logical-plan db (vec clauses) bound-set
+                                                  rules guarded-rules)]
+     (lower logical-plan db rules))))
+
+(defn- normalize-and-plan-branches
+  "Normalize branch clauses and create sub-plans for each branch.
+   Used by both OR and OR-JOIN planning.
+
+   Branch forms:
+   - Single data pattern:  [?e :attr ?v]       → wrap as [[?e :attr ?v]]
+   - Single predicate:     [(pred ?a ?b)]       → wrap as [[(pred ?a ?b)]]
+   - Multiple clauses:     [[?e :a ?v] [(> ?v 5)]] → use as-is
+   - AND compound:         (and [?e :a ?v] ...)  → use as-is
+
+   The key distinction: a multi-clause branch has a vector as its first element
+   (Datalog clauses are vectors). A single predicate like [(= ?a 1)] has a list
+   as its first element (the function call expression).
+
+   Sub-plans are built via the full IR pipeline so each branch gets the
+   logical pass (LOptionalScan recognition for get-else, etc.) before
+   the physical lowering — same as top-level queries."
+  [db branches bound-vars rules]
+  (mapv (fn [branch]
+          (let [branch-clauses (if (and (sequential? branch)
+                                        (not (vector? (first branch))))
+                                 [branch]
+                                 (vec branch))]
+            (plan-via-ir db branch-clauses bound-vars rules)))
+        branches))
+
+(defn plan-or-op
+  "Plan an OR or OR-JOIN clause. When join-vars? is true, validates and
+   includes :join-vars in the op (OR-JOIN semantics)."
+  ([db clause-info bound-vars rules]
+   (plan-or-op db clause-info bound-vars rules false))
+  ([db clause-info bound-vars rules join-vars?]
+   (let [join-vars (when join-vars?
+                     (let [raw (:join-vars clause-info)]
+                       (when (some sequential? raw)
+                         (throw (ex-info (str "Insufficient bindings: "
+                                              (into #{} (mapcat analyze/extract-vars) raw)
+                                              " not bound in " (:clause clause-info))
+                                         {:error :query/where :form (:clause clause-info)})))
+                       (set raw)))
+         sub-plans (normalize-and-plan-branches db (:branches clause-info) bound-vars rules)
+         ;; A branch's first sized op estimates it: by its attribute, and, once
+         ;; one of the entity or value vars its scan was planned bound on is
+         ;; bound (`:bound-on`, one set per such branch), by what that scan
+         ;; reads given them (`:scan-card`, see `plan/op-cost`).
+         bound (if (map? bound-vars) (set (keys bound-vars)) (set bound-vars))
+         firsts (keep (fn [p] (some #(when (:estimated-card %) %) (:ops p))) sub-plans)
+         total-est (reduce + 0 (map :estimated-card firsts))
+         bound-est (reduce + 0 (map #(or (:scan-card %) (:estimated-card %)) firsts))
+         bound-on (into [] (keep (fn [op] (when (:scan-card op)
+                                            (let [[e _ v] (:clause op)]
+                                              (not-empty (into #{} (filter bound) [e v]))))))
+                        firsts)]
+     (cond-> {:op (if join-vars? :or-join :or)
+              :clause (:clause clause-info)
+              :branches sub-plans
+              ;; An or-join binds only its join vars; the others are local
+              ;; to its branches.
+              :vars (if join-vars? join-vars (:vars clause-info))
+              :estimated-card (max 1 total-est)}
+       (seq bound-on) (assoc :bound-card (max 1 bound-est) :bound-on bound-on)
+       join-vars? (assoc :join-vars join-vars)))))
+
+(defn plan-not-op
+  "Plan a NOT or NOT-JOIN clause. When join-vars? is true, scopes the
+   sub-plan to only the join-vars (NOT-JOIN semantics)."
+  ([db clause-info bound-vars rules]
+   (plan-not-op db clause-info bound-vars rules false))
+  ([db clause-info bound-vars rules join-vars?]
+   (let [join-vars (when join-vars? (set (:join-vars clause-info)))
+         sub-plan (plan-via-ir db (:sub-clauses clause-info)
+                               (if join-vars? join-vars bound-vars) rules)]
+     (cond-> {:op (if join-vars? :not-join :not)
+              :clause (:clause clause-info)
+              :sub-plan sub-plan
+              :vars (:vars clause-info)
+              :estimated-card nil}
+       join-vars? (assoc :join-vars join-vars)))))
+
+(defn- rename-branch-vars
+  "Rename variables in a rule branch body, substituting rule-args with call-args.
+   Constant call-args get synthetic variables with identity-binding preamble so they
+   are available to function clauses in the body. Internal vars get unique suffixes.
+   Returns vector of renamed clauses."
+  [branch call-args seqid db]
+  (let [[[_ & rule-args] & clauses] branch
+        ;; Replace constant call-args with synthetic variables
+        call-args-safe (map-indexed (fn [i arg]
+                                      (if (analyze/free-var? arg)
+                                        arg
+                                        (symbol (str "?__const__" i "__auto__" seqid))))
+                                    call-args)
+        ;; Build identity-binding clauses for constant args (not equality predicates!)
+        ;; [(identity 42) ?__const__0__auto__1] creates a binding for the synthetic var.
+        const-bindings (into []
+                             (keep (fn [[safe orig]]
+                                     (when (not= safe orig)
+                                       [(list 'identity orig) safe])))
+                             (map vector call-args-safe call-args))
+        replacements (zipmap rule-args call-args-safe)
+        ;; Resolve keyword attrs to entity refs in attribute-refs mode.
+        ;;
+        ;; The resolution must recurse through compound clause forms
+        ;; (or, or-join, and, not, not-join, source-prefixed) to reach
+        ;; data patterns nested inside them. Without recursion, a rule
+        ;; body like `(or-join [...] [?e :attr ?v] ...)` would keep its
+        ;; inner pattern's attribute as a keyword while the outer
+        ;; query's clauses get resolved by substitute-consts-with-lookup-refs
+        ;; — at execute-time the lookup-batch-search path then slices
+        ;; AEVT for the keyword, finds zero datoms (datoms in
+        ;; :attribute-refs? mode are stored with attr=eid, not keyword),
+        ;; and the rule branch silently produces empty results. Surface
+        ;; symptom in jobtech: 3 changelog tests on HistoricalDB return
+        ;; 0 rows instead of the expected change events.
+        attr-refs? (:attribute-refs? (dbi/-config db))
+        data-pattern? (fn [x]
+                        (and (vector? x)
+                             (let [f (first x)]
+                               (or (and (symbol? f) (analyze/free-var? f))
+                                   (number? f)
+                                   (and (vector? f) (= 2 (count f)))))
+                             (or (keyword? (second x))
+                                 (and (symbol? (second x)) (analyze/free-var? (second x)))
+                                 (number? (second x)))))
+        resolve-attr-in-pattern (fn [pat]
+                                  (if (and attr-refs? (keyword? (second pat)))
+                                    (assoc pat 1 (dbi/-ref-for db (second pat)))
+                                    pat))
+        resolve-recursive (fn resolve-recursive [form]
+                            (cond
+                              ;; Data pattern: resolve its attr.
+                              (data-pattern? form)
+                              (resolve-attr-in-pattern form)
+
+                              ;; Compound list form (or, or-join, and, not, not-join, etc.)
+                              ;; — recurse into elements that look like clauses.
+                              (and (sequential? form)
+                                   (symbol? (first form))
+                                   (#{'or 'or-join 'and 'not 'not-join} (first form)))
+                              (let [head (first form)
+                                    ;; or-join / not-join have a vars vector after the head
+                                    [pre-rest body] (case head
+                                                      (or-join not-join) [(take 2 form) (drop 2 form)]
+                                                      [(take 1 form) (rest form)])]
+                                (concat pre-rest (map resolve-recursive body)))
+
+                              :else form))
+        renamed (mapv (fn [c]
+                        (resolve-recursive
+                         (clojure.walk/postwalk
+                          (fn [x]
+                            (if (analyze/free-var? x)
+                              (if (contains? replacements x)
+                                (get replacements x)
+                                (symbol (str (name x) "__auto__" seqid)))
+                              x))
+                          c)))
+                      clauses)]
+    ;; Put const-bindings first so synthetic vars are bound before body uses them
+    (into const-bindings renamed)))
+
+(defn- simple-binary-pattern
+  "If `op` is a bare pattern scan over `[?e :attr ?v]` — free entity and
+   value vars, ground attribute, no pushdown predicates, not optional —
+   return {:e ?e :attr attr :v ?v}. Otherwise nil.
+
+   Used to derive the structural topology info that gates the fixpoint
+   executor's delta-driven and magic-set shortcuts (see
+   `execute-recursive-rule`). Anything richer than this shape (predicates,
+   functions, entity groups, ground endpoints) must take the plain plan
+   path, so returning nil is always safe."
+  [op]
+  (when (and (= :pattern-scan (:op op))
+             (empty? (:pushdown-preds op))
+             (not (:optional? op)))
+    (let [clause (:clause op)]
+      (when (and (sequential? clause) (= 3 (count clause)))
+        (let [[e a v] clause]
+          (when (and (analyze/free-var? e)
+                     (analyze/free-var? v)
+                     (not= e v)
+                     (some? a)
+                     (not (analyze/free-var? a)))
+            {:e e :attr a :v v}))))))
+
+(defn- base-scan-info
+  "Structural info for the magic-set demand-driven base scan.
+
+   Applicable only when the rule has EXACTLY ONE base branch whose plan is
+   a single simple binary pattern over both head vars. Returns
+   {:attr attr :e-head-pos 0|1} — `:e-head-pos` is the head position whose
+   var sits at the pattern's ENTITY slot, which tells the executor whether
+   a demanded head value is looked up forward (EAVT, demand var at E) or
+   reverse (AVET, demand var at V). Nil disables the magic base scan
+   (plain base-plan execution, always correct)."
+  [head-vars base-plans]
+  (when (and (= 1 (count base-plans))
+             (= 2 (count head-vars)))
+    (let [ops (vec (:ops (first base-plans)))]
+      (when (= 1 (count ops))
+        (when-let [{:keys [e v] :as info} (simple-binary-pattern (first ops))]
+          (when (= (set head-vars) #{e v})
+            {:attr (:attr info)
+             :e-head-pos (if (= e (nth head-vars 0)) 0 1)}))))))
+
+(defn- rec-expand-info
+  "Structural topology of ONE recursive clause version, when it is exactly
+   `[pattern] (rule ?c0 ?c1)` — one simple binary pattern plus one
+   rule-lookup — linked by a single fresh var. Returns
+
+     {:attr             pattern attribute
+      :link-pattern-pos :e | :v   — where the link var sits in the pattern
+      :link-call-pos    0 | 1     — where the link var sits in the call
+      :pattern-head-pos 0 | 1     — head position the pattern's OTHER var
+                                    (a head var) occupies}
+
+   or nil for any other shape. The delta-driven expansion solves the
+   pattern's head var from a delta tuple's link value: `:v` means the link
+   is the pattern VALUE (reverse AVET lookup of entities pointing at it,
+   e.g. `[?x :edge ?z] (reach ?z ?y)`), `:e` means the link is the pattern
+   ENTITY (forward EAVT lookup of its attr values, e.g.
+   `[?m :parent ?a] (descendant ?m ?d)`). The two forms recurse in
+   opposite directions — this info is what makes the executor's shortcuts
+   direction-aware instead of assuming the `:v` form (2026-07-11)."
+  [head-vars cv-plan]
+  (let [ops (vec (:ops cv-plan))]
+    (when (= 2 (count ops))
+      (let [rl (first (filter #(= :rule-lookup (:op %)) ops))
+            ps (first (filter #(= :pattern-scan (:op %)) ops))]
+        (when (and rl ps)
+          (when-let [{:keys [e attr v]} (simple-binary-pattern ps)]
+            (let [call-args (:call-args rl)]
+              (when (and (= 2 (count call-args))
+                         (every? analyze/free-var? call-args)
+                         (apply distinct? call-args))
+                (let [head-set (set head-vars)
+                      pattern-vars #{e v}
+                      links (filterv #(and (pattern-vars %)
+                                           (not (head-set %)))
+                                     call-args)]
+                  (when (= 1 (count links))
+                    (let [link (first links)
+                          link-call-pos (if (= link (nth call-args 0)) 0 1)
+                          pass (nth call-args (- 1 link-call-pos))
+                          pattern-head-var (if (= link e) v e)]
+                      (when (head-set pattern-head-var)
+                        (let [p (if (= pattern-head-var (nth head-vars 0)) 0 1)]
+                          ;; the call's pass-through arg must be the OTHER
+                          ;; head var — then a delta tuple fully determines
+                          ;; the emitted head tuple
+                          (when (= pass (nth head-vars (- 1 p)))
+                            {:attr attr
+                             :link-pattern-pos (if (= link e) :e :v)
+                             :link-call-pos link-call-pos
+                             :pattern-head-pos p}))))))))))))))
+
+(defn- rec-expand-infos
+  "Per-version `rec-expand-info` for ALL recursive clause versions, or nil
+   if ANY version doesn't conform. All-or-nothing: the delta-driven
+   shortcut replaces the whole rec-branch execution, so it may only fire
+   when every version is expandable."
+  [head-vars rec-clause-versions]
+  (when (and (= 2 (count head-vars))
+             (seq rec-clause-versions))
+    (let [infos (mapv #(rec-expand-info head-vars %) rec-clause-versions)]
+      (when (every? some? infos)
+        infos))))
+
+(defn- invariant-head-positions
+  "Positions of `rule-name`'s head that every recursive call in each branch
+   passes that branch's own head var at, and whose call arg is a free var named
+   once in `call-args`: an outer binding of such a call arg binds every tuple
+   the fixpoint derives."
+  [rule-name branches call-args]
+  (let [once? (fn [arg] (= 1 (count (filter #{arg} call-args))))
+        passes-through? (fn [i [[_ & head] & body]]
+                          (let [hv (nth (vec head) i nil)]
+                            (and (analyze/free-var? hv)
+                                 (every? #(= hv (nth (vec (rest %)) i nil))
+                                         (filter #(and (seq? %) (= rule-name (first %)))
+                                                 (tree-seq sequential? seq body))))))]
+    (into #{}
+          (filter (fn [i]
+                    (let [arg (nth call-args i)]
+                      (and (analyze/free-var? arg)
+                           (once? arg)
+                           (every? #(passes-through? i %) branches)))))
+          (range (count call-args)))))
+
+(defn plan-rule-op [db clause-info bound-vars rules scc-info]
+  (let [[rule-name & call-args] (:clause clause-info)
+        ;; Validate: non-var rule args must be scalars (not collections/maps)
+        _ (doseq [arg call-args]
+            (when (and (not (analyze/free-var? arg))
+                       (not (nil? arg))
+                       (or (and (vector? arg)
+                                (not= 2 (count arg)))  ;; allow lookup-refs [attr val]
+                           (map? arg)
+                           (set? arg)))
+              (throw (ex-info (str "Bad format for value in pattern, must be a scalar, nil or a vector of two elements. Got: " (pr-str arg))
+                              {:error :query/where
+                               :form (:clause clause-info)}))))
+        branches (get rules rule-name)]
+    (if (not branches)
+      (plan/plan-passthrough-op clause-info)
+      (let [{:keys [scc recursive?]} (get scc-info rule-name)]
+        (if recursive?
+          ;; Recursive rule — pre-build branch plans with clause versions.
+          ;; IMPORTANT: We use the rule head vars (all free) for branch renaming,
+          ;; NOT the call-args (which may contain constants like 62).
+          ;; Constants are filtered AFTER the fixpoint completes.
+          ;; This ensures the recursive accumulator contains the full relation.
+          ;;
+          ;; For mutual recursion (SCC with multiple rules), we collect base/rec
+          ;; branches from ALL rules in the SCC. Each rule has its own accumulator.
+          (let [seqid (gensym "r")
+                scc-rule-names scc
+                is-scc-call? (fn [c]
+                               (and (sequential? c)
+                                    (symbol? (first c))
+                                    (contains? scc-rule-names (first c))))
+                ;; For each SCC rule, extract head vars and build branch plans
+                scc-rule-plans
+                (into {}
+                      (map (fn [rn]
+                             (let [rn-branches (get rules rn)
+                                   head-vars (vec (rest (first (first rn-branches))))
+                                   ;; The fixpoint keeps every outer relation sharing a var
+                                   ;; with the branch plans. A head position may take the
+                                   ;; call arg's name, so the caller's values restrict the
+                                   ;; closure, only when every recursive call passes that
+                                   ;; head var through unchanged (`invariant-head-positions`);
+                                   ;; every other head var gets a name private to this rule
+                                   ;; op. The result is joined back by call-arg position.
+                                   invariant (if (and (= rn rule-name) (= 1 (count scc-rule-names)))
+                                               (invariant-head-positions rn rn-branches call-args)
+                                               #{})
+                                   free-call-args (vec (map-indexed
+                                                        (fn [i hv]
+                                                          (if (contains? invariant i)
+                                                            (nth call-args i)
+                                                            (symbol (str (if (analyze/free-var? hv) (name hv) (str "?" (name hv)))
+                                                                         "__head__" seqid))))
+                                                        head-vars))
+                                   is-base? (fn [branch]
+                                              (let [[_head & body] branch]
+                                                (not (some is-scc-call? body))))
+                                   base-bs (filterv is-base? rn-branches)
+                                   rec-bs (filterv (complement is-base?) rn-branches)
+                          ;; Head vars are NOT pre-bound at the start of either
+                          ;; base or recursive branch bodies:
+                          ;;
+                          ;;  - Base branch: head-vars are produced by the body
+                          ;;    (a pattern binds them, a function computes them).
+                          ;;  - Recursive branch: head-vars are produced by the
+                          ;;    branch's rule-lookup op (the accumulator scan),
+                          ;;    which is itself a regular op the planner orders.
+                          ;;    Rule-lookup's outputs propagate through the
+                          ;;    bindedness tracker like any other producer.
+                          ;;
+                          ;; Earlier code added head-vars to branch-bound with a
+                          ;; conservative card-1 placeholder, intending it as a
+                          ;; cardinality hint. Under the new op-required-vars
+                          ;; contract, however, any entry in bound-vars is
+                          ;; treated as runnability-bound — so :function ops
+                          ;; that reference a head-var (e.g. `[(str ?id "/")
+                          ;; ?path]`) would appear runnable from clause-zero,
+                          ;; get cost-ordered AHEAD of the pattern that
+                          ;; actually binds the var, and produce a relation
+                          ;; missing the function's output binding. The
+                          ;; downstream rel-dedup-into! then sees a head-var
+                          ;; missing from :attrs and NPEs.
+                          ;;
+                          ;; Fix: keep branch-bound = the OUTER scope's bound
+                          ;; vars only. Cardinality estimation for patterns
+                          ;; that reference head-vars now correctly treats them
+                          ;; as free (worst-case attribute-total estimate)
+                          ;; until the body's own producer op binds them with
+                          ;; a known card.
+                                   branch-bound bound-vars
+                                   ;; Rule branch bodies go through the
+                                   ;; shared IR-pipeline helper — same
+                                   ;; routing OR / NOT / AND sub-plans
+                                   ;; use, so kernel features that
+                                   ;; depend on logical recognition
+                                   ;; (most visibly `[(get-else $ ?e
+                                   ;; :attr default) ?v]` becoming an
+                                   ;; LOptionalScan that binds `?e`)
+                                   ;; apply uniformly inside rule
+                                   ;; bodies.
+                                   plan-branch (fn plan-branch
+                                                 [branch-clauses guarded]
+                                                 (plan-via-ir db branch-clauses branch-bound
+                                                              rules guarded))
+                                   base-ps (mapv (fn [b]
+                                                   (let [renamed (rename-branch-vars b free-call-args seqid db)]
+                                                     (plan-branch (vec renamed) nil)))
+                                                 base-bs)
+                                   rec-cvs
+                                   (vec (mapcat
+                                         (fn [branch]
+                                           (let [renamed (rename-branch-vars branch free-call-args seqid db)
+                                                 scc-indices (keep-indexed
+                                                              (fn [i c] (when (is-scc-call? c) i))
+                                                              renamed)]
+                                             (map (fn [delta-idx]
+                                                    (let [versioned
+                                                          (vec (map-indexed
+                                                                (fn [i c]
+                                                                  (if (is-scc-call? c)
+                                                                    (with-meta (vec c)
+                                                                      {:rule-lookup-mode
+                                                                       (if (= i delta-idx) :delta :main)})
+                                                                    c))
+                                                                renamed))]
+                                                      (plan-branch versioned scc-rule-names)))
+                                                  scc-indices)))
+                                         rec-bs))]
+                               [rn {:head-vars free-call-args
+                                    :base-plans base-ps
+                                    :rec-clause-versions rec-cvs}])))
+                      scc-rule-names)
+                ;; Note: an earlier `has-scanless-base?` guard nilled out
+                ;; `scc-rule-plans` whenever a base case lacked an
+                ;; `:entity-group` / `:pattern-scan` op (e.g. SQL
+                ;; `WITH RECURSIVE … (SELECT 1 …)` anchor lowering to
+                ;; `[(identity 1) ?n]`, or a `[(ground […]) [?v ...]]`
+                ;; collection seed), routing such rules to `legacy/solve-rule`.
+                ;; Legacy can't evaluate recursive bodies that bind head vars
+                ;; through `:function` ops and then filter them with predicates
+                ;; — those queries hung or failed.
+                ;;
+                ;; The fixpoint executor already handles function-only base
+                ;; cases: `execute-branch-plans` runs the base plan against
+                ;; an empty ctx, `legacy/bind-by-fn` produces a single-tuple
+                ;; Relation, and the recursive branch's `rule-lookup` ops feed
+                ;; off the accumulator as usual. Magic sets are silently
+                ;; skipped when `base-info` is nil (the
+                ;; `magic-direction-ok?` gate in `execute-recursive-rule`).
+                ;; An earlier `has-scanless-base?` guard was redundant and
+                ;; introduced a real regression for scanless-base recursion.
+                ;;
+                ;; Structural topology info for the executor's shortcuts
+                ;; (magic-set base scan + delta-driven expansion). Nil for
+                ;; any non-conforming shape → plain fixpoint, always correct.
+                base-info
+                (when scc-rule-plans
+                  (let [{:keys [head-vars base-plans]} (get scc-rule-plans rule-name)]
+                    (base-scan-info head-vars base-plans)))
+                rec-infos
+                (when scc-rule-plans
+                  (let [{:keys [head-vars rec-clause-versions]} (get scc-rule-plans rule-name)]
+                    (rec-expand-infos head-vars rec-clause-versions)))]
+            {:op :recursive-rule
+             :clause (:clause clause-info)
+             :rule-name rule-name
+             :call-args (vec call-args)
+             :head-vars (when scc-rule-plans (:head-vars (get scc-rule-plans rule-name)))
+             :scc-rule-names scc-rule-names
+             :scc-rule-plans scc-rule-plans
+             :base-plans (when scc-rule-plans (:base-plans (get scc-rule-plans rule-name)))
+             :rec-clause-versions (when scc-rule-plans (:rec-clause-versions (get scc-rule-plans rule-name)))
+             :base-scan-info base-info
+             :rec-expand-infos rec-infos
+             :vars (:vars clause-info)
+             :estimated-card nil})
+          ;; Non-recursive — expand to OR
+          (let [seqid (gensym "r")
+                expanded (for [branch branches]
+                           (rename-branch-vars branch call-args seqid db))
+                ;; Body's bound-vars = outer scope's bound-vars only.
+                ;;
+                ;; The const-safe-vars (synthetic vars wrapping non-var call-args)
+                ;; are produced by the [(identity X) safe-var] preamble that
+                ;; rename-branch-vars prepends to each branch body. They are
+                ;; NOT bound at the start of the body — they're bound by the
+                ;; identity op's execution. Pre-binding them in rule-bound
+                ;; would look like a cardinality hint (card 1, since identity
+                ;; produces a single value) but under the central op-required-
+                ;; vars contract, any entry in bound-vars is read as runnability
+                ;; -bound. A predicate `[(< ?safe 100)]` referencing a pre-
+                ;; bound safe-var would then appear runnable from clause-zero,
+                ;; cost-order ahead of the identity preamble, and run against
+                ;; an empty :rels at execute time.
+                ;;
+                ;; The card-1 cardinality hint we want for downstream
+                ;; estimation reaches subsequent clauses naturally via
+                ;; bvc-eff threading: identity is the first clause processed
+                ;; in create-plan's reduce, its function-output-var-cards
+                ;; map (?safe → 1) is folded into bvc-eff by extend-bvc, and
+                ;; every later clause sees safe-var → 1 in its planning
+                ;; environment without it leaking into the runnability
+                ;; check's seed-bound set.
+                ;; Same IR-pipeline routing as the recursive branch above
+                ;; and as the OR / NOT / AND sub-plan paths in create-plan.
+                sub-plans (mapv (fn [branch-clauses]
+                                  (plan-via-ir db branch-clauses bound-vars rules))
+                                expanded)
+                total-est (reduce + 0 (keep (fn [p] (some :estimated-card (:ops p))) sub-plans))]
+            {:op :or
+             :clause (:clause clause-info)
+             :branches sub-plans
+             :vars (:vars clause-info)
+             :estimated-card (max 1 total-est)}))))))
+
+;; ---------------------------------------------------------------------------
+;; Collect all scans from logical plan (including from entity joins)
+
+(defn- collect-all-scans
+  "Extract all LScan nodes from the logical plan, including those
+   nested inside LEntityJoin nodes."
+  [nodes]
+  (reduce
+   (fn [acc node]
+     (cond
+       (ir/scan? node)
+       (conj acc node)
+
+       (instance? datahike.query.ir.LEntityJoin node)
+       (let [^datahike.query.ir.LEntityJoin ej node]
+         (into (into acc (.-scans ej)) (.-anti_scans ej)))
+
+       :else acc))
+   []
+   nodes))
+
+;; Pipeline construction and structural fusability are now in plan.cljc:
+;; plan/build-pipeline, plan/structurally-fusable?
+
+;; ---------------------------------------------------------------------------
+;; Per-node output cardinality estimates for outer bound-var-cards propagation
+;;
+;; To make scan-vs-merge selection inside a rule body / OR branch / entity-group
+;; aware of how constrained an upstream-bound var actually is, we estimate per-LP-
+;; node output-var cardinalities BEFORE lowering, then for each node N feed the
+;; UNION of OTHER nodes' estimates as `bound-var-cards` into N's lowering. This
+;; replaces the prior "vars are either bound or free" model with "vars are
+;; either bound with-known-cardinality or free", so estimate-pattern-with-bindings
+;; can produce differentiated estimates instead of returning the attribute-total
+;; for every pattern with the same attribute.
+
+(defn- estimate-node-output-cards
+  "Estimate output cardinality per free-var for an LP node, without lowering it.
+   Returns {var-symbol → long} or nil if the estimate isn't useful.
+
+   The node-borne half of the planner's produce-side cardinality seeding: it
+   routes LScan/LOptionalScan (pattern source) and LBind (function-bind source)
+   through plan/source-cards — the single definition of how each cardinality
+   source seeds the {var → card} map. The :in-input source is seeded separately
+   (initial-bvc in `lower`), since :in bindings are not LP nodes. Other node
+   types return nil — their downstream propagation falls back to the existing
+   all-vars-treated-as-free behavior; LEntityJoin / LRuleCall / LUnion arms can
+   be added as follow-ups."
+  ([node db provenance] (estimate-node-output-cards node db provenance nil))
+  ([node db provenance bound-var-cards]
+   (cond
+     (ir/scan? node)
+     ;; `bound-var-cards` is what is already bound ENTERING this node, so the
+     ;; output estimate reflects the probe rather than the attribute extent.
+     (plan/source-cards {:kind :pattern :classified (scan->classified node) :db db
+                         :bound-var-cards bound-var-cards})
+
+     ;; Function binds whose var advertises :datahike/output-cardinality (e.g.
+     ;; a graph algorithm whose result size is data-dependent). Without this the
+     ;; bind is opaque and downstream patterns over its output var fall back to
+     ;; the full attribute extent. Only the binding's own free vars are bounded.
+     (ir/bind? node)
+     (plan/source-cards {:kind :bind :classified (bind->classified node) :db db
+                         :provenance provenance})
+
+     :else nil)))
+
+(defn- bind-provenance
+  "Map each var bound by a scalar function bind to the form that produced it,
+   e.g. {?g (attr-graph :follows)}. Lets a downstream op's
+   :datahike/output-cardinality cost model resolve a graph passed by variable
+   back to its constructor (and through transformer wrappers)."
+  [nodes]
+  (reduce (fn [m node]
+            (if (ir/bind? node)
+              (let [ci (bind->classified node)
+                    b (:binding ci)]
+                (if (symbol? b)
+                  (assoc m b (first (:clause ci)))
+                  m))
+              m))
+          {} nodes))
+
+;; ---------------------------------------------------------------------------
+;; Entity group construction from LEntityJoin
+
+(defn- lower-entity-join
+  "Lower an LEntityJoin to an :entity-group physical op.
+   - Builds pattern-scan ops for each scan via plan/plan-pattern-op
+   - Applies DP merge ordering
+   - Sorts anti-merges by selectivity
+   - Computes output cardinality estimate"
+  [^datahike.query.ir.LEntityJoin ej db pushdowns consumed-acc bound-vars total-entities]
+  (let [scans (.-scans ej)
+        anti-scans (.-anti_scans ej)
+        source (.-source ej)
+
+        ;; Build physical pattern-scan ops for each scan
+        {scan-ops :ops new-consumed :consumed}
+        (reduce
+         (fn [acc scan]
+           (let [ci (scan->classified scan)
+                 schema-info (analyze/pattern-schema-info db ci)
+                 preds (get pushdowns (:clause ci) [])
+                 [op consumed-preds] (plan/plan-pattern-op db ci schema-info preds bound-vars)]
+             (-> acc
+                 (update :ops conj (cond-> op source (assoc :source source)))
+                 (update :consumed into (or consumed-preds #{})))))
+         {:ops [] :consumed #{}}
+         scans)
+
+        ;; Build anti-merge ops
+        anti-ops
+        (mapv (fn [anti-scan]
+                (let [ci (scan->classified anti-scan)
+                      schema-info (analyze/pattern-schema-info db ci)
+                      [op _] (plan/plan-pattern-op db ci schema-info [] bound-vars)]
+                  (assoc op :anti? true)))
+              anti-scans)
+
+        ;; Delegate DP ordering, anti-merge sorting, cardinality estimation,
+        ;; and pipeline construction to the shared primitive.
+        {:keys [op merge-lost-preds unfolded-antis]}
+        (plan/assemble-entity-group db (.-entity_var ej) source
+                                    scan-ops anti-ops total-entities)]
+
+    {:op (assoc op :merge-lost-preds merge-lost-preds)
+     :consumed new-consumed
+     :unfolded-antis unfolded-antis}))
+
+(defn- lower-standalone-scan
+  "Lower a standalone LScan or LOptionalScan to a :pattern-scan physical op."
+  [scan db pushdowns consumed-acc bound-vars]
+  (let [ci (scan->classified scan)
+        source (:source scan)
+        schema-info (analyze/pattern-schema-info db ci)
+        preds (get pushdowns (:clause ci) [])
+        [op consumed-preds] (plan/plan-pattern-op db ci schema-info preds bound-vars)]
+    {:op (cond-> (assoc op :pipeline (plan/build-pipeline op [] db))
+           source (assoc :source source))
+     :consumed (or consumed-preds #{})}))
+
+;; ---------------------------------------------------------------------------
+;; Main lowering pass
+
+(defn lower
+  "Lower a LogicalPlan to a physical plan map.
+
+   The output is a physical plan map:
+   {:ops [ordered-physical-ops...]
+    :consumed-preds #{consumed-predicate-clauses}
+    :classified [classified-clause-maps...]
+    :group-joins {consumer-idx → {:producer-idx :probe-vars}}
+    :has-passthrough? boolean}
+
+   `in-cards` (optional) is a value-independent {var → card} seed for :in
+   collection/relation bindings (see plan/source-cards :input); it overrides the
+   card-1 placeholder so a join driven by a passed collection is ordered as a
+   multi-row source. nil for sub-plans / queries without relation :in bindings."
+  [logical-plan db rules & [in-cards]]
+  (let [nodes (.-nodes ^datahike.query.ir.LogicalPlan logical-plan)
+        provenance (bind-provenance nodes)
+        bound-vars (.-bound_vars ^datahike.query.ir.LogicalPlan logical-plan)
+        classified (.-classified ^datahike.query.ir.LogicalPlan logical-plan)
+        all-clause-vars (into bound-vars (mapcat :vars) classified)
+
+        ;; Pre-compute SCC info for rules
+        scc-info (when rules (plan/compute-rule-sccs rules))
+
+        ;; ---------------------------------------------------------------
+        ;; Step 1: Pushdown detection
+        ;; Collect all pattern + predicate classified clauses for pushdown analysis
+        all-scans (collect-all-scans nodes)
+        scan-classifieds (mapv scan->classified all-scans)
+        filter-nodes (filterv #(instance? datahike.query.ir.LFilter %) nodes)
+        filter-classifieds (mapv filter->classified filter-nodes)
+
+        {:keys [pushdowns consumed]}
+        (analyze/detect-pushdown
+         (into scan-classifieds filter-classifieds)
+         bound-vars)
+
+        ;; ---------------------------------------------------------------
+        ;; Step 2: Lower each node to physical op(s)
+        total-entities (estimate/estimate-total-entities db)
+
+        ;; Per-node output-card estimates + initial bound-vars (Map form).
+        ;; SOURCE-ORDER directional bvc: each node's bound-var-cards is the
+        ;; union of `initial-bvc` and outputs of every node with a STRICTLY
+        ;; LOWER `:source-idx` (set by build-logical-plan). This avoids the
+        ;; over-binding bug where build-logical-plan groups all
+        ;; entity-nodes BEFORE rule-nodes, causing the lower.cljc reduce
+        ;; to add later-in-source patterns' outputs to the rule call's
+        ;; bvc — making the rule body's planner treat consumed-by-later
+        ;; vars (e.g. ?related-c in the edge query) as upstream-bound
+        ;; probe constraints. Source order is sound (Datalog is set
+        ;; semantics; correctness doesn't depend on bvc accuracy — only
+        ;; estimate quality and downstream scan choice). Datalog
+        ;; programmers conventionally write clauses in dependency order,
+        ;; so source-idx is a reasonable proxy for "what's bound entering
+        ;; this clause." The execution path itself is reordered later by
+        ;; order-plan-ops based on actual cost, independent of this.
+        ;; Per-node BINDING vars — the free vars a node binds for
+        ;; downstream consumption. Distinct from output-cards (which
+        ;; carries numeric cardinality estimates and is restricted to
+        ;; scan nodes to avoid the sibling-pattern-bound regression
+        ;; called out in the extend-bvc comment block in plan.cljc).
+        ;; Bindedness is the contract that the post-ordering NOT
+        ;; validation and op-required-vars runnability checks rely
+        ;; on; without it, an or-join branch whose :not references a
+        ;; var bound by an outer get-else / function clause is
+        ;; rejected with `Insufficient bindings` even though the var
+        ;; is bound at execute time. We add bindings as ::in-scope
+        ;; sentinels — estimate-pattern-with-bindings' card-of treats
+        ;; non-numeric entries as "bound but unknown card", so this
+        ;; doesn't perturb cardinality estimation.
+        node-binding-vars (fn [^datahike.query.ir.LogicalPlan _logical n]
+                            (cond
+                              (ir/scan? n)
+                              (filter analyze/free-var? (:vars (scan->classified n)))
+                              (instance? datahike.query.ir.LBind n)
+                              (analyze/extract-vars (.-binding ^datahike.query.ir.LBind n))
+                              (instance? datahike.query.ir.LEntityJoin n)
+                              (let [scans (concat (.-scans ^datahike.query.ir.LEntityJoin n) [])]
+                                (mapcat (fn [s] (filter analyze/free-var? (:vars (scan->classified s))))
+                                        scans))
+                              (instance? datahike.query.ir.LUnion n)
+                              (let [jv (.-join_vars ^datahike.query.ir.LUnion n)]
+                                (when jv (vec jv)))
+                              (instance? datahike.query.ir.LRuleCall n)
+                              (let [args (.-call_args ^datahike.query.ir.LRuleCall n)]
+                                (filter analyze/free-var? args))
+                              :else nil))
+        node->binding-vars (zipmap nodes (map #(node-binding-vars logical-plan %) nodes))
+        ;; Nodes without :source-idx (AND-flattened sub-plans, etc.) are
+        ;; treated as "comes last" via a sentinel beyond any real index.
+        ;; #?(:clj Long/MAX_VALUE :cljs js/Number.MAX_SAFE_INTEGER) keeps
+        ;; this portable across both the JVM and the Node target.
+        max-src-idx #?(:clj Long/MAX_VALUE :cljs (.-MAX_SAFE_INTEGER js/Number))
+        node->src-idx (into {} (map (fn [n] [n (or (:source-idx (meta n))
+                                                   max-src-idx)])) nodes)
+        ;; :in vars seed at card 1 (placeholder), overridden by `in-cards` for
+        ;; collection/relation bindings (plan/source-cards :input) so a passed
+        ;; collection is ordered as a real multi-row source, not a singleton.
+        initial-bvc (cond (map? bound-vars) bound-vars
+                          :else (merge (zipmap (or bound-vars #{}) (repeat 1))
+                                       (or in-cards {})))
+        merge-cards (fn [acc-map outs]
+                      (reduce-kv
+                       (fn [m v c]
+                         (let [cur (get m v)]
+                           (cond
+                             (and (number? cur) (number? c)) (assoc m v (long (min cur c)))
+                             (number? c) (assoc m v c)
+                             :else m)))
+                       acc-map outs))
+        merge-bindings (fn [acc-map vs]
+                         (reduce (fn [m v]
+                                   (if (contains? m v) m (assoc m v ::in-scope)))
+                                 acc-map
+                                 (or vs [])))
+        ;; NOT a pre-pass. Output cards are computed in SOURCE ORDER, each node
+        ;; under the bindings accumulated from the nodes before it, because an
+        ;; unbound pre-pass throws away exactly the information this map exists
+        ;; to carry.
+        ;;
+        ;; A scan cannot output more rows than it matches. `[?c :concept/id
+        ;; ?from-id]` with `?from-id` bound to a one-element `:in` collection
+        ;; matches one row and costed itself at one — but the pre-pass then
+        ;; advertised `?c` at the full 2000-concept extent, so the next clause
+        ;; `[?r :relation/concept-1 ?c]` was priced against 2000 rather than 1
+        ;; and came out at the whole 8000-row relation. The planner duly drove
+        ;; from the relation and hash-joined the probe in.
+        ;;
+        ;; The visible symptom was a plan that did not change at all between a
+        ;; 1-element and a 1000-element probe — constant time in the input,
+        ;; where the base engine scales with it (#973).
+        ;;
+        ;; Order is by `source-idx`, the same proxy the bvc propagation below
+        ;; already uses, and the same caveat applies: correctness never depends
+        ;; on cardinality accuracy (Datalog is set semantics), only plan
+        ;; quality. `merge-cards` takes the MIN, so a bound-aware estimate can
+        ;; only tighten what a later node sees, never loosen it.
+        ordered-nodes (sort-by node->src-idx nodes)
+        node->output-cards
+        (:cards
+         (reduce (fn [{:keys [bvc] :as acc} n]
+                   (let [outs (estimate-node-output-cards n db provenance bvc)]
+                     (-> acc
+                         (assoc-in [:cards n] outs)
+                         (assoc :bvc (cond-> bvc
+                                       (some? outs) (merge-cards outs)
+                                       (seq (node-binding-vars logical-plan n))
+                                       (merge-bindings (node-binding-vars logical-plan n)))))))
+                 {:cards {} :bvc initial-bvc}
+                 ordered-nodes))
+        ;; Pre-compute bvc per node from PRECEDING source-idx nodes'
+        ;; outputs (cardinality, scan-only) and bindings (every binder
+        ;; node).
+        node->bvc (into {}
+                        (map (fn [n]
+                               (let [my-idx (node->src-idx n)
+                                     prior (filter (fn [other]
+                                                     (let [oi (node->src-idx other)]
+                                                       (and (not (identical? other n))
+                                                            (< oi my-idx))))
+                                                   nodes)
+                                     bvc (reduce (fn [acc o]
+                                                   (cond-> acc
+                                                     (some? (node->output-cards o))
+                                                     (merge-cards (node->output-cards o))
+                                                     (seq (node->binding-vars o))
+                                                     (merge-bindings (node->binding-vars o))))
+                                                 initial-bvc prior)]
+                                 [n bvc])))
+                        nodes)
+
+        {:keys [ops actual-consumed not-ops]}
+        (reduce
+         (fn [acc node]
+           (let [bvc (get node->bvc node initial-bvc)]
+             (cond
+               ;; LEntityJoin → entity-group op
+               (instance? datahike.query.ir.LEntityJoin node)
+               (let [{:keys [op consumed unfolded-antis]}
+                     (lower-entity-join node db pushdowns (:actual-consumed acc)
+                                        bvc total-entities)]
+                 (-> acc
+                     (update :ops conj op)
+                     (update :not-ops into (map #(plan-not-op db (analyze/classify-clause (list 'not %)) all-clause-vars rules))
+                             unfolded-antis)
+                     (update :actual-consumed into consumed)))
+
+               ;; Standalone LScan or LOptionalScan → pattern-scan op
+               (ir/scan? node)
+               (let [{:keys [op consumed]}
+                     (lower-standalone-scan node db pushdowns (:actual-consumed acc)
+                                            bvc)]
+                 (-> acc
+                     (update :ops conj op)
+                     (update :actual-consumed into consumed)))
+
+               ;; LFilter → deferred predicate (may be consumed by pushdown)
+               (instance? datahike.query.ir.LFilter node)
+               (update acc :ops conj [:maybe-pred (filter->classified node)])
+
+               ;; LBind → function op
+               (instance? datahike.query.ir.LBind node)
+               (update acc :ops conj (plan/plan-function-op (bind->classified node) db provenance))
+
+               ;; LAntiJoin → NOT/NOT-JOIN op (delegate to plan.cljc)
+               (instance? datahike.query.ir.LAntiJoin node)
+               (let [ci (anti-join->classified node)
+                     join-vars? (= :not-join (.-type ^datahike.query.ir.LAntiJoin node))
+                     op (plan-not-op db ci all-clause-vars rules join-vars?)]
+                 (if join-vars?
+                   (update acc :ops conj op)
+                   (update acc :not-ops conj op)))
+
+               ;; LUnion → OR/OR-JOIN op (delegate to plan.cljc)
+               (instance? datahike.query.ir.LUnion node)
+               (let [ci (union->classified node)
+                     join-vars? (= :or-join (.-type ^datahike.query.ir.LUnion node))]
+                 (update acc :ops conj (plan-or-op db ci bvc rules join-vars?)))
+
+               ;; LRuleCall → delegate to plan-rule-op
+               (instance? datahike.query.ir.LRuleCall node)
+               (let [ci (rule-call->classified node)]
+                 (update acc :ops conj (plan-rule-op db ci bvc rules scc-info)))
+
+             ;; LRuleLookup → rule lookup op
+               (instance? datahike.query.ir.LRuleLookup node)
+               (let [ci (rule-lookup->classified node)]
+                 (update acc :ops conj
+                         (plan/plan-rule-lookup-op ci (.-mode ^datahike.query.ir.LRuleLookup node))))
+
+             ;; LPassthrough → passthrough op
+               (instance? datahike.query.ir.LPassthrough node)
+               (let [ci (passthrough->classified node)
+                     ptype (.-type ^datahike.query.ir.LPassthrough node)]
+                 (if (= :source-prefix ptype)
+                 ;; Source-prefix passthrough: re-classify inner clause and delegate
+                   (let [clause (.-clause ^datahike.query.ir.LPassthrough node)
+                         source-sym (first clause)
+                         inner-clause (vec (rest clause))
+                         inner-ci (analyze/classify-clause inner-clause)
+                         inner-ci (assoc inner-ci :source source-sym)]
+                     (case (:type inner-ci)
+                       :not (let [op (plan-not-op db inner-ci all-clause-vars rules)]
+                              (update acc :ops conj (assoc op :source source-sym)))
+                       :not-join (let [op (plan-not-op db inner-ci all-clause-vars rules true)]
+                                   (update acc :ops conj (assoc op :source source-sym)))
+                       :or (update acc :ops conj
+                                   (assoc (plan-or-op db inner-ci all-clause-vars rules) :source source-sym))
+                       :or-join (update acc :ops conj
+                                        (assoc (plan-or-op db inner-ci all-clause-vars rules true) :source source-sym))
+                       (update acc :ops conj (plan/plan-passthrough-op ci))))
+                 ;; Regular passthrough
+                   (update acc :ops conj (plan/plan-passthrough-op ci))))
+
+               ;; Anything else → passthrough
+               :else
+               (update acc :ops conj (plan/plan-passthrough-op
+                                      {:clause nil :type :unknown :vars #{}})))))
+         {:ops [] :actual-consumed #{} :not-ops []}
+         nodes)
+
+        ;; ---------------------------------------------------------------
+        ;; Step 3: Resolve deferred predicates
+        ;; Collect pattern ops for predicate sampling
+        raw-pattern-ops (filterv #(and (map? %) (= :pattern-scan (:op %))) ops)
+
+        resolved-ops
+        (reduce
+         (fn [acc op]
+           (if (and (vector? op) (= :maybe-pred (first op)))
+             (let [ci (second op)]
+               (if (contains? actual-consumed (:clause ci))
+                 acc ;; consumed by pushdown
+                 (conj acc (plan/plan-predicate-op ci db raw-pattern-ops))))
+             (conj acc op)))
+         []
+         ops)
+
+        ;; ---------------------------------------------------------------
+        ;; Step 4: Separate entity-groups from other ops, then build entity groups
+        ;; from pattern-scan ops that weren't already part of an LEntityJoin
+        pattern-ops (filterv #(= :pattern-scan (:op %)) resolved-ops)
+        entity-group-ops (filterv #(= :entity-group (:op %)) resolved-ops)
+        other-ops (filterv #(not (#{:pattern-scan :entity-group} (:op %))) resolved-ops)
+
+        ;; Entity groups from LEntityJoin are already built.
+        ;; Standalone pattern-scan ops stay as-is (they came from standalone LScans).
+        ;; We do NOT re-group them — the logical IR already decided the grouping.
+        all-groups (into (vec entity-group-ops) pattern-ops)
+
+        ;; Step 4b: Restore predicates consumed as pushdowns on merge-ops.
+        ;; Merges use EAVT lookupGE, not AVET scans, so pushdowns can't be applied.
+        ;; Collect them and re-emit as standalone predicate ops.
+        merge-lost-pred-clauses (into #{} (comp (filter #(= :entity-group (:op %)))
+                                                (mapcat :merge-lost-preds))
+                                      entity-group-ops)
+        restored-preds (when (seq merge-lost-pred-clauses)
+                         (let [ci-by-clause (into {} (map (fn [ci] [(:clause ci) ci])) classified)]
+                           (mapv (fn [pred-clause]
+                                   (plan/plan-predicate-op (or (ci-by-clause pred-clause) (analyze/classify-clause pred-clause))
+                                                           db raw-pattern-ops))
+                                 merge-lost-pred-clauses)))
+        other-ops (if (seq restored-preds)
+                    (into other-ops restored-preds)
+                    other-ops)
+        all-groups (mapv #(dissoc % :merge-lost-preds) all-groups)
+        actual-consumed (if (seq merge-lost-pred-clauses)
+                          (reduce disj actual-consumed merge-lost-pred-clauses)
+                          actual-consumed)
+
+        ;; ---------------------------------------------------------------
+        ;; Step 4c: Attach single-group predicates to their entity group.
+        ;; A predicate whose free-var args are a subset of exactly one group's
+        ;; vars is evaluated during that group's execution, not as a post-filter.
+        {:keys [all-groups other-ops]}
+        (let [pred-ops   (filterv #(= :predicate (:op %)) other-ops)
+              non-preds  (filterv #(not= :predicate (:op %)) other-ops)]
+          (if (empty? pred-ops)
+            {:all-groups all-groups :other-ops other-ops}
+            (let [group-vars (mapv #(or (:output-vars %) (:vars %)) all-groups)]
+              (reduce
+               (fn [{:keys [all-groups other-ops]} pred]
+                 (let [pred-free (into #{} (filter analyze/free-var?) (:args pred))
+                       matching  (keep-indexed
+                                  (fn [i gvars]
+                                    (when (clojure.set/subset? pred-free gvars) i))
+                                  group-vars)]
+                   (if (and (= 1 (count matching))
+                            (plan/post-op-direct-eligible? pred))
+                     ;; Attach to the single matching group
+                     (let [gi (first matching)]
+                       {:all-groups (update all-groups gi
+                                            update :attached-preds (fnil conj []) pred)
+                        :other-ops other-ops})
+                     ;; Multi-group or no-group: keep as standalone
+                     {:all-groups all-groups
+                      :other-ops (conj other-ops pred)})))
+               {:all-groups all-groups :other-ops non-preds}
+               pred-ops))))
+
+        ;; ---------------------------------------------------------------
+        ;; Step 5: Order everything (entity-groups + other ops + remaining NOTs)
+        all-ops (into (into all-groups other-ops) not-ops)
+        ;; Seed the orderer with the externally-bound (:in collection/tuple) vars
+        ;; so a producer keyed on a bound root (e.g. a recursive rule, or/not) is
+        ;; "ready" from the start and ordered by its cost, not deferred behind a
+        ;; broad attribute scan. (bound-vars excludes $/%/scalar-consts/fn-outputs
+        ;; — only genuine bound relation columns; group DP order is independent of
+        ;; this seed, which only affects non-group op readiness.)
+        ordered-ops (plan/order-plan-ops all-ops bound-vars db)
+
+        ;; ---------------------------------------------------------------
+        ;; Step 6: Detect inter-group value joins
+        group-joins (plan/detect-inter-group-joins
+                     (filterv #(#{:entity-group :pattern-scan} (:op %)) ordered-ops))
+
+        ;; ---------------------------------------------------------------
+        ;; Step 7: NOT binding validation.
+        ;; Walks the ordered ops in execution order, tracking which vars
+        ;; are bound after each op runs. NOT/NOT-JOIN must have at least
+        ;; one of its vars bound by a prior op (legacy semantics).
+        ;;
+        ;; The per-op contribution-set must mirror what the executor
+        ;; will actually bind:
+        ;;  - :entity-group → scan + merge vars
+        ;;  - :pattern-scan → pattern vars
+        ;;  - :function     → the result-binding var (`:binding` from
+        ;;                    plan-function-op). Predicates produce no
+        ;;                    new bindings; or/or-join handle their own
+        ;;                    binding internally.
+        ;; Earlier this case used `(:bind-vars op)` which plan-function-op
+        ;; never sets — function ops looked like they bound nothing, so
+        ;; any subsequent NOT/predicate whose only required var came from
+        ;; a function chain (e.g. `format_type(...)` feeding NOT IN) was
+        ;; falsely rejected with "Insufficient bindings".
+        _ (loop [remaining ordered-ops
+                 vars-so-far bound-vars]
+            (when (seq remaining)
+              (let [op (first remaining)]
+                (when (#{:not :not-join} (:op op))
+                  (let [not-vars (:vars op)]
+                    (when (empty? (clojure.set/intersection not-vars vars-so-far))
+                      (throw (ex-info (str "Insufficient bindings: none of " not-vars
+                                           " is bound in " (:clause op))
+                                      {:error :query/where
+                                       :form (:clause op)})))))
+                (recur (rest remaining)
+                       (into vars-so-far
+                             (case (:op op)
+                               :entity-group (into (:vars (:scan-op op))
+                                                   (mapcat :vars (:merge-ops op)))
+                               :pattern-scan (:vars op)
+                               :function (analyze/extract-vars (:binding op))
+                               nil))))))]
+
+    {:ops ordered-ops
+     :consumed-preds actual-consumed
+     :classified classified
+     :group-joins group-joins
+     :has-passthrough? (boolean (some #(= :passthrough (:op %)) ordered-ops))
+     :structurally-fusable? (plan/structurally-fusable? ordered-ops)}))

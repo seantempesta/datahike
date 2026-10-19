@@ -1,0 +1,929 @@
+(ns datahike.test.api-test
+  (:require
+   ;; Load hitchhiker-tree FIRST before anything that loads datahike.index
+   #?(:clj [datahike.index.hitchhiker-tree])
+   #?(:cljs [cljs.test :as t :refer-macros [is are deftest testing]]
+      :clj  [clojure.test :as t :refer [is are deftest testing]])
+   [datahike.test.utils :as utils]
+   [datahike.api :as d]
+   [datahike.db :as db]
+   [datahike.query :as dq]
+   [datahike.db.interface :as dbi]
+   [datahike.index.interface :as di]
+   [datahike.constants :refer [tx0]]))
+
+(deftest test-transact-docs
+  (let [cfg (utils/provide-unique-id
+             {:store {:backend :memory}
+              :keep-history? false
+              :schema-flexibility :read})
+        conn (utils/setup-db cfg false)
+        dvec #(vector (:e %) (:a %) (:v %))]
+    (try
+      ;; add a single datom to an existing entity (1)
+      (is (= [[1 :name "Ivan"]]
+             (map dvec (:tx-data (d/transact conn {:tx-data [[:db/add 1 :name "Ivan"]]})))))
+
+    ;; retract a single datom
+      (is (= [[1 :name "Ivan"]]
+             (map dvec (:tx-data (d/transact conn {:tx-data [[:db/retract 1 :name "Ivan"]]})))))
+
+    ;; retract single entity attribute
+      (is (= []
+             (map dvec (:tx-data (d/transact conn {:tx-data [[:db.fn/retractAttribute 1 :name]]})))))
+
+    ;; retract all entity attributes (effectively deletes entity)
+      (is (= []
+             (map dvec (:tx-data (d/transact conn {:tx-data [[:db.fn/retractEntity 1]]})))))
+
+    ;; create a new entity (`-1`, as any other negative value, is a tempid
+    ;; that will be replaced with DataScript to a next unused eid)
+      (is (= '([2 :name "Ivan"])
+             (map dvec (:tx-data (d/transact conn {:tx-data [[:db/add -1 :name "Ivan"]]})))))
+
+    ;; check assigned id (here `*1` is a result returned from previous `transact` call)
+      (is (= {-1 3, :db/current-tx 536870918}
+             (:tempids (d/transact conn {:tx-data [[:db/add -1 :name "Ivan"]]}))))
+
+    ;; check actual datoms inserted
+      (is (= '([4 :name "Ivan"])
+             (map dvec (:tx-data (d/transact conn {:tx-data [[:db/add -1 :name "Ivan"]]}))))) ; => [#datahike/Datom [296 :name "Ivan"]]
+
+    ;; tempid can also be a string
+      (is (= {"ivan" 5, :db/current-tx 536870920}
+             (:tempids (d/transact conn {:tx-data [[:db/add "ivan" :name "Ivan"]]}))))
+
+    ;; reference another entity (must exist)
+      (is (= '([6 :friend 296])
+             (map dvec (:tx-data (d/transact conn {:tx-data [[:db/add -1 :friend 296]]})))))
+
+    ;; create an entity and set multiple attributes (in a single transaction
+    ;; equal tempids will be replaced with the same unused yet entid)
+      (is (= '([7 :name "Ivan"] [7 :likes "fries"] [7 :likes "pizza"] [7 :friend 296])
+             (map dvec (:tx-data (d/transact conn {:tx-data [[:db/add -1 :name "Ivan"]
+                                                             [:db/add -1 :likes "fries"]
+                                                             [:db/add -1 :likes "pizza"]
+                                                             [:db/add -1 :friend 296]]})))))
+
+    ;; create an entity and set multiple attributes (alternative map form)
+      (is (= '([8 :name "Ivan"] [8 :likes ["fries" "pizza"]] [8 :friend 296])
+             (map dvec (:tx-data (d/transact conn {:tx-data [{:db/id  -1
+                                                              :name   "Ivan"
+                                                              :likes  ["fries" "pizza"]
+                                                              :friend 296}]})))))
+
+    ;; update an entity (alternative map form). Can’t retract attributes in
+    ;; map form. For cardinality many attrs, value (fish in this example)
+    ;; will be added to the list of existing values
+      (is (= '([296 :name "Oleg"] [296 :likes ["fish"]])
+             (map dvec (:tx-data (d/transact conn {:tx-data [{:db/id  296
+                                                              :name   "Oleg"
+                                                              :likes  ["fish"]}]})))))
+
+    ;; ref attributes can be specified as nested map, that will create netsed entity as well
+      (is (= '([297 :name "Oleg"] [297 :friend {:db/id -2, :name "Sergey"}])
+             (map dvec (:tx-data (d/transact conn {:tx-data [{:db/id  -1
+                                                              :name   "Oleg"
+                                                              :friend {:db/id -2
+                                                                       :name "Sergey"}}]})))))
+
+    ;; schema is needed for using a reverse attribute
+      (is (= '([298 :db/valueType :db.type/ref] [298 :db/cardinality :db.cardinality/one] [298 :db/ident :friend])
+             (map dvec (:tx-data (d/transact conn {:tx-data [{:db/valueType :db.type/ref
+                                                              :db/cardinality :db.cardinality/one
+                                                              :db/ident :friend}]})))))
+
+    ;; reverse attribute name can be used if you want created entity to become
+    ;; a value in another entity reference
+      (is (= '([299 :name "Oleg"] [296 :friend 299])
+             (map dvec (:tx-data (d/transact conn {:tx-data [{:db/id  -1
+                                                              :name   "Oleg"
+                                                              :_friend 296}]})))))
+
+    ;; equivalent to
+      (is (= '([300 :name "Oleg"] [296 :friend 300])
+             (map dvec (:tx-data (d/transact conn {:tx-data [{:db/id  -1, :name   "Oleg"}
+                                                             {:db/id 296, :friend -1}]})))))
+
+    ;; deprecated api
+      (is (= '([301 :name "Oleg"] [301 :likes "pie"] [301 :likes "dates"] [301 :friend 297])
+             (map dvec (:tx-data (d/transact conn [[:db/add -1 :name "Oleg"]
+                                                   [:db/add -1 :likes "pie"]
+                                                   [:db/add -1 :likes "dates"]
+                                                   [:db/add -1 :friend 297]])))))
+
+    ;; lazy sequence
+      (is (= '([302 :name "Oleg"] [302 :likes "pie"] [302 :likes "dates"] [302 :friend 297])
+             (map dvec (:tx-data (d/transact conn (take 4 [[:db/add -1 :name "Oleg"]
+                                                           [:db/add -1 :likes "pie"]
+                                                           [:db/add -1 :likes "dates"]
+                                                           [:db/add -1 :friend 297]]))))))
+
+    ;; incorrect arguments
+      (is (thrown? clojure.lang.ExceptionInfo (d/transact conn nil)))
+      (is (thrown? clojure.lang.ExceptionInfo (d/transact conn :foo)))
+      (is (thrown? clojure.lang.ExceptionInfo (d/transact conn 1)))
+      (is (thrown? clojure.lang.ExceptionInfo (d/transact conn {:foo "bar"})))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
+
+(deftest test-transact!-docs
+  (let [cfg (utils/provide-unique-id
+             {:store {:backend :memory}
+              :keep-history? false
+              :schema-flexibility :read})
+        conn (utils/setup-db cfg false)]
+    (try
+      ;; add a single datom to an existing entity (1)
+      (is (d/transact! conn [[:db/add 1 :name "Ivan"]]))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
+
+    ;; retract a single datom
+
+(deftest test-pull-docs
+  (let [cfg {:store {:backend :memory
+                     :id #uuid "0011aaaa-0000-0000-0000-000000000001"}
+             :initial-tx [{:db/ident :likes
+                           :db/cardinality :db.cardinality/many}
+                          {:db/ident :friends
+                           :db/cardinality :db.cardinality/many}]
+             :keep-history? false
+             :schema-flexibility :read}
+        conn (utils/setup-db cfg)
+        dvec #(vector (:e %) (:a %) (:v %))]
+    (is (d/transact conn [{:db/id 1
+                           :name "Ivan"
+                           :likes :pizza
+                           :friends 2}
+                          {:db/id 2
+                           :name "Oleg"}]))
+
+    (is (= {:db/id   1,
+            :name    "Ivan"
+            :likes   [:pizza]
+            :friends [{:db/id 2, :name "Oleg"}]}
+           (d/pull @conn '{:selector [:db/id :name :likes {:friends [:db/id :name]}] :eid 1})))
+
+    (is (= {:db/id   1,
+            :name    "Ivan"
+            :likes   [:pizza]
+            :friends [{:db/id 2, :name "Oleg"}]}
+           (d/pull @conn '[:db/id :name :likes {:friends [:db/id :name]}] 1)))
+    (d/release conn)))
+
+(deftest test-pull-many-docs
+  (let [cfg (utils/provide-unique-id
+             {:store {:backend :memory}
+              :initial-tx [[:db/add 1 :name "Ivan"]
+                           [:db/add 2 :name "Oleg"]]
+              :keep-history? false
+              :schema-flexibility :read})
+        conn (utils/setup-db cfg false)]
+    (try
+      (is (= (d/pull-many @conn [:db/id :name] [1 2])
+             [{:db/id 1, :name "Ivan"}
+              {:db/id 2, :name "Oleg"}]))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
+
+(deftest test-q-docs
+  (let [cfg {:store {:backend :memory
+                     :id #uuid "00000000-0000-0000-0000-00000000000a"}
+             :initial-tx [[:db/add -1 :name "Ivan"]
+                          [:db/add -1 :likes "fries"]
+                          [:db/add -1 :likes "pizza"]
+                          [:db/add -1 :friend 296]]
+             :keep-history? false
+             :schema-flexibility :read}
+        conn (utils/setup-db cfg)]
+    (is (= #{["fries"] ["candy"] ["pie"] ["pizza"]}
+           (d/q '[:find ?value :where [_ :likes ?value]]
+                #{[1 :likes "fries"]
+                  [2 :likes "candy"]
+                  [3 :likes "pie"]
+                  [4 :likes "pizza"]})))
+
+    (is (= #{["fries"] ["candy"] ["pie"] ["pizza"]}
+           (d/q {:query '[:find ?value :where [_ :likes ?value]]
+                 :args [#{[1 :likes "fries"]
+                          [2 :likes "candy"]
+                          [3 :likes "pie"]
+                          [4 :likes "pizza"]}]})))
+
+    (is (= 1
+           (count (d/q {:query '[:find ?value :where [_ :likes ?value]]
+                        :offset 2
+                        :limit 1
+                        :args [#{[1 :likes "fries"]
+                                 [2 :likes "candy"]
+                                 [3 :likes "pie"]
+                                 [4 :likes "pizza"]}]}))))
+
+    (is (= #{["fries"] ["pie"] ["candy"] ["pizza"]}
+           (d/q {:query '[:find ?value :where [_ :likes ?value]]
+                 :offset 0
+                 :timeout 50
+                 :args [#{[1 :likes "fries"]
+                          [2 :likes "candy"]
+                          [3 :likes "pie"]
+                          [4 :likes "pizza"]}]})))
+
+    (is (= 2
+           (count (d/q {:query '[:find ?value :where [_ :likes ?value]]
+                        :offset 2
+                        :timeout 50
+                        :args [#{[1 :likes "fries"]
+                                 [2 :likes "candy"]
+                                 [3 :likes "pie"]
+                                 [4 :likes "pizza"]}]}))))
+
+    (is (= #{["fries"] ["candy"] ["pie"] ["pizza"]}
+           (d/q '{:find [?value] :where [[_ :likes ?value]]}
+                #{[1 :likes "fries"]
+                  [2 :likes "candy"]
+                  [3 :likes "pie"]
+                  [4 :likes "pizza"]})))
+
+    (is (= #{["fries"] ["candy"] ["pie"] ["pizza"]}
+           (d/q {:query '{:find [?value] :where [[_ :likes ?value]]}
+                 :args [#{[1 :likes "fries"]
+                          [2 :likes "candy"]
+                          [3 :likes "pie"]
+                          [4 :likes "pizza"]}]})))
+
+    (is (= #{["fries"] ["candy"] ["pie"] ["pizza"]}
+           (d/q {:query "[:find ?value :where [_ :likes ?value]]"
+                 :args [#{[1 :likes "fries"]
+                          [2 :likes "candy"]
+                          [3 :likes "pie"]
+                          [4 :likes "pizza"]}]})))
+
+    ;; TODO better testing
+    (is (= [{:db/id 1, :friend 296, :likes "pizza", :name "Ivan"}]
+           (d/q '[:find [(pull ?e [*]) ...]
+                  :where [?e ?a ?v]]
+                @conn)))
+    (d/release conn)))
+
+(deftest test-with-docs
+  (let [cfg {:store {:backend :memory
+                     :id #uuid "00000111-7bbb-0000-0000-000000000001"}
+             :keep-history? false
+             :schema-flexibility :read}
+        conn (utils/setup-db cfg)
+        dvec #(vector (:e %) (:a %) (:v %))]
+    ;; add a single datom to an existing entity (1)
+    (let [res (d/with @conn {:tx-data [[:db/add 1 :name "Ivan"]]})]
+      (is (= #{:db/txInstant}
+             (set (keys (:tx-meta res)))))
+      (is (= '([1 :name "Ivan"])
+             (map dvec (:tx-data res)))))
+    (let [res (d/with @conn {:tx-data [[:db/add 1 :name "Ivan"]]
+                             :tx-meta {:foo :bar}})]
+      (is (= {:foo :bar}
+             (dissoc (:tx-meta res) :db/txInstant)))
+      (is (= '([1 :name "Ivan"])
+             (map dvec (:tx-data res)))))
+    (d/release conn)))
+
+;; TODO testing properly on what?
+(deftest test-db-docs
+  (let [cfg {:store {:backend :memory
+                     :id #uuid "00000dbb-0000-0000-0000-000000000001"}
+             :keep-history? false
+             :schema-flexibility :read}
+        conn (utils/setup-db cfg)]
+    (is (= datahike.db.DB
+           (type (d/db conn))))
+    (is (= datahike.db.DB
+           (type @conn)))
+    (d/release conn)))
+
+(deftest test-history-docs
+  (let [cfg {:store {:backend :memory
+                     :id #uuid "b15700ee-0000-0000-0000-000000000001"}
+             :initial-tx [{:db/ident :name
+                           :db/valueType :db.type/string
+                           :db/unique :db.unique/identity
+                           :db/index true
+                           :db/cardinality :db.cardinality/one}
+                          {:db/ident :age
+                           :db/valueType :db.type/long
+                           :db/cardinality :db.cardinality/one}]
+             :keep-history? true
+             :schema-flexibility :read}
+        conn (utils/setup-db cfg)]
+
+    (d/transact conn {:tx-data [{:name "Alice" :age 25} {:name "Bob" :age 30}]})
+
+    (is (= #{["Alice" 25] ["Bob" 30]}
+           (d/q {:query '[:find ?n ?a :where [?e :name ?n] [?e :age ?a]]
+                 :args [(d/history (d/db conn))]})))
+
+    (d/transact conn {:tx-data [{:db/id [:name "Alice"] :age 35}]})
+
+    (is (= #{["Alice" 35] ["Bob" 30]}
+           (d/q {:query '[:find ?n ?a :where [?e :name ?n] [?e :age ?a]]
+                 :args [(d/db conn)]})))
+
+    (is (= #{["Alice" 25] ["Alice" 35] ["Bob" 30]}
+           (d/q {:query '[:find ?n ?a :where [?e :name ?n] [?e :age ?a]]
+                 :args [(d/history (d/db conn))]})))
+    (d/release conn)))
+
+(deftest test-as-of-docs
+  (let [cfg {:store {:backend :memory
+                     :id #uuid "a500ffff-0000-0000-0000-000000000001"}
+             :initial-tx [{:db/ident :name
+                           :db/valueType :db.type/string
+                           :db/unique :db.unique/identity
+                           :db/index true
+                           :db/cardinality :db.cardinality/one}
+                          {:db/ident :age
+                           :db/valueType :db.type/long
+                           :db/cardinality :db.cardinality/one}]
+             :keep-history? true
+             :schema-flexibility :read}
+        conn (utils/setup-db cfg)]
+
+    (d/transact conn {:tx-data [{:name "Alice" :age 25} {:name "Bob" :age 30}]})
+
+    (Thread/sleep 100)
+
+    (def date (java.util.Date.))
+
+    (Thread/sleep 100)
+
+    (d/transact conn {:tx-data [{:db/id [:name "Alice"] :age 35}]})
+
+    (is (= #{["Alice" 25] ["Bob" 30]}
+           (d/q {:query '[:find ?n ?a :where [?e :name ?n] [?e :age ?a]]
+                 :args [(d/as-of (d/db conn) date)]})))
+
+    (is (= #{["Alice" 35] ["Bob" 30]}
+           (d/q {:query '[:find ?n ?a :where [?e :name ?n] [?e :age ?a]]
+                 :args [(d/db conn)]})))
+    (d/release conn)))
+
+(deftest test-since-docs
+  (let [cfg {:store {:backend :memory
+                     :id #uuid "051ceeee-0000-0000-0000-000000000001"}
+             :initial-tx [{:db/ident :name
+                           :db/valueType :db.type/string
+                           :db/unique :db.unique/identity
+                           :db/index true
+                           :db/cardinality :db.cardinality/one}
+                          {:db/ident :age
+                           :db/valueType :db.type/long
+                           :db/cardinality :db.cardinality/one}]
+             :keep-history? true
+             :schema-flexibility :read}
+        conn (utils/setup-db cfg)]
+    (d/transact conn {:tx-data [{:name "Alice" :age 25} {:name "Bob" :age 30}]})
+
+    (Thread/sleep 100)
+
+    (def date (java.util.Date.))
+
+    (Thread/sleep 100)
+
+    (d/transact conn [{:db/id [:name "Alice"] :age 30}])
+
+    (is (= #{["Alice" 30]}
+           (d/q '[:find ?n ?a
+                  :in $ $since
+                  :where
+                  [$ ?e :name ?n]
+                  [$since ?e :age ?a]]
+                @conn
+                (d/since @conn date))))
+
+    (is (= #{["Alice" 30] ["Bob" 30]}
+           (d/q {:query '[:find ?n ?a :where [?e :name ?n] [?e :age ?a]]
+                 :args [(d/db conn)]})))
+    (d/release conn)))
+
+(deftest test-datoms-docs
+  (let [cfg {:store {:backend :memory
+                     :id #uuid "da7000aa-0000-0000-0000-000000000001"}
+             :initial-tx [{:db/ident :name
+                           :db/type :db.type/string
+                           :db/cardinality :db.cardinality/one}
+                          {:db/ident :likes
+                           :db/type :db.type/string
+                           :db/index true
+                           :db/cardinality :db.cardinality/many}
+                          {:db/ident :friends
+                           :db/type :db.type/ref
+                           :db/cardinality :db.cardinality/many}]
+             :keep-history? false
+             :schema-flexibility :read}
+        db (utils/setup-db cfg)
+        _ (d/transact db [{:db/id 4 :name "Ivan"}
+                          {:db/id 4 :likes "fries"}
+                          {:db/id 4 :likes "pizza"}
+                          {:db/id 4 :friends 5}])
+        _ (d/transact db [{:db/id 5 :name "Oleg"}
+                          {:db/id 5 :likes "candy"}
+                          {:db/id 5 :likes "pie"}
+                          {:db/id 5 :likes "pizza"}])
+        dvec #(vector (:e %) (:a %) (:v %))]
+
+    ;; find all datoms for entity id == 1 (any attrs and values)
+    ;; sort by attribute, then value
+    (is (= '([4 :friends 5]
+             [4 :likes "fries"]
+             [4 :likes "pizza"]
+             [4 :name "Ivan"])
+           (map dvec (d/datoms @db {:index :eavt :components [4]}))))
+          ;; => (#datahike/Datom [1 :friends 2]
+          ;;     #datahike/Datom [1 :likes \"fries\"]
+          ;;     #datahike/Datom [1 :likes \"pizza\"]
+          ;;     #datahike/Datom [1 :name \"Ivan\"])
+
+    ;; find all datoms for entity id == 1 and attribute == :likes (any values)
+    ;; sorted by value
+    (is (= '([4 :likes "fries"]
+             [4 :likes "pizza"])
+           (map dvec (d/datoms @db {:index :eavt :components [4 :likes]}))))
+    ;; => (#datahike/Datom [1 :likes \"fries\"]
+    ;;     #datahike/Datom [1 :likes \"pizza\"])
+
+    ;; find all datoms for entity id == 1, attribute == :likes and value == \"pizza\"
+    (is (= '([4 :likes "pizza"])
+           (map dvec (d/datoms @db {:index :eavt :components [4 :likes "pizza"]}))))
+    ;; => (#datahike/Datom [1 :likes \"pizza\"])
+
+    ;; find all datoms for attribute == :likes (any entity ids and values)
+    ;; sorted by entity id, then value
+    (is (= '([4 :likes "fries"]
+             [4 :likes "pizza"]
+             [5 :likes "candy"]
+             [5 :likes "pie"]
+             [5 :likes "pizza"])
+           (map dvec (d/datoms @db {:index :aevt :components [:likes]}))))
+      ;; => (#datahike/Datom [1 :likes \"fries\"]
+      ;;     #datahike/Datom [1 :likes \"pizza\"]
+      ;;     #datahike/Datom [2 :likes \"candy\"]
+      ;;     #datahike/Datom [2 :likes \"pie\"]
+      ;;     #datahike/Datom [2 :likes \"pizza\"])
+
+    ;; find all datoms that have attribute == `:likes` and value == `\"pizza\"` (any entity id)
+    ;; `:likes` must be a unique attr, reference or marked as `:db/index true`
+    (is (= '([4 :likes "pizza"]
+             [5 :likes "pizza"])
+           (map dvec (d/datoms @db {:index :avet :components [:likes "pizza"]}))))
+    ;; => (#datahike/Datom [1 :likes \"pizza\"]
+    ;;     #datahike/Datom [2 :likes \"pizza\"])
+
+    ;; find all datoms sorted by entity id, then attribute, then value
+    (is (= '([1 :db/cardinality :db.cardinality/one] [1 :db/ident :name] [1 :db/type :db.type/string] [2 :db/cardinality :db.cardinality/many] [2 :db/ident :likes] [2 :db/index true] [2 :db/type :db.type/string] [3 :db/cardinality :db.cardinality/many] [3 :db/ident :friends] [3 :db/type :db.type/ref] [4 :friends 5] [4 :likes "fries"] [4 :likes "pizza"] [4 :name "Ivan"] [5 :likes "candy"] [5 :likes "pie"] [5 :likes "pizza"] [5 :name "Oleg"])
+           (map dvec (d/datoms @db {:index :eavt})))) ; => (...)))
+
+    ;; get all values of :db.cardinality/many attribute
+    (is (= '("fries" "pizza")
+           (->> (d/datoms @db {:index :eavt :components [4 :likes]})
+                (map :v))))
+
+    ;; lookup entity ids by attribute value
+    (is (= '(4 5)
+           (->> (d/datoms @db {:index :avet :components [:likes "pizza"]})
+                (map :e))))
+
+    ;; find all entities with a specific attribute
+    (is (= '(4 5)
+           (->> (d/datoms @db {:index :aevt :components [:name]})
+                (map :e))))
+
+    ;; find “singleton” entity by its attr
+    (is (= 4
+           (->> (d/datoms @db {:index :aevt :components [:name]})
+                first :e)))
+
+    ;; find N entities with lowest attr value (e.g. 10 earliest posts)
+    #_(is (= "fail"
+             (->> (d/datoms @db {:index :avet :components [:name]})
+                  (take 2))))
+
+    ;; find N entities with highest attr value (e.g. 10 latest posts)
+    #_(is (= "fail"
+             (->> (d/datoms @db {:index :avet :components [:name]})
+                  (reverse)
+                  (take 2))
+             (map dvec (d/datoms @db {:index :eavt})))) ; => (...)))
+
+    ;; get all values of :db.cardinality/many attribute
+    (is (= '("fries" "pizza")
+           (->> (d/datoms @db {:index :eavt :components [4 :likes]})
+                (map :v))))
+
+    ;; lookup entity ids by attribute value
+    (is (= '(4 5)
+           (->> (d/datoms @db {:index :avet :components [:likes "pizza"]})
+                (map :e))))
+
+    ;; find all entities with a specific attribute
+    (is (= '(4 5)
+           (->> (d/datoms @db {:index :aevt :components [:name]})
+                (map :e))))
+
+    ;; find “singleton” entity by its attr
+    (is (= 4
+           (->> (d/datoms @db {:index :aevt :components [:name]})
+                first :e)))
+
+    ;; find N entities with lowest attr value (e.g. 10 earliest posts)
+    #_(is (= "fail"
+             (->> (d/datoms @db {:index :avet :components [:name]})
+                  (take 2))))
+
+    ;; find N entities with highest attr value (e.g. 10 latest posts)
+    #_(is (= "fail"
+             (->> (d/datoms @db {:index :avet :components [:name]})
+                  (reverse)
+                  (take 2))))
+    (d/release db)))
+
+(deftest test-seek-datoms-doc
+  (let [cfg {:store {:backend :memory
+                     :id #uuid "5eeeeeee-da70-00aa-0000-000000000001"}
+             :initial-tx  [{:db/ident :name
+                            :db/type :db.type/string
+                            :db/index true
+                            :db/cardinality :db.cardinality/one}
+                           {:db/ident :likes
+                            :db/type :db.type/string
+                            :db/index true
+                            :db/cardinality :db.cardinality/many}
+                           {:db/ident :friends
+                            :db/type :db.type/ref
+                            :db/index true
+                            :db/cardinality :db.cardinality/many}]
+             :keep-history? false
+             :schema-flexibility :read}
+        db (utils/setup-db cfg)
+        dvec #(vector (:e %) (:a %) (:v %))
+        _ (d/transact db {:tx-data [{:db/id 4 :name "Ivan"}
+                                    {:db/id 4 :likes "fries"}
+                                    {:db/id 4 :likes "pizza"}
+                                    {:db/id 4 :friends 5}
+                                    {:db/id 5 :likes "candy"}
+                                    {:db/id 5 :likes "pie"}
+                                    {:db/id 5 :likes "pizza"}]})]
+
+    (is (= '([4 :friends 5]
+             [4 :likes "fries"]
+             [4 :likes "pizza"]
+             [4 :name "Ivan"]
+             [5 :likes "candy"]
+             [5 :likes "pie"]
+             [5 :likes "pizza"])
+           (map dvec (d/seek-datoms @db {:index :eavt :components [4]}))))
+
+    (is (= '([4 :name "Ivan"]
+             [5 :likes "candy"]
+             [5 :likes "pie"]
+             [5 :likes "pizza"])
+           (map dvec (d/seek-datoms @db {:index :eavt :components [4 :name]}))))
+
+    (is (= '([5 :likes "candy"]
+             [5 :likes "pie"]
+             [5 :likes "pizza"])
+           (map dvec (d/seek-datoms @db {:index :eavt :components [5]}))))
+
+    (is (= '([5 :likes "pie"]
+             [5 :likes "pizza"])
+           (map dvec (d/seek-datoms @db {:index :eavt :components [5 :likes "fish"]}))))
+    (d/release db)))
+
+(deftest test-index-range-doc
+  (let [cfg {:store {:backend :memory
+                     :id #uuid "5eeeeeee-da70-00aa-0000-000000000001"}
+             :initial-tx [{:db/ident :name
+                           :db/type :db.type/string
+                           :db/cardinality :db.cardinality/one}
+                          {:db/ident :likes
+                           :db/index true
+                           :db/type :db.type/string
+                           :db/cardinality :db.cardinality/many}
+                          {:db/ident :age
+                           :db/unique :db.unique/identity
+                           :db/type :db.type/ref
+                           :db/cardinality :db.cardinality/many}]
+             :keep-history? false
+             :schema-flexibility :read}
+        db (utils/setup-db cfg)
+        dvec #(vector (:e %) (:a %) (:v %))
+        _ (d/transact db {:tx-data [{:name "Ivan"}
+                                    {:likes "fries"}
+                                    {:likes "pizza"}
+                                    {:age 19}
+                                    {:likes "candy"}
+                                    {:likes "pie"}
+                                    {:likes "pizza"}]})]
+    (is (= '([8 :likes "candy"] [5 :likes "fries"] [9 :likes "pie"] [6 :likes "pizza"] [10 :likes "pizza"])
+           (map dvec (d/index-range @db {:attrid :likes :start "a" :end "zzzzzzzzz"}))))
+
+    (is (= '([5 :likes "fries"] [9 :likes "pie"])
+           (map dvec (d/index-range @db {:attrid :likes :start "egg" :end "pineapple"}))))
+    (d/release db)))
+
+(defn- database-hash-after-reopen [cfg]
+  (let [conn (d/connect cfg)]
+    (try
+      (hash @conn)
+      (finally
+        (d/release conn)))))
+
+(deftest test-database-hash
+  (testing "Hashing without history"
+    (let [cfg (utils/provide-unique-id
+               {:store {:backend :memory}
+                :keep-history? false
+                :schema-flexibility :read})
+          conn (utils/setup-db cfg false)
+          hash-0 0]
+      (try
+        (testing "first hash equals zero"
+          (is (= hash-0 (hash @conn))))
+        (testing "hash remains 0 after reconnecting"
+          (is (= hash-0 (database-hash-after-reopen cfg))))
+        (testing "add entity to database"
+          (let [_ (d/transact conn [{:db/id 1 :name "Max Mustermann"}])
+                hash-1 (hash @conn)]
+            (is (= hash-1 (database-hash-after-reopen cfg)))
+            (testing "remove entity again"
+              (let [_ (d/transact conn [[:db/retractEntity 1]])
+                    hash-2 (hash @conn)]
+                (is (not= hash-2 hash-1))
+                (is (= hash-0 hash-2))))))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg)))))
+  (testing "Hashing with history"
+    (let [cfg (utils/provide-unique-id
+               {:store {:backend :memory}
+                :keep-history? true
+                :schema-flexibility :read})
+          conn (utils/setup-db cfg false)
+          hash-0 (hash @conn)]
+      (try
+        (testing "first hash equals zero"
+          (is (= hash-0 (hash @conn))))
+        (testing "hash remains 0 after reconnecting"
+          (is (= hash-0 (database-hash-after-reopen cfg))))
+        (testing "add entity to database"
+          (let [_ (d/transact conn [{:db/id 1 :name "Max Mustermann"}])
+                hash-1 (hash @conn)]
+            (is (= hash-1 (database-hash-after-reopen cfg)))
+            (testing "retract entity again"
+              (let [_ (d/transact conn [[:db/retractEntity 1]])
+                    hash-2 (hash @conn)]
+                (is (not= hash-1 hash-2))
+                (is (not= hash-0 hash-2))))))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
+(deftest test-database-schema
+  (letfn [(test-schema [cfg]
+            (let [conn                      (utils/setup-db cfg)
+                  name-schema               {:db/ident       :name
+                                             :db/valueType   :db.type/string
+                                             :db/cardinality :db.cardinality/one
+                                             :db/unique      :db.unique/identity}
+                  related-to-schema         {:db/ident       :related-to
+                                             :db/valueType   :db.type/ref
+                                             :db/cardinality :db.cardinality/many}
+                  age-schema                {:db/ident       :age
+                                             :db/valueType   :db.type/long
+                                             :db/cardinality :db.cardinality/one
+                                             :db/noHistory   true}
+                  coerced-schema            (fn [db]
+                                              (reduce-kv
+                                               (fn [m k v]
+                                                 (assoc m k (dissoc v :db/id)))
+                                               {}
+                                               (d/schema db)))
+                  name-reverse-schema       {:db/ident           #{:name}
+                                             :db/index           #{:name}
+                                             :db.unique/identity #{:name}
+                                             :db/unique          #{:name}}
+                  age-reverse-schema        (-> name-reverse-schema
+                                                (update :db/ident conj :age)
+                                                (assoc :db/noHistory #{:age}))
+                  related-to-reverse-schema (-> age-reverse-schema
+                                                (update :db/ident conj :related-to)
+                                                (update :db/index conj :related-to)
+                                                (assoc :db.cardinality/many #{:related-to})
+                                                (assoc :db.type/ref #{:related-to}))]
+              (d/transact conn {:tx-data [name-schema]})
+              (is (= {:name name-schema}
+                     (coerced-schema @conn)))
+              (is (= name-reverse-schema (d/reverse-schema @conn)))
+
+              (d/transact conn {:tx-data [age-schema]})
+              (is (= {:name name-schema
+                      :age  age-schema}
+                     (coerced-schema @conn)))
+              (is (= age-reverse-schema
+                     (d/reverse-schema @conn)))
+
+              (d/transact conn {:tx-data [related-to-schema]})
+              (is (= {:name       name-schema
+                      :age        age-schema
+                      :related-to related-to-schema}
+                     (coerced-schema @conn)))
+              (is (= related-to-reverse-schema
+                     (d/reverse-schema @conn)))
+              (d/release conn)))]
+    (let [base-cfg {:store              {:backend :memory
+                                         :id      #uuid "a0100000-0000-0000-0000-000000000001"}
+                    :keep-history?      false
+                    :attribute-refs?    false
+                    :schema-flexibility :write}]
+      (testing "Empty database without any schema"
+        (let [conn (do
+                     (d/delete-database base-cfg)
+                     (d/create-database base-cfg)
+                     (d/connect base-cfg))]
+          (is (= {}
+                 (d/schema @conn)))
+          (is (= {}
+                 (d/reverse-schema @conn)))
+          (d/release conn)))
+      (testing "Empty database with write flexibility and no attribute refs"
+        (test-schema base-cfg))
+      (testing "Empty database with write flexibility and attribute refs"
+        (test-schema (assoc base-cfg :attribute-refs? true)))
+      (testing "Empty database with read flexibility and no attribute refs"
+        (test-schema (assoc base-cfg :schema-flexibility :read))))))
+
+(deftest test-db-meta
+  (let [cfg {:store              {:backend :memory
+                                  :id      #uuid "a0100000-0000-0000-0000-000000000002"}
+             :keep-history?      false
+             :attribute-refs?    false
+             :schema-flexibility :write}
+        conn (utils/setup-db cfg)]
+    (is (= #{:datahike/version :datahike/id :datahike/created-at :konserve/version :hitchhiker.tree/version :persistent.set/version :datahike/commit-id}
+           (-> @conn :meta keys set)))
+    (d/release conn)))
+
+(def ^:private metrics-base-cfg {:store              {:backend :memory}
+                                 :index              :datahike.index/persistent-set
+                                 :keep-history?      true
+                                 :schema-flexibility :write
+                                 :attribute-refs?    false})
+
+(defn test-metrics [cfg]
+  (let [schema              [{:db/ident       :name
+                              :db/cardinality :db.cardinality/one
+                              :db/index       true
+                              :db/unique      :db.unique/identity
+                              :db/valueType   :db.type/string}
+                             {:db/ident       :parents
+                              :db/cardinality :db.cardinality/many
+                              :db/valueType   :db.type/ref}
+                             {:db/ident       :age
+                              :db/cardinality :db.cardinality/one
+                              :db/valueType   :db.type/long}]
+        conn                (utils/setup-db cfg)
+        schema-on-write? (= (:schema-flexibility (.-config @conn)) :write)
+        attribute-refs? (:attribute-refs? (:config @conn))
+        ;; the persistent-set temporal index holds only datoms that left the
+        ;; current index (temporal-upsert); the hitchhiker tree copies each assertion
+        moves-only-what-leaves? (not= :datahike.index/hitchhiker-tree (:index cfg))
+        schema-count 11                                     ;; amount of user schema datoms in temporal eavt index
+        temporal-count 10                                   ;; amount of user data datoms in temporal eavt index when using schema-on-write
+        temporal-avet-count 9                               ;; amount of user data datoms in temporal avet index when using schema-on write
+        sys-attr-count 107                                  ;; amount of system schema datoms in temporal eavt index when using attribute refs (was 79; +6 for the :db.secondary/* family idents; +22 for the :dh.ref/* entries)
+        sys-attr-avet-count 61                              ;; amount of system schema datoms in temporal avet index when using attribute refs (was 50; +6 for the :db/ident datoms of the new :db.secondary/* attrs; +5 for :dh.ref/*)
+        update-for-schema-on-write
+        (fn [metrics]
+          (-> (update metrics :count #(+ % 11))
+              (update :avet-count #(+ % 6))
+              ((fn [m] (merge-with merge m {:per-attr-counts     {:db/ident        3
+                                                                  :db/cardinality  3
+                                                                  :db/index        1
+                                                                  :db/unique       1
+                                                                  :db/valueType    3}
+                                            :per-entity-counts   {1          5
+                                                                  2          3
+                                                                  3          3
+                                                                  5          2
+                                                                  6          3}})))))
+        update-for-history
+        (fn [metrics schema-on-write? attribute-refs?]
+          (->> (update metrics :count #(+ % 4))
+               (merge-with merge {:per-attr-counts     {:db/txInstant 4}
+                                  :per-entity-counts   {(+ tx0 1) 1
+                                                        (+ tx0 2) 1
+                                                        (+ tx0 3) 1
+                                                        (+ tx0 4) 1}
+                                  ; 10 == 11 minus 1 parent datom that wouldn't get added unless retracted
+                                  :temporal-count      (if moves-only-what-leaves?
+                                                         ;; Donald's name and age and Dinky's parent ref left the
+                                                         ;; current index: each assertion and its retraction (6);
+                                                         ;; attribute refs' system datoms are still created there
+                                                         (+ 6 (if attribute-refs? sys-attr-count 0))
+                                                         (+ schema-count
+                                                          (if schema-on-write?
+                                                            (if attribute-refs?
+                                                              (+ temporal-count sys-attr-count)
+                                                              temporal-count)
+                                                            (if attribute-refs?
+                                                              (+ temporal-count sys-attr-count)
+                                                              0))))
+                                  :temporal-avet-count (if moves-only-what-leaves?
+                                                         ;; name and parents are indexed: 4, schema-on-write only;
+                                                         ;; attribute refs' indexed system datoms: 52
+                                                         (+ (if schema-on-write? 4 0) (if attribute-refs? 52 0))
+                                                         (if schema-on-write?
+                                                         (if attribute-refs?
+                                                           sys-attr-avet-count
+                                                           temporal-avet-count)
+                                                         (if attribute-refs?
+                                                           sys-attr-avet-count
+                                                           0)))})))
+        update-for-attr-refs
+        (fn [metrics]
+          (let [update-counts (fn [coll] (reduce (fn [m counted] (update m counted #(if % (inc %) 1)))
+                                                 {}
+                                                 coll))
+                ref-attrs (map #(dbi/ident-for @conn (.-a %) :error-on-missing) db/ref-datoms)
+                ref-datom-per-attr-counts (update-counts ref-attrs)
+                indexed? (fn [a] (-> (:db/index (.-rschema @conn))
+                                     (contains? a)))]
+            (-> (update metrics :per-attr-counts #(merge-with + % ref-datom-per-attr-counts))
+                (assoc :per-entity-counts (update-counts (map :e (d/datoms @conn :eavt))))
+                (update :count #(+ % (count db/ref-datoms)))
+                (update :avet-count #(+ % 4 (count (filter indexed? ref-attrs)))))))
+        compare-vals
+        (fn [metrics expected]
+          (doseq [[metric val] metrics]
+            (testing (str (name metric) " is correct")
+              (is (= (metric expected) val)))))]
+    (when schema-on-write?
+      (d/transact conn {:tx-data schema}))
+    (d/transact conn {:tx-data [{:name "Donald" :age  35}
+                                {:name "Daisy"  :age  35}]})
+    (if schema-on-write?
+      (do
+        (d/transact conn {:tx-data [{:name      "Dinky"
+                                     :age       5
+                                     :parents   [[:name "Donald"] [:name "Daisy"]]}]})
+        (d/transact conn {:tx-data [[:db/retractEntity [:name "Donald"]]]}))
+      (do
+        (d/transact conn {:tx-data [{:name      "Dinky"
+                                     :age       5}]})
+        (d/transact conn {:tx-data [[:db/add 3 :parents 1]
+                                    [:db/add 3 :parents 2]]})
+        (d/transact conn {:tx-data [[:db/retractEntity 1]]})))
+    (compare-vals (d/metrics @conn)
+                  (cond-> {:count               5
+                           :per-attr-counts     {:name     2
+                                                 :age      2
+                                                 :parents  1}
+                           :per-entity-counts   {2 2
+                                                 3 3}
+                           :avet-count          0}
+                    schema-on-write?  update-for-schema-on-write
+                    (dbi/-keep-history? @conn) (update-for-history schema-on-write? attribute-refs?)
+                    (:attribute-refs? (.-config @conn)) update-for-attr-refs))
+    (d/release conn)))
+
+(deftest test-metrics-hht
+  (test-metrics (assoc metrics-base-cfg :index :datahike.index/hitchhiker-tree
+                       :index-config (di/default-index-config :datahike.index/hitchhiker-tree))))
+
+(deftest test-metrics-pset
+  (test-metrics metrics-base-cfg))
+
+(deftest test-metrics-history
+  (test-metrics (assoc metrics-base-cfg :keep-history? false)))
+
+(deftest test-metrics-schema-read
+  (test-metrics (assoc metrics-base-cfg :schema-flexibility :read)))
+
+(deftest test-metrics-attr-refs
+  (test-metrics (assoc metrics-base-cfg :attribute-refs? true)))
+
+(deftest test-no-history-datoms-in-empty-db
+  (testing "When attribute-refs? is false, there are no initial datoms"
+    (utils/with-connect [conn (-> {:store {:backend :memory
+                                           :id #uuid "ba5b1000-0000-0000-0000-000000000001"}
+                                   :keep-history? true
+                                   :schema-flexibility :write}
+                                  utils/provide-unique-id
+                                  utils/recreate-database)]
+      (is (-> @conn
+              d/history
+              (d/datoms {:index :aevt
+                         :components []
+                         :limit -1})
+              empty?)))))

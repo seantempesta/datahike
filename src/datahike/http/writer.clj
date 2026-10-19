@@ -1,0 +1,82 @@
+(ns datahike.http.writer
+  "Remote writer implementation for datahike.http.server through datahike.http.client."
+  (:require [datahike.writer :refer [PWriter create-writer create-database delete-database]]
+            [datahike.http.client :refer [request-json] :as client]
+            [datahike.connector :as connector]
+            [datahike.remote :as remote]
+            [datahike.tools :as dt :refer [throwable-promise]]
+            [replikativ.logging :as log]
+            [clojure.core.async :refer [promise-chan put!]]))
+
+(defrecord DatahikeServerWriter [remote-peer conn]
+  PWriter
+  (-dispatch! [_ arg-map]
+    (let [{:keys [op args]} arg-map
+          p (promise-chan)
+          config (:config @(:wrapped-atom conn))]
+      (log/debug :datahike/http-write-op {:op op})
+      (log/trace :datahike/http-write-args {:arg-map arg-map})
+      (put! p
+            (try
+              (binding [remote/*remote-peer* remote-peer]
+                (request-json :post
+                              (str op "-writer")
+                              remote-peer
+                              (vec (concat [config] args))))
+              (catch Exception e
+                e)))
+      p))
+  (-shutdown [_]
+    (let [done (promise-chan)]
+      (put! done true)
+      done))
+  (-streaming? [_] false))
+
+(defmethod create-writer :datahike-server
+  [config connection]
+  (log/debug :datahike/http-writer-create {:config config})
+  (->DatahikeServerWriter config connection))
+
+(defmethod create-database :datahike-server
+  [& args]
+  (let [p (throwable-promise)
+        {:keys [writer] :as config} (first args)]
+    ;; redirect call to remote-peer as writer config
+    (deliver p (try (->
+                     (request-json :post
+                                   "create-database-writer"
+                                   writer
+                                   (vec (concat [(-> config
+                                                     (assoc :remote-peer writer)
+                                                     (dissoc :writer))]
+                                                (rest args))))
+                     (dissoc :remote-peer))
+                    (catch Exception e
+                      e)))
+    p))
+
+(defmethod delete-database :datahike-server
+  [& args]
+  (let [p (throwable-promise)
+        {:keys [writer] :as config} (first args)]
+    ;; redirect call to remote-peer as writer config
+    (deliver p (try
+                 (-> (request-json :post
+                                   "delete-database-writer"
+                                   writer
+                                   (vec (concat [(-> config
+                                                     (assoc  :remote-peer writer)
+                                                     (dissoc :writer))]
+                                                (rest args))))
+                     (dissoc :remote-peer))
+                 (catch Exception e
+                   e)))
+    p))
+
+;; =============================================================================
+;; Connection Integration
+;; =============================================================================
+
+(defmethod connector/-connect* :datahike-server [config opts]
+  ;; HTTP uses standard connection logic with async+sync behavior
+  (connector/-connect-impl* config opts))

@@ -1,0 +1,534 @@
+(ns ^:no-doc datahike.datom
+  (:require  [clojure.walk]
+             [clojure.data]
+             [datahike.array :as da]
+             [datahike.constants :refer [tx0]]
+             [datahike.tools :refer [combine-hashes]]
+             #?(:cljs [goog.array :as garray]))
+  #?(:cljs (:require-macros [datahike.datom :refer [combine-cmp]])))
+
+(declare hash-datom equiv-datom seq-datom nth-datom assoc-datom val-at-datom)
+
+(defprotocol IDatom
+  (datom-tx [this])
+  (datom-added [this]))
+
+(deftype Datom #?(:clj  [^long e a v ^long tx ^:unsynchronized-mutable ^int _hash]
+                  :cljs [^number e a v ^number tx ^:mutable ^number _hash])
+  IDatom
+  (datom-tx [d] (if (pos? tx) tx (- tx)))
+  (datom-added [d] (pos? tx))
+
+  #?@(:cljs
+      [IHash
+       (-hash [d] (if (zero? _hash)
+                    (set! _hash (hash-datom d))
+                    _hash))
+       IEquiv
+       (-equiv [d o] (and (instance? Datom o) (equiv-datom d o)))
+
+       ISeqable
+       (-seq [d] (seq-datom d))
+
+       IFn
+       (-invoke [d k] (val-at-datom d k nil))
+       (-invoke [d k v] (val-at-datom d k v))
+
+       ILookup
+       (-lookup [d k] (val-at-datom d k nil))
+       (-lookup [d k nf] (val-at-datom d k nf))
+
+       IIndexed
+       (-nth [this i] (nth-datom this i))
+       (-nth [this i not-found] (nth-datom this i not-found))
+
+       IAssociative
+       (-assoc [d k v] (assoc-datom d k v))
+
+       IPrintWithWriter
+       (-pr-writer [d writer opts]
+                   (pr-sequential-writer writer pr-writer
+                                         "#datahike/Datom [" " " "]"
+                                         opts [(.-e d) (.-a d) (.-v d) (datom-tx d) (datom-added d)]))]
+      :clj
+      [Object
+       (hashCode [d]
+                 (if (zero? _hash)
+                   (let [h (int (hash-datom d))]
+                     (set! _hash h)
+                     h)
+                   _hash))
+       (toString [d] (pr-str d))
+
+       clojure.lang.IHashEq
+       (hasheq [d] (.hashCode d))
+
+       clojure.lang.Seqable
+       (seq [d] (seq-datom d))
+
+       clojure.lang.IPersistentCollection
+       (equiv [d o] (and (instance? Datom o) (equiv-datom d o)))
+       (empty [d] (throw (UnsupportedOperationException. "empty is not supported on Datom")))
+       (count [d] 5)
+       (cons [d [k v]] (assoc-datom d k v))
+
+       clojure.lang.Indexed
+       (nth [this i] (nth-datom this i))
+       (nth [this i not-found] (nth-datom this i not-found))
+
+       clojure.lang.IFn
+       (invoke [d k] (val-at-datom d k nil))
+       (invoke [d k v] (val-at-datom d k v))
+
+       clojure.lang.ILookup
+       (valAt [d k] (val-at-datom d k nil))
+       (valAt [d k nf] (val-at-datom d k nf))
+
+       clojure.lang.Associative
+       (entryAt [d k] (some->> (val-at-datom d k nil) (clojure.lang.MapEntry. k)))
+       (containsKey [e k] (#{:e :a :v :tx :added} k))
+       (assoc [d k v] (assoc-datom d k v))]))
+
+#?(:cljs (goog/exportSymbol "datahike.datom.Datom" Datom))
+
+(defn ^Datom datom
+  ([e a v] (Datom. e a v tx0 0))
+  ([e a v tx] (Datom. e a v tx 0))
+  ([e a v tx added] (Datom. e a v (if added tx (- tx)) 0)))
+
+(defn datom? [x] (instance? Datom x))
+
+(defn- hash-datom [^Datom d]
+  (-> (hash (.-e d))
+      (combine-hashes (hash (.-a d)))
+      (combine-hashes (hash (.-v d)))))
+
+(defn- equiv-datom [^Datom d ^Datom o]
+  (and (== (.-e d) (.-e o))
+       (= (.-a d) (.-a o))
+       (= (.-v d) (.-v o))))
+
+(defn- seq-datom [^Datom d]
+  (list (.-e d) (.-a d) (.-v d) (datom-tx d) (datom-added d)))
+
+;; keep it fast by duplicating for both keyword and string cases
+;; instead of using sets or some other matching func
+(defn- val-at-datom [^Datom d k not-found]
+  (case k
+    :e (.-e d) "e" (.-e d)
+    :a (.-a d) "a" (.-a d)
+    :v (.-v d) "v" (.-v d)
+    :tx (datom-tx d)
+    "tx" (datom-tx d)
+    :added (datom-added d)
+    "added" (datom-added d)
+    not-found))
+
+(defn- nth-datom
+  ([^Datom d ^long i]
+   (case i
+     0 (.-e d)
+     1 (.-a d)
+     2 (.-v d)
+     3 (datom-tx d)
+     4 (datom-added d)
+     #?(:clj  (throw (IndexOutOfBoundsException.))
+        :cljs (throw (js/Error. (str "Datom/-nth: Index out of bounds: " i))))))
+  ([^Datom d ^long i not-found]
+   (case i
+     0 (.-e d)
+     1 (.-a d)
+     2 (.-v d)
+     3 (datom-tx d)
+     4 (datom-added d)
+     not-found)))
+
+(defn- ^Datom assoc-datom [^Datom d k v]
+  (case k
+    :e (datom v (.-a d) (.-v d) (datom-tx d) (datom-added d))
+    :a (datom (.-e d) v (.-v d) (datom-tx d) (datom-added d))
+    :v (datom (.-e d) (.-a d) v (datom-tx d) (datom-added d))
+    :tx (datom (.-e d) (.-a d) (.-v d) v (datom-added d))
+    :added (datom (.-e d) (.-a d) (.-v d) (datom-tx d) v)
+    (throw (#?(:clj IllegalArgumentException. :cljs js/Error.)
+            (str "invalid key for #datahike/Datom: " k)))))
+
+;; printing and reading
+;; #datomic/DB {:schema <map>, :datoms <vector of [e a v tx]>}
+
+(defn ^Datom datom-from-reader [vec]
+  (apply datom vec))
+
+#?(:clj
+   (defmethod print-method Datom [^Datom d, ^java.io.Writer w]
+     (.write w (str "#datahike/Datom "))
+     (binding [*out* w]
+       (pr [(.-e d) (.-a d) (.-v d) (datom-tx d) (datom-added d)]))))
+
+;; ----------------------------------------------------------------------------
+;; datom cmp macros/funcs
+;;
+
+#?(:clj
+   (defmacro combine-cmp [& comps]
+     (loop [comps (reverse comps)
+            res (num 0)]
+       (if (not-empty comps)
+         (recur
+          (next comps)
+          `(let [c# ~(first comps)]
+             (if (== 0 c#)
+               ~res
+               c#)))
+         res))))
+
+(defn cmp [o1 o2]
+  (if (nil? o1) 0
+      (if (nil? o2) 0
+          (compare o1 o2))))
+
+(defn long-cmp [^long a ^long b]
+  #?(:clj  (Long/compare a b)
+     :cljs (- a b)))
+
+(defn boolean-cmp [a b]
+  #?(:clj  (Boolean/compare ^Boolean a ^Boolean b)
+     :cljs (- a b)))
+
+(comment
+;; Slower cmp-* fns allows for datom fields to be nil.
+;; Such datoms come from slice method where they are used as boundary markers.
+
+  (defn cmp-datoms-eavt [^Datom d1, ^Datom d2]
+    (combine-cmp
+     (#?(:clj Long/compare :cljs -) (.-e d1) (.-e d2))
+     (cmp (.-a d1) (.-a d2))
+     (cmp (.-v d1) (.-v d2))
+     (#?(:clj Long/compare :cljs -) (datom-tx d1) (datom-tx d2))))
+
+  (defn cmp-datoms-aevt [^Datom d1, ^Datom d2]
+    (combine-cmp
+     (cmp (.-a d1) (.-a d2))
+     (#?(:clj Long/compare :cljs -) (.-e d1) (.-e d2))
+     (cmp (.-v d1) (.-v d2))
+     (#?(:clj Long/compare :cljs -) (datom-tx d1) (datom-tx d2))))
+
+  (defn cmp-datoms-avet [^Datom d1, ^Datom d2]
+    (combine-cmp
+     (cmp (.-a d1) (.-a d2))
+     (cmp (.-v d1) (.-v d2))
+     (#?(:clj Long/compare :cljs -) (.-e d1) (.-e d2))
+     (#?(:clj Long/compare :cljs -) (datom-tx d1) (datom-tx d2))))
+
+  (defn cmp-temporal-datoms-eavt [^Datom d1, ^Datom d2]
+    (combine-cmp
+     (#?(:clj Long/compare :cljs -) (.-e d1) (.-e d2))
+     (cmp (.-a d1) (.-a d2))
+     (cmp (.-v d1) (.-v d2))
+     (#?(:clj Long/compare :cljs -) (datom-tx d1) (datom-tx d2))
+     (#?(:clj Boolean/compare :cljs -) (datom-added d1) (datom-added d2))))
+
+  (defn cmp-temporal-datoms-aevt [^Datom d1, ^Datom d2]
+    (combine-cmp
+     (cmp (.-a d1) (.-a d2))
+     (#?(:clj Long/compare :cljs -) (.-e d1) (.-e d2))
+     (cmp (.-v d1) (.-v d2))
+     (#?(:clj Long/compare :cljs -) (datom-tx d1) (datom-tx d2))
+     (#?(:clj Boolean/compare :cljs -) (datom-added d1) (datom-added d2))))
+
+  (defn cmp-temporal-datoms-avet [^Datom d1, ^Datom d2]
+    (combine-cmp
+     (cmp (.-a d1) (.-a d2))
+     (cmp (.-v d1) (.-v d2))
+     (#?(:clj Long/compare :cljs -) (.-e d1) (.-e d2))
+     (#?(:clj Long/compare :cljs -) (datom-tx d1) (datom-tx d2))
+     (#?(:clj Boolean/compare :cljs -) (datom-added d1) (datom-added d2)))))
+
+;; fast versions without nil checks
+
+(defn cmp-attr-quick [a1 a2]
+  ;; either both are keywords or both are strings
+  #?(:cljs
+     (if (keyword? a1)
+       (-compare a1 a2)
+       (garray/defaultCompare a1 a2))
+     :clj
+     (.compareTo ^Comparable a1 a2)))
+
+(defn- class-name
+  "A string naming the value's type on both platforms (cljs `(type x)` is a
+   constructor, which `compare` cannot order)."
+  [x]
+  #?(:clj (.getName (class x))
+     :cljs (str (type x))))
+
+(defn- class-order
+  "Order two values of DIFFERENT types by type name, so one attribute's values
+   stay totally ordered across a type change. Port of upstream 515786f6 (#955)."
+  [a b]
+  (compare (class-name a) (class-name b)))
+
+(declare compare-value)
+
+#?(:clj
+   (defn- compare-lists
+     "Order two lists the way Clojure orders vectors: the shorter first, then
+      element by element. Storage reads a stored vector or map entry back as a
+      java.util.List (Fressian's Arrays$ArrayList), which is not Comparable, so
+      a value keeps its place in an index across a round trip only if every
+      list orders by its elements."
+     [^java.util.List l1 ^java.util.List l2]
+     (let [n1 (.size l1) n2 (.size l2)]
+       (if (== n1 n2)
+         (loop [i 0]
+           (if (== i n1)
+             0
+             (let [c (compare-value (.get l1 i) (.get l2 i))]
+               (if (zero? c) (recur (inc i)) c))))
+         (if (< n1 n2) -1 1)))))
+
+(defn compare-value
+  "Compare two values with cross-platform UUID compatibility.
+   CLJS UUID comparison is adjusted to match CLJ's signed comparison,
+   ensuring consistent ordering when indices are built on CLJ and queried on CLJS.
+   Byte arrays are compared element-wise via datahike.array/compare-arrays,
+   since byte[] does not implement Comparable. Two lists (vectors, map entries
+   and the java.util.List storage reads them back as) order element-wise
+   (`compare-lists`)."
+  [v1 v2]
+  #?(:clj (cond
+            (and (da/bytes? v1) (da/bytes? v2))
+            (da/compare-arrays v1 v2)
+
+            (and (instance? java.util.List v1) (instance? java.util.List v2))
+            (compare-lists v1 v2)
+
+            :else
+            ;; Two Comparables of different types throw from `compare`. One
+            ;; attribute's datoms hold both when it is reinstalled with another
+            ;; :db/valueType (history keeps the old values; a purge leaves its
+            ;; removal buffered in a Branch), or under :schema-flexibility :read.
+            ;; Only `cmp-nil` caught it, so the *-quick comparators crashed.
+            (try (compare v1 v2)
+                 (catch ClassCastException e
+                   (if (identical? (class v1) (class v2))
+                     (throw e)
+                     (class-order v1 v2)))))
+     :cljs
+     (try
+      (cond
+       (and (uuid? v1) (uuid? v2))
+       ;; Match Java's signed UUID comparison where MSB is treated as signed
+       ;; In signed comparison: 0x8... is negative, so 0x8... < 0x0...
+       (let [s1 (.-uuid ^cljs.core/UUID v1)
+             s2 (.-uuid ^cljs.core/UUID v2)
+             c1 (.charCodeAt s1 0)
+             c2 (.charCodeAt s2 0)
+             ;; charCode 56 = "8", chars 8-F are "negative" in signed
+             neg1 (>= c1 56)
+             neg2 (>= c2 56)]
+         (cond
+           (and neg1 (not neg2)) -1  ;; v1 "negative", v2 "positive" → v1 < v2
+           (and neg2 (not neg1)) 1   ;; v2 "negative", v1 "positive" → v1 > v2
+           :else (compare s1 s2)))   ;; same sign → string compare works
+
+       (and (da/bytes? v1) (da/bytes? v2))
+       (da/compare-arrays v1 v2)
+
+       :else (compare v1 v2))
+      (catch :default e
+        (if (identical? (type v1) (type v2))
+          (throw e)
+          (class-order v1 v2))))))
+
+(defn- safe-compare [a b]
+  (try
+    (compare-value a b)
+    (catch #?(:clj Exception :cljs js/Error) _e
+      (class-order a b))))
+
+(defn cmp-nil [o1 o2]
+  (if (nil? o1) nil
+      (if (nil? o2) nil
+          (safe-compare o1 o2))))
+
+(defn type-hint-datom [x]
+  (vary-meta x assoc :tag `Datom))
+
+(defn cmp-val [val]
+  (case val
+    :e (fn [^Datom d1 ^Datom d2] (long-cmp (.-e d1) (.-e d2)))
+    :a (fn [^Datom d1 ^Datom d2] (cmp-nil (.-a d1) (.-a d2)))
+    :v (fn [^Datom d1 ^Datom d2] (cmp-nil (.-v d1) (.-v d2)))
+    :tx (fn [^Datom d1 ^Datom d2] (long-cmp (datom-tx d1) (datom-tx d2)))
+    :added (fn [^Datom d1 ^Datom d2] (long-cmp (datom-added d1) (datom-added d2)))))
+
+(defn cmp-val-expr [val d1 d2]
+  (case val
+    :e `(long-cmp (.-e ~d1) (.-e ~d2))
+    :a `(cmp-nil (.-a ~d1) (.-a ~d2))
+    :v `(cmp-nil (.-v ~d1) (.-v ~d2))
+    :tx `(long-cmp (datom-tx ~d1) (datom-tx ~d2))
+    :added `(boolean-cmp (datom-added ~d1) (datom-added ~d2))))
+
+(defn cmp-datoms-eavt-quick [^Datom d1, ^Datom d2]
+  (combine-cmp
+   (long-cmp (.-e d1) (.-e d2))
+   (cmp-attr-quick (.-a d1) (.-a d2))
+   (compare-value (.-v d1) (.-v d2))
+   (long-cmp (datom-tx d1) (datom-tx d2))))
+
+(defn cmp-datoms-aevt-quick [^Datom d1, ^Datom d2]
+  (combine-cmp
+   (cmp-attr-quick (.-a d1) (.-a d2))
+   (long-cmp (.-e d1) (.-e d2))
+   (compare-value (.-v d1) (.-v d2))
+   (long-cmp (datom-tx d1) (datom-tx d2))))
+
+(defn cmp-datoms-avet-quick [^Datom d1, ^Datom d2]
+  (combine-cmp
+   (cmp-attr-quick (.-a d1) (.-a d2))
+   (compare-value (.-v d1) (.-v d2))
+   (long-cmp (.-e d1) (.-e d2))
+   (long-cmp (datom-tx d1) (datom-tx d2))))
+
+(defn cmp-temporal-datoms-eavt-quick [^Datom d1, ^Datom d2]
+  (combine-cmp
+   (long-cmp (.-e d1) (.-e d2))
+   (cmp-attr-quick (.-a d1) (.-a d2))
+   (compare-value (.-v d1) (.-v d2))
+   (long-cmp (datom-tx d1) (datom-tx d2))
+   (boolean-cmp (datom-added d1) (datom-added d2))))
+
+(defn cmp-temporal-datoms-aevt-quick [^Datom d1, ^Datom d2]
+  (combine-cmp
+   (cmp-attr-quick (.-a d1) (.-a d2))
+   (long-cmp (.-e d1) (.-e d2))
+   (compare-value (.-v d1) (.-v d2))
+   (long-cmp (datom-tx d1) (datom-tx d2))
+   (boolean-cmp (datom-added d1) (datom-added d2))))
+
+(defn cmp-temporal-datoms-avet-quick [^Datom d1, ^Datom d2]
+  (combine-cmp
+   (cmp-attr-quick (.-a d1) (.-a d2))
+   (compare-value (.-v d1) (.-v d2))
+   (long-cmp (.-e d1) (.-e d2))
+   (long-cmp (datom-tx d1) (datom-tx d2))
+   (boolean-cmp (datom-added d1) (datom-added d2))))
+
+;; EA-only comparator for merge lookups (compare e,a only, ignoring v and tx)
+;; Used by compiled query engine for seekGE merge lookups where we only need
+;; to find the first datom with matching (entity, attribute).
+(defn cmp-datoms-ea [^Datom d1, ^Datom d2]
+  (combine-cmp
+   (long-cmp (.-e d1) (.-e d2))
+   (cmp-attr-quick (.-a d1) (.-a d2))))
+
+;; Prefix comparators for existence checks (compare e,a,v only, ignoring tx)
+;; Used by insert to check if ANY datom with same e,a,v exists
+(defn cmp-datoms-eavt-prefix [^Datom d1, ^Datom d2]
+  (combine-cmp
+   (long-cmp (.-e d1) (.-e d2))
+   (cmp-attr-quick (.-a d1) (.-a d2))
+   (compare-value (.-v d1) (.-v d2))))
+
+(defn cmp-datoms-aevt-prefix [^Datom d1, ^Datom d2]
+  (combine-cmp
+   (cmp-attr-quick (.-a d1) (.-a d2))
+   (long-cmp (.-e d1) (.-e d2))
+   (compare-value (.-v d1) (.-v d2))))
+
+(defn cmp-datoms-avet-prefix [^Datom d1, ^Datom d2]
+  (combine-cmp
+   (cmp-attr-quick (.-a d1) (.-a d2))
+   (compare-value (.-v d1) (.-v d2))
+   (long-cmp (.-e d1) (.-e d2))))
+
+(defn diff-sorted [a b cmp]
+  (loop [only-a []
+         only-b []
+         both []
+         a a
+         b b]
+    (cond
+      (empty? a) [(not-empty only-a) (not-empty (into only-b b)) (not-empty both)]
+      (empty? b) [(not-empty (into only-a a)) (not-empty only-b) (not-empty both)]
+      :else
+      (let [first-a (first a)
+            first-b (first b)
+            diff (cmp first-a first-b)]
+        (cond
+          (== diff 0) (recur only-a only-b (conj both first-a) (next a) (next b))
+          (< diff 0) (recur (conj only-a first-a) only-b both (next a) b)
+          (> diff 0) (recur only-a (conj only-b first-b) both a (next b)))))))
+
+(defn coll->datoms
+  "Converts a collection with elements of form [e a v t] into a collection of Datoms."
+  [coll]
+  (map
+   (fn [[e a v t]]
+     (datom e a v t))
+   coll))
+
+(defn index-type->cmp-quick
+  ([index-type] (index-type->cmp-quick index-type true))
+  ([index-type current?] (if current?
+                           (case index-type
+                             :aevt cmp-datoms-aevt-quick
+                             :avet cmp-datoms-avet-quick
+                             cmp-datoms-eavt-quick)
+                           (case index-type
+                             :aevt cmp-temporal-datoms-aevt-quick
+                             :avet cmp-temporal-datoms-avet-quick
+                             cmp-temporal-datoms-eavt-quick))))
+
+;; Comparators for replace operations - only compare key parts, not values
+(defn cmp-datoms-eavt-replace
+  "Compare datoms by (e,a) only, ignoring v and tx.
+   Used for replace operations where value changes."
+  [^Datom d1, ^Datom d2]
+  (combine-cmp
+   (long-cmp (.-e d1) (.-e d2))
+   (cmp-attr-quick (.-a d1) (.-a d2))))
+
+(defn cmp-datoms-av-only
+  "Compare datoms by (a,v) only, ignoring e and tx.
+   Used for point lookup in AVET index when entity is unbound."
+  [^Datom d1, ^Datom d2]
+  (combine-cmp
+   (cmp-attr-quick (.-a d1) (.-a d2))
+   (compare-value (.-v d1) (.-v d2))))
+
+(defn cmp-datoms-aevt-replace
+  "Compare datoms by (a,e) only, ignoring v and tx.
+   Used for replace operations where value changes."
+  [^Datom d1, ^Datom d2]
+  (combine-cmp
+   (cmp-attr-quick (.-a d1) (.-a d2))
+   (long-cmp (.-e d1) (.-e d2))))
+
+(defn cmp-datoms-avet-replace
+  "Compare datoms by (a,e) only, ignoring v and tx.
+   Used for replace operations in AVET index where value changes."
+  [^Datom d1, ^Datom d2]
+  (combine-cmp
+   (cmp-attr-quick (.-a d1) (.-a d2))
+   (long-cmp (.-e d1) (.-e d2))))
+
+(defn index-type->cmp-replace
+  "Get comparator for replace operations.
+   Only compares the logical key parts, allowing value/tx to differ."
+  [index-type]
+  (case index-type
+    :aevt cmp-datoms-aevt-replace
+    :avet cmp-datoms-avet-replace
+    cmp-datoms-eavt-replace))
+
+(defn index-type->cmp-prefix
+  "Get prefix comparator for (e,a,v) matching, ignoring tx.
+   Used for existence checks in insert operations."
+  [index-type]
+  (case index-type
+    :aevt cmp-datoms-aevt-prefix
+    :avet cmp-datoms-avet-prefix
+    cmp-datoms-eavt-prefix))

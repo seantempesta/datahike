@@ -1,0 +1,726 @@
+(ns datahike.test.schema-test
+  (:require
+   #?(:cljs [cljs.test :as t :refer-macros [is deftest testing]]
+      :clj  [clojure.test :as t :refer [is deftest testing]])
+   [datahike.api :as d]
+   [datahike.db.interface :as dbi]
+   [datahike.db.transaction :as dbt]
+   [datahike.datom :as da]
+   [datahike.constants :as const]
+   [datahike.schema :as ds])
+  (:import [java.lang System]
+           [java.util UUID]))
+
+#?(:cljs (def Throwable js/Error))
+
+#?(:clj
+   (defn random-uuid []
+     (UUID/randomUUID)))
+
+(def name-schema {:db/ident       :name
+                  :db/valueType   :db.type/string
+                  :db/cardinality :db.cardinality/one})
+
+(def personal-id-schema {:db/ident :id
+                         :db/valueType :db.type/long
+                         :db/unique :db.unique/identity
+                         :db/cardinality :db.cardinality/many})
+
+(def find-name-q '[:find ?n
+                   :where [_ :name ?n]])
+
+(def find-schema-q '[:find ?n ?vt ?c
+                     :where
+                     [?e :db/ident ?n]
+                     [?e :db/valueType ?vt]
+                     [?e :db/cardinality ?c]])
+
+(deftest test-empty-db
+  (let [cfg {:store {:backend :memory
+                     :id #uuid "5c100000-0000-0000-0000-000000000001"}}
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)
+        db (d/db conn)
+        tx [{:name "Alice"}]]
+
+    (is (= const/non-ref-implicit-schema (dbi/-schema db)))
+
+    (testing "transact without schema present"
+      (is (thrown-with-msg? Throwable
+                            #"Bad entity attribute :name at \{:db/id 1, :name \"Alice\"\}, not defined in current schema"
+                            (d/transact conn tx))))
+
+    (testing "transacting new schema"
+      (d/transact conn [name-schema])
+      (is (= #{[:name :db.type/string :db.cardinality/one]}
+             (d/q find-schema-q (d/db conn))))
+      (is (= (merge const/non-ref-implicit-schema
+                    {:name     #:db{:ident       :name
+                                    :valueType   :db.type/string
+                                    :cardinality :db.cardinality/one}
+                     (d/q '[:find ?e . :where [?e :db/ident :name]] (d/db conn)) :name})
+             (dbi/-schema (d/db conn)))))
+
+    (testing "transacting data with schema present"
+      (d/transact conn tx)
+      (is (= #{["Alice"]}
+             (d/q find-name-q (d/db conn)))))
+
+    (testing "insert new data with wrong data type"
+      (is (thrown-with-msg? Throwable
+                            #"Bad entity value 42 at \[:db/add [0-9]+ :name 42\], value does not match schema definition. Must be conform to: string\?"
+                            (d/transact conn [{:name 42}]))))
+
+    (testing "insert new data with additional attributes not in schema"
+      (is (thrown-with-msg? Throwable
+                            #"Bad entity attribute :age at \{:db/id [0-9]+, :age 42\}, not defined in current schema"
+                            (d/transact conn [{:name "Bob" :age 42}]))))
+
+    (testing "insert incomplete schema :db/valueType"
+      (is (thrown-with-msg? Throwable
+                            #"Incomplete schema transaction attributes, expected :db/ident, :db/valueType, :db/cardinality"
+                            (d/transact conn [{:db/valueType :db.type/string}]))))
+
+    (testing "insert incomplete schema :db/cardinality"
+      (is (thrown-with-msg? Throwable
+                            #"Incomplete schema transaction attributes, expected :db/ident, :db/valueType, :db/cardinality"
+                            (d/transact conn [{:db/cardinality :db.cardinality/many}]))))
+
+    (testing "insert incomplete schema :db/cardinality, :db/ident"
+      (is (thrown-with-msg? Throwable
+                            #"Incomplete schema transaction attributes, expected :db/ident, :db/valueType, :db/cardinality"
+                            (d/transact conn [{:db/ident :phone :db/cardinality :db.cardinality/many}]))))
+
+    (testing "insert schema with incorrect value type"
+      (is (thrown-with-msg? Throwable
+                            (re-pattern (str "Bad entity value " :string " at \\[:db/add [0-9]+ :db/valueType :string\\], "
+                                             "value does not match schema definition. "
+                                             "Must be conform to: "
+                                             "#\\{:db.type/number :db.type/unique :db.type/instant :db.type/cardinality "
+                                             ":db.type/tuple :db.type/boolean :db.type/bytes :db.type/uuid :db.type/value "
+                                             ":db.type/string :db.type/keyword :db.type/ref :db.type/bigdec "
+                                             ":db.type.install/attribute :db.type/float :db.type/bigint :db.type/double "
+                                             ":db.type/long :db.type/valueType :db.type/symbol\\}"))
+                            (d/transact conn [{:db/ident       :phone
+                                               :db/cardinality :db.cardinality/one
+                                               :db/valueType   :string}]))))
+    (d/release conn)))
+
+(deftest test-db-with-initial-schema
+  (let [cfg {:store {:backend :memory
+                     :id #uuid "5c100000-0000-0000-0000-000000000002"}
+             :initial-tx [name-schema]}
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)]
+
+    (testing "schema existence"
+      (let [db (d/db conn)]
+        (is (= (merge const/non-ref-implicit-schema
+                      {:name     #:db{:ident       :name
+                                      :valueType   :db.type/string
+                                      :cardinality :db.cardinality/one}
+                       1         :name})
+               (dbi/-schema db)))
+        (is (= #{[:name :db.type/string :db.cardinality/one]} (d/q find-schema-q db)))))
+
+    (testing "insert new data according to schema"
+      (d/transact conn [{:name "Alice"}])
+      (is (= #{["Alice"]} (d/q find-name-q (d/db conn)))))
+
+    (testing "extend schema with :age"
+      (d/transact conn [{:db/ident       :age
+                         :db/valueType   :db.type/long
+                         :db/cardinality :db.cardinality/one}])
+      (let [db (d/db conn)]
+        (is (= (merge const/non-ref-implicit-schema
+                      {:name     #:db{:ident       :name
+                                      :valueType   :db.type/string
+                                      :cardinality :db.cardinality/one}
+                       1         :name
+                       :age      #:db{:ident       :age
+                                      :valueType   :db.type/long
+                                      :cardinality :db.cardinality/one}
+                       3         :age})
+               (dbi/-schema db)))
+        (is (= #{[:name :db.type/string :db.cardinality/one] [:age :db.type/long :db.cardinality/one]}
+               (d/q find-schema-q db)))))
+
+    (testing "insert new data"
+      (d/transact conn [{:name "Bob" :age 42}])
+      (is (= #{["Alice"] ["Bob"]} (d/q find-name-q (d/db conn)))))
+
+    (testing "change cardinality for :name"
+      (d/transact conn [{:db/ident :name
+                         :db/cardinality :db.cardinality/many}])
+      (let [db (d/db conn)]
+        (is (= (merge const/non-ref-implicit-schema
+                      {:name     #:db{:ident       :name
+                                      :valueType   :db.type/string
+                                      :cardinality :db.cardinality/many}
+                       1         :name
+                       :age      #:db{:ident       :age
+                                      :valueType   :db.type/long
+                                      :cardinality :db.cardinality/one}
+                       3         :age})
+               (dbi/-schema db)))
+        (is (= #{[:name :db.type/string :db.cardinality/many] [:age :db.type/long :db.cardinality/one]}
+               (d/q find-schema-q db)))))
+    (d/release conn)))
+
+(defn testing-type [conn type-name tx-val wrong-val]
+  (testing type-name
+    (let [schema-name (keyword "value" type-name)]
+      (d/transact conn [{schema-name tx-val}])
+      (is (= #{[tx-val]}
+             (d/q '[:find ?v :in $ ?sn :where [?e ?sn ?v]] (d/db conn) schema-name)))
+      (is (thrown-with-msg? Throwable
+                            (re-pattern (str "Bad entity value "
+                                             wrong-val
+                                             " at \\[:db/add "
+                                             "[0-9]+"
+                                             " "
+                                             schema-name
+                                             " "
+                                             wrong-val
+                                             "\\], value does not match schema definition"))
+                            (d/transact conn [{schema-name wrong-val}]))))))
+
+(deftest test-schema-types
+  (let [schema-tx [{:db/ident       :value/bigdec
+                    :db/valueType   :db.type/bigdec
+                    :db/cardinality :db.cardinality/one}
+                   {:db/ident       :value/bigint
+                    :db/valueType   :db.type/bigint
+                    :db/cardinality :db.cardinality/one}
+                   {:db/ident       :value/boolean
+                    :db/valueType   :db.type/boolean
+                    :db/cardinality :db.cardinality/one}
+                   {:db/ident       :value/double
+                    :db/valueType   :db.type/double
+                    :db/cardinality :db.cardinality/one}
+                   {:db/ident       :value/float
+                    :db/valueType   :db.type/float
+                    :db/cardinality :db.cardinality/one}
+                   {:db/ident       :value/instant
+                    :db/valueType   :db.type/instant
+                    :db/cardinality :db.cardinality/one}
+                   {:db/ident       :value/keyword
+                    :db/valueType   :db.type/keyword
+                    :db/cardinality :db.cardinality/one}
+                   {:db/ident       :value/long
+                    :db/valueType   :db.type/long
+                    :db/cardinality :db.cardinality/one}
+                   {:db/ident       :value/string
+                    :db/valueType   :db.type/string
+                    :db/cardinality :db.cardinality/one}
+                   {:db/ident       :value/symbol
+                    :db/valueType   :db.type/symbol
+                    :db/cardinality :db.cardinality/one}
+                   {:db/ident       :value/uuid
+                    :db/valueType   :db.type/uuid
+                    :db/cardinality :db.cardinality/one}]
+        cfg {:store {:backend :memory
+                     :id #uuid "5c100000-0000-0000-0000-000000000003"}
+             :initial-tx schema-tx}
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)]
+
+    (testing-type conn "bigdec" (bigdec 1) 1)
+    (testing-type conn "bigint" (biginteger 1) 1.0)
+    (testing-type conn "boolean" true 0)
+    (testing-type conn "double" (double 1) 1)
+    (testing-type conn "float" (float 1) 1)
+    (testing-type conn "instant" (java.util.Date.) 1)
+    (testing-type conn "keyword" :one 1)
+    (testing-type conn "long" (long 2) :2)
+    (testing-type conn "string" "one" :one)
+    (testing-type conn "symbol" 'one :one)
+    (testing-type conn "uuid" (random-uuid) 1)
+    (d/release conn)))
+
+(deftest test-schema-cardinality
+  (let [schema-tx [{:db/ident       :owner
+                    :db/valueType   :db.type/string
+                    :db/index       true
+                    :db/unique      :db.unique/identity
+                    :db/cardinality :db.cardinality/one}
+                   {:db/ident       :cars
+                    :db/valueType   :db.type/keyword
+                    :db/cardinality :db.cardinality/many}]
+        cfg {:store {:backend :memory
+                     :id #uuid "5c100000-0000-0000-0000-000000000004"}
+             :initial-tx schema-tx}
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)]
+
+    (testing "insert :owner and :cars one by one"
+      (d/transact conn [{:db/id -1
+                         :owner "Alice"}
+                        {:db/id -1
+                         :cars  :audi}
+                        {:db/id -1
+                         :cars  :bmw}])
+      (is (= #{["Alice" :audi] ["Alice" :bmw]}
+             (d/q '[:find ?o ?c :where [?e :owner ?o] [?e :cars ?c]] (d/db conn)))))
+
+    (testing "insert :cars as list"
+      (d/transact conn [{:db/id -2
+                         :owner "Bob"
+                         :cars  [:chrysler :daimler]}])
+      (is (= #{["Alice" :audi] ["Alice" :bmw] ["Bob" :chrysler] ["Bob" :daimler]}
+             (d/q '[:find ?o ?c :where [?e :owner ?o] [?e :cars ?c]] (d/db conn)))))
+
+    (testing "insert to cardinality one"
+      (d/transact conn [{:db/id [:owner "Alice"]
+                         :owner "Charlie"}])
+      (is (= #{["Charlie" :audi] ["Charlie" :bmw] ["Bob" :chrysler] ["Bob" :daimler]}
+             (d/q '[:find ?o ?c :where [?e :owner ?o] [?e :cars ?c]] (d/db conn)))))
+
+    (testing "test cardinality change if unique is set"
+      (is (thrown-with-msg? Throwable
+                            #"Update not supported for these schema attributes"
+                            (d/transact conn [{:db/ident       :owner
+                                               :db/cardinality :db.cardinality/many}])))
+      (is (thrown-with-msg? Throwable
+                            #"Update not supported for these schema attributes"
+                            (d/transact conn [{:db/id [:db/ident :owner]
+                                               :db/cardinality :db.cardinality/many}]))))
+    (d/release conn)))
+
+(deftest test-schema-persistence
+  (testing "test file persistence"
+    (let [os (System/getProperty "os.name")
+          path (case os
+                 "Windows 10"  (str (System/getProperty "java.io.tmpdir") "dh-test-persistence")
+                 "/tmp/dh-test-persistence")
+          cfg {:store {:backend :file
+                       :path path
+                       :id (random-uuid)}
+               :initial-tx [name-schema]}
+          _ (d/delete-database cfg)
+          _ (d/create-database cfg)
+          conn (d/connect cfg)]
+      (testing "schema exists on creation and first connection"
+        (is (= #{[:name :db.type/string :db.cardinality/one]} (d/q find-schema-q (d/db conn)))))
+      (testing "reconnect with db"
+        (let [new-conn (d/connect cfg)]
+          (is (= #{[:name :db.type/string :db.cardinality/one]} (d/q find-schema-q (d/db new-conn))))
+          (d/release new-conn)))
+      (d/release conn)
+      (d/delete-database cfg)))
+  (testing "test mem persistence"
+    (let [cfg {:store {:backend :memory
+                       :id (random-uuid)}
+               :initial-tx [name-schema]}
+          _ (d/delete-database cfg)
+          _ (d/create-database cfg)
+          conn (d/connect cfg)]
+      (try
+        (testing "schema exists on creation and first connection"
+          (is (= #{[:name :db.type/string :db.cardinality/one]} (d/q find-schema-q (d/db conn)))))
+        (testing "reconnect with db"
+          (let [new-conn (d/connect cfg)]
+            (try
+              (is (= #{[:name :db.type/string :db.cardinality/one]}
+                     (d/q find-schema-q (d/db new-conn))))
+              (finally
+                (d/release new-conn)))))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
+(deftest test-schema-on-read-db
+  (testing "test database creation with schema-on-read"
+    (let [cfg {:store {:backend :memory
+                       :id #uuid "d0000000-0000-0000-0000-00000000000d"}
+               :schema-flexibility :read}
+          _ (d/delete-database cfg)
+          _ (d/create-database cfg)
+          conn (d/connect cfg)]
+      (testing "insert any data"
+        (d/transact conn [{:name "Alice" :age 26} {:age "12" :car :bmw}])
+        (is (= #{[1 "Alice" 26]}
+               (d/q '[:find ?e ?n ?a :where [?e :name ?n] [?e :age ?a]] (d/db conn))))
+        (is (= #{[2 "12" :bmw]}
+               (d/q '[:find ?e ?a ?c :where [?e :age ?a] [?e :car ?c]] (d/db conn)))))
+      (d/release conn))))
+
+(deftest test-ident
+  (testing "use db/ident as enum"
+    (let [schema [{:db/ident :important}
+                  {:db/ident :archive}
+                  {:db/ident       :message
+                   :db/valueType   :db.type/string
+                   :db/cardinality :db.cardinality/one}
+                  {:db/ident       :tag
+                   :db/valueType   :db.type/ref
+                   :db/cardinality :db.cardinality/many}]
+          cfg {:store {:backend :memory
+                       :id #uuid "5c100000-0000-0000-0000-000000000006"}
+               :initial-tx schema}
+          _ (d/delete-database cfg)
+          _ (d/create-database cfg)
+          conn (d/connect cfg)]
+      (testing "insert data with enums"
+        (d/transact conn [{:message "important" :tag :important} {:message "archive" :tag [:important :archive]}])
+        (is (= #{["important" :important] ["archive" :important] ["archive" :archive]}
+               (d/q '[:find ?m ?t :where [?e :message ?m] [?e :tag ?te] [?te :db/ident ?t]] (d/db conn))))
+        (d/release conn)))))
+
+(deftest test-remove-schema
+  (let [cfg {:store {:backend :memory
+                     :id #uuid "5c100000-0000-0000-0000-000000000007"}}
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)
+        db (d/db conn)]
+    (testing "non existing schema should throw exception"
+      (is (thrown-with-msg? Throwable
+                            #"Schema with attribute :name does not exist"
+                            (dbt/remove-schema db (da/datom 1 :db/ident :name)))))
+    (testing "when upserting a non existing schema, it should not throw an exception"
+      (is (d/transact conn [name-schema])))
+    (d/release conn)))
+
+(deftest test-update-schema
+  (let [cfg {:store {:backend :memory
+                     :id (random-uuid)}
+             :initial-tx [name-schema personal-id-schema]}
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)
+        update-name-attr (fn [attr new-value] (d/transact conn {:tx-data [(assoc name-schema attr new-value)]}))]
+    (try
+      (testing "Allow to update doc"
+        (is (update-name-attr :db/doc "Some doc") "It should be allowed to add :db/doc.")
+        (is (update-name-attr :db/doc "Some new doc") "It should be allowed to update :db/doc.")
+        (is (d/transact conn {:tx-data [[:db/retract :name :db/doc]]}) "It should be allowed to retract :db/doc."))
+
+      (testing "Allow to toggle noHistory"
+        (is (update-name-attr :db/noHistory true) "It should be allowed to enable :db/noHistory.")
+        (is (update-name-attr :db/noHistory false) "It should be allowed to disable :db/noHistory."))
+
+      (testing "Allow to toggle isComponent"
+        (is (update-name-attr :db/isComponent true) "It should be allowed to enable :db/isComponent.")
+        (is (update-name-attr :db/isComponent false) "It should be allowed to disable :db/isComponent."))
+
+      (testing "Reject unsupported :db/unique changes"
+        (is (thrown-with-msg? Throwable
+                              #"Update not supported for these schema attributes"
+                              (d/transact conn {:tx-data [(assoc name-schema :db/unique :db.unique/value)]}))
+            "It shouldn't be allowed to update :db/unique if it doesn't exist already.")
+        (is (thrown-with-msg? Throwable
+                              #"Update not supported for these schema attributes"
+                              (d/transact conn {:tx-data [(assoc personal-id-schema :db/unique :db.unique/value)]}))
+            "A cardinality-many unique attribute cannot change uniqueness semantics."))
+
+      (testing "Allow to update :db/cardinality "
+        (testing "if :db/unique is not set"
+          (is (update-name-attr :db/cardinality :db.cardinality/many)
+              "It should be allowed to update :db/cardinality to :db.cardinality/many.")
+          (is (update-name-attr :db/cardinality :db.cardinality/one)
+              "It should be allowed to update :db/cardinality to :db.cardinality/one."))
+
+        (testing "if :db/unique is set"
+          (is (d/transact conn {:tx-data [(assoc personal-id-schema :db/cardinality :db.cardinality/one)]})
+              "It should be allowed to update :db/cardinality to :db.cardinality/one.")
+          (is (thrown-with-msg? Throwable
+                                #"Update not supported for these schema attributes"
+                                (d/transact conn {:tx-data [(assoc personal-id-schema :db/cardinality :db.cardinality/many)]}))
+              "It shouldn't be allowed to update :db/cardinality to :db.cardinality/many")))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
+
+(deftest additive-index-update-backfills-current-and-history
+  (let [event-at-schema {:db/ident :event/at
+                         :db/valueType :db.type/long
+                         :db/cardinality :db.cardinality/one}
+        indexed-schema (assoc event-at-schema :db/index true)
+        cfg {:store {:backend :memory :id (random-uuid)}
+             :schema-flexibility :write
+             :keep-history? true
+             :initial-tx [event-at-schema]}
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)]
+    (try
+      (d/transact conn [{:db/id 100 :event/at 1000}
+                        {:db/id 200 :event/at 1500}])
+      (let [before-update-t (:max-tx @conn)
+            _ (d/transact conn [{:db/id 100 :event/at 2000}])
+            target-eavt (vec (d/datoms @conn :eavt 100 :event/at))
+            target-aevt (vec (d/datoms @conn :aevt :event/at))]
+        (is (empty? (d/datoms @conn :avet :event/at)))
+        (d/transact conn [indexed-schema])
+        (testing "existing values are backfilled in AVET value order"
+          (is (= [1500 2000]
+                 (mapv :v (d/datoms @conn :avet :event/at))))
+          (is (= target-eavt (vec (d/datoms @conn :eavt 100 :event/at))))
+          (is (= target-aevt (vec (d/datoms @conn :aevt :event/at)))))
+        (testing "retained additions and retractions are backfilled into temporal AVET"
+          (is (= [[1000 true] [1000 false] [1500 true] [2000 true]]
+                 (mapv (juxt :v :added)
+                       (d/datoms (d/history @conn) :avet :event/at))))
+          (is (= 1000
+                 (d/q '[:find ?v . :where [100 :event/at ?v]]
+                      (d/as-of @conn before-update-t))))
+          (is (= 2000
+                 (d/q '[:find ?v . :where [100 :event/at ?v]]
+                      (d/since @conn before-update-t)))))
+        (testing "later writes maintain both current and temporal AVET"
+          (d/transact conn [{:db/id 100 :event/at 2500}])
+          (is (= [1500 2500]
+                 (mapv :v (d/datoms @conn :avet :event/at))))
+          (is (= [[1000 true] [1000 false]
+                  [1500 true]
+                  [2000 true] [2000 false]
+                  [2500 true]]
+                 (mapv (juxt :v :added)
+                       (d/datoms (d/history @conn) :avet :event/at)))))
+        (testing "redeclaring the converged schema does not duplicate index content"
+          (let [before (vec (d/datoms (d/history @conn) :avet :event/at))]
+            (d/transact conn [indexed-schema])
+            (is (= before
+                   (vec (d/datoms (d/history @conn) :avet :event/at))))))
+        (testing "every transaction syntax rejects index removal atomically"
+          (let [snapshot (fn []
+                           {:max-tx (:max-tx @conn)
+                            :schema (get-in (dbi/-schema @conn) [:event/at])
+                            :current (vec (d/datoms @conn :avet :event/at))
+                            :history (vec (d/datoms (d/history @conn) :avet :event/at))})
+                before (snapshot)
+                removals [[(assoc indexed-schema :db/index false)]
+                          [[:db/add :event/at :db/index false]]
+                          [[:db/retract :event/at :db/index true]]
+                          [[:db.fn/cas :event/at :db/index true false]]
+                          [[:db.fn/retractAttribute :event/at :db/index]]
+                          [[:db.fn/retractEntity :event/at]]]]
+            (doseq [tx-data removals]
+              (is (thrown-with-msg? Throwable
+                                    #"Update not supported for these schema attributes"
+                                    (d/transact conn tx-data)))
+              (is (= before (snapshot))))
+            (d/transact conn [{:db/id 300 :event/at 3000}])
+            (is (= [1500 2500 3000]
+                   (mapv :v (d/datoms @conn :avet :event/at)))))))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
+
+(deftest additive-index-update-covers-same-transaction-orderings
+  (doseq [[label tx-data]
+          [["data before schema"
+            [{:db/id 100 :event/at 1000}
+             {:db/ident :event/at
+              :db/valueType :db.type/long
+              :db/cardinality :db.cardinality/one
+              :db/index true}]]
+           ["schema before data"
+            [{:db/ident :event/at
+              :db/valueType :db.type/long
+              :db/cardinality :db.cardinality/one
+              :db/index true}
+             {:db/id 100 :event/at 1000}]]]]
+    (testing label
+      (let [schema {:db/ident :event/at
+                    :db/valueType :db.type/long
+                    :db/cardinality :db.cardinality/one}
+            cfg {:store {:backend :memory :id (random-uuid)}
+                 :schema-flexibility :write
+                 :keep-history? true
+                 :initial-tx [schema]}
+            _ (d/delete-database cfg)
+            _ (d/create-database cfg)
+            conn (d/connect cfg)]
+        (try
+          (d/transact conn tx-data)
+          (is (= [1000] (mapv :v (d/datoms @conn :avet :event/at))))
+          (finally
+            (d/release conn)
+            (d/delete-database cfg)))))))
+
+(deftest schema-removal-requires-empty-current-aevt
+  (doseq [indexed? [false true]]
+    (let [schema (cond-> {:db/ident :event/at
+                          :db/valueType :db.type/long
+                          :db/cardinality :db.cardinality/one}
+                   indexed? (assoc :db/index true))
+          cfg {:store {:backend :memory :id (random-uuid)}
+               :schema-flexibility :write
+               :keep-history? true
+               :initial-tx [schema]}
+          _ (d/delete-database cfg)
+          _ (d/create-database cfg)
+          conn (d/connect cfg)]
+      (try
+        (d/transact conn [{:db/id 100 :event/at 1000}])
+        (let [data-t (:max-tx @conn)
+              before @conn]
+          (testing (str "current data refuses whole-schema removal atomically; indexed=" indexed?)
+            (is (thrown-with-msg? Throwable
+                                  #"Update not supported for these schema attributes"
+                                  (d/transact conn [[:db.fn/retractEntity :event/at]])))
+            (is (= (:max-tx before) (:max-tx @conn)))
+            (is (= schema (get-in (dbi/-schema @conn) [:event/at])))
+            (is (= 1000
+                   (d/q '[:find ?v . :where [100 :event/at ?v]] @conn))))
+          (testing (str "removal succeeds after current data is retracted and preserves history; indexed=" indexed?)
+            (d/transact conn [[:db/retract 100 :event/at 1000]])
+            (d/transact conn [[:db.fn/retractEntity :event/at]])
+            (is (not (contains? (dbi/-schema @conn) :event/at)))
+            (is (nil? (d/q '[:find ?v . :where [100 :event/at ?v]] @conn)))
+            (is (= 1000
+                   (d/q '[:find ?v . :where [100 :event/at ?v]]
+                        (d/as-of @conn data-t))))))
+        (finally
+          (d/release conn)
+          (d/delete-database cfg))))))
+
+(deftest never-used-indexed-schema-can-be-removed
+  (let [schema {:db/ident :event/at
+                :db/valueType :db.type/long
+                :db/cardinality :db.cardinality/one
+                :db/index true}
+        cfg {:store {:backend :memory :id (random-uuid)}
+             :schema-flexibility :write
+             :keep-history? true
+             :initial-tx [schema]}
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)]
+    (try
+      (d/transact conn [[:db.fn/retractEntity :event/at]])
+      (is (not (contains? (dbi/-schema @conn) :event/at)))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
+
+(deftest explicit-index-facet-preserves-implicitly-indexed-content
+  (let [schema {:db/ident :event/id
+                :db/valueType :db.type/string
+                :db/cardinality :db.cardinality/one
+                :db/unique :db.unique/identity}
+        cfg {:store {:backend :memory :id (random-uuid)}
+             :schema-flexibility :write
+             :keep-history? true
+             :initial-tx [schema]}
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)]
+    (try
+      (d/transact conn [{:event/id "a"} {:event/id "b"}])
+      (let [before (vec (d/datoms (d/history @conn) :avet :event/id))]
+        (d/transact conn [(assoc schema :db/index true)])
+        (is (true? (get-in (dbi/-schema @conn) [:event/id :db/index])))
+        (is (= before (vec (d/datoms (d/history @conn) :avet :event/id)))))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
+
+(deftest additive-index-update-rejects-incompatible-sibling-change-atomically
+  (let [schema {:db/ident :event/at
+                :db/valueType :db.type/long
+                :db/cardinality :db.cardinality/one}
+        cfg {:store {:backend :memory :id (random-uuid)}
+             :schema-flexibility :write
+             :keep-history? true
+             :initial-tx [schema]}
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)]
+    (try
+      (d/transact conn [{:db/id 100 :event/at 1000}])
+      (let [before @conn]
+        (is (thrown-with-msg? Throwable
+                              #"Update not supported for these schema attributes"
+                              (d/transact conn [(assoc schema
+                                                       :db/valueType :db.type/string
+                                                       :db/index true)])))
+        (is (= (:max-tx before) (:max-tx @conn)))
+        (is (nil? (get-in (dbi/-schema @conn) [:event/at :db/index])))
+        (is (empty? (d/datoms @conn :avet :event/at))))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
+
+#?(:clj
+   (deftest additive-index-backfill-survives-reopen
+     (let [schema {:db/ident :event/tag
+                   :db/valueType :db.type/string
+                   :db/cardinality :db.cardinality/many}
+           indexed-schema (assoc schema :db/index true)
+           cfg {:store {:backend :file
+                        :path (str (System/getProperty "java.io.tmpdir")
+                                   "/datahike-additive-index-backfill")
+                        :id (random-uuid)}
+                :schema-flexibility :write
+                :keep-history? true}
+           _ (d/delete-database cfg)
+           _ (d/create-database cfg)]
+       (try
+         (let [conn (d/connect cfg)]
+           (d/transact conn [schema])
+           (d/transact conn [{:db/id 100 :event/tag ["z" "a"]}
+                             {:db/id 200 :event/tag ["m"]}])
+           (d/transact conn [[:db/retract 100 :event/tag "z"]])
+           (d/transact conn [indexed-schema])
+           (d/release conn))
+         (let [conn (d/connect cfg)]
+           (testing "schema and both AVET projections reopen together"
+             (is (true? (get-in (dbi/-schema @conn) [:event/tag :db/index])))
+             (is (= ["a" "m"]
+                    (mapv :v (d/datoms @conn :avet :event/tag))))
+             (is (= [["a" true] ["m" true] ["z" true] ["z" false]]
+                    (mapv (juxt :v :added)
+                          (d/datoms (d/history @conn) :avet :event/tag)))))
+           (testing "later cardinality-many values maintain reopened AVET"
+             (d/transact conn [{:db/id 200 :event/tag ["b"]}])
+             (is (= ["a" "b" "m"]
+                    (mapv :v (d/datoms @conn :avet :event/tag)))))
+           (d/release conn))
+         (finally
+           (d/delete-database cfg))))))
+
+(deftest incompatible-schema-update-survives-later-entries
+  (let [old-schema #:db{:ident :name
+                        :valueType :db.type/string
+                        :cardinality :db.cardinality/one}
+        invalid-update [:db/valueType
+                        [:db.type/string :db.type/long]]
+        updates [(array-map :db/valueType :db.type/long
+                            :db/ident :name
+                            :db/cardinality :db.cardinality/one
+                            :db/doc "allowed")
+                 (array-map :db/ident :name
+                            :db/valueType :db.type/long
+                            :db/cardinality :db.cardinality/one
+                            :db/doc "allowed")
+                 (array-map :db/ident :name
+                            :db/cardinality :db.cardinality/one
+                            :db/doc "allowed"
+                            :db/valueType :db.type/long)]
+        cfg {:store {:backend :memory
+                     :id #uuid "5c100000-0000-0000-0000-000000000009"}
+             :initial-tx [name-schema]}
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)]
+    (testing "pure comparison preserves an incompatible change at every position"
+      (doseq [update updates]
+        (is (= (into {} [invalid-update])
+               (ds/find-invalid-schema-updates update old-schema)))))
+    (testing "transaction rejection preserves the schema and database coordinate"
+      (let [before @conn]
+        (is (thrown-with-msg? Throwable
+                              #"Update not supported for these schema attributes"
+                              (d/transact conn [(first updates)])))
+        (is (= (:max-tx before) (:max-tx @conn)))
+        (is (= :db.type/string
+               (get-in (dbi/-schema @conn) [:name :db/valueType])))))
+    (d/release conn)
+    (d/delete-database cfg)))

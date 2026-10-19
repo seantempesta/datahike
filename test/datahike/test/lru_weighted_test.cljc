@@ -1,0 +1,164 @@
+(ns datahike.test.lru-weighted-test
+  (:require
+   #?(:cljs [cljs.test :as t :refer-macros [is deftest]]
+      :clj  [clojure.test :as t :refer [is deftest]])
+   [datahike.lru :as lru]
+   [datahike.resource :as resource]
+   #?(:clj [datahike.api :as d])
+   #?(:clj [datahike.query :as q])))
+
+(defn- weighted-state [c] (.-state c))
+(defn- total-weight [c] (:total-weight (weighted-state c)))
+(defn- entry-count [c] (count (:key-value (weighted-state c))))
+
+(deftest bounded-weight-inspection-is-total-and-non-realizing
+  (is (nil? (resource/shallow-weight-within
+             [nil (apply str (repeat 64 "x"))] 16)))
+  (is (nil? (resource/shallow-weight-within
+             (map identity (range 1000)) 16))))
+
+(deftest count-bound-evicts-oldest
+  (let [c (-> (lru/weighted-lru 2 0) (assoc :a 1) (assoc :b 2) (assoc :c 3))]
+    (is (nil? (get c :a)))
+    (is (= 2 (get c :b)))
+    (is (= 3 (get c :c)))
+    (is (= 2 (entry-count c)))))
+
+(deftest weight-bound-evicts-oldest
+  (let [c (-> (lru/weighted-lru 100 5 count) (assoc :a [1 2 3]) (assoc :b [4 5 6]))]
+    (is (nil? (get c :a)))
+    (is (= [4 5 6] (get c :b)))
+    (is (<= (total-weight c) 5))))
+
+(deftest keeps-newest-even-when-alone-over-budget
+  (let [c (-> (lru/weighted-lru 100 2 count) (assoc :big [1 2 3 4 5]))]
+    (is (= [1 2 3 4 5] (get c :big)))
+    (is (= 1 (entry-count c)))))
+
+(deftest lru-touch-protects-recently-used
+  (let [c (-> (lru/weighted-lru 2 0) (assoc :a 1) (assoc :b 2) (assoc :a 1) (assoc :c 3))]
+    (is (= 1 (get c :a)))
+    (is (nil? (get c :b)))
+    (is (= 3 (get c :c)))))
+
+(deftest weighted-touch-does-not-reweigh-an-unchanged-entry
+  (let [weigh-calls (atom 0)
+        weigh (fn [value] (swap! weigh-calls inc) (count value))
+        before (-> (lru/weighted-lru 2 100 weigh)
+                   (assoc :a [1 2 3])
+                   (assoc :b [4 5]))
+        touched (lru/weighted-touch before :a)]
+    (is (= 2 @weigh-calls))
+    (is (= 5 (lru/weighted-total-weight touched)))
+    (let [after (assoc touched :c [6])]
+      (is (= [1 2 3] (get after :a)))
+      (is (nil? (get after :b))))))
+
+(deftest shrink-loop-evicts-until-within-budget
+  (let [c (reduce (fn [c k] (assoc c k [k k k]))
+                  (lru/weighted-lru 100 4 count)
+                  [:a :b :c :d])]
+    (is (nil? (get c :a)))
+    (is (nil? (get c :c)))
+    (is (= [:d :d :d] (get c :d)))
+    (is (<= (total-weight c) 4))))
+
+(deftest disabled-budget-behaves-as-count-lru
+  (let [c (reduce (fn [c i] (assoc c i (vec (range 100))))
+                  (lru/weighted-lru 3 0)
+                  (range 10))]
+    (is (= 3 (entry-count c)))
+    (is (zero? (total-weight c)))))
+
+(deftest remove-where-preserves-weight-and-generation-bookkeeping
+  (let [before (-> (lru/weighted-lru 10 100 count)
+                   (assoc [:scope-a 1] [1 2 3])
+                   (assoc [:scope-b 1] [4 5])
+                   (assoc [:scope-a 2] [6]))
+        after (lru/weighted-remove-where before #(= :scope-a (first %)))
+        state (weighted-state after)]
+    (is (= {[:scope-b 1] [4 5]} (lru/weighted-entries after)))
+    (is (= 2 (lru/weighted-total-weight after)))
+    (is (= (set (keys (:key-value state))) (set (keys (:key-gen state)))))
+    (is (= (set (vals (:gen-key state))) (set (keys (:key-value state)))))))
+
+#?(:clj
+   (deftest query-cache-bounded-by-weight-budget
+     (let [orig-limit @#'q/*query-cache-weight-limit*
+           orig-size  @#'q/*query-cache-size*
+           cfg        {:store {:backend :memory :id (random-uuid)}
+                       :schema-flexibility :read
+                       :keep-history?      false}]
+       (try
+         (q/set-query-cache-size! 1000)
+         (q/set-query-cache-weight-limit! 200)
+         (q/clear-query-cache!)
+         (d/create-database cfg)
+         (let [conn (d/connect cfg)]
+           (d/transact conn {:tx-data (vec (for [i (range 60)]
+                                             {:db/id (- (inc i)) :nm (str "e" i) :age i}))})
+           (dotimes [t 30]
+             (d/transact conn {:tx-data [{:nm (str "x" t)}]})
+             (d/q '[:find ?n ?a :where [?e :nm ?n] [?e :age ?a]] @conn))
+           (let [st (.-state (:lru @q/query-result-cache))]
+             (is (<= (:total-weight st) 200))
+             (is (< (count (:key-value st)) 30)))
+           (d/release conn))
+         (finally
+           (d/delete-database cfg)
+           (q/set-query-cache-size! orig-size)
+           (q/set-query-cache-weight-limit! orig-limit)
+           (q/clear-query-cache!))))))
+
+#?(:clj
+   (deftest scalar-find-cacheable-under-weight-budget
+     ;; Regression: a scalar find (`[:find ?x .]`) caches a non-collection
+     ;; result. The weigh path must not `(count ...)` it — that threw
+     ;; "count not supported on this type" and broke every scalar query
+     ;; while the (default) weight budget was enabled.
+     (let [orig-limit @#'q/*query-cache-weight-limit*
+           cfg        {:store {:backend :memory :id (random-uuid)}
+                       :schema-flexibility :write
+                       :keep-history?      false}]
+       (try
+         (q/set-query-cache-weight-limit! 1000000)   ; default budget on
+         (q/clear-query-cache!)
+         (d/create-database cfg)
+         (let [conn (d/connect cfg)]
+           (d/transact conn [{:db/ident :pos/x :db/valueType :db.type/long
+                              :db/cardinality :db.cardinality/one}])
+           (d/transact conn [{:pos/x 42}])
+           (let [db @conn]
+             (is (= 42 (d/q '[:find ?x . :where [_ :pos/x ?x]] db)))
+             (is (= 42 (d/q '[:find ?x . :where [_ :pos/x ?x]] db)))   ; cache-hit path
+             (is (= #{[42]} (d/q '[:find ?x :where [_ :pos/x ?x]] db)))) ; other finds still fine
+           (d/release conn))
+         (finally
+           (d/delete-database cfg)
+           (q/set-query-cache-weight-limit! orig-limit)
+           (q/clear-query-cache!))))))
+
+#?(:clj
+   (deftest overweight-one-row-result-is-not-cached
+     (let [orig-limit @#'q/*query-cache-weight-limit*
+           cfg {:store {:backend :memory :id (random-uuid)}
+                :schema-flexibility :write
+                :keep-history? false}]
+       (try
+         (q/set-query-cache-weight-limit! 32)
+         (q/clear-query-cache!)
+         (d/create-database cfg)
+         (let [conn (d/connect cfg)
+               huge (apply str (repeat 128 "x"))]
+           (d/transact conn [{:db/ident :cache/huge
+                              :db/valueType :db.type/string
+                              :db/cardinality :db.cardinality/one}])
+           (d/transact conn [{:cache/huge huge}])
+           (is (= #{[huge]}
+                  (d/q '[:find ?v :where [_ :cache/huge ?v]] @conn)))
+           (is (zero? (-> @q/query-result-cache :lru .-state :total-weight)))
+           (d/release conn))
+         (finally
+           (d/delete-database cfg)
+           (q/set-query-cache-weight-limit! orig-limit)
+           (q/clear-query-cache!))))))

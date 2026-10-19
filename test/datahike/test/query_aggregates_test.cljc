@@ -1,0 +1,133 @@
+(ns datahike.test.query-aggregates-test
+  (:require
+   #?(:cljs [cljs.test    :as t :refer-macros [is deftest testing]]
+      :clj  [clojure.test :as t :refer        [is deftest testing]])
+   [clojure.core.async :refer [<!]]
+   [datahike.api :as d]
+   [datahike.test.async #?(:clj :refer :cljs :refer-macros) [deftest-async]]))
+
+(defn- connect!
+  "Create + connect to `cfg`. Returns a channel yielding the connection so the
+   body works on both JVM (sync) and cljs (async writer)."
+  [cfg]
+  (clojure.core.async/go
+    #?(:clj  (do (d/create-database cfg) (d/connect cfg))
+       :cljs (do (<! (d/create-database cfg)) (<! (d/connect cfg {:sync? false}))))))
+
+(defn sort-reverse [xs]
+  (reverse (sort xs)))
+
+(deftest-async test-aggregates
+  (let [monsters [["Cerberus" 3]
+                  ["Medusa" 1]
+                  ["Cyclops" 1]
+                  ["Chimera" 1]]]
+    (testing "with"
+      (is (= (d/q '[:find ?heads
+                    :with ?monster
+                    :in   [[?monster ?heads]]]
+                  [["Medusa" 1]
+                   ["Cyclops" 1]
+                   ["Chimera" 1]])
+             [[1] [1] [1]])))
+
+    (testing "Wrong grouping without :with"
+      (is (= (d/q '[:find (sum ?heads)
+                    :in   [[?monster ?heads]]]
+                  monsters)
+             [[4]])))
+
+    (testing "Multiple aggregates, correct grouping with :with"
+      (is (= (d/q '[:find (sum ?heads) (min ?heads) (max ?heads) (count ?heads) (count-distinct ?heads)
+                    :with ?monster
+                    :in   [[?monster ?heads]]]
+                  monsters)
+             [[6 1 3 4 2]])))
+
+    (testing "Min and max are using comparator instead of default compare"
+      ;; Wrong: using js '<' operator
+      ;; (apply min [:a/b :a-/b :a/c]) => :a-/b
+      ;; (apply max [:a/b :a-/b :a/c]) => :a/c
+      ;; Correct: use IComparable interface
+      ;; (sort compare [:a/b :a-/b :a/c]) => (:a/b :a/c :a-/b)
+      (is (= (d/q '[:find (min ?x) (max ?x)
+                    :in [?x ...]]
+                  [:a-/b :a/b])
+             [[:a/b :a-/b]]))
+
+      (is (= (d/q '[:find (min 2 ?x) (max 2 ?x)
+                    :in [?x ...]]
+                  [:a/b :a-/b :a/c])
+             [[[:a/b :a/c] [:a/c :a-/b]]])))
+
+    (testing "Grouping and parameter passing"
+      (is (= (set (d/q '[:find ?color (max ?amount ?x) (min ?amount ?x)
+                         :in   [[?color ?x]] ?amount]
+                       [[:red 1]  [:red 2] [:red 3] [:red 4] [:red 5]
+                        [:blue 7] [:blue 8]]
+                       3))
+             #{[:red  [3 4 5] [1 2 3]]
+               [:blue [7 8]   [7 8]]})))
+
+    (testing "avg aggregate"
+      (is (= (ffirst (d/q '[:find (avg ?x)
+                            :in [?x ...]]
+                          [10 15 20 35 75]))
+             31)))
+
+    (testing "median aggregate"
+      (is (= (ffirst (d/q '[:find (median ?x)
+                            :in [?x ...]]
+                          [10 15 20 35 75]))
+             20)))
+
+    (testing "variance aggregate"
+      (is (= (ffirst (d/q '[:find (variance ?x)
+                            :in [?x ...]]
+                          [10 15 20 35 75]))
+             554)))
+
+    (testing "stddev aggregate"
+      (is (= (ffirst (d/q '[:find (stddev ?x)
+                            :in [?x ...]]
+                          [10 15 20 35 75]))
+             23.53720459187964)))
+
+    (testing "Custom aggregates"
+      (let [data   [[:red 1]  [:red 2] [:red 3] [:red 4] [:red 5]
+                    [:blue 7] [:blue 8]]
+            result #{[:red [5 4 3 2 1]] [:blue [8 7]]}]
+
+        (is (= (set (d/q '[:find ?color (aggregate ?agg ?x)
+                           :in   [[?color ?x]] ?agg]
+                         data
+                         sort-reverse))
+               result))
+
+        #?(:clj
+           (is (= (set (d/q '[:find ?color (datahike.test.query-aggregates-test/sort-reverse ?x)
+                              :in   [[?color ?x]]]
+                            data))
+                  result))))))
+
+  (testing "Aggregate with predicate filter"
+    ;; Regression: the columnar aggregate path (via stratum) skipped
+    ;; attached-preds, so predicates in WHERE were ignored for COUNT/SUM.
+    (let [cfg {:store {:backend :memory :id (random-uuid)}
+               :schema-flexibility :write
+               :keep-history? true}
+          conn (<! (connect! cfg))]
+      (<! (d/transact! conn [{:db/ident :num/v :db/valueType :db.type/long
+                              :db/cardinality :db.cardinality/one}]))
+      (<! (d/transact! conn [{:num/v 1} {:num/v 2} {:num/v 3} {:num/v 4} {:num/v 5}]))
+      (let [db (d/db conn)]
+        (is (= [[3]] (d/q '{:find [(count ?e)]
+                            :where [[?e :num/v ?v] [(> ?v 2)]]} db))
+            "COUNT with > predicate")
+        (is (= [[12]] (d/q '{:find [(sum ?v)]
+                             :where [[?e :num/v ?v] [(> ?v 2)]]} db))
+            "SUM with > predicate")
+        (is (= [[2]] (d/q '{:find [(count ?e)]
+                            :where [[?e :num/v ?v] [(< ?v 3)]]} db))
+            "COUNT with < predicate"))
+      (d/release conn))))

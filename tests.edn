@@ -1,0 +1,31 @@
+#kaocha/v1
+        #meta-merge [{:tests    [{:id          :clj-pss
+                                  :ns-patterns ["datahike.test."]
+                                  :bindings {datahike.config/*default-index* :datahike.index/persistent-set}}
+                                 {:id          :clj-hht
+                                  :ns-patterns ["datahike.test."]
+                                  :bindings {datahike.config/*default-index* :datahike.index/hitchhiker-tree}
+                                  :kaocha.plugin.hooks/pre-load [datahike.index.hitchhiker-tree]}
+                                 {:id          :specs
+                                  :skip-meta   [:no-spec]
+                                  :ns-patterns ["datahike.test."]}
+                                 ;; The `:cljs` kaocha-type profile remains disabled — the
+                                 ;; canonical CLJS test workflow is `bb node-cljs-test`, which
+                                 ;; uses the shadow-cljs `:node-test` build defined in
+                                 ;; shadow-cljs.edn against `datahike.test.nodejs-test`. Wiring
+                                 ;; kaocha-cljs would duplicate that infra (karma/chrome-headless
+                                 ;; or node-runner glue + cljs.test integration), and there's no
+                                 ;; bb task that drives it today.
+                                 #_{:id          :cljs
+                                    :type        :kaocha.type/cljs
+                                    :ns-patterns ["datahike.test."]}
+                                 {:id         :norm
+                                  :test-paths ["test/datahike/norm"]}
+                                 {:id         :integration
+                                  :test-paths ["test/datahike/integration_test"]}
+                                 {:id         :kabel
+                                  :test-paths ["test/datahike/kabel"]
+                                  :skip-meta  [:browser]}]
+                      ;; More verbose than the default reporter, and with prettier errors
+                      :reporter kaocha.report/documentation}
+                     #include "tests.user.edn"]
