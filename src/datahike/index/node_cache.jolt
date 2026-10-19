@@ -1,0 +1,28 @@
+(ns datahike.index.node-cache
+  "jolt stand-in for the Caffeine node cache: an atom over a core.cache LRU,
+   bounded by node count (max-bytes / 4096) instead of weighed bytes."
+  (:require [clojure.core.cache :as c]))
+
+(defn node-bytes [_node] 4096)
+
+(defrecord NodeCache [state max-bytes hits misses])
+
+(defn cache? [value] (instance? NodeCache value))
+
+(defn create [max-bytes]
+  (->NodeCache (atom (c/lru-cache-factory {} :threshold (max 16 (quot (long max-bytes) 4096))))
+               max-bytes (atom 0) (atom 0)))
+
+(defn lookup [cache address]
+  (let [v (get @(:state cache) address)]
+    (if (some? v)
+      (do (swap! (:hits cache) inc) (swap! (:state cache) c/hit address) v)
+      (do (swap! (:misses cache) inc) nil))))
+
+(defn put! [cache address node] (swap! (:state cache) c/miss address node) nil)
+(defn evict! [cache address] (swap! (:state cache) c/evict address) nil)
+
+(defn stats [cache]
+  {:nodes (count @(:state cache)) :max-bytes (:max-bytes cache)
+   :weighted-bytes (* 4096 (count @(:state cache)))
+   :hits @(:hits cache) :misses @(:misses cache) :evictions 0})

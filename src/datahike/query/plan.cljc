@@ -646,14 +646,14 @@
         scan-card-many? (not (get-in scan-op [:schema-info :card-one?] true))
         has-anti? (boolean (some :anti? merge-ops))
         has-optional? (boolean (some :optional? merge-ops))
-        use-cursors? #?(:clj (and (pos? n-merges)
+        use-cursors? #?(:jolt false :clj (and (pos? n-merges)
                                   (or (= index :eavt)
                                       (= index :aevt)
                                       (and (= index :avet)
                                            (let [sv (get clause 2)]
                                              (and (some? sv) (not (analyze/free-var? sv)))))))
                         :cljs false)
-        use-sorted-scan? #?(:clj (and use-cursors?
+        use-sorted-scan? #?(:jolt false :clj (and use-cursors?
                                       (pos? n-merges)
                                       scan-attr-ground?
                                       (not has-card-many?)

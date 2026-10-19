@@ -38,7 +38,7 @@
             [datahike.api.impl]
             #?(:cljs [datahike.api.async])
             [datahike.writer :as dw]
-            #?(:clj [datahike.http.writer])
+            #?@(:jolt [] :clj [[datahike.http.writer]])
             [datahike.writing :as writing]
             [konserve.store]
             [datahike.constants :as const]

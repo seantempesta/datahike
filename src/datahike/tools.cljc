@@ -144,9 +144,8 @@
                      "/" (name dep) "/pom.properties")
            props (io/resource path)]
        (when props
-         (with-open [stream (io/input-stream props)]
-           (let [props (doto (Properties.) (.load stream))]
-             (.getProperty props "version")))))))
+         ;; jolt: java.util.Properties has no .load; parse the version line
+         (second (re-find #"(?m)^version=(.*)$" (slurp props)))))))
 
 #?(:clj (def datahike-version (or (get-version 'org.replikativ/datahike) "DEVELOPMENT")))
 

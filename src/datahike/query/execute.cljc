@@ -78,7 +78,8 @@
 (defn- pss-instance?
   "Check if x is a PersistentSortedSet (CLJ) or BTSet (CLJS)."
   [x]
-  #?(:clj  (instance? PersistentSortedSet x)
+  #?(:jolt false ;; jolt: the stand-in index has no PSS cursors
+     :clj  (instance? PersistentSortedSet x)
      :cljs (instance? BTSet x)))
 
 (defn- pss-lookup-ge
@@ -285,7 +286,7 @@
          (let [^Datom d1 d1 ^Datom d2 d2
                c (Long/compare (.-e d1) (.-e d2))]
            (if (zero? c)
-             (.compareTo ^Comparable (.-a d1) (.-a d2))
+             (compare (.-a d1) (.-a d2)) ;; jolt: Keyword has no .compareTo (same result on the JVM)
              (int c)))))))
 
 ;; ---------------------------------------------------------------------------
@@ -2894,7 +2895,7 @@
                    (when (< i n)
                      (aset out i (adopt-vector (result-list-get result-list i)))
                      (recur (unchecked-inc-int i))))
-                 (datahike.java.QueryResult. out n)))
+                 #?(:jolt (into #{} out) :clj (datahike.java.QueryResult. out n))))
              :cljs
              (let [n (result-list-size result-list)]
                (persistent!

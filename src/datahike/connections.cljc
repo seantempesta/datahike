@@ -141,5 +141,5 @@
 
 (defn delete-connection! [conn-id]
   (when-let [conn (get-in @*connections* [conn-id :conn])]
-    (reset! conn :released)
+    #?(:jolt (reset! (:wrapped-atom conn) :released) :clj (reset! conn :released))
     (swap! *connections* dissoc conn-id)))
