@@ -160,7 +160,22 @@
   (let [ds (if (= index-type :avet) (filter #(contains? indexed (:a %)) datoms) datoms)]
     (->PSet (into (empty-tree index-type) ds) index-type nil (:storage store) {:index-type index-type})))
 
+;; EDN (StringSerializer) form of a flushed index: its address and type only.
+;; The tag has no dot in its namespace: Jolt's clojure.edn reads #a.b/T as a
+;; record-constructor form and never consults :readers (Jolt v0.8.23).
+;; the datoms live under (store-key address) and with-storage reloads them.
+(defmethod print-method PSet [^PSet p ^java.io.Writer w]
+  (.write w (str "#datahike/PSet " (pr-str {:address (.-address p) :index-type (.-index-type p)}))))
+
+(defn- pset-from-reader [{:keys [address index-type]}]
+  (PSet. nil index-type address nil {:index-type index-type}))
+
 (defmethod di/add-konserve-handlers :datahike.index/persistent-set [config store]
+  (when-let [rh (:read-handlers store)]
+    (when (instance? clojure.lang.IAtom rh)
+      (swap! rh assoc
+             'datahike/PSet pset-from-reader
+             'datahike/Datom dd/datom-from-reader)))
   (let [storage (or (:storage store) (create-storage store config))]
     (when-let [sa (:storage-atom store)] (reset! sa storage))
     (assoc store :storage storage :datahike/store-id (or (get-in config [:store :id]) (:id config)))))
