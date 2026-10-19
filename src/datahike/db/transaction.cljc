@@ -61,8 +61,9 @@
   [report db]
   (let [eid #?(:clj (if-some [allocator (::eid-allocator report)]
                       (.updateAndGet ^java.util.concurrent.atomic.AtomicLong allocator
-                                     (reify java.util.function.LongUnaryOperator
-                                       (applyAsLong [_ issued] (inc (max issued (:max-eid db))))))
+                                     #?(:jolt (fn [issued] (inc (max issued (:max-eid db)))) ;; jolt: functional interfaces are fns
+                                        :clj (reify java.util.function.LongUnaryOperator
+                                               (applyAsLong [_ issued] (inc (max issued (:max-eid db)))))))
                       (inc (:max-eid db)))
                :cljs (inc (:max-eid db)))]
     (when (>= eid tx0)

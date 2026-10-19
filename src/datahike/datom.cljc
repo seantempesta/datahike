@@ -248,7 +248,8 @@
 
 (defn cmp-attr-quick [a1 a2]
   ;; either both are keywords or both are strings
-  #?(:cljs
+  #?(:jolt (compare a1 a2) ;; jolt: Keyword has no .compareTo
+     :cljs
      (if (keyword? a1)
        (-compare a1 a2)
        (garray/defaultCompare a1 a2))

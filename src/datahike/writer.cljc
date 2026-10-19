@@ -116,7 +116,8 @@
      nanoseconds."
      []
      (let [threads (ManagementFactory/getThreadMXBean)]
-       [(if (instance? com.sun.management.ThreadMXBean threads)
+       [(if #?(:jolt false ;; jolt: no per-thread allocation counter
+               :clj (instance? com.sun.management.ThreadMXBean threads))
           (.getCurrentThreadAllocatedBytes ^com.sun.management.ThreadMXBean threads)
           -1)
         (.getCurrentThreadCpuTime threads)])))
@@ -132,6 +133,9 @@
            [allocated' cpu'] (thread-counters)]
        [committed (cond-> {:cpu-ns (- cpu' cpu)}
                     (<= 0 allocated allocated') (assoc :alloc-bytes (- allocated' allocated)))])))
+
+;; jolt: core.async buffers do not support count; pressure warnings are skipped.
+(defn- buf-count [b] #?(:jolt 0 :default (count b)))
 
 (defn create-thread
   "Creates new transaction thread"
@@ -151,8 +155,8 @@
                   (loop [old @(:wrapped-atom connection)]
                     (if-let [{:keys [op args callback applied] :as invocation} (<?- transaction-queue)]
                     (do
-                      (when (> (count transaction-queue-buffer) (* 0.9 transaction-queue-size))
-                        (log/warn :datahike/tx-queue-pressure "Transaction queue buffer >90% full" {:count (count transaction-queue-buffer) :size transaction-queue-size}))
+                      (when (> (buf-count transaction-queue-buffer) (* 0.9 transaction-queue-size))
+                        (log/warn :datahike/tx-queue-pressure "Transaction queue buffer >90% full" {:count (buf-count transaction-queue-buffer) :size transaction-queue-size}))
                       (let [;; TODO remove this after import is ported to writer API.
                             ;; An external writer may advance the committed basis,
                             ;; but the connection remains behind while this writer's
@@ -216,8 +220,8 @@
 
                               (not= res :error)
                               (do
-                                (when (> (count commit-queue-buffer) (/ commit-queue-size 2))
-                                  (log/warn :datahike/commit-queue-pressure "Commit queue buffer >50% full" {:count (count commit-queue-buffer) :size commit-queue-size})
+                                (when (> (buf-count commit-queue-buffer) (/ commit-queue-size 2))
+                                  (log/warn :datahike/commit-queue-pressure "Commit queue buffer >50% full" {:count (buf-count commit-queue-buffer) :size commit-queue-size})
                                   (<! (timeout 50)))
                                 ;; A transaction is not admitted to the commit
                                 ;; stage until core.async confirms this put.
@@ -301,7 +305,7 @@
                                                 (boolean merge-parents))))
                                 commit-time (- (get-time-ms) start-ts)]
                             (log/trace :datahike/commit-time {:duration-ms commit-time})
-                            (reset! connection commit-db)
+                            #?(:jolt (reset! (.-wrapped-atom connection) commit-db) :clj (reset! connection commit-db)) ;; jolt: reset! takes only jolt atoms
                     ;; notify all processes that transaction is complete
                             ;; Every report of the batch carries the one
                             ;; commit that made it durable: the batch's
@@ -399,7 +403,7 @@
 (defmethod create-database :self [& args]
   (let [p (throwable-promise)]
     (go
-      (#?(:clj deliver :cljs put!) p (<! (apply w/create-database args))))
+      (#?(:jolt (fn [p v] (p v)) :clj deliver :cljs put!) p (<! (apply w/create-database args))))
     p))
 
 (defmulti delete-database backend-dispatch)
@@ -408,7 +412,7 @@
   (let [p (throwable-promise)]
     (go
       (let [res (<! (apply w/delete-database args))]
-        #?(:clj (deliver p res) :cljs (if (nil? res) (close! p) (put! p res)))))
+        #?(:jolt (p res) :clj (deliver p res) :cljs (if (nil? res) (close! p) (put! p res)))))
     p))
 
 (defn- detect-new-building-indices
@@ -484,7 +488,7 @@
                                               :args [arg-map]}
                                        applied (assoc :applied applied))))
             listeners (some-> (:listeners (meta connection)) deref)]
-        (#?(:clj deliver :cljs put!) p tx-report)
+        (#?(:jolt (fn [p v] (p v)) :clj deliver :cljs put!) p tx-report)
         (when (map? tx-report) ;; not error
           ;; Dispatch backfill for any newly created secondary indices
           #?(:clj
@@ -508,7 +512,7 @@
       (let [tx-report (<! (dispatch! writer
                                      {:op 'load-entities
                                       :args [entities]}))]
-        (#?(:clj deliver :cljs put!) p tx-report)))
+        (#?(:jolt (fn [p v] (p v)) :clj deliver :cljs put!) p tx-report)))
     p))
 
 (defn merge-db!
@@ -523,7 +527,7 @@
                                      {:op 'merge!
                                       :args [arg-map]}))
             listeners (some-> (:listeners (meta connection)) deref)]
-        (#?(:clj deliver :cljs put!) p tx-report)
+        (#?(:jolt (fn [p v] (p v)) :clj deliver :cljs put!) p tx-report)
         (when (map? tx-report)
           (notify-listeners! connection listeners tx-report))))
     p))
@@ -535,5 +539,5 @@
       (let [result (<! (dispatch! writer
                                   {:op 'gc-storage!
                                    :args (vec args)}))]
-        (#?(:clj deliver :cljs put!) p result)))
+        (#?(:jolt (fn [p v] (p v)) :clj deliver :cljs put!) p result)))
     p))

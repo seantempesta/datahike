@@ -849,10 +849,12 @@
   [db]
   #?(:clj (when-some [store-id (get-in db [:config :store :id])]
             (.computeIfAbsent ^java.util.concurrent.ConcurrentHashMap eid-allocators store-id
-                              (reify java.util.function.Function
-                                (apply [_ _]
+                              (#?(:jolt fn :clj reify) #?@(:jolt [] :clj [java.util.function.Function])
+                                #?(:jolt [_] :clj (apply [_ _]
                                   (java.util.concurrent.atomic.AtomicLong.
-                                   (max (:max-eid db) (roster-max-eid (:store db))))))))
+                                   (max (:max-eid db) (roster-max-eid (:store db))))))
+                                #?@(:jolt [(java.util.concurrent.atomic.AtomicLong.
+                                            (max (:max-eid db) (roster-max-eid (:store db))))] :clj []))))
      :cljs nil))
 
 (defn- with-store-eids
@@ -861,7 +863,11 @@
   [old transact]
   (let [allocator (eid-allocator old)
         report (transact allocator)]
-    #?(:clj (when allocator
+    #?(:jolt (when allocator ;; jolt: the AtomicLong shim has no accumulateAndGet
+               (let [reached (get-in report [:db-after :max-eid])]
+                 (loop [] (let [c (.get allocator)]
+                            (when-not (.compareAndSet allocator c (max c reached)) (recur))))))
+       :clj (when allocator
               (.accumulateAndGet ^java.util.concurrent.atomic.AtomicLong allocator
                                  (get-in report [:db-after :max-eid])
                                  (reify java.util.function.LongBinaryOperator

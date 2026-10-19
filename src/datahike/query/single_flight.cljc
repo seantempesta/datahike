@@ -21,7 +21,8 @@
    :compute-nanos :wait-nanos :cache-stores :cache-skips])
 
 (defonce ^:private counters
-  #?(:clj (into {} (map (fn [counter]
+  #?(:jolt (atom (zipmap counter-names (repeat 0)))
+     :clj (into {} (map (fn [counter]
                           [counter (java.util.concurrent.atomic.LongAdder.)]))
                 counter-names)
      :cljs (atom (zipmap counter-names (repeat 0)))))
@@ -86,17 +87,20 @@
        @registered?)))
 
 (defn- counter-values []
-  #?(:clj (into {} (map (fn [[counter value]]
+  #?(:jolt @counters
+     :clj (into {} (map (fn [[counter value]]
                           [counter (.sum ^java.util.concurrent.atomic.LongAdder value)]))
                 counters)
      :cljs @counters))
 
 (defn- increment! [counter]
-  #?(:clj (.increment ^java.util.concurrent.atomic.LongAdder (get counters counter))
+  #?(:jolt (swap! counters update counter (fnil inc 0))
+     :clj (.increment ^java.util.concurrent.atomic.LongAdder (get counters counter))
      :cljs (swap! counters update counter (fnil inc 0))))
 
 (defn- add! [counter n]
-  #?(:clj (.add ^java.util.concurrent.atomic.LongAdder (get counters counter) n)
+  #?(:jolt (swap! counters update counter (fnil + 0) n)
+     :clj (.add ^java.util.concurrent.atomic.LongAdder (get counters counter) n)
      :cljs (swap! counters update counter (fnil + 0) n)))
 
 #?(:clj
