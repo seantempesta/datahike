@@ -577,6 +577,8 @@
 
 (def ^:const DEFAULT_BRANCHING_FACTOR 512)
 
+(declare add-konserve-handlers-clj)
+
 ;; The root meta carries `:index-type` (for the comparator) and `:pss/storage-id` (so a wire reader
 ;; resolves this store's storage from pss-fress/storage-registry). In-store reads ignore
 ;; `:pss/storage-id` (lexical resolver); it's there to make new roots wire-ready.
@@ -650,7 +652,38 @@
      :cljs {datahike.datom.Datom (fn [w d] (fress/write-tag w "datahike.datom.Datom" 1)
                                    (fress/write-object w (vec (seq d))))}))
 
+#?(:jolt
+   (do
+     ;; Jolt: no org.fressian. Roots and nodes travel as EDN through konserve's StringSerializer:
+     ;; #pss/set {:address :count :meta} for a root, #pss/leaf / #pss/branch for nodes.
+     (defmethod print-method PersistentSortedSet [^PersistentSortedSet p ^java.io.Writer w]
+       (when-not (.-_address p)
+         (throw (ex-info "unflushed index cannot be serialized" {})))
+       (.write w "#pss/set ")
+       (print-method {:address (.-_address p) :count (.-_count p) :meta (meta p)} w))))
+
 (defmethod di/add-konserve-handlers :datahike.index/persistent-set [config store]
+  #?(:jolt
+     (let [store-id (or (get-in config [:store :id]) (:id config))
+           bf       (get-in config [:index-config :branching-factor] DEFAULT_BRANCHING_FACTOR)
+           storage  (or (:storage store) (create-storage store config))
+           settings (psset/default-settings bf)]
+       (when-let [sa (:storage-atom store)] (reset! sa storage))
+       (when-let [rh (:read-handlers store)]
+         (when (instance? clojure.lang.IAtom rh)
+           (swap! rh merge
+                  (psset/edn-read-handlers settings)
+                  {'datahike/Datom dd/datom-from-reader
+                   'pss/set (fn [{:keys [address count meta]}]
+                              (with-meta
+                                (PersistentSortedSet. nil (index-type->cmp-quick (:index-type meta) false)
+                                                      address storage nil (or count -1) settings 0)
+                                meta))})))
+       (assoc store :storage storage :datahike/store-id store-id
+              :datahike/branching-factor bf :datahike/diff-buf-size 0 :datahike/ref-type nil))
+     :default (add-konserve-handlers-clj config store)))
+
+(defn- add-konserve-handlers-clj [config store]
   (let [store-id (or (get-in config [:store :id]) (:id config))  ; the konserve store's UUID
         bf       (get-in config [:index-config :branching-factor] DEFAULT_BRANCHING_FACTOR)
         ;; diff-buf write-buffering (EXPERIMENTAL, default off). Like bf this is a
