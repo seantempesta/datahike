@@ -192,7 +192,8 @@
      :cljs (- a b)))
 
 (defn boolean-cmp [a b]
-  #?(:clj  (Boolean/compare ^Boolean a ^Boolean b)
+  #?(:jolt (compare a b) ;; jolt: no Boolean/compare shim
+     :clj  (Boolean/compare ^Boolean a ^Boolean b)
      :cljs (- a b)))
 
 (comment
