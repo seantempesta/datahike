@@ -524,8 +524,11 @@
       ;; Evict old cached value when reusing an address
       (when reused
         (di/cache-evict! cache address))
+      ;; A node just written is not put in the read cache: the new db value already
+      ;; holds it in memory (its parent's children), and the cache is for nodes read
+      ;; back from the store (restore below). Putting every written node cost a
+      ;; cache insert per node per commit and displaced nodes that are read.
       (swap! pending-writes conj [address node])
-      (di/cache-put! cache address node)
       address))
   (accessed [_ address]
     (@cost-center-fn :accessed)
