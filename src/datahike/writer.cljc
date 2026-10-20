@@ -151,7 +151,7 @@
                 (try
                   ;; delay processing until the writer we are part of in connection is set
                   (while (not (:writer @(:wrapped-atom connection)))
-                    (<! (timeout 10)))
+                    (<! (timeout 0))) ; proto: was 10 ms, which every first transact after a connect waited out
                   (loop [old @(:wrapped-atom connection)]
                     (if-let [{:keys [op args callback applied] :as invocation} (<?- transaction-queue)]
                     (do

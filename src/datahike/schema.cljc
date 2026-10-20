@@ -32,6 +32,20 @@
 (s/def :db.type/uuid uuid?)
 (s/def :db.type/tuple vector?)
 
+;; proto (G1): the value types' predicates, checked directly (the same predicates as the
+;; specs above); s/valid? stays for any other type.
+(def type-preds
+  #?(:cljs nil
+     ;; :db.type/id's spec above answers `string?` (a truthy fn) for any non-Long, so it
+     ;; admits every value; kept as it behaves
+     :default {:db.type/id (constantly true) :db.type/ref (constantly true)
+               :db.type/bigdec decimal? :db.type/bigint integer? :db.type/boolean boolean?
+               :db.type/bytes bytes? :db.type/double double? :db.type/float float?
+               :db.type/number number? :db.type/instant #(= (class %) java.util.Date)
+               :db.type/keyword keyword? :db.type/long #(= (class %) java.lang.Long)
+               :db.type/string string? :db.type/symbol symbol? :db.type/uuid uuid?
+               :db.type/tuple vector?}))
+
 (s/def :db.type/value
   #{:db.type/bigdec
     :db.type/bigint
@@ -62,17 +76,21 @@
 ;; only for old datomic compliance, will be part of partioning in the future
 (s/def :db.type.install/_attribute #{:db.part/tx :db.part/db :db.part/user})
 
-(s/def ::schema-attribute #{:db/id :db/ident :db/isComponent :db/noHistory :db/valueType :db/cardinality :db/unique :db/index :db.install/_attribute :db/doc :db/tupleAttrs  :db/tupleType :db/tupleTypes :db.secondary/only})
+(def schema-attributes #{:db/id :db/ident :db/isComponent :db/noHistory :db/valueType :db/cardinality :db/unique :db/index :db.install/_attribute :db/doc :db/tupleAttrs  :db/tupleType :db/tupleTypes :db.secondary/only})
+(s/def ::schema-attribute schema-attributes)
 
-(s/def ::secondary-index-attribute #{:db.secondary/type :db.secondary/attrs :db.secondary/config :db.secondary/status :db.secondary/building-since-tx})
+(def secondary-index-attributes #{:db.secondary/type :db.secondary/attrs :db.secondary/config :db.secondary/status :db.secondary/building-since-tx})
+(s/def ::secondary-index-attribute secondary-index-attributes)
 
-(s/def ::entity-spec-attribute #{:db/ensure :db.entity/attrs :db.entity/preds})
+(def entity-spec-attributes #{:db/ensure :db.entity/attrs :db.entity/preds})
+(s/def ::entity-spec-attribute entity-spec-attributes)
 ;; ADR — bitemporal v1: :db.valid/from and :db.valid/to graduate from
 ;; userland tx-meta into datahike system schema. They are tx-attached
 ;; (every datom in a tx inherits its tx's vt window) and AVET-indexed
 ;; so the query planner can seek into them.
-(s/def ::meta-attribute #{:db/txInstant :db/retracted :db/noCommit
+(def meta-attributes #{:db/txInstant :db/retracted :db/noCommit
                           :db.valid/from :db.valid/to})
+(s/def ::meta-attribute meta-attributes)
 
 (s/def ::schema (s/keys :req [:db/ident :db/valueType :db/cardinality]
                         :opt [:db/id :db/unique :db/index :db.install/_attribute :db/doc :db/noHistory :db/tupleType :db/tupleTypes :db.secondary/only]))
@@ -199,31 +217,35 @@
 (defn explain-old-schema [schema]
   (s/explain-data ::old-schema schema))
 
+;; proto (G1): the attribute classes are plain sets, tested with contains?. The same sets
+;; are the specs; s/valid? on a set spec cost ~1-2 us per call on Jolt and ran several
+;; times per datom (46% of a small transaction's time, dev/g1_txprof.clj).
 (defn meta-attr? [a-ident]
-  (s/valid? ::meta-attribute a-ident))
+  (contains? meta-attributes a-ident))
 
 (defn schema-attr? [a-ident]
-  (s/valid? ::schema-attribute a-ident))
+  (contains? schema-attributes a-ident))
 
 (defn sys-ident? [a-ident]
   (s/valid? ::sys-idents a-ident))
 
 (defn entity-spec-attr? [a-ident]
-  (s/valid? ::entity-spec-attribute a-ident))
+  (contains? entity-spec-attributes a-ident))
 
 (defn secondary-index-attr? [a-ident]
-  (s/valid? ::secondary-index-attribute a-ident))
+  (contains? secondary-index-attributes a-ident))
 
 ;; Cross-database reference attrs (datahike.reference) — system-installed
 ;; USER-DATA attrs: transactable without user schema (see the
 ;; schema-flexibility gate in db.utils), type-validated against
 ;; implicit-schema-spec, but NOT schema-entities (no `schema?` datom
 ;; classification).
-(s/def ::reference-attribute #{:dh.ref/db :dh.ref/attr :dh.ref/value
+(def reference-attributes #{:dh.ref/db :dh.ref/attr :dh.ref/value
                                :dh.ref/temporal :dh.ref/type})
+(s/def ::reference-attribute reference-attributes)
 
 (defn reference-attr? [a-ident]
-  (s/valid? ::reference-attribute a-ident))
+  (contains? reference-attributes a-ident))
 
 (defn value-valid? [a-ident v-ident schema]
   (let [schema (if (or (meta-attr? a-ident) (schema-attr? a-ident) (entity-spec-attr? a-ident)
@@ -231,7 +253,9 @@
                  implicit-schema-spec
                  schema)
         value-type (get-in schema [a-ident :db/valueType])]
-    (s/valid? value-type v-ident)))
+    (if-let [p (get type-preds value-type)]
+      (p v-ident)
+      (s/valid? value-type v-ident))))
 
 (defn instant? [db ^Datom datom schema]
   (let [a-ident (if (:attribute-refs? (:config db))
