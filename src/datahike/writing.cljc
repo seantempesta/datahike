@@ -16,6 +16,7 @@
             [datahike.schema-cache :as sc]
             [datahike.online-gc :as online-gc]
             [konserve.core :as k]
+            [datahike.roster :refer [roster roster-add!]]
             [konserve.store :as ks]
             [replikativ.logging :as log]
             [hasch.core :refer [uuid squuid]]
@@ -841,7 +842,7 @@
   small record reads, no index loaded."
   [store]
   (transduce (map #(:max-eid (read-head store %) 0))
-             max 0 (k/get store :branches nil {:sync? true})))
+             max 0 (roster store)))
 
 (defn eid-allocator
   "The eid allocator of `db`'s store, seeded on first use in this process past
@@ -978,9 +979,9 @@
            (<?- (k/assoc store gk gv {:immutable? true} opts))))
        (<?- (k/assoc store cid db-to-store {:immutable? true} opts)) ; content-addressed commit
        (<?- (k/assoc store :db db-to-store opts))             ; mutable: branch head
-       ;; :branches names :db, so it is a POINTER and must be written LAST — a
+       ;; the roster names :db, so it is a POINTER and must be written LAST — a
        ;; collector that reads it before the head exists marks nothing for :db.
-       (<?- (k/assoc store :branches #{:db} opts))           ; mutable: branch set
+       (<?- (roster-add! store :db opts))                    ; the roster log
        (ks/release-store store-config store)
        config
        (finally

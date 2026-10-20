@@ -20,6 +20,7 @@
      (def stop-ch (start-background-gc! store {...opts...}))
      ;; Later: (async/close! stop-ch)"
   (:require [konserve.core :as k]
+            [datahike.roster :refer [roster]]
             [konserve.utils :refer [multi-key-capable?]]
             #?@(:clj  [[clojure.core.cache.wrapped :as wrapped]]
                 :cljs [[cljs.cache.wrapped :as wrapped]])
@@ -173,7 +174,7 @@
     (if sync? 0 (go-try- 0))
     (if sync?
       ;; Synchronous mode
-      (let [branches (k/get store :branches nil {:sync? true})
+      (let [branches (roster store)
             multi-branch? (> (count branches) 1)]
         (if multi-branch?
           (do
@@ -193,7 +194,7 @@
               0))))
       ;; Asynchronous mode
       (go-try-
-       (let [branches (<?- (k/get store :branches nil {:sync? false}))
+       (let [branches (roster store)
              multi-branch? (> (count branches) 1)]
          (if multi-branch?
            (do

@@ -270,13 +270,13 @@
                (is (uuid? @installed))
                (is (= @installed (commit-id (branch-as-db conn :db)))
                    "force-branch! returns the head it installed")
-               (is (= [:db :branches]
+               (is (= [:db]
                       (->> @events
                            (keep #(when (= :update (first %)) (second %)))
                            (partition-by identity)
                            (map first)
-                           (take-last 2)))
-                   "the forced head precedes the GC discovery roster"))
+                           (take-last 1)))
+                   "forcing an existing branch updates its head and appends nothing to the roster"))
              (let [forced (branch-as-db conn :db)]
                (is (= #{:at-t}
                       (set (d/q '[:find [?v ...] :where [_ :value ?v]] forced))))
