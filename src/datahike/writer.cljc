@@ -383,6 +383,90 @@
       :inflight-ops inflight-ops
       :streaming? true})))
 
+;; proto (lane F1): the caller is the serializer. A :sync writer applies the operation
+;; and commits it on the calling thread, so a single serial caller (proto's Flow
+;; :writer proc) is THE writer: no transaction queue, no commit loop, no thread or go
+;; block per transaction. The commit is the same one the :self commit loop makes for
+;; a batch of one (w/commit! with the revision change and the advanced query cache
+;; context). Callers must be serial: two concurrent callers would both commit on the
+;; same parent. Channel-returning ops (gc, index backfill) are not supported here.
+(defn- sync-apply! [connection write-fn-map last-cid {:keys [op args]}]
+  (let [old @(:wrapped-atom connection)
+        res (apply (write-fn-map op) old args)
+        parent-db old
+        db (:db-after res)
+        merge-parents (get-in db [:meta :datahike/merge-parents])
+        db (if merge-parents (update db :meta dissoc :datahike/merge-parents) db)
+        start-ts (get-time-ms)
+        modified-attrs (w/batch-cache-revision-attributes [res])
+        stored (w/commit! db (not-empty merge-parents) true @last-cid
+                          {:prior (:cache-context parent-db) :modified-attrs modified-attrs
+                           :unsafe? (boolean (seq merge-parents))})
+        commit-id (get-in stored [:meta :datahike/commit-id])
+        commit-db (assoc stored :cache-context
+                         (some-> (:cache-context parent-db)
+                                 (q/advance-query-cache-context commit-id modified-attrs (boolean (seq merge-parents)))))
+        report (-> res
+                   (assoc-in [:tx-meta :db/commitId] commit-id)
+                   (assoc :db-after commit-db)
+                   (assoc :datahike/commit {:commit-id commit-id :tx-count 1 :duration-ms (- (get-time-ms) start-ts)}))]
+    (vreset! last-cid commit-id)
+    #?(:jolt (reset! (.-wrapped-atom connection) commit-db) :clj (reset! connection commit-db))
+    (committed-report/offer-committed! commit-db report)
+    report))
+
+(defrecord SyncWriter [connection write-fn-map last-cid]
+  PWriter
+  (-dispatch! [_ arg-map]
+    (let [p (promise-chan)]
+      (put! p (try (sync-apply! connection write-fn-map last-cid arg-map)
+                   (catch #?(:clj Throwable :cljs js/Error) e e)))
+      p))
+  (-shutdown [_] (go true))
+  (-streaming? [_] false))
+
+(defn transact-batch!
+  "proto (lane F2): group commit at the serial caller. Applies each arg-map with
+  `w/transact!` in order, threading the db value (a failing transaction answers its
+  exception and leaves the value as it was), then commits ONCE: one `w/commit!` for the
+  whole batch, as the :self commit loop does for the reports queued behind a commit.
+  Answers a vector, one report or exception per arg-map; every report carries the one
+  commit (`:datahike/commit` `:tx-count`). Only on a :sync writer: its caller is serial."
+  [connection arg-maps]
+  (let [writer (:writer @(:wrapped-atom connection))
+        _ (assert (instance? SyncWriter writer) "transact-batch! needs a :sync writer")
+        tx! (get (:write-fn-map writer) 'transact!)
+        parent-db @(:wrapped-atom connection)
+        [db rs] (reduce (fn [[db rs] am]
+                          (let [r (try (tx! db am) (catch #?(:clj Throwable :cljs js/Error) e e))]
+                            (if (map? r) [(:db-after r) (conj rs r)] [db (conj rs r)])))
+                        [parent-db []] arg-maps)
+        ok (filterv map? rs)]
+    (if (empty? ok)
+      rs
+      (let [start-ts (get-time-ms)
+            modified-attrs (w/batch-cache-revision-attributes ok)
+            stored (w/commit! db nil true @(:last-cid writer)
+                              {:prior (:cache-context parent-db) :modified-attrs modified-attrs :unsafe? false})
+            commit-id (get-in stored [:meta :datahike/commit-id])
+            commit-db (assoc stored :cache-context
+                             (some-> (:cache-context parent-db)
+                                     (q/advance-query-cache-context commit-id modified-attrs false)))
+            commit {:commit-id commit-id :tx-count (count ok) :duration-ms (- (get-time-ms) start-ts)}]
+        (vreset! (:last-cid writer) commit-id)
+        #?(:jolt (reset! (.-wrapped-atom connection) commit-db) :clj (reset! connection commit-db))
+        (mapv (fn [r]
+                (if (map? r)
+                  (let [r (-> r (assoc-in [:tx-meta :db/commitId] commit-id) (assoc :datahike/commit commit))]
+                    (committed-report/offer-committed! commit-db r)
+                    r)
+                  r))
+              rs)))))
+
+(defmethod create-writer :sync
+  [{:keys [write-fn-map]} connection]
+  (->SyncWriter connection (merge default-write-fn-map write-fn-map) (volatile! nil)))
+
 ;; Note: :kabel backend is implemented in datahike.kabel.writer
 ;; Require that namespace to register the defmethod
 
@@ -482,7 +566,13 @@
   ([connection arg-map applied]
   (let [p (throwable-promise)
         writer (:writer @(:wrapped-atom connection))]
-    (go
+    (if (instance? SyncWriter writer)
+      (let [tx-report (try (sync-apply! connection (:write-fn-map writer) (:last-cid writer) {:op 'transact! :args [arg-map]})
+                           (catch #?(:clj Throwable :cljs js/Error) e e))]
+        (#?(:jolt (fn [p v] (p v)) :clj deliver :cljs put!) p tx-report)
+        (when (map? tx-report) (notify-listeners! connection (some-> (:listeners (meta connection)) deref) tx-report))
+        p)
+    (do (go
       (let [tx-report (<! (dispatch! writer
                                      (cond-> {:op 'transact!
                                               :args [arg-map]}
@@ -503,7 +593,7 @@
                      (dispatch! writer {:op 'install-secondary-index!
                                         :args [build-result]}))))))
           (notify-listeners! connection listeners tx-report))))
-    p)))
+    p)))))
 
 (defn load-entities [connection entities]
   (let [p (throwable-promise)
@@ -541,3 +631,7 @@
                                    :args (vec args)}))]
         (#?(:jolt (fn [p v] (p v)) :clj deliver :cljs put!) p result)))
     p))
+
+;; proto (lane F1): a :sync writer's database is created and deleted as :self's is
+(defmethod create-database :sync [& args] (apply (get-method create-database :self) args))
+(defmethod delete-database :sync [& args] (apply (get-method delete-database :self) args))
