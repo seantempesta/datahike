@@ -12,7 +12,7 @@
                                       #?@(:clj [release-db])
                                       commit! create-commit-id get-and-clear-pending-kvs!
                                       write-pending-kvs! branch-heads-as-commits
-                                      read-head compact-head commit-graph-writes
+                                      read-head resolve-head compact-head compact-head? commit-graph-writes
                                       commit-graph-records commit-graph-key]]
             [datahike.writer]
             [datahike.index.secondary :as sec]
@@ -259,7 +259,20 @@
                             _ (when (<?- (k/exists? store new-branch store-opts))
                                 (log/raise "Branch already exists." {:type :branch-already-exists
                                                                      :new-branch new-branch}))
-                            stored-db (<?- (read-head store from store-opts))]
+                            ;; A branch made from a branch whose head is a compact head is
+                            ;; that same pointer under a new name: nothing about the commit
+                            ;; is read, unless secondary indices must be branched with it.
+                            raw-head (when (keyword? from) (<?- (k/get store from nil store-opts)))
+                            pointer? (and commit-graph?
+                                          (compact-head? raw-head)
+                                          (not (:datahike/secondary? raw-head))
+                                          (empty? (:secondary-indices @conn)))]
+                        (if pointer?
+                          (do (<?- (k/assoc store new-branch raw-head store-opts))
+                              (<?- (roster-add-held! gc-sid roster-permit store new-branch store-opts)))
+                        (let [stored-db (if (keyword? from)
+                                          (<?- (resolve-head store from raw-head store-opts))
+                                          (<?- (read-head store from store-opts)))]
                         (when-not (stored-db? stored-db)
                           (log/raise (if commit-source?
                                        "Commit record does not exist."
@@ -277,12 +290,12 @@
                                    (branch-secondary-indices conn stored-db from new-branch store))
                                  :cljs nil)
                               updated-db (if (and commit-graph? (empty? branched-sec-keys))
-                                           (compact-head (get-in stored-db [:meta :datahike/commit-id]))
+                                           (compact-head (get-in stored-db [:meta :datahike/commit-id]) stored-db)
                                            (cond-> (assoc-in stored-db [:config :branch] new-branch)
                                              (seq branched-sec-keys) (assoc :secondary-index-keys branched-sec-keys)))]
                           (<?- (k/assoc store new-branch updated-db store-opts))
                           ;; :branches is the GC discovery pointer and is published last.
-                          (<?- (roster-add-held! gc-sid roster-permit store new-branch store-opts))))
+                          (<?- (roster-add-held! gc-sid roster-permit store new-branch store-opts))))))
                       (finally
                         (when owned-permit?
                           (guard/release-reachability-permit! roster-permit))))))))))
@@ -451,7 +464,7 @@
                                                 :branch branch
                                                 :expected-current-commit expected-current-commit
                                                 :current-commit stored-commit}))
-                                  (if commit-graph? (compact-head cid) db-to-store)))
+                                  (if commit-graph? (compact-head cid db-to-store) db-to-store)))
                               store-opts))
 
                         ;; Publish the GC discovery pointer only after its head exists.
