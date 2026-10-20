@@ -9,6 +9,7 @@
             [datahike.writing :as writing]
             [datahike.gc-guard :as guard]
             [datahike.api :as d]
+            [datahike.query :as dq]
             #?(:clj [clojure.core.async :as async])
             [konserve.core :as k]
             [superv.async :refer [<?? S]]))
@@ -155,8 +156,11 @@
                  attached-via-db (commit-as-db @conn first-commit)
                  detached (commit-as-db store first-commit)
                  query '[:find ?value . :where [1 :value ?value]]
-                 owner (d/q-with-evidence query attached)
-                 hit (d/q-with-evidence query attached-via-db)]
+                 ;; cache evidence needs the result cache, which is off by default
+                 ;; on our Jolt line (datahike.query/*query-result-cache?*)
+                 [owner hit] (binding [dq/*query-result-cache?* true]
+                               [(d/q-with-evidence query attached)
+                                (d/q-with-evidence query attached-via-db)])]
              (doseq [db-value [attached attached-via-db]]
                (is (= (select-keys head-identity
                                    [:datahike.value/connection-id

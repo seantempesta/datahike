@@ -11,6 +11,17 @@
    #?(:clj [datahike.store :as store])
    #?(:clj [datahike.writing :as writing])))
 
+#?(:clj
+   ;; The result cache is off by default on our Jolt line (datahike.query/*query-result-cache?*);
+   ;; these tests are about the cache, so they run with it on.
+   (t/use-fixtures :each (fn [f] (binding [dq/*query-result-cache?* true] (f)))))
+
+#?(:clj
+   (deftest query-result-cache-is-off-by-default-and-can-be-turned-on
+     (is (false? (.getRawRoot #'dq/*query-result-cache?*)) "the root value is off")
+     (binding [dq/*query-result-cache?* true]
+       (is (true? dq/*query-result-cache?*)))))
+
 (defn- with-temp-db
   "Create a temp in-memory db with schema, run f with the connection, then clean up."
   ([schema-txs f]
