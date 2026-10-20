@@ -66,8 +66,12 @@
   `[:meta :datahike/commit-id]`, so readers that need only the head's commit
   id read it unchanged; readers that need the record go through
   `resolve-head`."
-  [cid]
-  {:meta {:datahike/commit-id cid}})
+  ([cid] {:meta {:datahike/commit-id cid}})
+  ([cid record]
+   ;; :datahike/secondary? says the record has secondary-index keys, so a branch made
+   ;; from this head must read the record to branch them (versioning/branch!)
+   (cond-> {:meta {:datahike/commit-id cid}}
+     (seq (:secondary-index-keys record)) (assoc :datahike/secondary? true))))
 
 (defn compact-head?
   "True for a head written by `compact-head`. A full stored record always
@@ -700,7 +704,7 @@
                         ;; before it (`compact-head`; readers `resolve-head`),
                         ;; so the fused record is encoded and written once.
                         ;; Without a commit graph there is no record to name.
-                          head          (if commit-graph? (compact-head cid) db-to-store)
+                          head          (if commit-graph? (compact-head cid db-to-store) db-to-store)
                         ;; The commit's graph record (parents + generation) is
                         ;; written in the same ordered batch, before the
                         ;; commit record, so no commit exists without it.
