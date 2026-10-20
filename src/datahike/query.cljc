@@ -71,9 +71,12 @@
      :cljs false))
 
 (def ^:dynamic *query-result-cache?*
-  "When true (default), query results are cached by [query args db-snapshot].
-   Bind to false for benchmarking raw query execution."
-  true)
+  "When true, query results are cached by [query args db-snapshot]. Off by default
+   on our Jolt line (owner decision, L1 measurement 2026-10-20): a query on a value
+   just committed paid the cache's key, lookup and insert and missed; on proto's
+   render and agent-session workloads the uncached query is faster at p50 and p95.
+   A caller that repeats one query on one value should keep its result."
+  false)
 
 (declare -collect -resolve-clause resolve-clause resolve-context raw-q memoized-parse-query
          query-attribute-dependencies query-dependency-plan
