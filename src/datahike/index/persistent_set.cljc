@@ -263,12 +263,13 @@
 #?(:clj
    (defn- slot-datoms
      "The datoms buffered in child `i`'s slot of `branch`: edits not yet pushed into the child.
-     A branch holding no buffer (`slots` is nil: restored without one, or built whole) has none."
-     [^Branch branch i]
-     (when-let [^objects slots (.slots branch)]
-       (when-let [^Slot slot (aget slots (int i))]
+     A branch holding no buffer (`slots` is nil: restored without one, built whole, or a
+     persistent-sorted-set without diff buffers) has none."
+     [branch i]
+     (when-let [slots (.slots ^Branch branch)]
+       (when-let [slot (aget ^objects slots (int i))]
          (filter #(instance? Datom %)
-                 (tree-seq #(and (coll? %) (not (instance? Datom %))) seq (.-diff slot)))))))
+                 (tree-seq #(and (coll? %) (not (instance? Datom %))) seq (.-diff ^Slot slot)))))))
 
 #?(:clj
    (defn diff
@@ -276,69 +277,75 @@
      `index-type`) held by exactly one of two persistent sorted sets: `[only-a only-b]`,
      each a vector in index order. A datom differs by the set's own comparator.
 
-     Both trees are walked level by level and every child stored at an address both
-     sides hold is skipped, so the work follows the nodes that differ between the two
-     values (one branch's new commits against another's), never the range. The
+     Both trees are walked level by level and every child both sides hold (stored at
+     one address, or one unstored node in memory) is skipped, so the work follows the
+     nodes that differ between the two values (one branch's new commits against
+     another's, or a value and its `with`), never the range. The
      candidates are the datoms the two sides' unshared leaves do not both hold, plus
      every buffered edit of an expanded branch; each is decided by membership in the
      two whole sets."
-     [^PersistentSortedSet a ^PersistentSortedSet b index-type from to]
+     [a b index-type from to]
      (let [in-range (slice-comparator-constructor index-type from to)
-           ^java.util.Comparator cmp (.comparator a)
-           candidates (java.util.TreeSet. ^java.util.Comparator cmp)
-           take! (fn [d] (when (and (not (neg? (in-range d from))) (not (pos? (in-range d to))))
-                           (.add candidates d)))
-           ;; the in-range children of every branch in `level`; a child's buffered edits lie in its own range
-           children (fn [^IStorage storage level]
-                      (into [] (mapcat (fn [[_ ^Branch branch]]
-                                         (let [ks (.keys branch)]
-                                           (for [i (range (.len branch))
-                                                 :when (and (not (neg? (in-range (.get ks (int i)) from)))
-                                                            (or (zero? i) (not (pos? (in-range (.get ks (int (dec i))) to)))))
-                                                 :let [_ (run! take! (slot-datoms branch i))]]
-                                             [(.address branch (int i)) branch i storage]))))
-                            level))
-           ;; the entries at an address the other side does not hold; an unstored node (nil address) is never shared
+           within? (fn [d] (and (not (neg? (in-range d from))) (not (pos? (in-range d to)))))
+           cmp (.comparator ^PersistentSortedSet a)
+           ;; an entry is [identity node]: a child's identity is its address, or the node
+           ;; itself while unstored (then it is in memory, so reading it costs nothing)
            unshared (fn [as bs]
-                      (let [shared (java.util.HashSet. ^java.util.Collection (keep first as))]
-                        (.retainAll shared (java.util.HashSet. ^java.util.Collection (keep first bs)))
-                        [(into [] (remove #(.contains shared (first %))) as) (into [] (remove #(.contains shared (first %))) bs)]))
-           open (fn [entries] (mapv (fn [[address ^Branch branch i ^IStorage storage]] [address (.child branch storage (int i))]) entries))
-           ra (.root a) rb (.root b)
-           la (.level ^ANode ra) lb (.level ^ANode rb)]
-       (when-not (and (some? (.-_address a)) (= (.-_address a) (.-_address b)))
-         (loop [level (max la lb)
-                as (if (== la level) [[(.-_address a) ra]] [])
-                bs (if (== lb level) [[(.-_address b) rb]] [])]
-           (let [[as bs] (unshared as bs)]
-             (if (zero? level)
-               ;; a datom both sides' unshared leaves hold is no candidate; buffered edits already are
-               (let [leaf-datoms (fn [leaves] (let [out (java.util.ArrayList.)]
-                                                (doseq [[_ ^Leaf leaf] leaves, d (.keys leaf)]
-                                                  (when (and (not (neg? (in-range d from))) (not (pos? (in-range d to))))
-                                                    (.add out d)))
-                                                out))
-                     ^java.util.ArrayList xs (leaf-datoms as) ^java.util.ArrayList ys (leaf-datoms bs)
-                     nx (.size xs) ny (.size ys)]
-                 (loop [i 0 j 0]
-                   (cond (and (< i nx) (< j ny))
-                         (let [c (.compare cmp (.get xs i) (.get ys j))]
-                           (cond (zero? c) (recur (inc i) (inc j))
-                                 (neg? c) (do (.add candidates (.get xs i)) (recur (inc i) j))
-                                 :else (do (.add candidates (.get ys j)) (recur i (inc j)))))
-                         (< i nx) (do (.add candidates (.get xs i)) (recur (inc i) j))
-                         (< j ny) (do (.add candidates (.get ys j)) (recur i (inc j))))))
-               (let [[ea eb] (unshared (children (.-_storage a) as) (children (.-_storage b) bs))
-                     below (dec level)]
-                 (recur below
-                        (into (if (== la below) [[(.-_address a) ra]] []) (open ea))
-                        (into (if (== lb below) [[(.-_address b) rb]] []) (open eb))))))))
+                      (let [shared (into #{} (keep first) as)
+                            shared (into #{} (comp (keep first) (filter shared)) bs)]
+                        [(into [] (remove #(shared (first %))) as) (into [] (remove #(shared (first %))) bs)]))
+           ;; the in-range children of every branch in `level` that the other side does not
+           ;; also hold, opened (restored) only then; a child's buffered edits lie in its own range
+           children (fn [storage level]
+                      (into [] (mapcat (fn [[_ branch]]
+                                         (let [ks (.keys ^Branch branch)]
+                                           (for [i (range (.len ^Branch branch))
+                                                 :when (and (not (neg? (in-range (nth ks i) from)))
+                                                            (or (zero? i) (not (pos? (in-range (nth ks (dec i)) to)))))]
+                                             [(or (.address ^Branch branch (int i)) (.child ^Branch branch storage (int i))) branch i storage]))))
+                            level))
+           slots (fn [entries] (into [] (comp (mapcat (fn [[_ branch i]] (slot-datoms branch i))) (filter within?)) entries))
+           open (fn [entries] (mapv (fn [[id branch i storage]] [id (.child ^Branch branch storage (int i))]) entries))
+           leaf-datoms (fn [leaves] (into [] (comp (mapcat (fn [[_ leaf]] (.keys ^Leaf leaf))) (filter within?)) leaves))
+           ;; the datoms of two sorted vectors that only one holds
+           one-sided (fn [xs ys]
+                       (let [nx (count xs) ny (count ys)]
+                         (loop [i 0 j 0 out (transient [])]
+                           (cond (and (< i nx) (< j ny))
+                                 (let [c (long (cmp (nth xs i) (nth ys j)))]
+                                   (cond (zero? c) (recur (inc i) (inc j) out)
+                                         (neg? c) (recur (inc i) j (conj! out (nth xs i)))
+                                         :else (recur i (inc j) (conj! out (nth ys j)))))
+                                 (< i nx) (recur (inc i) j (conj! out (nth xs i)))
+                                 (< j ny) (recur i (inc j) (conj! out (nth ys j)))
+                                 :else (persistent! out)))))
+           sa (.-_storage ^PersistentSortedSet a) sb (.-_storage ^PersistentSortedSet b)
+           ra (.root ^PersistentSortedSet a) rb (.root ^PersistentSortedSet b)
+           la (long (.level ^Branch ra)) lb (long (.level ^Branch rb))
+           ida (or (.-_address ^PersistentSortedSet a) ra) idb (or (.-_address ^PersistentSortedSet b) rb)
+           candidates
+           (when-not (= ida idb)
+             (loop [level (max la lb)
+                    as (if (== la level) [[ida ra]] [])
+                    bs (if (== lb level) [[idb rb]] [])
+                    acc []]
+               (let [[as bs] (unshared as bs)]
+                 (if (zero? level)
+                   ;; a datom both sides' unshared leaves hold is no candidate; buffered edits already are
+                   (into acc (one-sided (leaf-datoms as) (leaf-datoms bs)))
+                   (let [ca (children sa as) cb (children sb bs)
+                         [ea eb] (unshared ca cb)
+                         below (dec level)]
+                     (recur below
+                            (into (if (== la below) [[ida ra]] []) (open ea))
+                            (into (if (== lb below) [[idb rb]] []) (open eb))
+                            (-> acc (into (slots ca)) (into (slots cb)))))))))]
        (reduce (fn [[only-a only-b] d]
-                 (let [in-a (.contains a d) in-b (.contains b d)]
+                 (let [in-a (contains? a d) in-b (contains? b d)]
                    (cond (and in-a (not in-b)) [(conj only-a d) only-b]
                          (and in-b (not in-a)) [only-a (conj only-b d)]
                          :else [only-a only-b])))
-               [[] []] candidates))))
+               [[] []] (into (sorted-set-by cmp) candidates)))))
 
 (defn- canon
   "Normalize a value for content hashing: Datoms become [e a v tx added] vectors,
