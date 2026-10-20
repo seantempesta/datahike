@@ -2620,7 +2620,10 @@
   [context commit-id modified-attrs unsafe?]
   (-> context
       (assoc :datahike.cache/commit-id commit-id
-             :datahike.cache/committed? true)
+             :datahike.cache/committed? true
+             ;; the value this commit was made on: a miss looks for an inheritable
+             ;; result there and only there (lineage-entry)
+             :datahike.cache/parent-commit-id (:datahike.cache/commit-id context))
       (db/advance-cache-context commit-id modified-attrs unsafe?)))
 
 (defn- source-key-contains-generation?
@@ -3022,23 +3025,6 @@
   [query-input]
   (dependency-plan-attributes (query-dependency-plan query-input)))
 
-(defn- source-key-members [source-key]
-  (if (= composite-source-key-tag (first source-key))
-    (second source-key)
-    [[nil nil source-key]]))
-
-(defn- compatible-source-keys?
-  "Same source bindings over the same stores; lineage is checked per context."
-  [cached-source-key current-source-key]
-  (let [cached-members (source-key-members cached-source-key)
-        current-members (source-key-members current-source-key)]
-    (and (= (mapv #(subvec % 0 2) cached-members)
-            (mapv #(subvec % 0 2) current-members))
-         (every? true?
-                 (map (fn [cached current]
-                        (= (first (nth cached 2)) (first (nth current 2))))
-                      cached-members current-members)))))
-
 (defn- source-context-unchanged?
   "Revisions are comparable only within one connection generation: a
    connection opens with no attribute revisions, so equal revisions across
@@ -3060,30 +3046,25 @@
                             [:datahike.cache/attribute-revisions attribute])))
                attributes)))
 
-(defn- inheritable-entry
-  [lru current-source-key cache-key current-contexts]
-  (some (fn [[cached-source-key {:keys [entries]}]]
-          (when (and (not= cached-source-key current-source-key)
-                     (compatible-source-keys? cached-source-key
-                                              current-source-key))
-            (when-let [{:keys [dependency-plan source-contexts] :as entry}
-                       (get entries cache-key)]
-              (when (every?
-                     true?
-                     (map (fn [cached-member current-member]
-                            (let [cached-key (nth cached-member 2)
-                                  current-key (nth current-member 2)
-                                  attributes
-                                  (dependency-plan-source-attributes
-                                   dependency-plan cached-source-key cached-key)]
-                              (source-context-unchanged?
-                               (get source-contexts cached-key)
-                               (get current-contexts current-key)
-                               attributes)))
-                          (source-key-members cached-source-key)
-                          (source-key-members current-source-key)))
-                entry))))
-        (lru/weighted-entries lru)))
+(defn- lineage-entry
+  "The cached result of `cache-key` on the value this one was committed on, when the
+   query's attributes did not change in that commit: one lookup, O(1). A result found
+   here is promoted to the new value, so a value re-read after each commit inherits
+   along its own lineage. Composite (multi-source) keys inherit nothing."
+  [lru result-key cache-key current-contexts]
+  (when (and (vector? result-key) (== 2 (count result-key))
+             (not= composite-source-key-tag (first result-key)))
+    (let [context (get current-contexts result-key)
+          parent (:datahike.cache/parent-commit-id context)]
+      (when parent
+        (let [parent-key [(nth result-key 0) parent]]
+          (when-let [{:keys [dependency-plan source-contexts] :as entry}
+                     (get (:entries (get lru parent-key)) cache-key)]
+            (when (source-context-unchanged?
+                   (get source-contexts parent-key)
+                   context
+                   (dependency-plan-source-attributes dependency-plan parent-key parent-key))
+              entry)))))))
 
 (defn- result-cache-get
   "Look up an exact result or lazily promote a dependency-safe older result.
@@ -3107,8 +3088,8 @@
                               (assoc lru result-key
                                      (update bucket :owners conj scope-key)))))
                    (if-let [entry
-                            (inheritable-entry lru result-key cache-key
-                                               current-contexts)]
+                            (lineage-entry lru result-key cache-key
+                                           current-contexts)]
                      (let [promoted
                            (assoc entry :source-contexts current-contexts)]
                        (vreset! found promoted)
