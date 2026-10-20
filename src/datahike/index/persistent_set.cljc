@@ -666,8 +666,31 @@
   #?(:jolt
      (let [store-id (or (get-in config [:store :id]) (:id config))
            bf       (get-in config [:index-config :branching-factor] DEFAULT_BRANCHING_FACTOR)
-           storage  (or (:storage store) (create-storage store config))
-           settings (psset/default-settings bf)]
+           settings (psset/default-settings bf)
+           ;; proto/core: a JVM-written store (Fressian nodes, E9's tags) opens with E4a's
+           ;; real nodes, each tag building what the EDN readers below build. The root
+           ;; handler needs the storage, which needs the store: a cell breaks the cycle.
+           cell     (atom nil)
+           ;; resolved here, not required: only a project with jolt-lang/fressian (proto/core) opens Fressian stores
+           read-obj (when (= :FressianSerializer (:default-serializer store)) (requiring-resolve 'fress.reader/readObject))
+           store    (if read-obj
+                      (k/assoc-serializers
+                        store
+                        {:FressianSerializer
+                         (fressian-serializer
+                           {"pss/leaf" (fn [rdr _ _] (let [m (read-obj rdr)] (psset/restore-node 0 (:keys m) nil settings)))
+                            "pss/branch" (fn [rdr _ _] (let [m (read-obj rdr)]
+                                                         (psset/restore-node (:level m) (:keys m) (:addresses m) (:subtree-count m -1) settings)))
+                            "pss/set" (fn [rdr _ _] (let [{:keys [address count meta]} (read-obj rdr)]
+                                                      (with-meta
+                                                        (PersistentSortedSet. nil (index-type->cmp-quick (:index-type meta) false)
+                                                                              address @cell nil (or count -1) settings 0)
+                                                        meta)))
+                            "datahike.datom.Datom" (fn [rdr _ _] (let [[e a v tx added] (read-obj rdr)] (dd/datom e a v tx added)))}
+                           {})})
+                      store)
+           storage  (or (:storage store) (create-storage store config))]
+       (reset! cell storage)
        (when-let [sa (:storage-atom store)] (reset! sa storage))
        (when-let [rh (:read-handlers store)]
          (when (instance? clojure.lang.IAtom rh)
