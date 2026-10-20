@@ -655,15 +655,23 @@
   [connection {:keys [parents tx-data tx-meta] :as arg-map}]
   (let [p (throwable-promise)
         writer (:writer @(:wrapped-atom connection))]
-    (go
-      (let [tx-report (<! (dispatch! writer
-                                     {:op 'merge!
-                                      :args [arg-map]}))
-            listeners (some-> (:listeners (meta connection)) deref)]
+    (if (instance? SyncWriter writer)
+      ;; a :sync writer merges on the calling thread, as its transact! does: no go block, so
+      ;; it works in a process with no scheduler threads (a forked agent; seon lane A1)
+      (let [tx-report (try (sync-apply! connection (:write-fn-map writer) (:last-cid writer) {:op 'merge! :args [arg-map]})
+                           (catch #?(:clj Throwable :cljs js/Error) e e))]
         (#?(:jolt (fn [p v] (p v)) :clj deliver :cljs put!) p tx-report)
-        (when (map? tx-report)
-          (notify-listeners! connection listeners tx-report))))
-    p))
+        (when (map? tx-report) (notify-listeners! connection (some-> (:listeners (meta connection)) deref) tx-report))
+        p)
+      (do (go
+            (let [tx-report (<! (dispatch! writer
+                                           {:op 'merge!
+                                            :args [arg-map]}))
+                  listeners (some-> (:listeners (meta connection)) deref)]
+              (#?(:jolt (fn [p v] (p v)) :clj deliver :cljs put!) p tx-report)
+              (when (map? tx-report)
+                (notify-listeners! connection listeners tx-report))))
+          p))))
 
 (defn gc-storage! [conn & args]
   (let [p (throwable-promise)
