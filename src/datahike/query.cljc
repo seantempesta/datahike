@@ -2583,34 +2583,6 @@
     (into #{} (map #(nth % 2)) (second source-key))
     #{source-key}))
 
-(defn- dependency-plan-source-attributes
-  [dependency-plan source-key database-key]
-  (if (= dependency-plan :all)
-    :all
-    (let [sources (:datahike.query.dependency/sources dependency-plan)
-          selected
-          (if (= composite-source-key-tag (first source-key))
-            (let [bindings (into #{}
-                                 (keep (fn [[symbol position member-key]]
-                                         (when (= database-key member-key)
-                                           [symbol position])))
-                                 (second source-key))]
-              (filter (fn [source]
-                        (contains?
-                         bindings
-                         [(:datahike.query.source/symbol source)
-                          (:datahike.query.source/argument-position source)]))
-                      sources))
-            sources)]
-      (if (seq selected)
-        (reduce (fn [attributes source]
-                  (merge-attr-deps
-                   attributes
-                   (:datahike.query.source/attributes source)))
-                #{}
-                selected)
-        :all))))
-
 (defn advance-query-cache-context
   "Advance immutable cache-validation facts for one committed transaction.
 
@@ -3022,71 +2994,10 @@
   [query-input]
   (dependency-plan-attributes (query-dependency-plan query-input)))
 
-(defn- source-key-members [source-key]
-  (if (= composite-source-key-tag (first source-key))
-    (second source-key)
-    [[nil nil source-key]]))
-
-(defn- compatible-source-keys?
-  "Same source bindings over the same stores; lineage is checked per context."
-  [cached-source-key current-source-key]
-  (let [cached-members (source-key-members cached-source-key)
-        current-members (source-key-members current-source-key)]
-    (and (= (mapv #(subvec % 0 2) cached-members)
-            (mapv #(subvec % 0 2) current-members))
-         (every? true?
-                 (map (fn [cached current]
-                        (= (first (nth cached 2)) (first (nth current 2))))
-                      cached-members current-members)))))
-
-(defn- source-context-unchanged?
-  "Revisions are comparable only within one connection generation: a
-   connection opens with no attribute revisions, so equal revisions across
-   two lineages would not prove equal datoms."
-  [cached-context current-context attributes]
-  (and (map? cached-context)
-       (map? current-context)
-       (not= attributes :all)
-       (= (:datahike.cache/connection-id cached-context)
-          (:datahike.cache/connection-id current-context))
-       (= (:datahike.cache/generation cached-context)
-          (:datahike.cache/generation current-context))
-       (= (:datahike.cache/conservative-revision cached-context)
-          (:datahike.cache/conservative-revision current-context))
-       (every? (fn [attribute]
-                 (= (get-in cached-context
-                            [:datahike.cache/attribute-revisions attribute])
-                    (get-in current-context
-                            [:datahike.cache/attribute-revisions attribute])))
-               attributes)))
-
-(defn- inheritable-entry
-  [lru current-source-key cache-key current-contexts]
-  (some (fn [[cached-source-key {:keys [entries]}]]
-          (when (and (not= cached-source-key current-source-key)
-                     (compatible-source-keys? cached-source-key
-                                              current-source-key))
-            (when-let [{:keys [dependency-plan source-contexts] :as entry}
-                       (get entries cache-key)]
-              (when (every?
-                     true?
-                     (map (fn [cached-member current-member]
-                            (let [cached-key (nth cached-member 2)
-                                  current-key (nth current-member 2)
-                                  attributes
-                                  (dependency-plan-source-attributes
-                                   dependency-plan cached-source-key cached-key)]
-                              (source-context-unchanged?
-                               (get source-contexts cached-key)
-                               (get current-contexts current-key)
-                               attributes)))
-                          (source-key-members cached-source-key)
-                          (source-key-members current-source-key)))
-                entry))))
-        (lru/weighted-entries lru)))
-
 (defn- result-cache-get
-  "Look up an exact result or lazily promote a dependency-safe older result.
+  "Look up an exact result: a value's cached result for this query. A miss on a new
+   value computes the query; it does not search older values for an inheritable
+   result (that search scanned every cached value, O(cache) per miss).
 
    `result-key` names the values; `scope-key` names the reading connection
    generations. An admitted reader joins the bucket's owners."
@@ -3106,22 +3017,7 @@
                               (lru/weighted-touch lru result-key)
                               (assoc lru result-key
                                      (update bucket :owners conj scope-key)))))
-                   (if-let [entry
-                            (inheritable-entry lru result-key cache-key
-                                               current-contexts)]
-                     (let [promoted
-                           (assoc entry :source-contexts current-contexts)]
-                       (vreset! found promoted)
-                       (if (source-key-generations-current?
-                            scope-key generations)
-                         (assoc state :lru
-                                (assoc lru result-key
-                                       (-> (or bucket empty-result-bucket)
-                                           (update :owners conj scope-key)
-                                           (assoc-in [:entries cache-key]
-                                                     promoted))))
-                         state))
-                     state)))))
+                   state))))
       @found)))
 
 (defn- result-cache-put!
