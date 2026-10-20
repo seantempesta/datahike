@@ -8,7 +8,9 @@
             [konserve.core :as k]
             [konserve.gc :refer [sweep!]]
             [replikativ.logging :as log]
-            [superv.async :refer [<? S go-try <<?]]
+            [superv.async :refer [<? S go-try <<? go-try- <?-]]
+            [konserve.utils :refer [#?(:clj async+sync) *default-sync-translation*]
+             #?@(:cljs [:refer-macros [async+sync]])]
             ;; go-loop drives start-background-gc!'s scheduler; it's a MACRO, so
             ;; cljs needs it via :require-macros (mirrors datahike.versioning).
             #?(:clj  [clojure.core.async :as async :refer [go-loop]]
@@ -29,16 +31,17 @@
   already claimed is walked there, and a node already marked had its whole
   subtree marked, so the mark costs the store's distinct commits and nodes,
   not branches times commits times tree size."
-  [store branch after-date config visited seen]
-  (go-try S
-          (let [head-cid (<? S (k/get-in store [branch :meta :datahike/commit-id]))]
+  [store branch after-date config visited seen sync?]
+  (async+sync sync? *default-sync-translation*
+   (go-try-
+          (let [head-cid (<?- (k/get-in store [branch :meta :datahike/commit-id] nil {:sync? sync?}))]
             (loop [[to-check & r] [branch]
                    reachable      #{branch head-cid}
                    key-maps       #{}]
               (if to-check
                 (if (contains? (first (swap-vals! visited conj to-check)) to-check) ;; claimed: skip
                   (recur r reachable key-maps)
-                  (if-let [record (<? S (read-head store to-check {:sync? false}))]
+                  (if-let [record (<?- (read-head store to-check {:sync? sync?}))]
                     (let [{:keys                         [eavt-key avet-key aevt-key
                                                           temporal-eavt-key temporal-avet-key temporal-aevt-key
                                                           eavt-root aevt-root avet-root
@@ -92,7 +95,7 @@
                     ;; mark. (Without this guard the nil destructure NPEs at
                     ;; get-time.)
                     (recur r reachable key-maps)))
-                {:reachable reachable :key-maps key-maps})))))
+                {:reachable reachable :key-maps key-maps}))))))
 
 (defn gc-storage!
   "Invokes garbage collection on the database by whitelisting currently known branches.
@@ -136,14 +139,20 @@
   ([db] (gc-storage! db (#?(:clj Date. :cljs js/Date.) 0)))
   ([db remove-before]
    (gc-storage! db remove-before {}))
+  ;; opts :sync? true runs the whole collection on the calling thread through the
+  ;; store's synchronous operations and returns its result, not a channel: what the
+  ;; writer's maintenance proc wants (on Jolt the async path costs a channel hand-off
+  ;; per store read)
   ([db remove-before opts]
-   (go-try S
+   (let [sync? (boolean (:sync? opts))]
+   (async+sync sync? *default-sync-translation*
+   (go-try-
            (let [{:keys [config store]} db
                  store-id (:id (:store config))
                  sweep-permit
-                 (<? S (guard/acquire-sweep-permit!
+                 (<?- (guard/acquire-sweep-permit!
                         store-id
-                        {:sync? false
+                        {:sync? sync?
                          :datahike.gc-guard/maintenance-receipt
                          (:datahike.gc/maintenance-receipt opts)}))]
              (try
@@ -163,10 +172,11 @@
                      _ (log/trace :datahike/gc-retain-branches {:branches branches})
                      visited (atom #{})
                      seen (atom #{})
-                     marked (->> branches
-                                 (map #(reachable-in-branch store % remove-before config visited seen))
-                                 async/merge
-                                 (<<? S))
+                     marked (if sync?
+                              (mapv #(reachable-in-branch store % remove-before config visited seen true) branches)
+                              (<?- (async/into [] (async/merge
+                                                   (map #(reachable-in-branch store % remove-before config visited seen false)
+                                                        branches)))))
                      native-reachable (into #{} (mapcat :reachable) marked)
                      retained-key-maps (into #{} (mapcat :key-maps) marked)
                      extension
@@ -182,7 +192,8 @@
                        #{})
                      reachable (into (into native-reachable (roster-store-keys store)) extension)
                      batch-size (or (:datahike.gc/batch-size opts) 1000)
-                     sweep-opts (or (:datahike.gc/sweep-opts opts) {})]
+                     sweep-opts (cond-> (or (:datahike.gc/sweep-opts opts) {})
+                                  sync? (assoc :konserve.gc/sync-io? true))]
                  (log/trace :datahike/gc-reachable {:reachable-count (count reachable)
                                                     :cutoff cutoff})
                  ;; Datahike decides reachability for secondary storage too:
@@ -191,9 +202,11 @@
                  ;; deleted branch's secondary state goes with its commits.
                  (doseq [[index-type key-maps] (group-by :type retained-key-maps)]
                    (sec/sweep-from-key-maps! index-type key-maps cutoff))
-                 (<? S (sweep! store reachable cutoff batch-size sweep-opts)))
+                 (if sync?
+                   (async/<!! (sweep! store reachable cutoff batch-size sweep-opts))
+                   (<?- (sweep! store reachable cutoff batch-size sweep-opts))))
                (finally
-                 (guard/release-reachability-permit! sweep-permit)))))))
+                 (guard/release-reachability-permit! sweep-permit)))))))))
 
 (defn start-background-gc!
   "Runs `gc-storage!` on `conn`'s database periodically in the background and
