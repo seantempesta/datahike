@@ -473,6 +473,10 @@
 (defmethod -connect* :self [config opts]
   (-connect-impl* config opts))
 
+;; proto (lane F1): a :sync writer (datahike.writer) connects as :self does
+(defmethod -connect* :sync [config opts]
+  (-connect-impl* config opts))
+
 ;; public API
 
 (defn connect
