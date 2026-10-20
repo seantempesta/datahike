@@ -78,8 +78,7 @@
 (defn- pss-instance?
   "Check if x is a PersistentSortedSet (CLJ) or BTSet (CLJS)."
   [x]
-  #?(:jolt false ;; jolt: the stand-in index has no PSS cursors
-     :clj  (instance? PersistentSortedSet x)
+  #?(:clj  (instance? PersistentSortedSet x)
      :cljs (instance? BTSet x)))
 
 (defn- pss-lookup-ge
