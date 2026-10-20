@@ -4,6 +4,7 @@
             [datahike.index.interface :refer [-mark -seed-root! with-storage]]
             [datahike.index.secondary :as sec]
             [datahike.writing :refer [read-head commit-graph-key]]
+            [datahike.roster :refer [roster roster-store-keys]]
             [konserve.core :as k]
             [konserve.gc :refer [sweep!]]
             [replikativ.logging :as log]
@@ -158,7 +159,7 @@
                                    {:writer (:backend (:writer config))
                                     :note "collecting a store this process does not write: in-flight commits elsewhere are invisible and may be swept"}))
                      _ (sc/clear-write-cache (:store config))
-                     branches (<? S (k/get store :branches))
+                     branches (roster store)
                      _ (log/trace :datahike/gc-retain-branches {:branches branches})
                      visited (atom #{})
                      seen (atom #{})
@@ -179,7 +180,7 @@
                              :datahike.gc/reachable native-reachable})
                            #{})
                        #{})
-                     reachable (into (conj native-reachable :branches) extension)
+                     reachable (into (into native-reachable (roster-store-keys store)) extension)
                      batch-size (or (:datahike.gc/batch-size opts) 1000)
                      sweep-opts (or (:datahike.gc/sweep-opts opts) {})]
                  (log/trace :datahike/gc-reachable {:reachable-count (count reachable)

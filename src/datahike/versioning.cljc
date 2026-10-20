@@ -7,11 +7,12 @@
             [datahike.connections :refer [*connections*]]
             [datahike.gc-guard :as guard]
             [datahike.store :refer [store-identity add-cache-and-handlers]]
+            [datahike.roster :refer [roster roster-add! roster-remove!]]
             [datahike.writing :refer [stored->db db->stored stored-db? stored-revisions
                                       #?@(:clj [release-db])
                                       commit! create-commit-id get-and-clear-pending-kvs!
                                       write-pending-kvs! branch-heads-as-commits
-                                      read-head compact-head commit-graph-writes
+                                      read-head resolve-head compact-head compact-head? commit-graph-writes
                                       commit-graph-records commit-graph-key]]
             [datahike.writer]
             [datahike.index.secondary :as sec]
@@ -171,11 +172,22 @@
       {}
       source-key-maps)))
 
-(defn- update-branches-held!
-  "Update the branch roster while the caller holds the store's roster permit."
-  [store-id permit store update-fn opts]
+(defn- roster-add-held!
+  "Append branch to the roster while the caller holds the store's roster permit."
+  [store-id permit store branch opts]
   (guard/require-reachability-permit! store-id :roster permit)
-  (k/update store :branches update-fn opts))
+  (roster-add! store branch opts))
+
+(defn- roster-remove-held!
+  "Append branch's removal to the roster and delete its head, while the caller
+  holds the store's roster permit. The head goes too: a branch exists exactly when
+  its head key does, which is what branch! and delete-branch! test (O(1))."
+  [store-id permit store branch opts]
+  (guard/require-reachability-permit! store-id :roster permit)
+  (async+sync (:sync? opts) *default-sync-translation*
+              (go-try-
+               (<?- (roster-remove! store branch opts))
+               (<?- (k/dissoc store branch opts)))))
 
 ;; ========================= public API =========================
 
@@ -186,7 +198,7 @@
    (let [store (extract-store conn)
          opts (select-keys opts [:sync?])]
      (async+sync (:sync? opts) *default-sync-translation*
-                 (go-try- (<?- (k/get store :branches nil opts)))))))
+                 (go-try- (<?- (roster store opts)))))))
 
 (defn branch-history
   "Returns the commit history of the branch of the connection in
@@ -244,11 +256,23 @@
                             _ (when-not (or (keyword? from) commit-source?)
                                 (log/raise "From must be a branch keyword or commit UUID."
                                            {:type :invalid-branch-source :from from}))
-                            existing-branches (<?- (k/get store :branches nil store-opts))
-                            _ (when (and existing-branches (existing-branches new-branch))
+                            _ (when (<?- (k/exists? store new-branch store-opts))
                                 (log/raise "Branch already exists." {:type :branch-already-exists
                                                                      :new-branch new-branch}))
-                            stored-db (<?- (read-head store from store-opts))]
+                            ;; A branch made from a branch whose head is a compact head is
+                            ;; that same pointer under a new name: nothing about the commit
+                            ;; is read, unless secondary indices must be branched with it.
+                            raw-head (when (keyword? from) (<?- (k/get store from nil store-opts)))
+                            pointer? (and commit-graph?
+                                          (compact-head? raw-head)
+                                          (not (:datahike/secondary? raw-head))
+                                          (empty? (:secondary-indices @conn)))]
+                        (if pointer?
+                          (do (<?- (k/assoc store new-branch raw-head store-opts))
+                              (<?- (roster-add-held! gc-sid roster-permit store new-branch store-opts)))
+                        (let [stored-db (if (keyword? from)
+                                          (<?- (resolve-head store from raw-head store-opts))
+                                          (<?- (read-head store from store-opts)))]
                         (when-not (stored-db? stored-db)
                           (log/raise (if commit-source?
                                        "Commit record does not exist."
@@ -266,14 +290,12 @@
                                    (branch-secondary-indices conn stored-db from new-branch store))
                                  :cljs nil)
                               updated-db (if (and commit-graph? (empty? branched-sec-keys))
-                                           (compact-head (get-in stored-db [:meta :datahike/commit-id]))
+                                           (compact-head (get-in stored-db [:meta :datahike/commit-id]) stored-db)
                                            (cond-> (assoc-in stored-db [:config :branch] new-branch)
                                              (seq branched-sec-keys) (assoc :secondary-index-keys branched-sec-keys)))]
                           (<?- (k/assoc store new-branch updated-db store-opts))
                           ;; :branches is the GC discovery pointer and is published last.
-                          (<?- (update-branches-held! gc-sid roster-permit store
-                                                     #(conj (set %) new-branch)
-                                                     store-opts))))
+                          (<?- (roster-add-held! gc-sid roster-permit store new-branch store-opts))))))
                       (finally
                         (when owned-permit?
                           (guard/release-reachability-permit! roster-permit))))))))))
@@ -301,8 +323,8 @@
                         owned-permit? (nil? supplied-permit)
                         store-opts (dissoc opts :datahike.gc-guard/reachability-permit)]
                     (try
-                      (let [existing-branches (<?- (k/get store :branches nil store-opts))]
-                        (when-not (and existing-branches (existing-branches branch))
+                      (do
+                        (when-not (<?- (k/exists? store branch store-opts))
                           (log/raise "Branch does not exist." {:type :branch-does-not-exist
                                                                :branch branch}))
                         (let [active-connections
@@ -315,9 +337,7 @@
                                        {:type :branch-has-active-connection
                                         :branch branch
                                         :connections active-connections})))
-                        (<?- (update-branches-held! store-id roster-permit store
-                                                   #(disj (set %) branch)
-                                                   store-opts)))
+                        (<?- (roster-remove-held! store-id roster-permit store branch store-opts)))
                       (finally
                         (when owned-permit?
                           (guard/release-reachability-permit! roster-permit))))))))))
@@ -370,6 +390,8 @@
                     (try
                       (let [store (:store db)
                             current-stored (<?- (read-head store branch store-opts))
+                            ;; the roster gets an entry only for a branch this creates
+                            existed-before? (some? current-stored)
                             current-commit (get-in current-stored [:meta :datahike/commit-id])
                             resolved-parents (branch-heads-as-commits store parents)
                             _ (when (and guard? (not= expected-current-commit current-commit))
@@ -442,13 +464,12 @@
                                                 :branch branch
                                                 :expected-current-commit expected-current-commit
                                                 :current-commit stored-commit}))
-                                  (if commit-graph? (compact-head cid) db-to-store)))
+                                  (if commit-graph? (compact-head cid db-to-store) db-to-store)))
                               store-opts))
 
                         ;; Publish the GC discovery pointer only after its head exists.
-                        (<?- (update-branches-held! gc-sid roster-permit store
-                                                   #(conj (set %) branch)
-                                                   store-opts))
+                        (when-not existed-before?
+                          (<?- (roster-add-held! gc-sid roster-permit store branch store-opts)))
                         (let [stored-head (<?- (k/get store branch nil store-opts))
                               stored-commit (get-in stored-head [:meta :datahike/commit-id])]
                           (when-not (= cid stored-commit)
@@ -630,7 +651,7 @@
   ([conn-or-store] (backfill-commit-graph! conn-or-store {}))
   ([conn-or-store {:keys [batch-size] :or {batch-size 1000}}]
    (let [store (extract-store conn-or-store)
-         branches (k/get store :branches nil {:sync? true})
+         branches (roster store)
          heads (keep #(read-head store % {:sync? true}) branches)]
      (when (some #(false? (get-in % [:config :commit-graph?])) heads)
        (log/raise "This store was created with :commit-graph? false, so it has no commit graph records."

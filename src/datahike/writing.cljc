@@ -16,6 +16,7 @@
             [datahike.schema-cache :as sc]
             [datahike.online-gc :as online-gc]
             [konserve.core :as k]
+            [datahike.roster :refer [roster roster-add!]]
             [konserve.store :as ks]
             [replikativ.logging :as log]
             [hasch.core :refer [uuid squuid]]
@@ -65,8 +66,12 @@
   `[:meta :datahike/commit-id]`, so readers that need only the head's commit
   id read it unchanged; readers that need the record go through
   `resolve-head`."
-  [cid]
-  {:meta {:datahike/commit-id cid}})
+  ([cid] {:meta {:datahike/commit-id cid}})
+  ([cid record]
+   ;; :datahike/secondary? says the record has secondary-index keys, so a branch made
+   ;; from this head must read the record to branch them (versioning/branch!)
+   (cond-> {:meta {:datahike/commit-id cid}}
+     (seq (:secondary-index-keys record)) (assoc :datahike/secondary? true))))
 
 (defn compact-head?
   "True for a head written by `compact-head`. A full stored record always
@@ -699,7 +704,7 @@
                         ;; before it (`compact-head`; readers `resolve-head`),
                         ;; so the fused record is encoded and written once.
                         ;; Without a commit graph there is no record to name.
-                          head          (if commit-graph? (compact-head cid) db-to-store)
+                          head          (if commit-graph? (compact-head cid db-to-store) db-to-store)
                         ;; The commit's graph record (parents + generation) is
                         ;; written in the same ordered batch, before the
                         ;; commit record, so no commit exists without it.
@@ -841,7 +846,7 @@
   small record reads, no index loaded."
   [store]
   (transduce (map #(:max-eid (read-head store %) 0))
-             max 0 (k/get store :branches nil {:sync? true})))
+             max 0 (roster store)))
 
 (defn eid-allocator
   "The eid allocator of `db`'s store, seeded on first use in this process past
@@ -978,9 +983,9 @@
            (<?- (k/assoc store gk gv {:immutable? true} opts))))
        (<?- (k/assoc store cid db-to-store {:immutable? true} opts)) ; content-addressed commit
        (<?- (k/assoc store :db db-to-store opts))             ; mutable: branch head
-       ;; :branches names :db, so it is a POINTER and must be written LAST — a
+       ;; the roster names :db, so it is a POINTER and must be written LAST — a
        ;; collector that reads it before the head exists marks nothing for :db.
-       (<?- (k/assoc store :branches #{:db} opts))           ; mutable: branch set
+       (<?- (roster-add! store :db opts))                    ; the roster log
        (ks/release-store store-config store)
        config
        (finally
