@@ -415,7 +415,7 @@
     (committed-report/offer-committed! commit-db report)
     report))
 
-(defrecord SyncWriter [connection write-fn-map last-cid]
+(defrecord SyncWriter [connection write-fn-map last-cid pending]
   PWriter
   (-dispatch! [_ arg-map]
     (let [p (promise-chan)]
@@ -465,7 +465,50 @@
 
 (defmethod create-writer :sync
   [{:keys [write-fn-map]} connection]
-  (->SyncWriter connection (merge default-write-fn-map write-fn-map) (volatile! nil)))
+  (->SyncWriter connection (merge default-write-fn-map write-fn-map) (volatile! nil) (volatile! nil)))
+
+;; seon (lane A1): run-ahead writes at the serial caller. The caller owns its branch alone (an
+;; agent process): each transaction is applied to the value ahead of the committed one and
+;; answered at once; the applied value is committed once, later (when the caller is idle, at
+;; a turn's end, or at the flush window). Entity ids come from the store's allocator as in
+;; any transact, so the ids a caller saw when it applied are the ids committed.
+
+(defn apply!
+  "Apply arg-map to the connection's run-ahead value (its pending value, else its committed
+  one) with `w/transact!`, without committing. Answers the report (its :db-after is the new
+  run-ahead value), or the exception, leaving the value as it was. Only on a :sync writer."
+  [connection arg-map]
+  (let [writer (:writer @(:wrapped-atom connection))
+        _ (assert (instance? SyncWriter writer) "apply! needs a :sync writer")
+        tx! (get (:write-fn-map writer) 'transact!)
+        {:keys [db reports]} (or @(:pending writer) {:db @(:wrapped-atom connection) :reports []})
+        r (try (tx! db arg-map) (catch #?(:clj Throwable :cljs js/Error) e e))]
+    (when (map? r) (vreset! (:pending writer) {:db (:db-after r) :reports (conj reports r)}))
+    r))
+
+(defn pending?
+  "Has the connection applied transactions not committed yet?"
+  [connection]
+  (some? @(:pending (:writer @(:wrapped-atom connection)))))
+
+(defn commit-pending!
+  "Commit the connection's run-ahead value once (as transact-batch! commits a batch) and make
+  it the committed value. Answers {:commit-id :tx-count :db}, or nil when nothing is pending."
+  [connection]
+  (let [writer (:writer @(:wrapped-atom connection))]
+    (when-let [{:keys [db reports]} @(:pending writer)]
+      (let [parent-db @(:wrapped-atom connection)
+            modified-attrs (w/batch-cache-revision-attributes reports)
+            stored (w/commit! db nil true @(:last-cid writer)
+                              {:prior (:cache-context parent-db) :modified-attrs modified-attrs :unsafe? false})
+            commit-id (get-in stored [:meta :datahike/commit-id])
+            commit-db (assoc stored :cache-context
+                             (some-> (:cache-context parent-db)
+                                     (q/advance-query-cache-context commit-id modified-attrs false)))]
+        (vreset! (:last-cid writer) commit-id)
+        (vreset! (:pending writer) nil)
+        #?(:jolt (reset! (.-wrapped-atom connection) commit-db) :clj (reset! connection commit-db))
+        {:commit-id commit-id :tx-count (count reports) :db commit-db}))))
 
 ;; Note: :kabel backend is implemented in datahike.kabel.writer
 ;; Require that namespace to register the defmethod
