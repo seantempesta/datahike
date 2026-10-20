@@ -321,7 +321,7 @@
                                  :else (persistent! out)))))
            sa (.-_storage ^PersistentSortedSet a) sb (.-_storage ^PersistentSortedSet b)
            ra (.root ^PersistentSortedSet a) rb (.root ^PersistentSortedSet b)
-           la (long (.level ^Branch ra)) lb (long (.level ^Branch rb))
+           la (long (.level ^ANode ra)) lb (long (.level ^ANode rb))
            ida (or (.-_address ^PersistentSortedSet a) ra) idb (or (.-_address ^PersistentSortedSet b) rb)
            candidates
            (when-not (= ida idb)
