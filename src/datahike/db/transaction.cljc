@@ -55,20 +55,51 @@
 (defn- current-tx [report]
   (inc (get-in report [:db-before :max-tx])))
 
+#?(:clj
+   (defonce ^{:doc "This process's ceiling on the entity ids it mints from a store's counter:
+  store id -> the first id it may not mint. Set by a process that was handed a block of
+  ids (a forked writer of its own branch, given a lease), absent otherwise."}
+     eid-ceilings
+     (java.util.concurrent.ConcurrentHashMap.)))
+
+(defn set-eid-ceiling!
+  "Make `ceiling` the first entity id this process may not mint from the counter of the
+  store with id `store-id` (nil: no ceiling). A transaction that would mint it is refused
+  with :entity-id/lease-spent, before anything applies."
+  [store-id ceiling]
+  #?(:clj (if (some? ceiling)
+            (.put ^java.util.concurrent.ConcurrentHashMap eid-ceilings store-id ceiling)
+            (.remove ^java.util.concurrent.ConcurrentHashMap eid-ceilings store-id))
+     :cljs nil)
+  nil)
+
+(defn eid-ceiling
+  "This process's ceiling for the store with id `store-id` (set-eid-ceiling!), or nil."
+  [store-id]
+  #?(:clj (when (some? store-id) (.get ^java.util.concurrent.ConcurrentHashMap eid-ceilings store-id))
+     :cljs nil))
+
 (defn next-eid
   "Assign a fresh entity id once from the store counter, or locally for speculation.
-  A failed transaction may leave gaps; entity ids stay below `tx0`."
+  A failed transaction may leave gaps; entity ids stay below `tx0`. A process with a
+  ceiling for the store (set-eid-ceiling!) holds a block of ids of its own: it mints from
+  its counter alone, never past the highest id its db holds (which, after a merge, may be
+  another block's), and never at or past its ceiling."
   [report db]
-  (let [eid #?(:clj (if-some [allocator (::eid-allocator report)]
+  (let [ceiling #?(:clj (when (::eid-allocator report) (eid-ceiling (get-in db [:config :store :id]))) :cljs nil)
+        eid #?(:clj (if-some [allocator (::eid-allocator report)]
                       (.updateAndGet ^java.util.concurrent.atomic.AtomicLong allocator
-                                     #?(:jolt (fn [issued] (inc (max issued (:max-eid db)))) ;; jolt: functional interfaces are fns
+                                     #?(:jolt (fn [issued] (inc (if ceiling issued (max issued (:max-eid db))))) ;; jolt: functional interfaces are fns
                                         :clj (reify java.util.function.LongUnaryOperator
-                                               (applyAsLong [_ issued] (inc (max issued (:max-eid db)))))))
+                                               (applyAsLong [_ issued] (inc (if ceiling issued (max issued (:max-eid db))))))))
                       (inc (:max-eid db)))
                :cljs (inc (:max-eid db)))]
     (when (>= eid tx0)
       (log/raise "Entity ids are exhausted: the next would reach tx0."
                  {:error :entity-id/range :entity-id eid}))
+    (when (and ceiling (>= eid ceiling))
+      (log/raise "This process's entity ids are spent: the next would reach its ceiling."
+                 {:error :entity-id/lease-spent :entity-id eid :ceiling ceiling}))
     eid))
 
 (defn- #?@(:clj [^Boolean tx-id?]
