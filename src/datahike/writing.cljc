@@ -867,7 +867,10 @@
   Reservations survive a refused transaction; speculation has no counter."
   [old transact]
   (let [allocator (eid-allocator old)
-        report (transact allocator)]
+        report (transact allocator)
+        ;; a process holding a block of ids (dbtx/eid-ceiling) mints from its counter alone:
+        ;; ids its db reached by a merge are another block's, not a reason to skip ahead
+        allocator (when-not (dbtx/eid-ceiling (get-in old [:config :store :id])) allocator)]
     #?(:jolt (when allocator ;; jolt: the AtomicLong shim has no accumulateAndGet
                (let [reached (get-in report [:db-after :max-eid])]
                  (loop [] (let [c (.get allocator)]
