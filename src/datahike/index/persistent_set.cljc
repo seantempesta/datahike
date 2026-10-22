@@ -166,17 +166,14 @@
           (psset/conj (dd/datom e a old-val tx false) cmp))
       pset)))
 
-(defn mark [pset]
-  ;; The flushed root address is `_address` on the JVM PersistentSortedSet but
-  ;; `address` on the cljs BTSet (see -merkle-root below) — reading the bare
-  ;; JVM field on cljs always saw nil and wrongly threw here, so GC never ran
-  ;; on ClojureScript.
-  (when-not #?(:clj (.-_address ^PersistentSortedSet pset) :cljs (.-address pset))
-    (throw (ex-info "Index needs to be properly flushed before marking."
-                    {:type :flush-before-marking})))
-  (let [addresses (atom #{})]
-    (psset/walk-addresses pset (fn [address] (swap! addresses conj address)))
-    @addresses))
+#?(:jolt (declare refs))
+(declare mark-unseen)
+
+(defn mark
+  "The konserve keys pset's tree reaches: its nodes' addresses and the values out of line
+  they reference (mark-unseen from nothing seen)."
+  [pset]
+  (mark-unseen pset (atom #{})))
 
 (defn mark-unseen
   "The addresses of `pset` not yet in the `seen` atom, adding them to it.
@@ -196,7 +193,13 @@
                                    (when-not (contains? before address)
                                      (vswap! addresses conj! address)
                                      true))))
-    (persistent! @addresses)))
+    (let [marked (persistent! @addresses)]
+      #?(:jolt
+         ;; and the values out of line each newly marked node references, read as stored (the
+         ;; storage's restore swaps them back); a fused root is in no key and holds none
+         (let [store (:store (.-_storage ^PersistentSortedSet pset))]
+           (into marked (mapcat #(some-> (k/get store % nil {:sync? true}) refs)) marked))
+         :default marked))))
 
 (extend-type #?(:clj PersistentSortedSet :cljs BTSet)
   IIndex
@@ -510,6 +513,99 @@
             addr
             (recur)))))))
 
+;; ---- large values out of line (Jolt) -----------------------------------------------
+;; A leaf holds its datoms' values inline, and a commit rewrites every node on its path, so
+;; a value in the index tail is written again by each later commit until its leaf splits
+;; (measured in Seon: 20 per-turn commits of 3.5 KB turns wrote 1,674 KB for 185 KB of
+;; turns). With `:index-config {:value-out-of-line-bytes n}`, `store` writes a node whose
+;; key holds a value of at least n bytes with a ValueRef to the value's own key instead:
+;; the content hash of the value, written once (the store or this commit's writes already
+;; holding it write nothing), so the value costs its bytes once and :eavt and :aevt share
+;; it. `restore` swaps the values back before the node enters the cache, so a live node
+;; never holds a ValueRef. GC's mark keeps the keys a stored node references (mark-unseen).
+;; Only stored nodes hold ValueRefs, and they describe themselves: a store holding both
+;; kinds reads either, whatever the setting is now.
+#?(:jolt
+   (do
+     (deftype ValueRef [key])
+
+     (defn- value-bytes
+       "A lower bound of v's serialized size in bytes, counted until it reaches limit: a
+       string's characters (its UTF-8 is at least as long), a byte array's length, a
+       collection's elements and one byte each; any other value 8."
+       [v limit]
+       (cond
+         (string? v) (count v)
+         (bytes? v) (alength ^bytes v)
+         (coll? v) (reduce (fn [n x] (let [n (+ n 1 (value-bytes x (- limit n)))] (if (>= n limit) (reduced n) n))) 0 v)
+         :else 8))
+
+     (defn- refs
+       "The ValueRef keys a stored node's keys hold."
+       [node]
+       (let [ks (.-_keys node)]
+         (loop [i 0 out []]
+           (if (< i (.-_len node))
+             (let [d (aget ks i)]
+               (recur (inc i) (if (and (dd/datom? d) (instance? ValueRef (.-v d))) (conj out (.-key ^ValueRef (.-v d))) out)))
+             out))))
+
+     (defn- value-key
+       "The content key of datom d's value, and the value queued on pending-writes unless
+       the store or the queue holds it. Hashing the value and asking the store each cost
+       ~15-18 us for 2 KB (measured on Jolt), and a commit rewrites the tail's nodes with
+       every large value in them, so the key of a value known to be stored (read back by
+       in-line, or found by the store here) is kept in the node cache under the datom (its
+       hash is cached in the datom): a value only queued is not, so a commit that fails
+       before writing it leaves no key naming a value the store lacks."
+       [store cache pending-writes d]
+       (or (di/cache-get cache d)
+           (let [v (.-v d) vk (uuid v)]
+             (cond
+               (some #(= vk (first %)) @pending-writes) nil
+               (k/exists? store vk {:sync? true}) (di/cache-put! cache d vk)
+               :else (swap! pending-writes conj [vk v]))
+             vk)))
+
+     (defn- out-of-line
+       "node as it is stored: each key whose value is at least `limit` bytes holding a
+       ValueRef to the value's content key (value-key). node itself when none is that large."
+       [store cache pending-writes limit node]
+       (let [ks (.-_keys node) n (.-_len node)
+             out (loop [i 0 out nil]
+                   (if (< i n)
+                     (let [d (aget ks i)
+                           v (when (dd/datom? d) (.-v d))]
+                       (if (and (some? v) (>= (value-bytes v limit) limit))
+                         (let [vk (value-key store cache pending-writes d)
+                               out (or out (aclone ^objects ks))]
+                           (aset ^objects out i (dd/datom (.-e d) (.-a d) (ValueRef. vk) (dd/datom-tx d) (dd/datom-added d)))
+                           (recur (inc i) out))
+                         (recur (inc i) out)))
+                     out))]
+         (cond
+           (nil? out) node
+           (instance? Branch node) (psset/restore-node (.-_level node) (vec (take n out)) (.addresses node) (.-_subtreeCount node) (.-_settings node))
+           :else (psset/restore-node 0 (vec (take n out)) nil (.-_settings node)))))
+
+     (defn- in-line
+       "A stored node with each ValueRef in its keys swapped for the value it names (in
+       place: the node was just read and nothing else holds it), each value's key kept in
+       the node cache under its datom (value-key)."
+       [store cache config node]
+       (let [ks (.-_keys node)]
+         (dotimes [i (.-_len node)]
+           (let [d (aget ks i)]
+             (when (and (dd/datom? d) (instance? ValueRef (.-v d)))
+               (let [vk (.-key ^ValueRef (.-v d))
+                     v (k/get store vk ::missing {:sync? true})]
+                 (when (= ::missing v)
+                   (log/raise "Value not found in storage." {:type :value-not-found :key vk :store (get-in config [:store :id])}))
+                 (let [d' (dd/datom (.-e d) (.-a d) v (dd/datom-tx d) (dd/datom-added d))]
+                   (aset ^objects ks i d')
+                   (di/cache-put! cache d' vk))))))
+         node))))
+
 (defrecord CachedStorage [store config cache stats pending-writes freed-addresses freed-set freelist cost-center-fn]
   IStorage
   (store [_ node #?(:cljs opts)]
@@ -528,7 +624,10 @@
       ;; holds it in memory (its parent's children), and the cache is for nodes read
       ;; back from the store (restore below). Putting every written node cost a
       ;; cache insert per node per commit and displaced nodes that are read.
-      (swap! pending-writes conj [address node])
+      (swap! pending-writes conj [address #?(:jolt (if-let [limit (get-in config [:index-config :value-out-of-line-bytes])]
+                                                      (out-of-line store cache pending-writes limit node)
+                                                      node)
+                                              :default node)])
       address))
   (accessed [_ address]
     (@cost-center-fn :accessed)
@@ -547,8 +646,9 @@
                                                    :address address
                                                    :store (get-in config [:store :id])}))
         (swap! stats update :reads inc)
-        (di/cache-put! cache address node)
-        node)))
+        (let [node #?(:jolt (in-line store cache config node) :default node)]
+          (di/cache-put! cache address node)
+          node))))
   (markFreed [_ address]
     (when address
       (let [now #?(:clj (java.util.Date.) :cljs (js/Date.))]
