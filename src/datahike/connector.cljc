@@ -89,7 +89,9 @@
       (let [store  (:store @wrapped-atom)
             stored (dsi/read-head store (:branch (:config @wrapped-atom)) {:sync? true})]
         (log/trace :datahike/db-deref {:config (:config stored)})
-        (let [fresh-db (dsi/stored->db stored store)
+        ;; the connection's own config, as connect builds its db (-connect-impl*): the stored
+        ;; one names the store as it was made (its path), so a moved store's db named the old path
+        (let [fresh-db (dsi/stored->db (assoc stored :config (:config @wrapped-atom)) store)
               commit-id (get-in fresh-db [:meta :datahike/commit-id])]
           (assoc fresh-db :cache-context
                  ;; Another process's commit carries its stored revisions.
