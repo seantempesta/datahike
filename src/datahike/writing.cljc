@@ -4,6 +4,7 @@
             [datahike.db :as db]
             [datahike.gc-guard :as guard]
             [datahike.db.transaction :as dbtx]
+            [datahike.ids]
             [datahike.db.utils :as dbu]
             [datahike.db.interface :as dbi]
             [datahike.index :as di]
@@ -832,54 +833,53 @@
 
 #?(:clj
    (defonce ^{:private true
-              :doc "The store's eid allocator: store id -> the AtomicLong holding the
-  last entity id any branch of that store reserved in this process, so two
-  branches never mint one id. A mutable cell for the reason the writer's own
-  state is: one process holds a store's writers (`datahike.gc-guard`). Rederived
-  from the committed heads when first used, dropped by `delete-database`;
-  advanced when `datahike.db.transaction/next-eid` assigns an id."}
-     eid-allocators
+              :doc "The store's ids: store id -> its id source (datahike.ids), the one every
+  branch of that store in this process takes entity ids and transaction ids from, so two
+  branches never issue one id. A source several processes share is set with `set-ids!`;
+  otherwise this process's own is derived from the committed heads when first used. Dropped
+  by `delete-database`."}
+     id-sources
      (java.util.concurrent.ConcurrentHashMap.)))
 
-(defn- roster-max-eid
-  "The highest max-eid over the heads of every branch of `store`: O(branches)
-  small record reads, no index loaded."
-  [store]
-  (transduce (map #(:max-eid (read-head store %) 0))
+(defn- roster-max
+  "The highest `k` (:max-eid or :max-tx) over the heads of every branch of `store`:
+  O(branches) small record reads, no index loaded."
+  [store k]
+  (transduce (map #(k (read-head store %) 0))
              max 0 (roster store)))
 
-(defn eid-allocator
-  "The eid allocator of `db`'s store, seeded on first use in this process past
-  every branch head's max-eid and `db`'s own; nil without a store id or in cljs."
+(defn set-ids!
+  "Make `ids` (datahike.ids/IIds) the id source of the store with id `store-id` in this
+  process, moved past every branch head's ids: the source every process writing the store
+  shares (one mapped across fork, in a file beside the store). Answers ids."
+  [store store-id ids]
+  #?(:clj (do (datahike.ids/-reach! ids :eid (roster-max store :max-eid))
+              (datahike.ids/-reach! ids :tx (roster-max store :max-tx))
+              (.put ^java.util.concurrent.ConcurrentHashMap id-sources store-id ids)))
+  ids)
+
+(defn ids
+  "The id source of `db`'s store (set-ids!, or this process's own, made on first use past
+  every branch head's ids and `db`'s own); nil without a store id or in cljs."
   [db]
   #?(:clj (when-some [store-id (get-in db [:config :store :id])]
-            (.computeIfAbsent ^java.util.concurrent.ConcurrentHashMap eid-allocators store-id
-                              (#?(:jolt fn :clj reify) #?@(:jolt [] :clj [java.util.function.Function])
-                                #?(:jolt [_] :clj (apply [_ _]
-                                  (java.util.concurrent.atomic.AtomicLong.
-                                   (max (:max-eid db) (roster-max-eid (:store db))))))
-                                #?@(:jolt [(java.util.concurrent.atomic.AtomicLong.
-                                            (max (:max-eid db) (roster-max-eid (:store db))))] :clj []))))
+            (or (.get ^java.util.concurrent.ConcurrentHashMap id-sources store-id)
+                (do (.putIfAbsent ^java.util.concurrent.ConcurrentHashMap id-sources store-id
+                                  (datahike.ids/process-ids (max (:max-eid db) (roster-max (:store db) :max-eid))
+                                                            (max (:max-tx db) (roster-max (:store db) :max-tx))))
+                    (.get ^java.util.concurrent.ConcurrentHashMap id-sources store-id))))
      :cljs nil))
 
-(defn- with-store-eids
-  "Apply the transaction once, allocating each fresh eid from the store counter.
-  Reservations survive a refused transaction; speculation has no counter."
+(defn- with-store-ids
+  "Apply the transaction once, taking its tx id and each fresh eid from the store's ids, and
+  move them past any explicit id the transaction holds (a carried datom's). Ids taken by a
+  refused transaction stay taken; speculation takes none."
   [old transact]
-  (let [allocator (eid-allocator old)
-        report (transact allocator)
-        ;; a process holding a block of ids (dbtx/eid-ceiling) mints from its counter alone:
-        ;; ids its db reached by a merge are another block's, not a reason to skip ahead
-        allocator (when-not (dbtx/eid-ceiling (get-in old [:config :store :id])) allocator)]
-    #?(:jolt (when allocator ;; jolt: the AtomicLong shim has no accumulateAndGet
-               (let [reached (get-in report [:db-after :max-eid])]
-                 (loop [] (let [c (.get allocator)]
-                            (when-not (.compareAndSet allocator c (max c reached)) (recur))))))
-       :clj (when allocator
-              (.accumulateAndGet ^java.util.concurrent.atomic.AtomicLong allocator
-                                 (get-in report [:db-after :max-eid])
-                                 (reify java.util.function.LongBinaryOperator
-                                   (applyAsLong [_ current reached] (max current reached))))))
+  (let [ids (ids old)
+        report (transact ids)]
+    (when ids
+      (datahike.ids/-reach! ids :eid (get-in report [:db-after :max-eid]))
+      (datahike.ids/-reach! ids :tx (get-in report [:db-after :max-tx])))
     report))
 
 (defn -database-exists?* [config]
@@ -1012,7 +1012,7 @@
                   {:type :database-has-active-connections
                    :connections (vec active-conns)}))
      (sc/clear-write-cache (:store config))
-     #?(:clj (when (nil? overlay) (.remove ^java.util.concurrent.ConcurrentHashMap eid-allocators config-store-id)))
+     #?(:clj (when (nil? overlay) (.remove ^java.util.concurrent.ConcurrentHashMap id-sources config-store-id)))
      ;; Await the backend deletion. Konserve >= 0.9.357 makes every backend
      ;; honour the async delete-store contract, including tiered stores.
      (<?- (ks/delete-store (:store config))))))
@@ -1154,7 +1154,7 @@
               {:error :transaction/stale-basis
                :datahike/expected-basis-t expected-basis-t
                :datahike/current-basis-t (:max-tx old)})))
-  (complete-db-update old (with-store-eids old #(core/with old tx-data tx-meta %))))
+  (complete-db-update old (with-store-ids old #(core/with old tx-data tx-meta %))))
 
 (defn merge-writer!
   "Writer operation for merge: the ordinary `transact!` (so its
@@ -1169,4 +1169,4 @@
 
 (defn load-entities [old entities]
   (log/debug :datahike/load-entities {:entity-count (count entities)})
-  (complete-db-update old (with-store-eids old #(core/load-entities-with old entities nil %))))
+  (complete-db-update old (with-store-ids old #(core/load-entities-with old entities nil %))))

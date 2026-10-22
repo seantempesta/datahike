@@ -488,7 +488,7 @@
          (finally (d/release foo) (d/release conn) (d/delete-database cfg))))))
 
 #?(:clj
-   (deftest branches-of-one-store-allocate-distinct-entity-ids
+   (deftest branches-of-one-store-allocate-distinct-ids
      (let [cfg {:store {:backend :file
                         :path (str "target/eid-allocator-" (random-uuid))
                         :id (random-uuid)}
@@ -510,6 +510,13 @@
                (let [a (born left "left") b (born right "right")]
                  (is (not= a b))
                  (is (every? #(< % const/tx0) [a b]))))
+             (testing "two branches' transactions take different tx ids, each past its branch's"
+               (let [t0 (:max-tx @left)
+                     ta (:max-tx (:db-after (d/transact left [{:name "left tx"}])))
+                     tb (:max-tx (:db-after (d/transact right [{:name "right tx"}])))]
+                 (is (not= ta tb))
+                 (is (< t0 ta))
+                 (is (< (max ta tb) (:db/current-tx (:tempids (d/transact right [{:name "right again"}])))))))
              (testing "a speculation spends no id"
                (let [issued (:max-eid @right)
                      speculative (:max-eid (:db-after (d/with @left [{:name "speculation"}])))]
@@ -526,7 +533,7 @@
                                  (some (comp :error ex-data) (take-while some? (iterate ex-cause error))))))))))
              (testing "a reopened store allocates above every head's max-eid"
                (let [highest (max (:max-eid @left) (:max-eid @right) (:max-eid @base))]
-                 (.remove ^java.util.concurrent.ConcurrentHashMap @#'writing/eid-allocators
+                 (.remove ^java.util.concurrent.ConcurrentHashMap @#'writing/id-sources
                           (get-in cfg [:store :id]))
                  (is (< highest (born base "after-reopen")))))
              (finally (d/release left) (d/release right))))
