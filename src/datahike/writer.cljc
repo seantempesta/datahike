@@ -415,11 +415,20 @@
     (committed-report/offer-committed! commit-db report)
     report))
 
+(defn- sync-collect!
+  "A collection (gc-storage!) on a :sync writer: run at the serial caller, synchronously, on
+  the writer's current db; it commits nothing, so its answer is the sweep's own."
+  [connection write-fn-map {:keys [args]}]
+  (let [[remove-before opts] args]
+    ((write-fn-map 'gc-storage!) @(:wrapped-atom connection) (or remove-before (java.util.Date. 0)) (assoc opts :sync? true))))
+
 (defrecord SyncWriter [connection write-fn-map last-cid pending]
   PWriter
   (-dispatch! [_ arg-map]
     (let [p (promise-chan)]
-      (put! p (try (sync-apply! connection write-fn-map last-cid arg-map)
+      (put! p (try (if (= 'gc-storage! (:op arg-map))
+                     (sync-collect! connection write-fn-map arg-map)
+                     (sync-apply! connection write-fn-map last-cid arg-map))
                    (catch #?(:clj Throwable :cljs js/Error) e e)))
       p))
   (-shutdown [_] (go true))
