@@ -32,6 +32,21 @@
 (s/def :db.type/uuid uuid?)
 (s/def :db.type/tuple vector?)
 
+(defn plain-data?
+  "Is v plain data, all the way down: nil, a boolean, number, character, string, keyword,
+  symbol, uuid, instant or byte array, or a map, vector, set or list of plain data? A
+  :db.type/data value is one: stored as data by the store's serializer (jfasl), no text
+  between."
+  [v]
+  (cond
+    (or (nil? v) (boolean? v) (number? v) (char? v) (string? v) (keyword? v) (symbol? v) (uuid? v) (inst? v) (bytes? v)) true
+    (record? v) false
+    (map? v) (every? (fn [[k x]] (and (plain-data? k) (plain-data? x))) v)
+    (or (vector? v) (set? v) (list? v) (seq? v)) (every? plain-data? v)
+    :else false))
+
+(s/def :db.type/data plain-data?)
+
 ;; proto (G1): the value types' predicates, checked directly (the same predicates as the
 ;; specs above); s/valid? stays for any other type.
 (def type-preds
@@ -44,7 +59,7 @@
                :db.type/number number? :db.type/instant #(= (class %) java.util.Date)
                :db.type/keyword keyword? :db.type/long #(= (class %) java.lang.Long)
                :db.type/string string? :db.type/symbol symbol? :db.type/uuid uuid?
-               :db.type/tuple vector?}))
+               :db.type/tuple vector? :db.type/data plain-data?}))
 
 (s/def :db.type/value
   #{:db.type/bigdec
@@ -63,6 +78,7 @@
     :db.type/uuid
     :db.type/value
     :db.type/tuple
+    :db.type/data
     :db.type/cardinality
     :db.type.install/attribute
     :db.type/valueType

@@ -289,6 +289,32 @@
                (if (zero? c) (recur (inc i)) c))))
          (if (< n1 n2) -1 1)))))
 
+#?(:jolt
+   (defn- compare-data
+     "A total order on plain data (:db.type/data), consistent with =: sequences element
+      by element, the shorter first (Clojure's order of vectors); maps by size, then
+      their entries ordered by key; sets by size, then their elements in order; values
+      of different kinds by type name. Jolt's compare orders none of maps, sets or lists."
+     [v1 v2]
+     (letfn [(elementwise [xs ys]
+               (loop [xs (seq xs) ys (seq ys)]
+                 (cond (nil? xs) 0
+                       :else (let [c (compare-value (first xs) (first ys))]
+                               (if (zero? c) (recur (next xs) (next ys)) c)))))
+             (sorted [xs] (sort compare-value xs))]
+       (cond
+         (and (sequential? v1) (sequential? v2))
+         (let [n1 (count v1) n2 (count v2)] (if (== n1 n2) (elementwise v1 v2) (if (< n1 n2) -1 1)))
+         (and (map? v1) (map? v2))
+         (let [n1 (count v1) n2 (count v2)]
+           (if (== n1 n2)
+             (elementwise (sort-by key compare-value v1) (sort-by key compare-value v2))
+             (if (< n1 n2) -1 1)))
+         (and (set? v1) (set? v2))
+         (let [n1 (count v1) n2 (count v2)] (if (== n1 n2) (elementwise (sorted v1) (sorted v2)) (if (< n1 n2) -1 1)))
+         (and (map-entry? v1) (map-entry? v2)) (elementwise v1 v2)
+         :else nil))))
+
 (defn compare-value
   "Compare two values with cross-platform UUID compatibility.
    CLJS UUID comparison is adjusted to match CLJ's signed comparison,
@@ -298,7 +324,14 @@
    and the java.util.List storage reads them back as) order element-wise
    (`compare-lists`)."
   [v1 v2]
-  #?(:clj (cond
+  #?(:jolt (cond
+             (and (da/bytes? v1) (da/bytes? v2)) (da/compare-arrays v1 v2)
+             :else (or (compare-data v1 v2)
+                       ;; two values of different kinds: compare throws, and their type names order them
+                       (try (compare v1 v2)
+                            (catch Exception e
+                              (if (= (class-name v1) (class-name v2)) (throw e) (class-order v1 v2))))))
+     :clj (cond
             (and (da/bytes? v1) (da/bytes? v2))
             (da/compare-arrays v1 v2)
 
