@@ -12,6 +12,7 @@
    [datahike.db.utils :as dbu]
    [datahike.bitemporal.platform :as bp]
    [datahike.constants :refer [e0 emax tx0 txmax]]
+   [datahike.ids :as ids]
    [datahike.tools :refer [get-date date->epoch-ms]]
    [replikativ.logging :as log]
    [datahike.schema :as ds]
@@ -52,54 +53,21 @@
                      (ds/describe-type (get-in schema-spec [a-ident :db/valueType]))
                      {:error :transact/schema :value v-ident :attribute a-ident :schema (get-in db [:schema a-ident])}))))))
 
-(defn- current-tx [report]
-  (inc (get-in report [:db-before :max-tx])))
-
-#?(:clj
-   (defonce ^{:doc "This process's ceiling on the entity ids it mints from a store's counter:
-  store id -> the first id it may not mint. Set by a process that was handed a block of
-  ids (a forked writer of its own branch, given a lease), absent otherwise."}
-     eid-ceilings
-     (java.util.concurrent.ConcurrentHashMap.)))
-
-(defn set-eid-ceiling!
-  "Make `ceiling` the first entity id this process may not mint from the counter of the
-  store with id `store-id` (nil: no ceiling). A transaction that would mint it is refused
-  with :entity-id/lease-spent, before anything applies."
-  [store-id ceiling]
-  #?(:clj (if (some? ceiling)
-            (.put ^java.util.concurrent.ConcurrentHashMap eid-ceilings store-id ceiling)
-            (.remove ^java.util.concurrent.ConcurrentHashMap eid-ceilings store-id))
-     :cljs nil)
-  nil)
-
-(defn eid-ceiling
-  "This process's ceiling for the store with id `store-id` (set-eid-ceiling!), or nil."
-  [store-id]
-  #?(:clj (when (some? store-id) (.get ^java.util.concurrent.ConcurrentHashMap eid-ceilings store-id))
-     :cljs nil))
+(defn- current-tx
+  "The transaction's id: the one it took from the store's ids when it began (::tx,
+  datahike.ids), or the next after its branch's for a speculation."
+  [report]
+  (or (::tx report) (inc (get-in report [:db-before :max-tx]))))
 
 (defn next-eid
-  "Assign a fresh entity id once from the store counter, or locally for speculation.
-  A failed transaction may leave gaps; entity ids stay below `tx0`. A process with a
-  ceiling for the store (set-eid-ceiling!) holds a block of ids of its own: it mints from
-  its counter alone, never past the highest id its db holds (which, after a merge, may be
-  another block's), and never at or past its ceiling."
+  "A fresh entity id: from the store's ids (::ids, datahike.ids), issued once across every
+  branch, or the next after the db's own for a speculation. A failed transaction may leave
+  gaps; entity ids stay below `tx0`."
   [report db]
-  (let [ceiling #?(:clj (when (::eid-allocator report) (eid-ceiling (get-in db [:config :store :id]))) :cljs nil)
-        eid #?(:clj (if-some [allocator (::eid-allocator report)]
-                      (.updateAndGet ^java.util.concurrent.atomic.AtomicLong allocator
-                                     #?(:jolt (fn [issued] (inc (if ceiling issued (max issued (:max-eid db))))) ;; jolt: functional interfaces are fns
-                                        :clj (reify java.util.function.LongUnaryOperator
-                                               (applyAsLong [_ issued] (inc (if ceiling issued (max issued (:max-eid db))))))))
-                      (inc (:max-eid db)))
-               :cljs (inc (:max-eid db)))]
+  (let [eid (if-some [ids (::ids report)] (ids/-take! ids :eid) (inc (:max-eid db)))]
     (when (>= eid tx0)
       (log/raise "Entity ids are exhausted: the next would reach tx0."
                  {:error :entity-id/range :entity-id eid}))
-    (when (and ceiling (>= eid ceiling))
-      (log/raise "This process's entity ids are spent: the next would reach its ceiling."
-                 {:error :entity-id/lease-spent :entity-id eid :ceiling ceiling}))
     eid))
 
 (defn- #?@(:clj [^Boolean tx-id?]
@@ -1339,11 +1307,11 @@
             ;; discipline.
             (validate-cross-tx-vt-windows! report)
             (-> report
-                (dissoc ::pending-vt-validation ::report-validator ::eid-allocator)
+                (dissoc ::pending-vt-validation ::report-validator ::ids ::tx)
                 (assoc :tx-data (vec (::effective-tx-data report)))
                 (dissoc ::effective-tx-data)
                 (assoc-in [:tempids :db/current-tx] (current-tx report))
-                (update-in [:db-after :max-tx] inc)
+                (assoc-in [:db-after :max-tx] (current-tx report))
                 (update :db-after persistent!)
                 (update :db-after finalize-secondary-indices)
                 (attach-speculative-cache-context)
@@ -1416,10 +1384,10 @@
          migration-state (get-in initial-report [:db-before :migration] {})]
     (if (empty? es)
       (-> report
-          (dissoc ::eid-allocator)
+          (dissoc ::ids ::tx)
           (assoc :tx-data (vec (::effective-tx-data report)))
           (dissoc ::effective-tx-data)
-          (update-in [:db-after :max-tx] inc)
+          (assoc-in [:db-after :max-tx] (current-tx report))
           (update-in [:db-after :migration] #(if %
                                                (merge % migration-state)
                                                migration-state))

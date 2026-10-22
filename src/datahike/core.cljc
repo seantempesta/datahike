@@ -7,6 +7,7 @@
    [datahike.db.interface :as dbi]
    [datahike.db.transaction :as dbt]
    [datahike.db.utils :as dbu]
+   [datahike.ids]
    [datahike.impl.entity :as de]
    [datahike.pull-api :as dp]
    [datahike.query :as dq])
@@ -127,10 +128,9 @@
   "Same as [[transact!]], but applies to an immutable database value. Returns transaction report (see [[transact!]])."
   ([db tx-data] (with db tx-data nil))
   ([db tx-data tx-meta] (with db tx-data tx-meta nil))
-  ;; `eid-allocator`: the store counter, handed only
-  ;; by the writer (`datahike.writing/with-store-eids`), so a speculation
-  ;; reserves no entity ids.
-  ([db tx-data tx-meta eid-allocator]
+  ;; `ids`: the store's ids (datahike.ids), handed only by the writer
+  ;; (`datahike.writing/with-store-ids`), so a speculation takes no ids.
+  ([db tx-data tx-meta ids]
    {:pre [(dbu/db? db)]}
    (if (is-filtered db)
      (throw (ex-info "Filtered DB cannot be modified" {:error :transaction/filtered}))
@@ -141,19 +141,19 @@
                 :tx-data   []
                 :tempids   {}
                 :tx-meta   tx-meta})
-        eid-allocator (assoc ::dbt/eid-allocator eid-allocator))
+        ids (assoc ::dbt/ids ids ::dbt/tx (datahike.ids/-take! ids :tx)))
       tx-data))))
 
 (defn load-entities-with
   ([db entities tx-meta] (load-entities-with db entities tx-meta nil))
-  ([db entities tx-meta eid-allocator]
+  ([db entities tx-meta ids]
    (update (dbt/transact-entities-directly
             (cond-> (db/map->TxReport {:db-before db
                                        :db-after  db
                                        :tx-data   []
                                        :tempids   {}
                                        :tx-meta   tx-meta})
-              eid-allocator (assoc ::dbt/eid-allocator eid-allocator))
+              ids (assoc ::dbt/ids ids ::dbt/tx (datahike.ids/-take! ids :tx)))
             entities)
            :db-after assoc :cache-context nil)))
 
