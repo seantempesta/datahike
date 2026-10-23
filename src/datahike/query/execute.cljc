@@ -183,10 +183,13 @@
      :cljs (aget entry i)))
 
 (def ^:private ^:const probe-driven-threshold
-  "Use probe-driven AVET seeks when probe-set-size * threshold < scan-size.
-   Empirically determined: AVET seek overhead ~50μs, scan+filter ~20ns/datom,
-   so break-even at K ≈ N/2500. Using 2500 as threshold."
-  2500)
+  "Use probe-driven seeks when probe-set-size * threshold < scan-size.
+   Measured on Jolt (ticks, jolt.host/ticks-of; a 12k-datom seon.db store, a 900-datom
+   attribute probed by one entity): one probe's seek and merge ~5.6k ticks, scan+filter
+   ~316 ticks per datom, so break-even at K ≈ N/18 (one measurement: an estimate). Jolt's
+   value only: the JVM's break-even is N/2500 (a ~50 us seek against ~20 ns per datom), so a
+   JVM build of this fork must set 2500; nothing here selects by platform."
+  18)
 
 #?(:clj
    (defn- probe-driven-iterable
@@ -2554,7 +2557,7 @@
                                               nil 0 -1
                                               max-results
                                               :temporal temporal
-                                              :scan-estimate (:estimated-card g)
+                                              :scan-estimate (:estimated-card scan-op)
                                               :pipeline (:pipeline g)
                                               :cancel cancel)
                         ;; Apply consumer attached-preds (if any). The consumer
@@ -2713,7 +2716,7 @@
                                                          (int (:consumer-scan-field pinfo))
                                                          nil 0 -1 nil
                                                          :temporal temporal
-                                                         :scan-estimate (:estimated-card consumer-g)
+                                                         :scan-estimate (:estimated-card c-scan-op)
                                                          :pipeline (:pipeline consumer-g)
                                                          :cancel cancel)
                                    (when (seq c-attached)
