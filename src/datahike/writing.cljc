@@ -885,7 +885,9 @@
 (defn -database-exists?* [config]
   (let [p (dt/throwable-promise)]
     (go
-      (put! p (try
+      ;; jolt: throwable-promise is no channel there (put! on it throws in this fiber and the
+      ;; caller waits for ever); it is delivered by calling it, as the writer's are
+      (#?(:jolt (fn [p v] (p v)) :default put!) p (try
                 (let [config (dc/load-config config)
                       store-config (:store config)
                       ;; First check if store exists (avoids exception when store not in registry)
