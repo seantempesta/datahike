@@ -1,7 +1,7 @@
 (ns datahike.gc
   (:require [clojure.set :as set]
             [datahike.gc-guard :as guard]
-            [datahike.index.interface :refer [-mark -seed-root! with-storage]]
+            [datahike.index.interface :refer [-mark -seed-root! with-storage collection-key]]
             [datahike.index.secondary :as sec]
             [datahike.writing :refer [read-head commit-graph-key]]
             [datahike.roster :refer [roster roster-store-keys]]
@@ -190,7 +190,7 @@
                              :datahike.gc/reachable native-reachable})
                            #{})
                        #{})
-                     reachable (into (into native-reachable (roster-store-keys store)) extension)
+                     reachable (-> native-reachable (into (roster-store-keys store)) (into extension) (conj collection-key))
                      batch-size (or (:datahike.gc/batch-size opts) 1000)
                      sweep-opts (cond-> (or (:datahike.gc/sweep-opts opts) {})
                                   sync? (assoc :konserve.gc/sync-io? true))]
@@ -202,9 +202,13 @@
                  ;; deleted branch's secondary state goes with its commits.
                  (doseq [[index-type key-maps] (group-by :type retained-key-maps)]
                    (sec/sweep-from-key-maps! index-type key-maps cutoff))
-                 (if sync?
-                   (async/<!! (sweep! store reachable cutoff batch-size sweep-opts))
-                   (<?- (sweep! store reachable cutoff batch-size sweep-opts))))
+                 (let [swept (if sync?
+                               (async/<!! (sweep! store reachable cutoff batch-size sweep-opts))
+                               (<?- (sweep! store reachable cutoff batch-size sweep-opts)))]
+                   ;; the next generation, after the sweep: a value key a node cache found
+                   ;; before it, in any process, is asked of the store again (value-key)
+                   (<?- (k/update store collection-key (fnil inc 0) {:sync? sync?}))
+                   swept))
                (finally
                  (guard/release-reachability-permit! sweep-permit)))))))))
 
