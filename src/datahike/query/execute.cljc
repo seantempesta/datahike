@@ -186,8 +186,8 @@
   "Use probe-driven seeks when probe-set-size * threshold < scan-size.
    Measured on Jolt (ticks, jolt.host/ticks-of; a 12k-datom seon.db store, a 900-datom
    attribute probed by one entity): one probe's seek and merge ~5.6k ticks, scan+filter
-   ~316 ticks per datom, so break-even at K ≈ N/18. (The JVM's figure was N/2500: a ~50 us
-   seek against ~20 ns per datom.)"
+   ~316 ticks per datom, so break-even at K ≈ N/18. Jolt only: the JVM's break-even is N/2500
+   (a ~50 us seek against ~20 ns per datom), and a JVM build of this fork restores 2500."
   18)
 
 #?(:clj
