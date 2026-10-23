@@ -117,15 +117,16 @@
 
 (defn- content-tempids
   "Before anything is resolved, give each entity that carries a :db/contentId attribute its
-  content eid: an entity map with no :db/id gets it as its :db/id, and a tempid (a map's,
-  or an op's [:db/add tempid a v]) resolves to it, so a ref to that tempid made earlier in
-  the transaction takes it too. Answers [report es]."
+  id: the entity db already holds with that value (an upsert's, whatever id it was minted
+  at), else its content eid. An entity map with no :db/id gets it as its :db/id, and a
+  tempid (a map's, or an op's [:db/add tempid a v]) resolves to it, so a ref to that tempid
+  made earlier in the transaction takes it too. Answers [report es]."
   [report db es]
   (reduce (fn [[report es] e]
             (cond
               (map? e)
               (if-let [[a v] (content-attr db e)]
-                (let [id (:db/id e) ce (content-eid a v)]
+                (let [id (:db/id e) ce (or (dbu/entid db [a v]) (content-eid a v))]
                   (cond (nil? id) [report (conj es (assoc e :db/id ce))]
                         (and (tempid? id) (nil? (get-in report [:tempids id]))) [(allocate-eid report id ce) (conj es e)]
                         :else [report (conj es e)]))
@@ -133,7 +134,7 @@
               (and (sequential? e) (= :db/add (first e)) (tempid? (second e))
                    (keyword? (nth e 2 nil)) (dbu/content-id? db (nth e 2))
                    (nil? (get-in report [:tempids (second e)])))
-              [(allocate-eid report (second e) (content-eid (nth e 2) (nth e 3))) (conj es e)]
+              [(allocate-eid report (second e) (or (dbu/entid db [(nth e 2) (nth e 3)]) (content-eid (nth e 2) (nth e 3)))) (conj es e)]
               :else [report (conj es e)]))
           [report []] es))
 
