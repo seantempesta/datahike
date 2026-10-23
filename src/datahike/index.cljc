@@ -1,5 +1,5 @@
 (ns ^:no-doc datahike.index
-  (:refer-clojure :exclude [-persistent! -flush -count -seq])
+  (:refer-clojure :exclude [-persistent! -flush -count -seq -lookup])
   (:require [datahike.index.interface :as di]
             [datahike.index.persistent-set]))
 
@@ -15,6 +15,7 @@
 (def -remove di/-remove)
 (def -slice di/-slice)
 (def -rslice di/-rslice)
+(def -lookup di/-lookup)
 (def -flush di/-flush)
 (def -transient di/-transient)
 (def -persistent! di/-persistent!)
