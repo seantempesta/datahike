@@ -1,9 +1,15 @@
 (ns ^:no-doc datahike.constants)
 
+;; The id partition, every id a Chez fixnum (below 2^60):
+;; [1, tx0)         entity ids from the store's counter (datahike.ids)
+;; [tx0, txmax]     transaction ids from the store's counter
+;; [ce0, emax]      content entity ids: an entity with a :db/contentId attribute, at the hash
+;;                  of [attribute value] (datahike.db.transaction/content-eid)
 (def ^:const e0 0x00000000)
 (def ^:const tx0 0x20000000)
-(def ^:const emax 0x7FFFFFFF)
-(def ^:const txmax 0x7FFFFFFF)
+(def ^:const txmax 0xFFFFFFFFFF)
+(def ^:const ce0 0x10000000000)
+(def ^:const emax 0x0FFFFFFFFFFFFFFF)
 
 (def ^:const system-schema
   [{:db/id        tx0
@@ -189,7 +195,12 @@
     :db/ident :dh.ref/type
     :db/valueType :db.type/keyword
     :db/cardinality :db.cardinality/one
-    :db/doc "Cross-db reference: link predicate (application vocabulary)"}])
+    :db/doc "Cross-db reference: link predicate (application vocabulary)"}
+   {:db/id 52
+    :db/ident :db/contentId
+    :db/valueType :db.type/boolean
+    :db/cardinality :db.cardinality/one
+    :db/doc "An identity attribute whose value names its entity's id: every branch mints one entity at the hash of [attribute value]"}])
 
 (def ^:const system-entities
   "Holds the entity IDs of system attributes"

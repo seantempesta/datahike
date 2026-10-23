@@ -92,7 +92,7 @@
 ;; only for old datomic compliance, will be part of partioning in the future
 (s/def :db.type.install/_attribute #{:db.part/tx :db.part/db :db.part/user})
 
-(def schema-attributes #{:db/id :db/ident :db/isComponent :db/noHistory :db/valueType :db/cardinality :db/unique :db/index :db.install/_attribute :db/doc :db/tupleAttrs  :db/tupleType :db/tupleTypes :db.secondary/only})
+(def schema-attributes #{:db/id :db/ident :db/isComponent :db/noHistory :db/valueType :db/cardinality :db/unique :db/index :db.install/_attribute :db/doc :db/tupleAttrs  :db/tupleType :db/tupleTypes :db.secondary/only :db/contentId})
 (s/def ::schema-attribute schema-attributes)
 
 (def secondary-index-attributes #{:db.secondary/type :db.secondary/attrs :db.secondary/config :db.secondary/status :db.secondary/building-since-tx})
@@ -109,7 +109,7 @@
 (s/def ::meta-attribute meta-attributes)
 
 (s/def ::schema (s/keys :req [:db/ident :db/valueType :db/cardinality]
-                        :opt [:db/id :db/unique :db/index :db.install/_attribute :db/doc :db/noHistory :db/tupleType :db/tupleTypes :db.secondary/only]))
+                        :opt [:db/id :db/unique :db/index :db.install/_attribute :db/doc :db/noHistory :db/tupleType :db/tupleTypes :db.secondary/only :db/contentId]))
 
 (s/def ::entity-spec (s/keys :opt [:db.entity/attrs :db.entity/preds]))
 
@@ -168,6 +168,8 @@
                                                   :db/cardinality :db.cardinality/one}
                                    :db.secondary/only {:db/valueType :db.type/boolean
                                                        :db/cardinality :db.cardinality/one}
+                                   :db/contentId {:db/valueType :db.type/boolean
+                                                  :db/cardinality :db.cardinality/one}
                                    :db/txInstant {:db/valueType :db.type/instant
                                                   :db/unique :db.unique/identity
                                                   :db/index true
@@ -218,7 +220,7 @@
 
 (def schema-keys #{:db/ident :db/isComponent :db/noHistory :db/valueType :db/cardinality :db/unique :db/index :db.install/_attribute :db/doc :db/tupleType :db/tupleTypes :db/tupleAttrs
                    :db.secondary/type :db.secondary/attrs :db.secondary/config :db.secondary/status :db.secondary/building-since-tx
-                   :db.secondary/only})
+                   :db.secondary/only :db/contentId})
 
 (s/def ::old-schema-val (s/keys :req [:db/valueType :db/cardinality]
                                 :opt [:db/ident :db/unique :db/index :db.install/_attribute :db/doc :db/noHistory]))
