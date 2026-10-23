@@ -324,6 +324,14 @@
              m
              (assoc m attr-def [old-value new-value]))
 
+           ;; A content id may be given to an existing identity attribute: its entities keep
+           ;; the ids they have (an upsert still finds them) and new values mint at their
+           ;; content ids. Taking it away is unsupported.
+           :db/contentId
+           (if (and (nil? old-value) (true? new-value))
+             m
+             (assoc m attr-def [old-value new-value]))
+
            ;; Always allow these attributes to be updated.
            :db/doc m
            :db/noHistory m
