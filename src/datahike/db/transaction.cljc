@@ -11,7 +11,7 @@
    [datahike.db.search :as dbs]
    [datahike.db.utils :as dbu]
    [datahike.bitemporal.platform :as bp]
-   [datahike.constants :refer [e0 emax tx0 txmax]]
+   [datahike.constants :refer [e0 emax tx0 txmax ce0]]
    [datahike.ids :as ids]
    [datahike.tools :refer [get-date date->epoch-ms]]
    [replikativ.logging :as log]
@@ -59,6 +59,20 @@
   [report]
   (or (::tx report) (inc (get-in report [:db-before :max-tx]))))
 
+(defn content-eid
+  "The entity id of the entity whose :db/contentId attribute `a` holds `v`: the hash of
+  [a v] (hasch's uuid, the content hash this namespace already uses) taken into
+  [ce0, emax], so every branch, every process and every store mints it alike; a fixnum."
+  [a v]
+  (+ ce0 (mod (bit-and (.getLeastSignificantBits ^java.util.UUID (hasch/uuid [a v])) 0x0FFFFFFFFFFFFFFF)
+              (- (inc emax) ce0))))
+
+(defn- content-attr
+  "The :db/contentId attribute entity map m carries, as [a v], or nil."
+  [db m]
+  (some (fn [[a v]] (when (and (keyword? a) (not= :db/id a) (dbu/content-id? db a) (not (sequential? v))) [a v]))
+        (sort-by key m)))
+
 (defn next-eid
   "A fresh entity id: from the store's ids (::ids, datahike.ids), issued once across every
   branch, or the next after the db's own for a speculation. A failed transaction may leave
@@ -100,6 +114,28 @@
      (assoc-in [:tempids e] eid)
      true
      (update-in [:db-after] advance-max-eid eid))))
+
+(defn- content-tempids
+  "Before anything is resolved, give each entity that carries a :db/contentId attribute its
+  content eid: an entity map with no :db/id gets it as its :db/id, and a tempid (a map's,
+  or an op's [:db/add tempid a v]) resolves to it, so a ref to that tempid made earlier in
+  the transaction takes it too. Answers [report es]."
+  [report db es]
+  (reduce (fn [[report es] e]
+            (cond
+              (map? e)
+              (if-let [[a v] (content-attr db e)]
+                (let [id (:db/id e) ce (content-eid a v)]
+                  (cond (nil? id) [report (conj es (assoc e :db/id ce))]
+                        (and (tempid? id) (nil? (get-in report [:tempids id]))) [(allocate-eid report id ce) (conj es e)]
+                        :else [report (conj es e)]))
+                [report (conj es e)])
+              (and (sequential? e) (= :db/add (first e)) (tempid? (second e))
+                   (keyword? (nth e 2 nil)) (dbu/content-id? db (nth e 2))
+                   (nil? (get-in report [:tempids (second e)])))
+              [(allocate-eid report (second e) (content-eid (nth e 2) (nth e 3))) (conj es e)]
+              :else [report (conj es e)]))
+          [report []] es))
 
 (defn update-schema [db ^Datom datom]
   (let [schema (dbi/-schema db)
@@ -819,8 +855,16 @@
         report (cond-> report
                  (and (vt-meta-attr? a-ident)
                       (>= ^long e ^long tx0)
+                      (<= ^long e ^long txmax)
                       (not= e (current-tx report)))
                  (update ::pending-vt-validation (fnil conj #{}) e))]
+    ;; an identity names its entity for good: a :db/contentId value is never replaced on its
+    ;; entity (a rename is a new entity), and a hash collision is refused, never merged
+    (when (dbu/content-id? db a-ident)
+      (when-let [^Datom old (first (dbi/search db [e a]))]
+        (when (not= (.-v old) v)
+          (log/raise "Entity " e " holds " a-ident " " (pr-str (.-v old)) "; it cannot also hold " (pr-str v)
+                     {:error :entity-id/collision :entity-id e :attribute a-ident :held (.-v old) :asserted v}))))
     (transact-report report new-datom upsert?)))
 
 (defn- transact-retract-datom
@@ -957,11 +1001,11 @@
                          {:error :transact/schema :entity entity}))))))))
 
 (defn- entity-id
-  "`e`, an explicit entity id: one below `tx0` (an entity) or naming this or an
-  earlier transaction (its metadata). Any other is refused: a transaction id not
-  yet issued, or one above `emax`, which no index scan reaches."
+  "`e`, an explicit entity id: one below `tx0` (an entity), naming this or an earlier
+  transaction (its metadata), or a content eid in [ce0, emax]. Any other is refused: a
+  transaction id not yet issued, or one above `emax`, which no index scan reaches."
   [report e entity]
-  (when (> e (current-tx report))
+  (when (and (> e (current-tx report)) (not (<= ce0 e emax)))
     (log/raise "Entity id " e " names neither an entity nor an issued transaction."
                {:error :entity-id/range :entity-id e :entity entity}))
   e)
@@ -1265,6 +1309,7 @@
                       (get-in initial-report [:tx-meta :datahike/validate-report]))
         initial-report (cond-> (update initial-report :tx-meta dissoc :datahike/validate-report)
                          validator (assoc ::report-validator validator))
+        [initial-report initial-es] (content-tempids initial-report db-before initial-es)
         has-tuples? (seq (dbi/-attrs-by (:db-after initial-report) :db.type/tuple))
         initial-es' (if has-tuples?
                       (interleave initial-es (repeat ::flush-tuples))
