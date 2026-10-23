@@ -829,6 +829,7 @@
 
         {:keys [pushdowns consumed]}
         (analyze/detect-pushdown
+         db
          (into scan-classifieds filter-classifieds)
          bound-vars)
 

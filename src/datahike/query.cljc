@@ -506,18 +506,24 @@
   (reduce (fn [_a b]
             (if b (reduced b) b)) nil args))
 
+(defn- compared
+  "Clojure's comparison of a with b, as a sign: a number or nil is compared as clojure.core/<
+  compares it (a number of any class against a number; anything else, nil included, throws),
+  any other value as clojure.core/compare does (strings, keywords, dates of one kind; values of
+  different kinds throw ClassCastException). A throw is the query's error, raised by the
+  clause's call (datahike.query.analyze/call-threw)."
+  [a b]
+  (if (or (number? a) (number? b) (nil? a) (nil? b))
+    (cond (< a b) -1 (> a b) 1 :else 0)
+    (compare a b)))
+
 (defn- ordered?
-  "Whether every adjacent pair of xs satisfies (ok? (compare-value a b)): the built-in
-  comparisons' one order, datahike.datom/compare-value, the order the indexes keep, so a
-  comparison the planner turns into a range scan answers what the predicate answers. Values of
-  different kinds are ordered by their type, as Datomic's range predicates order them, rather
-  than throwing. Before, < > <= >= dispatched on the first value's type and threw on a value of
-  another, and the throw was read as false."
+  "Whether every adjacent pair of xs satisfies (ok? (compared a b))."
   [ok? xs]
   (loop [a (first xs) more (next xs)]
     (or (nil? more)
         (let [b (first more)]
-          (and (ok? (datom/compare-value a b))
+          (and (ok? (compared a b))
                (recur b (next more)))))))
 
 (defn- not-pos? [c] (not (pos? c)))
@@ -525,19 +531,19 @@
 (defn- not-neg? [c] (not (neg? c)))
 
 (defn- lesser?
-  ([a b] (neg? (datom/compare-value a b)))
+  ([a b] (neg? (compared a b)))
   ([a b & more] (ordered? neg? (list* a b more))))
 
 (defn- lesser-equal?
-  ([a b] (not-pos? (datom/compare-value a b)))
+  ([a b] (not-pos? (compared a b)))
   ([a b & more] (ordered? not-pos? (list* a b more))))
 
 (defn- greater?
-  ([a b] (pos? (datom/compare-value a b)))
+  ([a b] (pos? (compared a b)))
   ([a b & more] (ordered? pos? (list* a b more))))
 
 (defn- greater-equal?
-  ([a b] (not-neg? (datom/compare-value a b)))
+  ([a b] (not-neg? (compared a b)))
   ([a b & more] (ordered? not-neg? (list* a b more))))
 
 (defn -min
@@ -702,9 +708,9 @@
   "Bitemporal rules pre-installed on every Context. User-supplied
    rules (via `:in $ %`) override built-ins on name collision.
 
-   The `<` `<=` `>` `>=` predicates order Dates (any values) by
-   `datahike.datom/compare-value`, so the rules can use them directly —
-   no `.compareTo` boilerplate."
+   The `<` `<=` `>` `>=` predicates compare Dates (any values of one
+   kind) by `compare`, so the rules can use them directly — no
+   `.compareTo` boilerplate."
   (parse-rules
    '[;; valid-at ?tx ?at — half-open membership: vf <= at < vt
      [(valid-at ?tx ?at)
@@ -732,8 +738,8 @@
      ;; ----- Allen interval predicates (4-arg, generic) ---------------------
      ;; Each takes two half-open intervals `[?af, ?at)` and `[?bf, ?bt)`
      ;; and asserts the Allen relation. Generic over any orderable type
-     ;; the `<` / `<=` / `>` / `>=` predicates order (java.util.Date,
-     ;; java.lang.Long, etc., by datahike.datom/compare-value). Use for
+     ;; the `<` / `<=` / `>` / `>=` predicates compare (java.util.Date,
+     ;; java.lang.Long, etc., each against its own kind). Use for
      ;; application-domain interval comparisons (lease vs contract dates,
      ;; not just the bitemporal axis). Mirrors stratum's 4-arg SQL
      ;; functions (OVERLAPS, EQUALS_PERIOD, CONTAINS_PERIOD, …).
