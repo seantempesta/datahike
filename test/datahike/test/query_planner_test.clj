@@ -1371,3 +1371,33 @@
           :where [?f :fn/sym ?sym] [?f :fn/arglists "([y])"] [?g :fn/calls ?f] [?g :fn/arglists ?a]]
         [['a/f0]])
       (finally (d/release conn) (d/delete-database cfg)))))
+
+(deftest test-a-probed-group-answers-the-same-either-side-of-the-seek-threshold
+  ;; A group on ?f probed by the ?f an earlier group binds seeks each probe when
+  ;; probes x probe-driven-threshold < the attribute's datoms, else scans it and
+  ;; filters (execute-group-direct). Around the threshold (18 on Jolt: K ≈ N/18),
+  ;; with one probe (N 17..19) and two (N 35..37), both sides answer the same, and
+  ;; the same as the legacy engine.
+  (doseq [n [17 18 19 35 36 37]]
+    (let [cfg {:store {:backend :memory :id (random-uuid)} :schema-flexibility :write :keep-history? false}
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          _ (d/transact conn [{:db/ident :f/src :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+                              {:db/ident :f/order :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+                              {:db/ident :v/name :db/valueType :db.type/symbol :db/cardinality :db.cardinality/one
+                               :db/unique :db.unique/identity}
+                              {:db/ident :v/tag :db/valueType :db.type/keyword :db/cardinality :db.cardinality/one}
+                              {:db/ident :v/form :db/valueType :db.type/ref :db/cardinality :db.cardinality/one}])
+          _ (d/transact conn (vec (mapcat (fn [i] [{:db/id (str "f" i) :f/src (str "(defn f" i ")") :f/order i}
+                                                   (cond-> {:db/id (str "v" i) :v/name (symbol "app" (str "f" i)) :v/form (str "f" i)}
+                                                     (< i 2) (assoc :v/tag :probed))])
+                                          (range n))))
+          db @conn
+          one '[:find ?src ?o :in $ ?n :where [?v :v/name ?n] [?v :v/form ?f] [?f :f/src ?src] [?f :f/order ?o]]
+          two '[:find ?src ?o :where [?v :v/tag :probed] [?v :v/form ?f] [?f :f/src ?src] [?f :f/order ?o]]]
+      (testing (str n " datoms of :f/src")
+        (is (= #{["(defn f1)" 1]} (set (d/q one db 'app/f1))))
+        (is (= #{["(defn f0)" 0] ["(defn f1)" 1]} (set (d/q two db))))
+        (assert-engines-agree db one ['app/f1])
+        (assert-engines-agree db two))
+      (d/release conn))))
