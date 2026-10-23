@@ -113,7 +113,7 @@
      (tempid? e)
      (assoc-in [:tempids e] eid)
      true
-     (update-in [:db-after] advance-max-eid eid))))
+     (update :db-after advance-max-eid eid))))
 
 (defn- content-tempids
   "Before anything is resolved, give each entity that carries a :db/contentId attribute its
@@ -351,9 +351,9 @@
         (let [attribute-schema (schema v-ident)]
           (reject-schema-removal-with-current-data db v-ident v-ident)
           (-> (assoc-in db [:schema e] (dissoc attribute-schema a-ident))
-              (update-in [:schema] #(dissoc % v-ident))
-              (update-in [:ident-ref-map] #(dissoc % v-ident))
-              (update-in [:ref-ident-map] #(dissoc % e)))))
+              (update :schema #(dissoc % v-ident))
+              (update :ident-ref-map #(dissoc % v-ident))
+              (update :ref-ident-map #(dissoc % e)))))
       (if-let [schema-entry (schema e)]
         (if (schema schema-entry)
           (update-in db [:schema schema-entry] #(dissoc % a-ident))
@@ -437,22 +437,20 @@
   (str (hasch/uuid v)))
 
 (defn- additive-index-attribute
-  "Attribute ident when `datom` adds :db/index to an existing schema."
-  [db ^Datom datom]
-  (let [attribute-refs? (:attribute-refs? (dbi/-config db))
-        a-ident (if attribute-refs?
-                  (dbi/ident-for db (.-a datom) :error-on-missing)
-                  (.-a datom))
-        v-ident (if (and attribute-refs?
-                         (contains? (dbi/-system-entities db) (.-v datom)))
-                  (dbi/ident-for db (.-v datom) :error-on-missing)
-                  (.-v datom))
-        attr-ident (get-in db [:schema (.-e datom)])]
-    (when (and (= :db/index a-ident)
-               (true? v-ident)
-               (keyword? attr-ident)
-               (nil? (get-in db [:schema attr-ident :db/index])))
-      attr-ident)))
+  "Attribute ident when `datom`, of attribute `a-ident` (resolved by the caller), adds
+  :db/index to an existing schema. Every datom asks, so any other attribute answers
+  on its first test."
+  [db a-ident ^Datom datom]
+  (when (= :db/index a-ident)
+    (let [v-ident (if (and (:attribute-refs? (dbi/-config db))
+                           (contains? (dbi/-system-entities db) (.-v datom)))
+                    (dbi/ident-for db (.-v datom) :error-on-missing)
+                    (.-v datom))
+          attr-ident (get-in db [:schema (.-e datom)])]
+      (when (and (true? v-ident)
+                 (keyword? attr-ident)
+                 (nil? (get-in db [:schema attr-ident :db/index])))
+        attr-ident))))
 
 (defn- insert-index-datoms
   [db index-key insert-fn datoms]
@@ -490,7 +488,7 @@
 (defn- with-datom [db ^Datom datom current-datom]
   (validate-datom db datom)
   (let [{a-ident :ident} (dbu/attr-info db (.-a datom) :error-on-missing)
-        additive-index-attr (additive-index-attribute db datom)
+        additive-index-attr (additive-index-attribute db a-ident datom)
         indexing? (dbu/indexing? db a-ident)
         schema? (or (ds/schema-attr? a-ident) (ds/entity-spec-attr? a-ident)
                     (ds/secondary-index-attr? a-ident))
@@ -506,9 +504,9 @@
                  {:error :transact/secondary-only-uncovered :attribute a-ident :datom datom}))
     (if (datom-added datom)
       (cond-> db
-        true (update-in [:eavt] #(di/-insert % prim :eavt op-count))
-        true (update-in [:aevt] #(di/-insert % prim :aevt op-count))
-        indexing? (update-in [:avet] #(di/-insert % prim :avet op-count))
+        true (update :eavt #(di/-insert % prim :eavt op-count))
+        true (update :aevt #(di/-insert % prim :aevt op-count))
+        indexing? (update :avet #(di/-insert % prim :avet op-count))
         has-secondary? (update-secondary-indices a-ident datom true)
         true (advance-max-eid (.-e datom))
         true (update :hash + (hash prim))
@@ -519,19 +517,19 @@
 
       (if-some [removing ^Datom current-datom]
         (cond-> db
-          true (update-in [:eavt] #(di/-remove % removing :eavt op-count))
-          true (update-in [:aevt] #(di/-remove % removing :aevt op-count))
-          indexing? (update-in [:avet] #(di/-remove % removing :avet op-count))
+          true (update :eavt #(di/-remove % removing :eavt op-count))
+          true (update :aevt #(di/-remove % removing :aevt op-count))
+          indexing? (update :avet #(di/-remove % removing :avet op-count))
           has-secondary? (update-secondary-indices a-ident datom false)
           true (update :hash - (hash removing))
           schema? (-> (remove-schema datom) update-rschema)
-          keep-history? (update-in [:temporal-eavt] #(di/-temporal-insert % removing :eavt op-count))
-          keep-history? (update-in [:temporal-eavt] #(di/-temporal-insert % prim :eavt (inc op-count)))
-          keep-history? (update-in [:temporal-aevt] #(di/-temporal-insert % removing :aevt op-count))
-          keep-history? (update-in [:temporal-aevt] #(di/-temporal-insert % prim :aevt (inc op-count)))
+          keep-history? (update :temporal-eavt #(di/-temporal-insert % removing :eavt op-count))
+          keep-history? (update :temporal-eavt #(di/-temporal-insert % prim :eavt (inc op-count)))
+          keep-history? (update :temporal-aevt #(di/-temporal-insert % removing :aevt op-count))
+          keep-history? (update :temporal-aevt #(di/-temporal-insert % prim :aevt (inc op-count)))
           keep-history? (update :hash + (hash prim))
-          (and keep-history? indexing?) (update-in [:temporal-avet] #(di/-temporal-insert % removing :avet op-count))
-          (and keep-history? indexing?) (update-in [:temporal-avet] #(di/-temporal-insert % prim :avet (inc op-count)))
+          (and keep-history? indexing?) (update :temporal-avet #(di/-temporal-insert % removing :avet op-count))
+          (and keep-history? indexing?) (update :temporal-avet #(di/-temporal-insert % prim :avet (inc op-count)))
           true (update :op-count + (if (or keep-history? indexing?) 2 1)))
         db))))
 
@@ -546,18 +544,18 @@
         op-count (:op-count db)
         has-secondary? (seq (get-in db [:rschema :db.secondary/index a-ident]))]
     (cond-> db
-      current? (update-in [:eavt] #(di/-remove % current-datom :eavt op-count))
-      current? (update-in [:aevt] #(di/-remove % current-datom :aevt op-count))
-      (and current? indexing?) (update-in [:avet] #(di/-remove % current-datom :avet op-count))
+      current? (update :eavt #(di/-remove % current-datom :eavt op-count))
+      current? (update :aevt #(di/-remove % current-datom :aevt op-count))
+      (and current? indexing?) (update :avet #(di/-remove % current-datom :avet op-count))
       current? (update :hash - (hash current-datom))
       ;; Secondary indices represent current state only; emit a retraction
       ;; event so they drop the purged datom. Skip when the datom was only
       ;; in history (already retracted earlier — never reached the secondary).
       (and current? has-secondary?) (update-secondary-indices a-ident current-datom false)
       (and current? schema?) (-> (remove-schema datom) update-rschema)
-      history? (update-in [:temporal-eavt] #(di/-remove % history-datom :eavt op-count))
-      history? (update-in [:temporal-aevt] #(di/-remove % history-datom :aevt op-count))
-      (and history? indexing?) (update-in [:temporal-avet] #(di/-remove % history-datom :avet op-count))
+      history? (update :temporal-eavt #(di/-remove % history-datom :eavt op-count))
+      history? (update :temporal-aevt #(di/-remove % history-datom :aevt op-count))
+      (and history? indexing?) (update :temporal-avet #(di/-remove % history-datom :avet op-count))
       (or current? history?) (update :op-count inc))))
 
 (defn- queue-tuple [queue tuple idx db e v]
@@ -588,12 +586,14 @@
 
 (defn- with-datom-upsert [db ^Datom datom old-datom]
   (validate-datom-upsert db datom)
-  (let [additive-index-attr (additive-index-attribute db datom)
-        indexing?     (dbu/indexing? db (.-a datom))
+  (let [indexing?     (dbu/indexing? db (.-a datom))
         {a-ident :ident} (dbu/attr-info db (.-a datom) :error-on-missing)
+        additive-index-attr (additive-index-attribute db a-ident datom)
         schema?       (or (ds/schema-attr? a-ident)
                           (ds/secondary-index-attr? a-ident))
-        keep-history? (and (dbi/-keep-history? db) (not (dbu/no-history? db a-ident))
+        ;; history holds only a value that left the current index (temporal-upsert): a
+        ;; first value of [e a] leaves nothing, so its temporal indexes are not touched
+        keep-history? (and (some? old-datom) (dbi/-keep-history? db) (not (dbu/no-history? db a-ident))
                            (not= :db/txInstant a-ident))
         op-count      (:op-count db)
         has-secondary? (seq (get-in db [:rschema :db.secondary/index a-ident]))
@@ -612,14 +612,14 @@
         (catch ExceptionInfo _e
           db))
 
-      keep-history? (update-in [:temporal-eavt] #(di/-temporal-upsert % prim :eavt op-count old-datom))
-      true          (update-in [:eavt] #(di/-upsert % prim :eavt op-count old-datom))
+      keep-history? (update :temporal-eavt #(di/-temporal-upsert % prim :eavt op-count old-datom))
+      true          (update :eavt #(di/-upsert % prim :eavt op-count old-datom))
 
-      keep-history? (update-in [:temporal-aevt] #(di/-temporal-upsert % prim :aevt op-count old-datom))
-      true          (update-in [:aevt] #(di/-upsert % prim :aevt op-count old-datom))
+      keep-history? (update :temporal-aevt #(di/-temporal-upsert % prim :aevt op-count old-datom))
+      true          (update :aevt #(di/-upsert % prim :aevt op-count old-datom))
 
-      (and keep-history? indexing?) (update-in [:temporal-avet] #(di/-temporal-upsert % prim :avet op-count old-datom))
-      indexing?                     (update-in [:avet] #(di/-upsert % prim :avet op-count old-datom))
+      (and keep-history? indexing?) (update :temporal-avet #(di/-temporal-upsert % prim :avet op-count old-datom))
+      indexing?                     (update :avet #(di/-upsert % prim :avet op-count old-datom))
 
       ;; Secondary indices: retract old, assert new (full value)
       (and has-secondary? old-datom) (update-secondary-indices a-ident old-datom false)
@@ -632,6 +632,10 @@
                   update-rschema)
       additive-index-attr (backfill-avet additive-index-attr))))
 
+;; conj onto a report's ::effective-tx-data, made once: built per datom, the fnil was ~900 B of
+;; each add
+(def ^:private conj-effective (fnil conj []))
+
 (defn- transact-report
   ([report datom] (transact-report report datom false))
   ([report datom upsert?]
@@ -640,15 +644,12 @@
          update-fn (if upsert? with-datom-upsert with-datom)
          {a-ident :ident} (dbu/attr-info db a :error-on-missing)
          primary-datom (project-primary (dbu/secondary-only? db a-ident) datom)
+         ;; a card-one attribute's current datom: the first of its [e a] in :eavt, by
+         ;; one descent (a slice's seq cost as much as the insert it precedes)
          current-datom (if upsert?
-                         (first (di/-slice (:eavt db)
-                                           (dd/datom (.-e primary-datom)
-                                                     (.-a primary-datom) nil
-                                                     (.-tx primary-datom))
-                                           (dd/datom (.-e primary-datom)
-                                                     (.-a primary-datom) nil
-                                                     (.-tx primary-datom))
-                                           :eavt))
+                         (di/-lookup (:eavt db)
+                                     (dd/datom (.-e primary-datom) (.-a primary-datom) nil (.-tx primary-datom))
+                                     dd/cmp-datoms-ea)
                          (first (dbi/search db [(.-e primary-datom)
                                                 (.-a primary-datom)
                                                 (.-v primary-datom)])))
@@ -664,7 +665,7 @@
          ;; only effective datoms for the public TxReport and listeners.
          report' (cond-> (update-in report [:tx-data] conj datom)
                    changed? (assoc :db-after (update-fn db datom current-datom))
-                   changed? (update ::effective-tx-data (fnil conj []) datom))]
+                   changed? (update ::effective-tx-data conj-effective datom))]
      (if (and changed? (dbu/tuple-source? db a))
        (let [e      (:e datom)
              v      (if (datom-added datom) (:v datom) nil)
@@ -882,8 +883,8 @@
   ;; revision tracking and reactive interests) must not infer "unchanged"
   ;; merely because purge's index surgery does not use transact-report.
   (-> report
-      (update-in [:db-after] with-temporal-datom d)
-      (update ::effective-tx-data (fnil conj [])
+      (update :db-after with-temporal-datom d)
+      (update ::effective-tx-data conj-effective
               (datom (.-e d) (.-a d) (.-v d) (current-tx report) false))))
 
 (defn- retract-components [db datoms]
@@ -1412,7 +1413,8 @@
               (let [_ (when (and (number? e) (#{:db/add :db/retract} op))
                         (entity-id report e entity))
                     [new-report new-entities] (apply-db-op db report entity)]
-                (recur new-report (concat new-entities entities)))))
+                ;; most ops make no entities: the rest is walked as it is, not wrapped per op
+                (recur new-report (if (seq new-entities) (concat new-entities entities) entities)))))
 
           (datom? entity)
           (let [[e a v tx added] entity]
