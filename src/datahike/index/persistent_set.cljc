@@ -557,27 +557,38 @@
        every large value in them, so the key of a value known to be stored (read back by
        in-line, or found by the store here) is kept in the node cache under the datom (its
        hash is cached in the datom): a value only queued is not, so a commit that fails
-       before writing it leaves no key naming a value the store lacks."
-       [store cache pending-writes d]
-       (or (di/cache-get cache d)
+       before writing it leaves no key naming a value the store lacks. The entry is
+       [generation key], and one from an earlier collection generation than gen (a delay
+       of the store's, read before the store is asked) is a miss: that collection may have
+       swept the value."
+       [store cache pending-writes gen d]
+       (let [[g k] (di/cache-get cache d)]
+         (if (and k (= g @gen))
+           k
            (let [v (.-v d) vk (uuid v)]
              (cond
                (some #(= vk (first %)) @pending-writes) nil
-               (k/exists? store vk {:sync? true}) (di/cache-put! cache d vk)
+               (k/exists? store vk {:sync? true}) (di/cache-put! cache d [@gen vk])
                :else (swap! pending-writes conj [vk v]))
-             vk)))
+             vk))))
+
+     (defn- generation
+       "A delay of the store's collection generation (di/collection-key): read once per
+       node, when a value of it is first looked up."
+       [store]
+       (delay (k/get store di/collection-key 0 {:sync? true})))
 
      (defn- out-of-line
        "node as it is stored: each key whose value is at least `limit` bytes holding a
        ValueRef to the value's content key (value-key). node itself when none is that large."
        [store cache pending-writes limit node]
-       (let [ks (.-_keys node) n (.-_len node)
+       (let [ks (.-_keys node) n (.-_len node) gen (generation store)
              out (loop [i 0 out nil]
                    (if (< i n)
                      (let [d (aget ks i)
                            v (when (dd/datom? d) (.-v d))]
                        (if (and (some? v) (>= (value-bytes v limit) limit))
-                         (let [vk (value-key store cache pending-writes d)
+                         (let [vk (value-key store cache pending-writes gen d)
                                out (or out (aclone ^objects ks))]
                            (aset ^objects out i (dd/datom (.-e d) (.-a d) (ValueRef. vk) (dd/datom-tx d) (dd/datom-added d)))
                            (recur (inc i) out))
@@ -593,17 +604,18 @@
        place: the node was just read and nothing else holds it), each value's key kept in
        the node cache under its datom (value-key)."
        [store cache config node]
-       (let [ks (.-_keys node)]
+       (let [ks (.-_keys node) gen (generation store)]
          (dotimes [i (.-_len node)]
            (let [d (aget ks i)]
              (when (and (dd/datom? d) (instance? ValueRef (.-v d)))
                (let [vk (.-key ^ValueRef (.-v d))
+                     g @gen
                      v (k/get store vk ::missing {:sync? true})]
                  (when (= ::missing v)
                    (log/raise "Value not found in storage." {:type :value-not-found :key vk :store (get-in config [:store :id])}))
                  (let [d' (dd/datom (.-e d) (.-a d) v (dd/datom-tx d) (dd/datom-added d))]
                    (aset ^objects ks i d')
-                   (di/cache-put! cache d' vk))))))
+                   (di/cache-put! cache d' [g vk]))))))
          node))))
 
 (defrecord CachedStorage [store config cache stats pending-writes freed-addresses freed-set freelist cost-center-fn]

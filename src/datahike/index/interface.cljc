@@ -12,6 +12,13 @@
    connection behind them, which get a private cache."
   ::node-cache)
 
+(def collection-key
+  "The store key holding the store's collection generation, absent until its first
+   collection: datahike.gc/gc-storage! counts it up after its sweep, and a value's key
+   held in a node cache is trusted only in the generation it was found in, in any
+   process (persistent-set value-key): the sweep may have deleted the value since."
+  :datahike.gc/generation)
+
 (defn make-node-cache
   "A shared node cache; a byte budget takes precedence over the legacy node count."
   [configuration]
