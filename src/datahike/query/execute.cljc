@@ -183,10 +183,12 @@
      :cljs (aget entry i)))
 
 (def ^:private ^:const probe-driven-threshold
-  "Use probe-driven AVET seeks when probe-set-size * threshold < scan-size.
-   Empirically determined: AVET seek overhead ~50μs, scan+filter ~20ns/datom,
-   so break-even at K ≈ N/2500. Using 2500 as threshold."
-  2500)
+  "Use probe-driven seeks when probe-set-size * threshold < scan-size.
+   Measured on Jolt (ticks, jolt.host/ticks-of; a 12k-datom seon.db store, a 900-datom
+   attribute probed by one entity): one probe's seek and merge ~5.6k ticks, scan+filter
+   ~316 ticks per datom, so break-even at K ≈ N/18. (The JVM's figure was N/2500: a ~50 us
+   seek against ~20 ns per datom.)"
+  18)
 
 #?(:clj
    (defn- probe-driven-iterable
