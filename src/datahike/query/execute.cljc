@@ -2554,7 +2554,7 @@
                                               nil 0 -1
                                               max-results
                                               :temporal temporal
-                                              :scan-estimate (:estimated-card g)
+                                              :scan-estimate (:estimated-card scan-op)
                                               :pipeline (:pipeline g)
                                               :cancel cancel)
                         ;; Apply consumer attached-preds (if any). The consumer
@@ -2713,7 +2713,7 @@
                                                          (int (:consumer-scan-field pinfo))
                                                          nil 0 -1 nil
                                                          :temporal temporal
-                                                         :scan-estimate (:estimated-card consumer-g)
+                                                         :scan-estimate (:estimated-card c-scan-op)
                                                          :pipeline (:pipeline consumer-g)
                                                          :cancel cancel)
                                    (when (seq c-attached)
