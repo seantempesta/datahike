@@ -508,19 +508,37 @@
 
 (defn- ordered?
   "Whether every adjacent pair of xs satisfies (ok? (compare-value a b)): the built-in
-  comparisons' one order, datahike.datom/compare-value, which orders values of different kinds
-  by their type (as the indexes do) rather than throwing. Before, < > <= >= dispatched on the
-  first value's type and threw on a value of another, and the throw was read as false."
+  comparisons' one order, datahike.datom/compare-value, the order the indexes keep, so a
+  comparison the planner turns into a range scan answers what the predicate answers. Values of
+  different kinds are ordered by their type, as Datomic's range predicates order them, rather
+  than throwing. Before, < > <= >= dispatched on the first value's type and threw on a value of
+  another, and the throw was read as false."
   [ok? xs]
-  (every? (fn [[a b]] (ok? (datom/compare-value a b))) (partition 2 1 xs)))
+  (loop [a (first xs) more (next xs)]
+    (or (nil? more)
+        (let [b (first more)]
+          (and (ok? (datom/compare-value a b))
+               (recur b (next more)))))))
 
-(defn- lesser? [& args] (ordered? neg? args))
+(defn- not-pos? [c] (not (pos? c)))
 
-(defn- lesser-equal? [& args] (ordered? (complement pos?) args))
+(defn- not-neg? [c] (not (neg? c)))
 
-(defn- greater? [& args] (ordered? pos? args))
+(defn- lesser?
+  ([a b] (neg? (datom/compare-value a b)))
+  ([a b & more] (ordered? neg? (list* a b more))))
 
-(defn- greater-equal? [& args] (ordered? (complement neg?) args))
+(defn- lesser-equal?
+  ([a b] (not-pos? (datom/compare-value a b)))
+  ([a b & more] (ordered? not-pos? (list* a b more))))
+
+(defn- greater?
+  ([a b] (pos? (datom/compare-value a b)))
+  ([a b & more] (ordered? pos? (list* a b more))))
+
+(defn- greater-equal?
+  ([a b] (not-neg? (datom/compare-value a b)))
+  ([a b & more] (ordered? not-neg? (list* a b more))))
 
 (defn -min
   ([coll] (reduce (fn [acc x]
@@ -1150,13 +1168,15 @@
                   (let [^Method method (find-method (class this) method-name (mapv class args))]
                     (Reflector/prepRet (.getReturnType method) (.invoke method this (into-array Object args))))))))))
 
-(defn call-threw
-  "The error of a where clause's call that threw on values (the tuple it was given, or its
-  arguments): :query/call-threw, naming the clause, the values and the cause."
-  [clause values e]
-  (ex-info (str "The call in " (pr-str clause) " threw on " (pr-str values) ": " (ex-message e))
-           {:error :query/call-threw :clause clause :values values}
-           e))
+(defn- call-args
+  "The arguments a call's args took from tuple of rel, as -call-fn gives them: a bound var's
+  value, a constant's value, a source by its name."
+  [context rel args tuple]
+  (mapv (fn [a]
+          (if-some [i (get (:attrs rel) a)]
+            (get tuple i)
+            (get (:consts context) a a)))
+        args))
 
 (defn filter-by-pred [context clause]
   (let [[[f & args]] clause
@@ -1177,7 +1197,7 @@
                         checked-pred (fn [tuple]
                                        (try (tuple-pred tuple)
                                             (catch #?(:clj Exception :cljs :default) e
-                                              (throw (call-threw clause (vec tuple) e)))))]
+                                              (throw (analyze/call-threw clause (call-args context production args tuple) e)))))]
                     (update production :tuples
                             #(filter (fn [tuple]
                                        (resource/charge-work!)
@@ -4029,6 +4049,7 @@
                          col-agg-adapter (resolve-stratum-fn 'columnar-aggregate-from-maps)]
                      (col-agg-adapter result-maps group-keys stratum-aggs find-elements))))))))
        (catch Exception e
+         (when (analyze/call-threw? e) (throw e))
          (log/warn "secondary-idx-agg not applicable:" (.getMessage e) (pr-str (type e)))
          nil))))
 
@@ -4051,6 +4072,7 @@
                                  (col-agg-fn column-map group-keys agg-specs find-elements))
                                cancel))))))
        (catch Exception e
+         (when (analyze/call-threw? e) (throw e))
          (log/debug "columnar-aggregate not applicable:" (.getMessage e))
          nil))))
 
@@ -4405,6 +4427,7 @@
         fused-rel (when (empty? (:rels context-in))
                     (try (exec-direct-rel plan db (:cancel context-in))
                          (catch #?(:clj Exception :cljs :default) e
+                           (when (analyze/call-threw? e) (throw e))
                            (log/debug "fused-scan-rel not applicable:" #?(:clj (.getMessage ^Exception e) :cljs (str e)))
                            nil)))
         context-out (if fused-rel
