@@ -2249,10 +2249,7 @@
                                          args)]
                           (if (try (apply f argv)
                                    (catch #?(:clj Exception :cljs :default) e
-                                     (throw (ex-info (str "The call in " (pr-str (:clause (nth pred-ops pi))) " threw on "
-                                                          (pr-str argv) ": " (ex-message e))
-                                                     {:error :query/call-threw :clause (:clause (nth pred-ops pi)) :values argv}
-                                                     e))))
+                                     (throw (analyze/call-threw (:clause (nth pred-ops pi)) argv e))))
                             (recur (inc pi))
                             false))))]
           (if pass?

@@ -257,3 +257,20 @@
        :indexed? (dbu/indexing? db a)
        :unique? (dbu/is-attr? db a :db/unique)
        :ref? (dbu/ref? db a)})))
+
+(defn call-threw
+  "The error of a where clause's call that threw e on values (its arguments):
+  :query/call-threw, naming the clause, the values and the cause. An e that is already a typed
+  error (ex-data with :error, a nested query's or a cancel's) is that error, passed on as is."
+  [clause values e]
+  (if (:error (ex-data e))
+    e
+    (ex-info (str "The call in " (pr-str clause) " threw on " (pr-str values) ": " (ex-message e))
+             {:error :query/call-threw :clause clause :values values}
+             e)))
+
+(defn call-threw?
+  "Whether e is the error of a where clause's call that threw (call-threw): an error of the
+  query, never a sign that an execution path is not applicable."
+  [e]
+  (= :query/call-threw (:error (ex-data e))))
