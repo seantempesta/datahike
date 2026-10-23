@@ -1377,7 +1377,8 @@
   ;; probes x probe-driven-threshold < the attribute's datoms, else scans it and
   ;; filters (execute-group-direct). Around the threshold (18 on Jolt: K ≈ N/18),
   ;; with one probe (N 17..19) and two (N 35..37), both sides answer the same, and
-  ;; the same as the legacy engine.
+  ;; the same as the legacy engine. It guards the answers, not which path ran: the
+  ;; cost of the path is Seon's proof (seon.program-cost-test/a-probed-entity-is-sought-not-scanned).
   (doseq [n [17 18 19 35 36 37]]
     (let [cfg {:store {:backend :memory :id (random-uuid)} :schema-flexibility :write :keep-history? false}
           _ (d/create-database cfg)
@@ -1395,9 +1396,10 @@
           db @conn
           one '[:find ?src ?o :in $ ?n :where [?v :v/name ?n] [?v :v/form ?f] [?f :f/src ?src] [?f :f/order ?o]]
           two '[:find ?src ?o :where [?v :v/tag :probed] [?v :v/form ?f] [?f :f/src ?src] [?f :f/order ?o]]]
-      (testing (str n " datoms of :f/src")
-        (is (= #{["(defn f1)" 1]} (set (d/q one db 'app/f1))))
-        (is (= #{["(defn f0)" 0] ["(defn f1)" 1]} (set (d/q two db))))
-        (assert-engines-agree db one ['app/f1])
-        (assert-engines-agree db two))
-      (d/release conn))))
+      (try
+        (testing (str n " datoms of :f/src")
+          (is (= #{["(defn f1)" 1]} (set (d/q one db 'app/f1))))
+          (is (= #{["(defn f0)" 0] ["(defn f1)" 1]} (set (d/q two db))))
+          (assert-engines-agree db one ['app/f1])
+          (assert-engines-agree db two))
+        (finally (d/release conn))))))
