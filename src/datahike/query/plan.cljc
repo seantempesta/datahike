@@ -694,9 +694,10 @@
    `(filter free-var?)` returns #{}, so the planner thinks the op has
    no inputs and orders it before its producers — leaving the legacy
    bind-by-fn path to fail with nil ctx until the next iteration.
-   The legacy engine is fine with nested expressions because it walks
-   them at runtime via `interpret-form`; the planner just has to
-   recognise the same shape during ordering."
+   A nested call is refused when the query is parsed
+   (`datahike.query/refuse-nested-calls`: no engine evaluates one), so
+   what reaches here nested is a quoted literal, whose variables this
+   still orders by."
   [args]
   (into #{} (mapcat analyze/extract-vars) args))
 
