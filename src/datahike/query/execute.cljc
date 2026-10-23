@@ -2227,9 +2227,9 @@
 (defn- post-filter-preds
   "Filter result-list in-place by evaluating predicate ops.
    var-index maps var-sym → position in the wide tuple Object[].
-   Removes tuples that don't satisfy all predicates.
-   Exception handling matches the Relation engine (filter-by-pred):
-   only ClassCastException and IllegalArgumentException are caught."
+   Removes tuples that don't satisfy all predicates. A predicate that throws is
+   an error of the query (:query/call-threw, its clause and values), as in the
+   Relation engine (filter-by-pred)."
   [result-list pred-ops var-index]
   (let [resolved (resolve-pred-fns pred-ops)
         n (result-list-size result-list)]
@@ -2248,9 +2248,11 @@
                                              a))
                                          args)]
                           (if (try (apply f argv)
-                                   #?(:clj (catch ClassCastException _ false))
-                                   #?(:clj (catch IllegalArgumentException _ false)
-                                      :cljs (catch :default _ false)))
+                                   (catch #?(:clj Exception :cljs :default) e
+                                     (throw (ex-info (str "The call in " (pr-str (:clause (nth pred-ops pi))) " threw on "
+                                                          (pr-str argv) ": " (ex-message e))
+                                                     {:error :query/call-threw :clause (:clause (nth pred-ops pi)) :values argv}
+                                                     e))))
                             (recur (inc pi))
                             false))))]
           (if pass?

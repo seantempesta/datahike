@@ -506,74 +506,21 @@
   (reduce (fn [_a b]
             (if b (reduced b) b)) nil args))
 
-(defprotocol CollectionOrder
-  (-strictly-decreasing? [x more])
-  (-decreasing? [x more])
-  (-strictly-increasing? [x more])
-  (-increasing? [x more]))
+(defn- ordered?
+  "Whether every adjacent pair of xs satisfies (ok? (compare-value a b)): the built-in
+  comparisons' one order, datahike.datom/compare-value, which orders values of different kinds
+  by their type (as the indexes do) rather than throwing. Before, < > <= >= dispatched on the
+  first value's type and threw on a value of another, and the throw was read as false."
+  [ok? xs]
+  (every? (fn [[a b]] (ok? (datom/compare-value a b))) (partition 2 1 xs)))
 
-(extend-protocol CollectionOrder
+(defn- lesser? [& args] (ordered? neg? args))
 
-  #?(:clj Number :cljs number)
-  (-strictly-decreasing? [x more] (apply < x more))
-  (-decreasing? [x more] (apply <= x more))
-  (-strictly-increasing? [x more] (apply > x more))
-  (-increasing? [x more] (apply >= x more))
+(defn- lesser-equal? [& args] (ordered? (complement pos?) args))
 
-  #?(:clj Date :cljs js/Date)
-  (-strictly-decreasing? [x more] #?(:clj (reduce (fn [res [d1 d2]] (if (.before ^Date d1 ^Date d2)
-                                                                      res
-                                                                      (reduced false)))
-                                                  true (map vector (cons x more) more))
-                                     :cljs (apply < x more)))
-  (-decreasing? [x more] #?(:clj (reduce (fn [res [d1 d2]] (if (.after ^Date d1 ^Date d2)
-                                                             (reduced false)
-                                                             res))
-                                         true (map vector (cons x more) more))
-                            :cljs (apply <= x more)))
-  (-strictly-increasing? [x more] #?(:clj (reduce (fn [res [d1 d2]] (if (.after ^Date d1 ^Date d2)
-                                                                      res
-                                                                      (reduced false)))
-                                                  true (map vector (cons x more) more))
-                                     :cljs (apply > x more)))
-  (-increasing? [x more] #?(:clj (reduce (fn [res [d1 d2]] (if (.before ^Date d1 ^Date d2)
-                                                             (reduced false)
-                                                             res))
-                                         true (map vector (cons x more) more))
-                            :cljs (apply >= x more)))
+(defn- greater? [& args] (ordered? pos? args))
 
-  #?(:clj Object :cljs object) ;; default
-  (-strictly-decreasing? [x more] (reduce (fn [res [v1 s2]] (if (neg? (compare  v1 s2))
-                                                              res
-                                                              (reduced false)))
-                                          true (map vector (cons x more) more)))
-
-  (-decreasing? [x more] (reduce (fn [res [v1 v2]] (if (pos? (compare v1 v2))
-                                                     (reduced false)
-                                                     res))
-                                 true (map vector (cons x more) more)))
-
-  (-strictly-increasing? [x more] (reduce (fn [res [v1 v2]] (if (pos? (compare v1 v2))
-                                                              res
-                                                              (reduced false)))
-                                          true (map vector (cons x more) more)))
-
-  (-increasing? [x more] (reduce (fn [res [v1 v2]] (if (neg? (compare v1 v2))
-                                                     (reduced false)
-                                                     res))
-                                 true (map vector (cons x more) more))))
-
-(defn- lesser? [& args]
-  (-strictly-decreasing? (first args) (rest args)))
-
-(defn- lesser-equal? [& args]
-  (-decreasing? (first args) (rest args)))
-
-(defn- greater? [& args]
-  (-strictly-increasing? (first args) (rest args)))
-
-(defn- greater-equal? [& args]
-  (-increasing? (first args) (rest args)))
+(defn- greater-equal? [& args] (ordered? (complement neg?) args))
 
 (defn -min
   ([coll] (reduce (fn [acc x]
@@ -737,8 +684,8 @@
   "Bitemporal rules pre-installed on every Context. User-supplied
    rules (via `:in $ %`) override built-ins on name collision.
 
-   The `<` `<=` `>` `>=` predicates dispatch on Date via the
-   `CollectionOrder` protocol, so the rules can use them directly —
+   The `<` `<=` `>` `>=` predicates order Dates (any values) by
+   `datahike.datom/compare-value`, so the rules can use them directly —
    no `.compareTo` boilerplate."
   (parse-rules
    '[;; valid-at ?tx ?at — half-open membership: vf <= at < vt
@@ -767,8 +714,8 @@
      ;; ----- Allen interval predicates (4-arg, generic) ---------------------
      ;; Each takes two half-open intervals `[?af, ?at)` and `[?bf, ?bt)`
      ;; and asserts the Allen relation. Generic over any orderable type
-     ;; the `<` / `<=` / `>` / `>=` predicates dispatch on (java.util.Date
-     ;; via CollectionOrder, java.lang.Long, etc.). Use for
+     ;; the `<` / `<=` / `>` / `>=` predicates order (java.util.Date,
+     ;; java.lang.Long, etc., by datahike.datom/compare-value). Use for
      ;; application-domain interval comparisons (lease vs contract dates,
      ;; not just the bitemporal axis). Mirrors stratum's 4-arg SQL
      ;; functions (OVERLAPS, EQUALS_PERIOD, CONTAINS_PERIOD, …).
@@ -1203,6 +1150,14 @@
                   (let [^Method method (find-method (class this) method-name (mapv class args))]
                     (Reflector/prepRet (.getReturnType method) (.invoke method this (into-array Object args))))))))))
 
+(defn call-threw
+  "The error of a where clause's call that threw on values (the tuple it was given, or its
+  arguments): :query/call-threw, naming the clause, the values and the cause."
+  [clause values e]
+  (ex-info (str "The call in " (pr-str clause) " threw on " (pr-str values) ": " (ex-message e))
+           {:error :query/call-threw :clause clause :values values}
+           e))
+
 (defn filter-by-pred [context clause]
   (let [[[f & args]] clause
         pred (or (get built-ins f)
@@ -1216,15 +1171,17 @@
         [context production] (rel-prod-by-attrs context (filter free-var? args))
         new-rel (if pred
                   (let [tuple-pred (-call-fn context production pred args)
-                        safe-pred (fn [tuple]
-                                    (try (tuple-pred tuple)
-                                         #?(:clj (catch ClassCastException _ false)
-                                            :cljs (catch :default _ false))
-                                         #?(:clj (catch IllegalArgumentException _ false))))]
+                        ;; a predicate that throws is an error of the query, raised with its
+                        ;; clause and the values it was given; read as false, it answered no
+                        ;; rows (task Seon datahike.query/a-predicate-that-throws-is-an-error)
+                        checked-pred (fn [tuple]
+                                       (try (tuple-pred tuple)
+                                            (catch #?(:clj Exception :cljs :default) e
+                                              (throw (call-threw clause (vec tuple) e)))))]
                     (update production :tuples
                             #(filter (fn [tuple]
                                        (resource/charge-work!)
-                                       (safe-pred tuple))
+                                       (checked-pred tuple))
                                      %)))
                   (assoc production :tuples []))]
     (update context :rels conj new-rel)))
