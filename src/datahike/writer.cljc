@@ -422,6 +422,8 @@
   (let [[remove-before opts] args]
     ((write-fn-map 'gc-storage!) @(:wrapped-atom connection) (or remove-before (java.util.Date. 0)) (assoc opts :sync? true))))
 
+(declare commit-pending!)
+
 (defrecord SyncWriter [connection write-fn-map last-cid pending]
   PWriter
   (-dispatch! [_ arg-map]
@@ -431,7 +433,10 @@
                      (sync-apply! connection write-fn-map last-cid arg-map))
                    (catch #?(:clj Throwable :cljs js/Error) e e)))
       p))
-  (-shutdown [_] (go true))
+  ;; a release drains: what was applied run-ahead and not committed yet is committed before
+  ;; the writer answers its shutdown, so releasing a connection never drops an accepted write
+  (-shutdown [_] (go (try (commit-pending! connection) true
+                          (catch #?(:clj Throwable :cljs js/Error) e e))))
   (-streaming? [_] false))
 
 (defn transact-batch!
