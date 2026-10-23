@@ -672,20 +672,27 @@
      'count-distinct (fn [coll] (count (distinct coll)))}))
 
 (defn- refuse-nested-call
-  "Raises when clause, a raw where clause, is a predicate or function clause whose call
-  has a call among its arguments, [(f (g ?x))], looking inside not, or, and and their
-  -join forms. Datalog evaluates no nested expression (Datomic refuses the query); the
-  parser reads (g ?x) as a constant list, so the clause would test the unevaluated list,
-  and a predicate that throws on it is read as false: the query answered nothing. A
-  quoted form, '(...) or a nested q's '[...], is a constant and passes."
+  "Raises when clause, a raw where clause, is a predicate or function clause with a
+  list among its call's arguments, looking inside not, or, and and their -join forms.
+  Datalog evaluates no nested expression (Datomic refuses the query): the parser reads
+  [(f (g ?x))]'s (g ?x) as a constant list, the clause tests the unevaluated list, and
+  a predicate that throws on it is read as false, so the query answered nothing. A
+  quoted form inside a quoted query is the list (quote x) too, never x; only q's query,
+  [(q '[...] $) ...], is unquoted (normalize-q-input), so it alone passes."
   [clause]
   (cond
     (and (vector? clause) (seq? (first clause)))
-    (doseq [arg (rest (first clause))
-            :when (and (seq? arg) (not= 'quote (first arg)))]
-      (log/raise "Cannot call " (pr-str arg) " inside the clause " (pr-str clause)
-                 ": Datalog evaluates no nested call. Bind it first, [" (pr-str arg) " ?v], and use ?v."
-                 {:error :query/nested-call :clause clause :argument arg}))
+    (let [[f & args] (first clause)]
+      (doseq [[i arg] (map-indexed vector args)
+              :when (and (seq? arg)
+                         (not (and (zero? i) (= 'quote (first arg)) (symbol? f) (= "q" (name f)))))]
+        (log/raise (if (= 'quote (first arg))
+                     (str "Cannot pass " (pr-str arg) " in the clause " (pr-str clause)
+                          ": inside a quoted query it is the list " (pr-str arg) ", not " (pr-str (second arg))
+                          ". Write " (pr-str (second arg)) " without the quote.")
+                     (str "Cannot call " (pr-str arg) " inside the clause " (pr-str clause)
+                          ": Datalog evaluates no nested call. Bind it first, [" (pr-str arg) " ?v], and use ?v."))
+                   {:error :query/nested-call :clause clause :argument arg})))
     (seq? clause) (run! refuse-nested-call (rest clause))))
 
 (defn refuse-nested-calls
