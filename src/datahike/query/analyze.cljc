@@ -4,7 +4,8 @@
    pushable predicates."
   (:require
    [datahike.db.utils :as dbu]
-   [datahike.db.interface :as dbi]))
+   [datahike.db.interface :as dbi]
+   [datahike.schema :as ds]))
 
 #?(:clj (set! *warn-on-reflection* true))
 
@@ -181,14 +182,35 @@
   "Operators that can be pushed into index scan bounds."
   #{'> '< '>= '<= '= '== 'not=})
 
+(def ^:private numeric-types
+  "The value types whose values are numbers, each comparable with any number."
+  #{:db.type/long :db.type/double :db.type/float :db.type/bigint :db.type/bigdec
+    :db.type/number :db.type/ref})
+
+(defn- of-the-values-kind?
+  "Whether const is of the kind of every value of attribute a in db: the schema is enforced on
+  write and const is valid for a's :db/valueType, or both are numbers. Only then does an index
+  range answer what the comparison answers; otherwise a value of another kind would sort outside
+  the range and be dropped, where the comparison throws on it (task Seon
+  datahike.query/a-predicate-that-throws-is-an-error)."
+  [db a const]
+  (let [vt (get-in (:schema db) [a :db/valueType])]
+    (and (= :write (get-in db [:config :schema-flexibility]))
+         (some? vt)
+         (not= :db.type/any vt)
+         (or (and (number? const) (contains? numeric-types vt))
+             (ds/value-valid? a const (:schema db))))))
+
 (defn- pushable-pred?
   "Returns pushdown info if predicate clause can be pushed into a pattern's
    index scan. A predicate is pushable when:
    - It's a binary comparison: (op ?var const) or (op const ?var)
    - op is a range operator
    - ?var appears as the value variable of a pattern with an indexed attribute
+   - for an ordering op, const is of the kind of every value of the attribute
+     (of-the-values-kind?), so the range drops no value the comparison would throw on
    Returns nil if not pushable."
-  [pred-info pattern-infos _bound-vars]
+  [db pred-info pattern-infos _bound-vars]
   (let [args (:args pred-info)
         op (:fn-sym pred-info)]
     (when (and (contains? range-ops op)
@@ -212,7 +234,9 @@
           (some (fn [pi]
                   (when (and (= :pattern (:type pi))
                              (= var-sym (:v pi))
-                             (not (free-var? (:a pi)))) ;; attribute must be ground
+                             (not (free-var? (:a pi))) ;; attribute must be ground
+                             (or (contains? '#{= not=} op)
+                                 (of-the-values-kind? db (:a pi) const-val)))
                     {:pred-clause (:clause pred-info)
                      :pattern-clause (:clause pi)
                      :var var-sym
@@ -228,12 +252,12 @@
    pattern scans. Returns a map:
    {:pushdowns {pattern-clause → [{:op :const-val :var}...]}
     :consumed #{consumed-predicate-clauses}}"
-  [classified-clauses bound-vars]
+  [db classified-clauses bound-vars]
   (let [patterns (filterv #(= :pattern (:type %)) classified-clauses)
         predicates (filterv #(= :predicate (:type %)) classified-clauses)]
     (reduce
      (fn [acc pred-info]
-       (if-let [push (pushable-pred? pred-info patterns bound-vars)]
+       (if-let [push (pushable-pred? db pred-info patterns bound-vars)]
          (-> acc
              (update-in [:pushdowns (:pattern-clause push)]
                         (fnil conj [])
