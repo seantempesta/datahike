@@ -671,9 +671,40 @@
      'count          count
      'count-distinct (fn [coll] (count (distinct coll)))}))
 
+(defn- refuse-nested-call
+  "Raises when clause, a raw where clause, is a predicate or function clause whose call
+  has a call among its arguments, [(f (g ?x))], looking inside not, or, and and their
+  -join forms. Datalog evaluates no nested expression (Datomic refuses the query); the
+  parser reads (g ?x) as a constant list, so the clause would test the unevaluated list,
+  and a predicate that throws on it is read as false: the query answered nothing. A
+  quoted form, '(...) or a nested q's '[...], is a constant and passes."
+  [clause]
+  (cond
+    (and (vector? clause) (seq? (first clause)))
+    (doseq [arg (rest (first clause))
+            :when (and (seq? arg) (not= 'quote (first arg)))]
+      (log/raise "Cannot call " (pr-str arg) " inside the clause " (pr-str clause)
+                 ": Datalog evaluates no nested call. Bind it first, [" (pr-str arg) " ?v], and use ?v."
+                 {:error :query/nested-call :clause clause :argument arg}))
+    (seq? clause) (run! refuse-nested-call (rest clause))))
+
+(defn refuse-nested-calls
+  "Refuses a nested call (refuse-nested-call) among a query's raw where clauses.
+  Answers clauses."
+  [clauses]
+  (run! refuse-nested-call clauses)
+  clauses)
+
+(defn- refuse-nested-calls-in-rules
+  "Refuses a nested call in any rule's body: rules is a vector of
+  [(head ?vars) clause ...]. Answers rules."
+  [rules]
+  (doseq [rule rules] (refuse-nested-calls (rest rule)))
+  rules)
+
 (defn parse-rules [rules]
   (let [rules (if (string? rules) (edn/read-string rules) rules)] ;; for datahike.js interop
-    (group-by ffirst rules)))
+    (group-by ffirst (refuse-nested-calls-in-rules rules))))
 
 ;; ============================================================================
 ;; Built-in bitemporal rules
@@ -2938,7 +2969,7 @@
        (assoc environment :rules
               (into {}
                     (map (fn [rule] [(get-in rule [:name :symbol]) rule]))
-                    (dp/parse-rules value)))
+                    (dp/parse-rules (refuse-nested-calls-in-rules value))))
 
        :else environment))
    {:bindings {} :rules {}}
@@ -3158,6 +3189,7 @@
   (if-some [cached (get @query-cache q nil)]
     cached
     (let [parsed (parse q)
+          _ (refuse-nested-calls (mapv dpi/get-source (:qwhere parsed)))
           entry {:parsed parsed
                  :source-bindings (parsed-source-bindings parsed)
                  :input-count (count (:qin parsed))}]
