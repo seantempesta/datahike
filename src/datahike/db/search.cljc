@@ -7,6 +7,7 @@
    [datahike.datom :refer [datom datom-tx datom-added type-hint-datom]]
    [datahike.db.utils :as dbu]
    [datahike.index :as di]
+   [datahike.index.interface :as dii]
    [datahike.lru :refer [lru-datom-cache-factory]]
    [datahike.tools :refer [match-vector]]
    [environ.core :refer [env]]
@@ -18,7 +19,9 @@
 
 (defn memoize-for [db key f]
   (if (or (zero? (or (:cache-size (:config db)) 0))
-          (zero? (:hash db))) ;; empty db
+          (zero? (:hash db)) ;; empty db
+          ;; reads being recorded: a hit would skip the index, and its ranges (datahike.reads)
+          (some? dii/*reads*))
     (f)
     (let [db-cache (cw/lookup-or-miss db-caches
                                       (:hash db)

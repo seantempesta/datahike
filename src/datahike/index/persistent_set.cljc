@@ -204,26 +204,34 @@
 (extend-type #?(:clj PersistentSortedSet :cljs BTSet)
   IIndex
   (-slice [^PersistentSortedSet pset from to index-type]
+    (di/record-read! from to)
     (psset/slice pset from to (slice-comparator-constructor index-type from to)))
   (-rslice [^PersistentSortedSet pset from to index-type]
     ;; rslice iterates DESCENDING from `from` down to `to` (from = upper
     ;; bound). Lazy: only the seek path + consumed range restore nodes.
     ;; The generated comparator inspects nil components of both bounds
     ;; symmetrically, so the same constructor serves both directions.
+    (di/record-read! from to)
     (psset/rslice pset from to (slice-comparator-constructor index-type from to)))
   (-lookup [^PersistentSortedSet pset key cmp]
+    (di/record-read! key key)
     #?(:clj  (.lookup pset key cmp)
        :cljs (psset/lookup pset key cmp)))
   (-count-slice [^PersistentSortedSet pset from to cmp]
+    (di/record-read! from to)
     (psset/count-slice pset from to cmp))
   (-has-subtree-counts? [^PersistentSortedSet pset]
     #?(:clj  (psset/has-subtree-counts? pset)
        :cljs true))
+  ;; the whole index: an open range
   (-all [pset]
+    (di/record-read! nil nil)
     (identity pset))
   (-seq [^PersistentSortedSet pset]
+    (di/record-read! nil nil)
     (seq pset))
   (-count [^PersistentSortedSet pset]
+    (di/record-read! nil nil)
     (count pset))
   (-insert [^PersistentSortedSet pset datom index-type _op-count]
     (insert pset datom index-type))

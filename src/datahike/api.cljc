@@ -50,6 +50,7 @@
             [datahike.tools :as dt]
             [datahike.db :as db #?@(:cljs [:refer [HistoricalDB AsOfDB SinceDB FilteredDB]])]
             [datahike.db.interface :as dbi]
+            [datahike.reads]
             [datahike.db.transaction :as dbt]
             [datahike.impl.entity :as de])
   #?(:clj
