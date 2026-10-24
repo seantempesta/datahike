@@ -6,7 +6,7 @@
             #?(:clj [datahike.index.node-cache :as nodes])))
 
 (def ^:dynamic *reads*
-  "While datahike.reads/with-reads runs f, a volatile of the ranges f's reads scanned, each
+  "While datahike.reads/with-reads runs f, an atom of the ranges f's reads scanned, each
   [from to] (two datoms, nil components and the e0/emax sentinels open); else nil. Every
   read reaches an index through this protocol, so the ranges are exactly what was read."
   nil)
@@ -14,7 +14,8 @@
 (defn record-read!
   "Record the range [from to] when reads are being recorded (*reads*)."
   [from to]
-  (when-some [r *reads*] (vswap! r conj [from to])))
+  ;; an atom: a future or a/thread inside f sees the binding too, and reads at once
+  (when-some [r *reads*] (swap! r conj [from to])))
 
 (def node-cache-key
   "Key under which a connection hands its storage the node cache it shares with

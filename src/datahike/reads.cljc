@@ -16,7 +16,7 @@
    protocol) with no result cache, and the search memo is bypassed, so every read reaches an
    index. f's result should be realized: a lazy read after it returns is not recorded."
   [f]
-  (let [r (volatile! [])
+  (let [r (atom [])
         result (binding [di/*reads* r
                          q/*disable-planner* true
                          q/*query-result-cache?* false]
