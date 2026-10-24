@@ -127,6 +127,46 @@
      :doc "Returns [only-a only-b]: the current datoms of an index matching components (as datoms takes them) held by exactly one of two database values, each in index order. Stored subtrees both values share are skipped, so the work follows what differs between them, on any two branches or commits of one store. A datom is compared whole (e, a, v and tx)."
      :impl datahike.db/datoms-diff}
 
+    with-reads
+    {:args [:=> [:cat ifn?] [:tuple :any [:vector :any]]]
+     :ret [:tuple :any [:vector :any]]
+     :categories [:query :host]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? false
+     :doc "Calls f (no arguments) and returns [result reads]: the index ranges f's reads scanned, each [from to] (two datoms; nil components and the e0/emax entity sentinels open). q, pull, datoms and entity reads all reach an index through one protocol, which records them; while recording, queries run on the relational engine with no result cache. f's result should be realized: a lazy read after f returns is not recorded."
+     :impl datahike.reads/with-reads}
+
+    reads-index
+    {:args [:=> [:cat [:sequential :any]] [:set :any]]
+     :ret [:set :any]
+     :categories [:query :host]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? true
+     :doc "The keys a with-reads result's reads touch, each range's most specific bound prefix: [:e e], [:ea e a], [:a a], [:av a v], or :any. Built once a read; reads-touched? and datom-keys look them up."
+     :impl datahike.reads/reads-index}
+
+    reads-touched?
+    {:args [:=> [:cat [:set :any] [:sequential :any]] :boolean]
+     :ret :boolean
+     :categories [:query :host]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? true
+     :doc "Whether a datom of tx-data (added or retracted) falls in a read of idx (reads-index): one set lookup a key a datom, whatever was read. A schema datom touches every read."
+     :impl datahike.reads/reads-touched?}
+
+    datom-keys
+    {:args [:=> [:cat :any] [:vector :any]]
+     :ret [:vector :any]
+     :categories [:query :host]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? true
+     :doc "The keys a datom touches ([:e e] [:ea e a] [:a a] [:av a v] :any; [:all] for a schema datom): an index from reads-index keys to readers finds the readers a transaction touched in O(its datoms)."
+     :impl datahike.reads/datom-keys}
+
     merge-base
     {:args [:function
             [:=> [:cat :any [:or :uuid :keyword] [:or :uuid :keyword]] [:maybe :uuid]]

@@ -5,6 +5,17 @@
                :cljs [cljs.cache :as cache])
             #?(:clj [datahike.index.node-cache :as nodes])))
 
+(def ^:dynamic *reads*
+  "While datahike.reads/with-reads runs f, a volatile of the ranges f's reads scanned, each
+  [from to] (two datoms, nil components and the e0/emax sentinels open); else nil. Every
+  read reaches an index through this protocol, so the ranges are exactly what was read."
+  nil)
+
+(defn record-read!
+  "Record the range [from to] when reads are being recorded (*reads*)."
+  [from to]
+  (when-some [r *reads*] (vswap! r conj [from to])))
+
 (def node-cache-key
   "Key under which a connection hands its storage the node cache it shares with
    every other connection to the same physical store (upstream d2b9e525). Read
