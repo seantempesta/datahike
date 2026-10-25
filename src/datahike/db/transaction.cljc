@@ -778,8 +778,10 @@
              (and (coll? vs) (not (map? vs)))))
     [vs]
 
-    ;; probably lookup ref, but not an entity spec
+    ;; probably lookup ref, but not an entity spec; only a ref's value can be one (a
+    ;; keyword attribute's two values, the first a unique attribute, are two values)
     (and (= (count vs) 2)
+         (or (dbu/reverse-ref? a-ident) (dbu/ref? db a-ident))
          (keyword? (first vs))
          (dbu/is-attr? db (first vs) :db.unique/identity)
          (not (ds/entity-spec-attr? a-ident)))
