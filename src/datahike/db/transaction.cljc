@@ -663,8 +663,14 @@
          ;; including an idempotent reassertion. Keep that internal view in
          ;; :tx-data while the reducer is running, but separately accumulate
          ;; only effective datoms for the public TxReport and listeners.
+         ;; a card-one assertion that replaces a held value retracts it: the report says so
+         ;; with the retraction before the assertion, as DataScript's does, so a reader of
+         ;; :tx-data sees the change whole (the index already drops it: with-datom-upsert)
+         replaced (when (and changed? upsert? (datom-added datom) current-datom)
+                    (dd/datom (.-e ^Datom current-datom) (.-a ^Datom current-datom) (.-v ^Datom current-datom) (.-tx primary-datom) false))
          report' (cond-> (update-in report [:tx-data] conj datom)
                    changed? (assoc :db-after (update-fn db datom current-datom))
+                   replaced (update ::effective-tx-data conj-effective replaced)
                    changed? (update ::effective-tx-data conj-effective datom))]
      (if (and changed? (dbu/tuple-source? db a))
        (let [e      (:e datom)

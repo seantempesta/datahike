@@ -32,7 +32,9 @@
            (rest (:tx-data (first @reports)))))
     (is (= {:some-metadata 1}
            (dissoc (:tx-meta (first @reports)) :db/txInstant :db/commitId)))
+    ;; a card-one value replaced is retracted in the report, as DataScript's listen test has it
     (is (= [(dd/datom 5 :name "Fedor"  (+ const/tx0 3) true)
+            (dd/datom 1 :name "Alex"   (+ const/tx0 3) false)
             (dd/datom 1 :name "Alex2"  (+ const/tx0 3) true)
             (dd/datom 4 :name "Evgeny" (+ const/tx0 3) false)]
            (rest (:tx-data (second @reports)))))
