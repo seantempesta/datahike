@@ -12,6 +12,7 @@ When something is added, it's typically marked *Experimental*. When the API cont
 
 ### Notable fixes
 
+- **A card-one value replaced is retracted in the transaction report** — a `:db/add` over a held cardinality-one value replaced it in the index, but `:tx-data` held only the new datom, so a reader of a report (a listener, a cache keyed by what a transaction touched, an incremental view) never saw the old value go: a ref that moved an entity to another parent left it at the old one. The report now carries the retraction before the assertion, as DataScript's does. Readers of `:tx-data` see one more datom per replacement. ([#TODO])
 - **Branch contention no longer re-executes transaction functions to allocate ids** — fresh entity ids are reserved at assignment from the process-owned store counter. Failed transactions may leave id gaps; speculative `with` reserves no store ids. Existing tempid conflict resolution is unchanged. ([#TODO])
 
 ### Features
