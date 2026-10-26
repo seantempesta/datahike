@@ -1,6 +1,5 @@
 (ns ^:no-doc datahike.pull-api
   (:require
-   [datahike.datom :as dd]
    [datahike.db.utils :as dbu]
    [datahike.db.interface :as dbi]
    [datahike.resource :as resource]
@@ -415,19 +414,12 @@
 (defn- reverse-datoms
   "Entity `eid`'s datoms of attribute `a`, last in index order first: `[eid a]` on
    :eavt forward, `[a eid]` on :avet reverse, read lazily by rseek-datoms and ended
-   at the prefix, so a :limit reads the datoms it keeps whatever the attribute holds.
-   A db read through a time predicate (as-of, since) realizes and regroups what it
-   reads by [e a] (post-process-datoms), losing index order, and over rseek's open
-   range that is the index down to its start: there the prefix's datoms are read
-   bounded and put in descending index order."
+   at the prefix, so a :limit reads the datoms it keeps whatever the attribute holds."
   [db forward? eid a]
   (let [[index cs keep?] (if forward?
                            [:eavt [eid a] (fn [^Datom d] (and (= eid (.-e d)) (= a (.-a d))))]
                            [:avet [a eid] (fn [^Datom d] (and (= a (.-a d)) (= eid (.-v d))))])]
-    (if (dbi/context-time-pred (dbi/-search-context db))
-      (let [cmp (dd/index-type->cmp-quick index false)]
-        (sort (fn [x y] (cmp y x)) (dbi/datoms db index cs)))
-      (take-while keep? (dbi/rseek-datoms db index cs)))))
+    (take-while keep? (dbi/rseek-datoms db index cs))))
 
 (defn pull-attr
   "Retrieve datoms for given entity id and specification from database"
