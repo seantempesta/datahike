@@ -15,7 +15,7 @@
    [datahike.index.secondary :as sec]
    [datahike.schema :as ds]
    [datahike.store :as store]
-   [datahike.tools :as tools :refer [group-by-step #?(:clj meta-data)]]
+   [datahike.tools :as tools :refer [#?(:clj meta-data)]]
    [org.replikativ.persistent-sorted-set.arrays :as arrays]
    [medley.core :as m]
    [replikativ.logging :as log])
@@ -152,45 +152,69 @@
   [time-point]
   (complement (as-of-pred time-point)))
 
-(defn assemble-datoms-xform [db]
-  (mapcat
-   (fn [[[_ a] datoms]]
-     (if (dbu/multival? db a)
-       (->> datoms
-            (sort-by datom-tx)
-            (reduce (fn [current-datoms ^Datom datom]
-                      (if (datom-added datom)
-                        (assoc current-datoms (.-v datom) datom)
-                        (dissoc current-datoms (.-v datom))))
-                    {})
-            vals)
-       (let [last-ea-tx (apply max (map datom-tx datoms))
-             current-ea-datom (first (filter #(and (datom-added %) (= last-ea-tx (datom-tx %)))
-                                             datoms))]
-         (if current-ea-datom
-           [current-ea-datom]
-           []))))))
+(defn- tx-kept?
+  "Does pred, a time predicate on a transaction's :db/txInstant datom, keep datom d's
+  transaction? Each transaction asked once, as its datoms arrive."
+  [pred db]
+  (let [txInstant (if (:attribute-refs? (dbi/-config db))
+                    (dbi/-ref-for db :db/txInstant)
+                    :db/txInstant)
+        seen (volatile! {})]
+    (fn [^Datom d]
+      (let [tx (datom-tx d)
+            k (get @seen tx ::unknown)]
+        (if (= ::unknown k)
+          (let [k (boolean (some (fn [^Datom t] (and (= txInstant (.-a t)) (pred t)))
+                                 (dbi/-datoms db :eavt [tx] dbu/temporal-context)))]
+            (vswap! seen assoc tx k)
+            k)
+          k)))))
 
-(defn temporal-datom-filter [datoms pred db]
-  (let [filtered-tx-ids (dbu/filter-txInstant datoms pred db)]
-    (filter (fn [^Datom d]
-              (contains? filtered-tx-ids
-                         (datom-tx d))))))
+(defn temporal-datom-filter
+  "The datoms whose transaction time-predicate pred keeps (tx-kept?), lazily."
+  [pred db]
+  (filter (tx-kept? pred db)))
 
-(defn post-process-datoms [datoms db context]
+(defn current-datoms-xform
+  "Of each run of datoms holding one [e a v] (adjacent in every index, which orders tx after
+  them), the one with the greatest tx, an assertion over a retraction of the same tx, kept
+  when it is an assertion: the value held at the time point. A replaced card-one value's
+  retraction is recorded, so this is the [e a] group's current value too. Keeps the input's
+  order, ascending or descending, and reads one datom past each run."
+  []
+  (fn [rf]
+    (let [held (volatile! nil)
+          later? (fn [^Datom d ^Datom h]
+                   (let [t (datom-tx d) u (datom-tx h)]
+                     (or (> t u) (and (= t u) (datom-added d)))))]
+      (fn
+        ([] (rf))
+        ([acc] (let [h @held]
+                 (vreset! held nil)
+                 (rf (if (and h (datom-added h)) (unreduced (rf acc h)) acc))))
+        ([acc ^Datom d]
+         (let [h @held]
+           (cond
+             (nil? h) (do (vreset! held d) acc)
+             (zero? (dd/cmp-datoms-eavt-prefix h d)) (do (when (later? d h) (vreset! held d)) acc)
+             :else (do (vreset! held d)
+                       (if (datom-added h) (rf acc h) acc)))))))))
+
+(defn post-process-datoms
+  "Datoms read through context: its time predicate (as-of, since) keeps the datoms of the
+  transactions it admits and, unless the read is historical, of each [e a v] the value held
+  at the time point (current-datoms-xform), in index order and lazily, so a seek reads what
+  it is taken for; then context's own xform."
+  [datoms db context]
   (let [xform (dbi/context-xform context)
         time-pred (dbi/context-time-pred context)]
     (cond
 
       time-pred
-      (let [time-xform (temporal-datom-filter datoms time-pred db)]
+      (let [time-xform (temporal-datom-filter time-pred db)]
         (if (dbi/context-historical? context)
           (into [] (dbi/nil-comp time-xform xform) datoms)
-          (->> datoms
-               (transduce time-xform
-                          (group-by-step (fn [^Datom datom]
-                                           [(.-e datom) (.-a datom)])))
-               (into [] (dbi/nil-comp (assemble-datoms-xform db) xform)))))
+          (sequence (dbi/nil-comp (comp time-xform (current-datoms-xform)) xform) datoms)))
 
       xform (into [] xform datoms)
 
