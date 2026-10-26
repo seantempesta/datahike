@@ -2454,8 +2454,9 @@
   (let [resolved (for [find find-elements]
                    (when (instance? Pull find)
                      [(-context-resolve (:source find) context)
-                      (dpp/parse-pull
-                       (-context-resolve (:pattern find) context))]))]
+                      ;; compiled as d/pull compiles it (its attribute options, :reverse included)
+                      (dpa/pull-plan-spec
+                       (dpa/compile-pull-plan (-context-resolve (:pattern find) context)))]))]
     (for [tuple resultset]
       (mapv (fn [env el]
               (if env
@@ -2926,7 +2927,7 @@
                attributes
                (if (sequential? pattern)
                  (dpa/pull-spec-attribute-dependencies
-                  (dpp/parse-pull pattern))
+                  (dpa/pull-plan-spec (dpa/compile-pull-plan pattern)))
                  :all)]
            (merge-source-attr-deps dependencies
                                    (source-attr-deps source attributes)))
