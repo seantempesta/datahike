@@ -387,13 +387,24 @@
       (if (nil? o2) nil
           (safe-compare o1 o2))))
 
+(defn cmp-attr-nil
+  "cmp-nil for two attributes: nil when either is nil (a slice bound left open), else their
+  order. A database's attributes are one type, all keywords or (with :attribute-refs?) all
+  entity ids, so their comparison cannot throw and needs no try: safe-compare's handler, entered
+  on every comparison, was most of a slice comparison's cost (417 B a call on Jolt, against 1 B
+  without it)."
+  [a1 a2]
+  (if (nil? a1) nil
+      (if (nil? a2) nil
+          (cmp-attr-quick a1 a2))))
+
 (defn type-hint-datom [x]
   (vary-meta x assoc :tag `Datom))
 
 (defn cmp-val [val]
   (case val
     :e (fn [^Datom d1 ^Datom d2] (long-cmp (.-e d1) (.-e d2)))
-    :a (fn [^Datom d1 ^Datom d2] (cmp-nil (.-a d1) (.-a d2)))
+    :a (fn [^Datom d1 ^Datom d2] (cmp-attr-nil (.-a d1) (.-a d2)))
     :v (fn [^Datom d1 ^Datom d2] (cmp-nil (.-v d1) (.-v d2)))
     :tx (fn [^Datom d1 ^Datom d2] (long-cmp (datom-tx d1) (datom-tx d2)))
     :added (fn [^Datom d1 ^Datom d2] (long-cmp (datom-added d1) (datom-added d2)))))
@@ -401,7 +412,7 @@
 (defn cmp-val-expr [val d1 d2]
   (case val
     :e `(long-cmp (.-e ~d1) (.-e ~d2))
-    :a `(cmp-nil (.-a ~d1) (.-a ~d2))
+    :a `(cmp-attr-nil (.-a ~d1) (.-a ~d2))
     :v `(cmp-nil (.-v ~d1) (.-v ~d2))
     :tx `(long-cmp (datom-tx ~d1) (datom-tx ~d2))
     :added `(boolean-cmp (datom-added ~d1) (datom-added ~d2))))
