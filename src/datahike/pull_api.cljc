@@ -1,5 +1,6 @@
 (ns ^:no-doc datahike.pull-api
   (:require
+   [datahike.datom :as dd]
    [datahike.db.utils :as dbu]
    [datahike.db.interface :as dbi]
    [datahike.resource :as resource]
@@ -48,14 +49,60 @@
       (first attribute))
     attribute))
 
+(defn- reverse-option
+  "Attribute expression `spec` without its `:reverse` option, which the pull parser
+   does not know (its options are :as, :limit and :default): `[spec' reverse]`, reverse
+   true or false as given, nil when spec has none. A spec with no option left is its
+   attribute name."
+  [spec]
+  (if (and (sequential? spec)
+           (not (contains? pull-recursion-operators (first spec)))
+           (even? (count (rest spec)))
+           (some #{:reverse} (take-nth 2 (rest spec))))
+    (let [[attr & opts] spec
+          pairs (partition 2 opts)
+          r (some (fn [[k v]] (when (= :reverse k) [v])) pairs)
+          kept (mapcat identity (remove (comp #{:reverse} first) pairs))]
+      (when-not (boolean? (first r))
+        (throw (ex-info (str "Expected :reverse true or false, got " (pr-str (first r)))
+                        {:error :parser/pull :fragment spec})))
+      [(if (seq kept) (into [attr] kept) attr) (first r)])
+    [spec nil]))
+
+(defn- lift-reverse
+  "Pattern without its attributes' `:reverse` options: `[pattern' display-keys lifted?]`,
+   the attributes that asked for it (true), by the key the parsed spec holds them
+   under, and whether any attribute gave the option at all."
+  [pattern]
+  (reduce (fn [[p ks lifted?] clause]
+            (cond
+              (map? clause)
+              (let [[m ks lifted?] (reduce (fn [[m ks lifted?] [k v]]
+                                             (let [[k' r] (reverse-option k)]
+                                               [(assoc m k' v) (cond-> ks r (conj (pull-map-display-key k'))) (or lifted? (some? r))]))
+                                           [(empty clause) ks lifted?] clause)]
+                [(conj p m) ks lifted?])
+
+              (sequential? clause)
+              (let [[c r] (reverse-option clause)]
+                [(conj p c) (cond-> ks r (conj (pull-map-display-key c))) (or lifted? (some? r))])
+
+              :else [(conj p clause) ks lifted?]))
+          [[] #{} false] pattern))
+
 (defn- compile-pull-spec
-  "Compiles shared selector subpatterns once and retains their identity."
+  "Compiles shared selector subpatterns once and retains their identity. An
+   attribute's `:reverse true` is lifted off before parsing and set on its spec:
+   its datoms are read last in index order first (`reverse-datoms`)."
   [selector]
   (let [compiled (atom {})]
     (letfn [(compile-pattern [pattern]
               (if-let [entry (find @compiled pattern)]
                 (val entry)
-                (let [spec (dpp/parse-pull (shallow-pull-pattern pattern))
+                (let [[lifted reversed lifted?] (lift-reverse pattern)
+                      ;; a pattern with no :reverse is parsed as it was given
+                      spec (dpp/parse-pull (shallow-pull-pattern (if lifted? lifted pattern)))
+                      spec (reduce (fn [spec k] (assoc-in spec [:attrs k :reverse] true)) spec reversed)
                       spec
                       (reduce
                        (fn [result [attribute nested]]
@@ -365,6 +412,23 @@
           (conj frames (update parent :kvps assoc! attr-key (:default opts))))
         (conj frames parent)))))
 
+(defn- reverse-datoms
+  "Entity `eid`'s datoms of attribute `a`, last in index order first: `[eid a]` on
+   :eavt forward, `[a eid]` on :avet reverse, read lazily by rseek-datoms and ended
+   at the prefix, so a :limit reads the datoms it keeps whatever the attribute holds.
+   A db read through a time predicate (as-of, since) realizes and regroups what it
+   reads by [e a] (post-process-datoms), losing index order, and over rseek's open
+   range that is the index down to its start: there the prefix's datoms are read
+   bounded and put in descending index order."
+  [db forward? eid a]
+  (let [[index cs keep?] (if forward?
+                           [:eavt [eid a] (fn [^Datom d] (and (= eid (.-e d)) (= a (.-a d))))]
+                           [:avet [a eid] (fn [^Datom d] (and (= a (.-a d)) (= eid (.-v d))))])]
+    (if (dbi/context-time-pred (dbi/-search-context db))
+      (let [cmp (dd/index-type->cmp-quick index false)]
+        (sort (fn [x y] (cmp y x)) (dbi/datoms db index cs)))
+      (take-while keep? (dbi/rseek-datoms db index cs)))))
+
 (defn pull-attr
   "Retrieve datoms for given entity id and specification from database"
   [db spec eid frames]
@@ -382,11 +446,11 @@
                        (not (number? attr)))
                 (dbi/-ref-for db attr)
                 attr)
-            results  (if (nil? a)
-                       []
-                       (if forward?
-                         (dbi/datoms db :eavt [eid a])
-                         (dbi/datoms db :avet [a eid])))]
+            results  (cond
+                       (nil? a) []
+                       (:reverse opts) (reverse-datoms db forward? eid a)
+                       forward? (dbi/datoms db :eavt [eid a])
+                       :else (dbi/datoms db :avet [a eid]))]
         (pull-attr-datoms db attr-key attr eid forward?
                           results opts frames)))))
 
@@ -423,7 +487,8 @@
           opts          (-> frame
                             (get-in [:pattern :attrs])
                             (get attr {}))]
-      (pull-attr-datoms db attr attr (:eid frame) true datoms opts
+      ;; a wildcard grouped the entity's datoms already: :reverse reads them back to front
+      (pull-attr-datoms db attr attr (:eid frame) true (cond-> datoms (:reverse opts) rseq) opts
                         (conj frames (update frame :datoms rest))))
     (if-let [rattrs (->> (get-in frame [:pattern :attrs])
                          (into {} filter-reverse-attrs)
