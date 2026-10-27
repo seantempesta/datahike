@@ -63,15 +63,16 @@
        (count keys-to-check))))
 
 (defn compact-head
-  "The branch-head value that only names commit `cid`. Its shape keeps
-  `[:meta :datahike/commit-id]`, so readers that need only the head's commit
-  id read it unchanged; readers that need the record go through
-  `resolve-head`."
+  "The branch-head value that only names commit `cid`, and with its `record`
+  carries the record's `:max-eid` and `:max-tx` (`set-ids!` reads a head's ids
+  without its record). Its shape keeps `[:meta :datahike/commit-id]`, so readers
+  that need only the head's commit id read it unchanged; readers that need the
+  record go through `resolve-head`."
   ([cid] {:meta {:datahike/commit-id cid}})
   ([cid record]
    ;; :datahike/secondary? says the record has secondary-index keys, so a branch made
    ;; from this head must read the record to branch them (versioning/branch!)
-   (cond-> {:meta {:datahike/commit-id cid}}
+   (cond-> {:meta {:datahike/commit-id cid} :max-eid (:max-eid record) :max-tx (:max-tx record)}
      (seq (:secondary-index-keys record)) (assoc :datahike/secondary? true))))
 
 (defn compact-head?
@@ -842,20 +843,27 @@
      (java.util.concurrent.ConcurrentHashMap.)))
 
 (defn- roster-max
-  "The highest `k` (:max-eid or :max-tx) over the heads of every branch of `store`:
-  O(branches) small record reads, no index loaded."
-  [store k]
-  (transduce (map #(k (read-head store %) 0))
-             max 0 (roster store)))
+  "The highest :max-eid and :max-tx over the heads of every branch of `store`, as
+  {:max-eid :max-tx}: one read of each head, which a compact head answers alone (it
+  carries its commit's ids); a head that does not (a full one, or a compact one written
+  before it carried them) is its record. O(branches) small reads, no index loaded."
+  [store]
+  (transduce (map (fn [b] (let [stored (k/get store b nil {:sync? true})]
+                            (if (and (compact-head? stored) (contains? stored :max-eid))
+                              stored
+                              (resolve-head store b stored)))))
+             (completing (fn [acc head] (merge-with max acc (select-keys head [:max-eid :max-tx]))))
+             {:max-eid 0 :max-tx 0} (roster store)))
 
 (defn set-ids!
   "Make `ids` (datahike.ids/IIds) the id source of the store with id `store-id` in this
   process, moved past every branch head's ids: the source every process writing the store
   shares (one mapped across fork, in a file beside the store). Answers ids."
   [store store-id ids]
-  #?(:clj (do (datahike.ids/-reach! ids :eid (roster-max store :max-eid))
-              (datahike.ids/-reach! ids :tx (roster-max store :max-tx))
-              (.put ^java.util.concurrent.ConcurrentHashMap id-sources store-id ids)))
+  #?(:clj (let [{:keys [max-eid max-tx]} (roster-max store)]
+            (datahike.ids/-reach! ids :eid max-eid)
+            (datahike.ids/-reach! ids :tx max-tx)
+            (.put ^java.util.concurrent.ConcurrentHashMap id-sources store-id ids)))
   ids)
 
 (defn ids
@@ -865,8 +873,9 @@
   #?(:clj (when-some [store-id (get-in db [:config :store :id])]
             (or (.get ^java.util.concurrent.ConcurrentHashMap id-sources store-id)
                 (do (.putIfAbsent ^java.util.concurrent.ConcurrentHashMap id-sources store-id
-                                  (datahike.ids/process-ids (max (:max-eid db) (roster-max (:store db) :max-eid))
-                                                            (max (:max-tx db) (roster-max (:store db) :max-tx))))
+                                  (let [heads (roster-max (:store db))]
+                                    (datahike.ids/process-ids (max (:max-eid db) (:max-eid heads))
+                                                              (max (:max-tx db) (:max-tx heads)))))
                     (.get ^java.util.concurrent.ConcurrentHashMap id-sources store-id))))
      :cljs nil))
 
