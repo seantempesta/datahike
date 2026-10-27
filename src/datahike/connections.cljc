@@ -106,6 +106,26 @@
       :else {:state :releasing
              :completion (:release-completion before-entry)})))
 
+(defn after-fork!
+  "Make the registry of a process forked from another (fork(2)) its own. The parent's
+  connections must not be used across the fork (their stores' handles are the parent's),
+  so they are forgotten, not released: releasing would close what the parent still holds.
+  Each node cache they held stays, alone, under an inherited key with no connection and a
+  zero count: a node is a decoded value at a content address, valid in any process, so the
+  fork's first connect to that store adopts the cache (`reserve-connection-opening!` shares
+  one by node store and threshold) and reads what the parent decoded instead of fetching
+  and decoding it again. Call it first thing in the child, before any connect."
+  []
+  (swap! *connections*
+         (fn [connections]
+           (into {} (for [[_ {:keys [node-store-key threshold node-cache]}] connections
+                          :when node-cache]
+                      [[::inherited node-store-key threshold]
+                       {:count 0
+                        :node-store-key node-store-key
+                        :threshold threshold
+                        :node-cache node-cache}])))))
+
 (defn complete-connection-opening!
   "Publish a reserved connection before waking opening waiters."
   [conn-id completion conn]
