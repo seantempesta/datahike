@@ -6,7 +6,10 @@
             [clojure.test.check.properties :as prop]
             [datahike.api :as d]
             [datahike.datom :as dd]
-            [datahike.versioning :as v]))
+            [datahike.versioning :as v]
+            ;; Jolt's :file backend (konserve.jolt.filestore): without it :file is konserve's JVM
+            ;; store, whose Fressian a Jolt process cannot read, and every restored history threw
+            [konserve.jolt.store]))
 
 (defn- config []
   {:store {:backend :memory :id (random-uuid)} :keep-history? true :schema-flexibility :write
