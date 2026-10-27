@@ -1403,3 +1403,23 @@
           (assert-engines-agree db one ['app/f1])
           (assert-engines-agree db two))
         (finally (d/release conn))))))
+
+;; A recursive branch's two-var predicate rides on its scan as an attached pred
+;; (`[(< ?e ?y)]` is no pushdown: it has no constant). The fixpoint's delta-driven
+;; and magic-set shortcuts take a "bare" scan only, and read only :pushdown-preds,
+;; so the scan looked bare and the predicate was never applied: the closure
+;; walked past the edge it forbids (10 -> 3 is not 10 < 3, yet 10 reached 4 and 5).
+
+(deftest a-recursive-branch-applies-its-attached-predicate
+  (let [db (d/db-with (db/empty-db {:u/ref {:db/valueType :db.type/ref :db/cardinality :db.cardinality/many}})
+                      [{:db/id 10 :u/ref [3]} {:db/id 3 :u/ref [4]} {:db/id 4 :u/ref [5]}])
+        path '[[(path ?e ?x) [?e :u/ref ?x]]
+               [(path ?e ?x) [?e :u/ref ?y] [(< ?e ?y)] (path ?y ?x)]]
+        run (fn [qf & args] (binding [q/*query-result-cache?* false] (set (apply d/q qf db path args))))]
+    (is (= #{[10 3]} (run '[:find ?e ?x :in $ % [?e ...] :where (path ?e ?x)] [10])))
+    (is (= #{[3]} (run '[:find ?x :in $ % ?a :where (path ?a ?x)] 10)))
+    (is (= #{[3]} (run '[:find ?x :in $ % :where (path 10 ?x)])))
+    (is (= #{[3 4] [3 5] [4 5] [10 3]} (run '[:find ?a ?x :in $ % :where (path ?a ?x)])))
+    (doseq [qf ['[:find ?e ?x :in $ % [?e ...] :where (path ?e ?x)] '[:find ?a ?x :in $ % :where (path ?a ?x)]]]
+      (is (= (binding [q/*disable-planner* true] (apply run qf (when (= '?e (second qf)) [[10]])))
+             (apply run qf (when (= '?e (second qf)) [[10]])))))))

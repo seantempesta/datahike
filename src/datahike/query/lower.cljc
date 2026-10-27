@@ -308,7 +308,9 @@
 
 (defn- simple-binary-pattern
   "If `op` is a bare pattern scan over `[?e :attr ?v]` — free entity and
-   value vars, ground attribute, no pushdown predicates, not optional —
+   value vars, ground attribute, no predicate pushed into it or attached to it
+   (a two-var comparison like `[(< ?e ?y)]` is attached, :attached-preds), not
+   optional —
    return {:e ?e :attr attr :v ?v}. Otherwise nil.
 
    Used to derive the structural topology info that gates the fixpoint
@@ -319,6 +321,7 @@
   [op]
   (when (and (= :pattern-scan (:op op))
              (empty? (:pushdown-preds op))
+             (empty? (:attached-preds op))
              (not (:optional? op)))
     (let [clause (:clause op)]
       (when (and (sequential? clause) (= 3 (count clause)))
