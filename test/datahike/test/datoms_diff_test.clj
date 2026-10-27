@@ -5,6 +5,7 @@
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
             [datahike.api :as d]
+            [datahike.datom :as dd]
             [datahike.versioning :as v]))
 
 (defn- config []
@@ -175,3 +176,20 @@
 (deftest datoms-diff-equals-the-plain-set-difference-over-generated-histories
   (let [{:keys [pass? fail seed]} (tc/quick-check 40 (prop/for-all [h history-gen] (replay h)) :seed 20261015 :max-size 30)]
     (is pass? (str "seed " seed " counterexample " (pr-str fail)))))
+
+(deftest a-diff-records-the-range-it-read
+  ;; A read built on a diff answers from both values over the diffed range, so with-reads
+  ;; records that range, as it does a slice's: a datom added in it touches the read, a datom
+  ;; of another attribute does not.
+  (let [cfg (config) _ (d/create-database cfg) conn (d/connect cfg)]
+    (d/transact conn (vec (for [i (range 200)] {:k/n (long i) :k/tags [(str "t" i)]})))
+    (let [a @conn
+          b (:db-after (d/transact conn [{:k/n 1000 :k/tags ["new"]}]))
+          [diff reads] (d/with-reads #(d/datoms-diff a b :aevt [:k/tags]))
+          idx (d/reads-index reads)
+          added-tag (dd/datom 999999 :k/tags "later" 536870999)
+          added-n (dd/datom 999999 :k/n 7 536870999)]
+      (is (= 1 (count (second diff))) "the diff itself is unchanged: one tag added on b")
+      (is (contains? idx [:a :k/tags]) "the diffed attribute is a read")
+      (is (d/reads-touched? idx [added-tag]) "a tag added later touches what the diff read")
+      (is (not (d/reads-touched? idx [added-n])) "a datom of another attribute does not"))))
