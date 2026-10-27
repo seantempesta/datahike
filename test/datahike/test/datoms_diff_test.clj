@@ -209,3 +209,18 @@
         (is (= 2 (count added)))
         (is (= [[] added] (mapv #(mapv (juxt :e :a :v) %) (d/datoms-diff @main @chain :aevt [:k/new]))))
         (is (= [added []] (mapv #(mapv (juxt :e :a :v) %) (d/datoms-diff @chain @main :aevt [:k/new]))))))))
+
+(deftest an-attribute-a-db-predates-has-no-datoms-there
+  ;; a past db value asked for an attribute declared after it (seon's agent reading its merge base,
+  ;; cut before :form/ops): it holds none of its datoms, as Datascript answers, where it threw 'not
+  ;; defined in current schema'; a transaction naming it is still refused
+  (let [cfg (config) _ (d/create-database cfg) main (d/connect cfg)]
+    (d/transact main [{:k/n 1}])
+    (let [before @main]
+      (d/transact main [{:db/ident :k/new :db/valueType :db.type/long :db/cardinality :db.cardinality/one :db/index true}])
+      (d/transact main [{:k/n 2 :k/new 20}])
+      (doseq [[index cs] [[:aevt [:k/new]] [:eavt [1 :k/new]] [:avet [:k/new 20]]]]
+        (is (empty? (d/datoms before {:index index :components cs})) (str index " on the db before the attribute"))
+        (is (= (case index :eavt 0 1) (count (d/datoms @main {:index index :components cs}))) (str index " on the db after it")))
+      (is (thrown-with-msg? Throwable #"not defined in current schema" (d/db-with before [{:k/new 1}]))
+          "a write naming it is still refused"))))

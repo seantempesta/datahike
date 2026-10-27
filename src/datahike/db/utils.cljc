@@ -185,13 +185,24 @@
 (defn ident-name? [x]
   (or (keyword? x) (string? x)))
 
+(defn- schema-checked? [a-ident db]
+  (and (= :write (:schema-flexibility (dbi/-config db)))
+       (not (or (ds/meta-attr? a-ident) (ds/schema-attr? a-ident) (ds/entity-spec-attr? a-ident)
+                (ds/secondary-index-attr? a-ident) (ds/reference-attr? a-ident)))))
+
+(defn undeclared-attr?
+  "Is attribute a, under a schema on write, one db's schema does not define (a past db value asked
+  for an attribute declared after it)? Such a db holds none of its datoms."
+  [db a]
+  (boolean (and (ident-name? a) (schema-checked? a db)
+                (when-let [db-idents (:db/ident (dbi/-rschema db))]
+                  (not (db-idents (if (reverse-ref? a) (reverse-ref a) a)))))))
+
 (defn validate-attr-ident [a-ident at db]
   (when-not (ident-name? a-ident)
     (log/raise "Bad entity attribute " a-ident " at " at ", expected keyword or string"
                {:error :transact/syntax, :attribute a-ident, :context at}))
-  (when (and (= :write (:schema-flexibility (dbi/-config db)))
-             (not (or (ds/meta-attr? a-ident) (ds/schema-attr? a-ident) (ds/entity-spec-attr? a-ident)
-                      (ds/secondary-index-attr? a-ident) (ds/reference-attr? a-ident))))
+  (when (schema-checked? a-ident db)
     (if-let [db-idents (:db/ident (dbi/-rschema db))]
       (let [attr (if (reverse-ref? a-ident)
                    (reverse-ref a-ident)
