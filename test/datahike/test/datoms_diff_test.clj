@@ -196,3 +196,16 @@
       (is (contains? idx [:a :k/tags]) "the diffed attribute is a read")
       (is (d/reads-touched? idx [added-tag]) "a tag added later touches what the diff read")
       (is (not (d/reads-touched? idx [added-n])) "a datom of another attribute does not"))))
+
+(deftest an-attribute-only-one-side-declares-diffs-as-that-sides-datoms
+  ;; seon's merge diffs every attribute either branch declares; a base cut before an attribute existed threw 'not defined in current schema'
+  (let [cfg (config) _ (d/create-database cfg) main (d/connect cfg)]
+    (d/transact main [{:k/n 1}])
+    (d/branch! main :db :chain)
+    (let [chain (d/connect (assoc cfg :branch :chain))]
+      (d/transact chain [{:db/ident :k/new :db/valueType :db.type/long :db/cardinality :db.cardinality/one}])
+      (d/transact chain [{:k/n 2 :k/new 20} {:k/new 30}])
+      (let [added (mapv (juxt :e :a :v) (d/datoms @chain {:index :aevt :components [:k/new]}))]
+        (is (= 2 (count added)))
+        (is (= [[] added] (mapv #(mapv (juxt :e :a :v) %) (d/datoms-diff @main @chain :aevt [:k/new]))))
+        (is (= [added []] (mapv #(mapv (juxt :e :a :v) %) (d/datoms-diff @chain @main :aevt [:k/new]))))))))
