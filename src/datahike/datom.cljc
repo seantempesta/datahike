@@ -290,30 +290,45 @@
          (if (< n1 n2) -1 1)))))
 
 #?(:jolt
+   (defn- compare-elementwise
+     "Two seqables ordered element by element (compare-value), the first difference
+      deciding; equal when the first runs out."
+     [xs ys]
+     (loop [xs (seq xs) ys (seq ys)]
+       (cond (nil? xs) 0
+             :else (let [c (compare-value (first xs) (first ys))]
+                     (if (zero? c) (recur (next xs) (next ys)) c))))))
+
+#?(:jolt
    (defn- compare-data
      "A total order on plain data (:db.type/data), consistent with =: sequences element
       by element, the shorter first (Clojure's order of vectors); maps by size, then
       their entries ordered by key; sets by size, then their elements in order; values
       of different kinds by type name. Jolt's compare orders none of maps, sets or lists."
      [v1 v2]
-     (letfn [(elementwise [xs ys]
-               (loop [xs (seq xs) ys (seq ys)]
-                 (cond (nil? xs) 0
-                       :else (let [c (compare-value (first xs) (first ys))]
-                               (if (zero? c) (recur (next xs) (next ys)) c)))))
-             (sorted [xs] (sort compare-value xs))]
-       (cond
-         (and (sequential? v1) (sequential? v2))
-         (let [n1 (count v1) n2 (count v2)] (if (== n1 n2) (elementwise v1 v2) (if (< n1 n2) -1 1)))
-         (and (map? v1) (map? v2))
-         (let [n1 (count v1) n2 (count v2)]
-           (if (== n1 n2)
-             (elementwise (sort-by key compare-value v1) (sort-by key compare-value v2))
-             (if (< n1 n2) -1 1)))
-         (and (set? v1) (set? v2))
-         (let [n1 (count v1) n2 (count v2)] (if (== n1 n2) (elementwise (sorted v1) (sorted v2)) (if (< n1 n2) -1 1)))
-         (and (map-entry? v1) (map-entry? v2)) (elementwise v1 v2)
-         :else nil))))
+     (cond
+       (and (sequential? v1) (sequential? v2))
+       (let [n1 (count v1) n2 (count v2)] (if (== n1 n2) (compare-elementwise v1 v2) (if (< n1 n2) -1 1)))
+       (and (map? v1) (map? v2))
+       (let [n1 (count v1) n2 (count v2)]
+         (if (== n1 n2)
+           (compare-elementwise (sort-by key compare-value v1) (sort-by key compare-value v2))
+           (if (< n1 n2) -1 1)))
+       (and (set? v1) (set? v2))
+       (let [n1 (count v1) n2 (count v2)]
+         (if (== n1 n2) (compare-elementwise (sort compare-value v1) (sort compare-value v2)) (if (< n1 n2) -1 1)))
+       (and (map-entry? v1) (map-entry? v2)) (compare-elementwise v1 v2)
+       :else nil)))
+
+#?(:jolt
+   (defn- one-scalar-kind?
+     "Both strings, both numbers, both keywords, both symbols, both uuids or both
+      booleans: Jolt's compare has an arm for each kind and cannot throw on such a
+      pair, so compare-value calls it outside the try that orders mixed kinds."
+     [v1 v2]
+     (or (and (string? v1) (string? v2)) (and (number? v1) (number? v2))
+         (and (keyword? v1) (keyword? v2)) (and (uuid? v1) (uuid? v2))
+         (and (symbol? v1) (symbol? v2)) (and (boolean? v1) (boolean? v2)))))
 
 (defn compare-value
   "Compare two values with cross-platform UUID compatibility.
@@ -325,6 +340,7 @@
    (`compare-lists`)."
   [v1 v2]
   #?(:jolt (cond
+             (one-scalar-kind? v1 v2) (compare v1 v2)
              (and (da/bytes? v1) (da/bytes? v2)) (da/compare-arrays v1 v2)
              :else (or (compare-data v1 v2)
                        ;; two values of different kinds: compare throws, and their type names order them
