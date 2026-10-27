@@ -292,8 +292,10 @@
      values (one branch's new commits against another's), never the range. The
      candidates are the datoms the two sides' unshared leaves do not both hold, plus
      every buffered edit of an expanded branch; each is decided by membership in the
-     two whole sets."
+     two whole sets. Its answer rests on both values over the whole range, so the range
+     is recorded as a read (di/record-read!), as -slice records its own."
      [^PersistentSortedSet a ^PersistentSortedSet b index-type from to]
+     (di/record-read! from to)
      (let [in-range (slice-comparator-constructor index-type from to)
            ^java.util.Comparator cmp (.comparator a)
            candidates (java.util.TreeSet. ^java.util.Comparator cmp)
