@@ -4,7 +4,7 @@
       :clj [clojure.test :as t :refer [is deftest]])
    [clojure.walk]
    [clojure.data]
-   #?(:clj [kaocha.stacktrace])
+   #?@(:jolt [] :clj [[kaocha.stacktrace]])
    [datahike.core :as dc]
    [datahike.constants :as const]
    [datahike.impl.entity :as de]))
@@ -64,7 +64,8 @@
 
 ;; Filter Kaocha frames from exceptions
 
-#?(:clj
+#?(:jolt nil
+   :clj
    (alter-var-root #'kaocha.stacktrace/*stacktrace-filters* (constantly ["java." "clojure." "kaocha." "orchestra."])))
 
 ;; Core tests
