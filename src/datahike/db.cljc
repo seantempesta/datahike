@@ -268,15 +268,20 @@
   (-> ((contextual-search-fn context) db pattern-mask batch-fn)
       (post-process-datoms db context)))
 
-(defn contextual-datoms [db index-type cs context]
-  (-> (case (dbi/context-temporal? context)
-        true (dbu/temporal-datoms db index-type cs)
-        false (di/-slice
-               (get db index-type)
-               (dbu/components->pattern db index-type cs e0 tx0)
-               (dbu/components->pattern db index-type cs emax txmax)
-               index-type))
-      (post-process-datoms db context)))
+(defn contextual-datoms
+  "The datoms of index-type matching components cs. An attribute in cs that db's schema does not
+  define (db predates it) has none there, as in Datascript; a transaction naming it is still refused."
+  [db index-type cs context]
+  (if (dbu/undeclared-attr? db (if (= :eavt index-type) (second cs) (first cs)))
+    []
+    (-> (case (dbi/context-temporal? context)
+          true (dbu/temporal-datoms db index-type cs)
+          false (di/-slice
+                 (get db index-type)
+                 (dbu/components->pattern db index-type cs e0 tx0)
+                 (dbu/components->pattern db index-type cs emax txmax)
+                 index-type))
+        (post-process-datoms db context))))
 
 #?(:clj
    (defn datoms-diff
