@@ -323,9 +323,8 @@
 #?(:jolt
    (defn- one-scalar-kind?
      "Both strings, both numbers, both keywords, both symbols, both uuids or both
-      booleans: compare orders them and cannot throw, so compare-value calls it with
-      no try (a try entered is 176 B a call on Jolt; one index insert compares ~13
-      values)."
+      booleans: Jolt's compare has an arm for each kind and cannot throw on such a
+      pair, so compare-value calls it outside the try that orders mixed kinds."
      [v1 v2]
      (or (and (string? v1) (string? v2)) (and (number? v1) (number? v2))
          (and (keyword? v1) (keyword? v2)) (and (uuid? v1) (uuid? v2))
