@@ -586,9 +586,9 @@
                                  #"shared temporal failure"
                                  (d/run-q! owner)))
            (is (= "shared temporal failure"
-                  (.getMessage (:throwable @owner-completion))))
+                  (.getMessage (ex-cause (:throwable @owner-completion)))))
            (is (= "shared temporal failure"
-                  (.getMessage (:throwable @waiter-completion))))
+                  (.getMessage (ex-cause (:throwable @waiter-completion)))))
            (let [retry (d/acquire-q!
                         {:query query :args [temporal predicate]
                          :request-id "temporal-failure-retry"})]
@@ -1315,9 +1315,9 @@
                                  #"shared host failure"
                                  (d/run-q! owner)))
            (is (= "shared host failure"
-                  (.getMessage (:throwable @owner-result))))
+                  (.getMessage (ex-cause (:throwable @owner-result)))))
            (is (= "shared host failure"
-                  (.getMessage (:throwable @waiter-result))))
+                  (.getMessage (ex-cause (:throwable @waiter-result)))))
            (let [retry
                  (d/acquire-q!
                   {:query query :args [@conn predicate]

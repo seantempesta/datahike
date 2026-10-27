@@ -42,7 +42,8 @@
                (d/connect cfg))
           ;; everything will fit into the root nodes of each index here
         num-roots 3
-        fresh-count (+ num-roots 5) ;; :branches + :db + cid + its graph record + roots + schema-meta
+        ;; :branches (an append log since c0f9149: two records) + :db + cid + its graph record + roots + schema-meta
+        fresh-count (+ num-roots 6)
         ;; a fresh assertion copies nothing into the temporal indexes
         ;; (temporal-upsert), so they keep their empty roots
         history-count 0]

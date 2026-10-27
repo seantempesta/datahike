@@ -109,7 +109,7 @@
           store (:store @conn)]
       (testing "Test branching."
         (branch! conn :db :foo)
-        (is (= (k/get store :branches nil {:sync? true})
+        (is (= (branches conn)
                #{:db :foo})))
       (testing "Test merging."
         (let [foo-conn (d/connect (assoc cfg :branch :foo))]
@@ -135,7 +135,7 @@
           (d/release conn-foo2)))
       (testing "Delete branch."
         (delete-branch! conn :foo)
-        (is (= (k/get store :branches nil {:sync? true})
+        (is (= (branches conn)
                #{:db :foo2})))
       (d/release conn))))
 
@@ -526,7 +526,8 @@
                (let [explicit (+ 1000 (:max-eid @right))]
                  (d/transact left [[:db/add explicit :name "explicit"]])
                  (is (< explicit (born right "after-explicit")))
-                 (doseq [e [(+ const/tx0 7) (bit-or (bit-shift-left 7 32) 1)]]
+                 ;; transaction ids are the store's, issued across every branch: an unissued one is past them all
+                 (doseq [e [(+ (max (:max-tx @left) (:max-tx @right)) 1000) (bit-or (bit-shift-left 7 32) 1)]]
                    (is (= :entity-id/range
                           (try (d/transact left [[:db/add e :name "out-of-range"]]) nil
                                (catch Exception error

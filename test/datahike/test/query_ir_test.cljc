@@ -208,15 +208,16 @@
 (deftest test-pipeline-fused-path-sorted-merge
   (testing "Entity join, all card-one, no anti → :sorted-merge"
     (let [pl (get-pipeline (db/empty-db {:name {} :age {}}) '[[?e :name ?n] [?e :age ?a]])]
-      (is (= :sorted-merge (:fused-path pl)))
-      (is (true? (:use-cursors? pl))))))
+      ;; Jolt, like cljs, has no forward cursors: its entity join merges per cursor
+      (is (= #?(:jolt :per-cursor-merge :clj :sorted-merge) (:fused-path pl)))
+      (is (= #?(:jolt false :clj true) (:use-cursors? pl))))))
 
 (deftest test-pipeline-fused-path-per-cursor-merge
   (testing "Entity join with anti-merge → :per-cursor-merge"
     (let [pl (get-pipeline (db/empty-db {:name {} :age {} :flag {}})
                            '[[?e :name ?n] [?e :age ?a] (not [?e :flag :deleted])])]
       (is (= :per-cursor-merge (:fused-path pl)))
-      (is (true? (:use-cursors? pl))))))
+      (is (= #?(:jolt false :clj true) (:use-cursors? pl))))))
 
 (deftest test-pipeline-fused-path-card-many
   (testing "Entity join with card-many attribute → :card-many-merge"
@@ -241,7 +242,7 @@
       (is (= [datahike.query.ir.PIndexScan
               datahike.query.ir.PGroundFilter
               datahike.query.ir.PProbeFilter
-              datahike.query.ir.PSortedMerge
+              #?(:jolt datahike.query.ir.PPerCursorMerge :clj datahike.query.ir.PSortedMerge)
               datahike.query.ir.PEmitTuple]
              step-types))))
 
