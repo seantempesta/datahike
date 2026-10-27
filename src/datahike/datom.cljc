@@ -304,10 +304,13 @@
      "A total order on plain data (:db.type/data), consistent with =: sequences element
       by element, the shorter first (Clojure's order of vectors); maps by size, then
       their entries ordered by key; sets by size, then their elements in order; values
-      of different kinds by type name. Jolt's compare orders none of maps, sets or lists."
+      of different kinds by type name. Jolt's compare orders none of maps, sets or lists. A
+      java.util.List orders as the vector it was (`compare-lists`, the :clj branch's)."
      [v1 v2]
      (cond
-       (and (sequential? v1) (sequential? v2))
+       ;; a java.util.List too (what Fressian reads a stored vector or map entry back as, reading a
+       ;; JVM-written store), which is not sequential?: its place in an index keeps its vector's
+       (and (or (sequential? v1) (instance? java.util.List v1)) (or (sequential? v2) (instance? java.util.List v2)))
        (let [n1 (count v1) n2 (count v2)] (if (== n1 n2) (compare-elementwise v1 v2) (if (< n1 n2) -1 1)))
        (and (map? v1) (map? v2))
        (let [n1 (count v1) n2 (count v2)]
