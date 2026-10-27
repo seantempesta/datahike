@@ -405,14 +405,18 @@
 
 (defn cmp-attr-nil
   "cmp-nil for two attributes: nil when either is nil (a slice bound left open), else their
-  order. A database's attributes are one type, all keywords or (with :attribute-refs?) all
-  entity ids, so their comparison cannot throw and needs no try: safe-compare's handler, entered
-  on every comparison, was most of a slice comparison's cost (417 B a call on Jolt, against 1 B
-  without it)."
+  order. A database's attributes are one kind, all keywords or (with :attribute-refs?) all
+  entity ids, so two of one kind compare with no try: safe-compare's handler, entered on every
+  comparison, was most of a slice comparison's cost (417 B a call on Jolt, against 1 B without
+  it). A query's slice bound can be any value a variable attribute was bound to (a string, a
+  long, a symbol), which a stored attribute cannot be compared with: safe-compare orders that
+  pair by type, so the slice holds nothing and the pattern joins nothing."
   [a1 a2]
-  (if (nil? a1) nil
-      (if (nil? a2) nil
-          (cmp-attr-quick a1 a2))))
+  (cond (nil? a1) nil
+        (nil? a2) nil
+        (or (and (keyword? a1) (keyword? a2)) (and (number? a1) (number? a2)) (and (string? a1) (string? a2)))
+        (cmp-attr-quick a1 a2)
+        :else (safe-compare a1 a2)))
 
 (defn type-hint-datom [x]
   (vary-meta x assoc :tag `Datom))
