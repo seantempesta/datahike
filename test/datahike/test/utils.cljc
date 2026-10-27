@@ -1,6 +1,7 @@
 (ns datahike.test.utils
   (:require ;; Load hitchhiker-tree FIRST before datahike.api which loads datahike.index
-   #?(:clj [datahike.index.hitchhiker-tree])
+   ;; (on the JVM; Jolt has no hitchhiker tree, its one index is the persistent set)
+   #?@(:jolt [] :clj [[datahike.index.hitchhiker-tree]])
    [clojure.core.async :refer [<!]]
    [datahike.api :as d]
    [datahike.tools :as tools])
