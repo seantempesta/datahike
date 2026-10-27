@@ -12,6 +12,7 @@
                      [datahike.api :as d]
                      [datahike.gc :as gc]
                      [datahike.gc-guard :as guard]
+                     [datahike.roster :as roster]
                      [datahike.versioning :as v]
                      [datahike.writing :as dw]
                      [datahike.test.async :refer [deftest-async]]
@@ -430,15 +431,16 @@
                    release-branches (promise)
                    sweep-requested (promise)
                    batch-issued    (promise)
-                   orig-update     k/update
+                   orig-roster-add roster/roster-add!
                    orig-acquire    guard/acquire-sweep-permit!]
-               ;; gate between the new branch's head record and the `:branches` publish
-               (with-redefs [k/update
-                             (fn [store key & more]
-                               (when (= key :branches)
-                                 (deliver head-written true)
-                                 @release-branches)
-                               (apply orig-update store key more))
+               ;; gate between the new branch's head record and the roster publish (an append to
+               ;; the `:branches` log since c0f9149; it was `k/update :branches`, a call no longer
+               ;; made, so the gate never opened and `@head-written` waited forever)
+               (with-redefs [roster/roster-add!
+                             (fn [store branch & more]
+                               (deliver head-written true)
+                               @release-branches
+                               (apply orig-roster-add store branch more))
                              guard/acquire-sweep-permit!
                              (fn [store-id opts]
                                (let [result (orig-acquire store-id opts)]
