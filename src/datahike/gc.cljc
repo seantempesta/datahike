@@ -206,8 +206,10 @@
                                (async/<!! (sweep! store reachable cutoff batch-size sweep-opts))
                                (<?- (sweep! store reachable cutoff batch-size sweep-opts)))]
                    ;; the next generation, after the sweep: a value key a node cache found
-                   ;; before it, in any process, is asked of the store again (value-key)
-                   (<?- (k/update store collection-key (fnil inc 0) {:sync? sync?}))
+                   ;; before it, in any process, is asked of the store again (value-key). A dry
+                   ;; run deletes nothing, so no key a cache holds went stale: it writes nothing
+                   (when-not (:konserve.gc/dry-run? sweep-opts)
+                     (<?- (k/update store collection-key (fnil inc 0) {:sync? sync?})))
                    swept))
                (finally
                  (guard/release-reachability-permit! sweep-permit)))))))))
