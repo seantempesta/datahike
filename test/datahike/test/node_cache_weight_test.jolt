@@ -1,0 +1,42 @@
+(ns datahike.test.node-cache-weight-test
+  "The jolt node cache holds nodes by their weighed bytes, not a fixed 4096 a node."
+  (:require [clojure.test :refer [deftest is]]
+            [datahike.index.interface :as index]
+            [datahike.index.node-cache :as nodes]
+            [datahike.datom :as datom])
+  (:import [org.replikativ.persistent_sorted_set Leaf Settings]))
+
+(defn- leaf [datoms] (Leaf. (count datoms) (object-array datoms) (Settings. 128 nil 0)))
+
+(deftest a-node-weighs-what-its-keys-retain
+  (let [small (leaf [(datom/datom 1 :value "s" 1)])
+        big (leaf (mapv #(datom/datom % :value (apply str (repeat 1000 "x")) 1) (range 10)))]
+    (is (< (nodes/node-bytes small) 1000))
+    (is (< 40000 (nodes/node-bytes big)) "ten 1,000-character strings at 4 bytes a character")))
+
+(deftest the-cache-stays-within-its-bytes-and-evicts-the-oldest
+  (let [cache (index/make-node-cache {:store-cache-bytes 100000})
+        node (leaf (mapv #(datom/datom % :value (apply str (repeat 1000 "x")) 1) (range 5)))
+        w (nodes/node-bytes node)]
+    (doseq [k (range 10)] (index/cache-put! cache k node))
+    (let [held (filter #(index/cache-get cache %) (range 10))]
+      (is (<= (:weighted-bytes (index/node-cache-stats cache)) 100000))
+      (is (= (quot 100000 w) (count held)) "as many as the bytes allow, not 100000 / 4096")
+      (is (= (range (- 10 (count held)) 10) held) "the newest are the ones held"))))
+
+(deftest an-oversize-node-is-refused
+  (let [cache (index/make-node-cache {:store-cache-bytes 10000})
+        large (leaf [(datom/datom 2 :value (apply str (repeat 100000 "x")) 1)])]
+    (index/cache-put! cache :large large)
+    (is (nil? (index/cache-get cache :large)))
+    (is (zero? (:weighted-bytes (index/node-cache-stats cache))))))
+
+(deftest a-hit-keeps-a-node-from-eviction
+  (let [cache (index/make-node-cache {:store-cache-bytes 100000})
+        node (leaf (mapv #(datom/datom % :value (apply str (repeat 1000 "x")) 1) (range 5)))
+        cap (quot 100000 (nodes/node-bytes node))]
+    (doseq [k (range cap)] (index/cache-put! cache k node))
+    (index/cache-get cache 0)
+    (index/cache-put! cache :new node)
+    (is (some? (index/cache-get cache 0)) "0 was touched, so 1 went first")
+    (is (nil? (index/cache-get cache 1)))))
