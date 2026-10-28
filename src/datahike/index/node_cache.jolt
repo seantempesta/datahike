@@ -1,28 +1,91 @@
 (ns datahike.index.node-cache
-  "jolt stand-in for the Caffeine node cache: an atom over a core.cache LRU,
-   bounded by node count (max-bytes / 4096) instead of weighed bytes."
-  (:require [clojure.core.cache :as c]))
+  "jolt stand-in for the Caffeine node cache: least recently used nodes evicted until the
+   weighed bytes are under max-bytes. Each node is weighed by an estimate of what its keys
+   retain on Chez (node-bytes), not counted at a fixed size: a decoded node held about 12.4 KB,
+   so the former count of max-bytes / 4096 nodes let the cache hold three times its budget.
+   The recency order is a sorted map from a tick to the address, so a hit or a put costs a
+   log of the size and an eviction takes the oldest first."
+  (:require [datahike.datom]))
 
-(defn node-bytes [_node] 4096)
+(def ^:private entry-bytes 200)
 
-(defrecord NodeCache [state max-bytes hits misses])
+
+(defn- value-bytes
+  "Bytes a key's value retains on Chez: a string is 4 bytes a character (Chez strings are
+   UTF-32) and a header; keywords and symbols are interned and shared."
+  [v]
+  (cond
+    (nil? v) 0
+    (string? v) (+ 16 (* 4 (count v)))
+    (keyword? v) 0
+    (symbol? v) 0
+    (boolean? v) 0
+    (number? v) 16
+    (instance? datahike.datom.Datom v) (+ 48 (value-bytes (:v v)))
+    (vector? v) (+ 32 (* 8 (count v)) (reduce + 0 (map value-bytes v)))
+    (map? v) (reduce-kv (fn [n k x] (+ n 32 (value-bytes k) (value-bytes x))) 64 v)
+    (coll? v) (+ 32 (* 16 (count v)) (reduce + 0 (map value-bytes v)))
+    :else 64))
+
+(defn node-bytes
+  "Estimated bytes a cached node retains: an entry, its key array and what its keys retain,
+   without following children into other nodes."
+  [node]
+  (let [ks (.keys node)]
+    (+ entry-bytes 64 (* 8 (count ks)) (reduce + 0 (map value-bytes ks)))))
+
+(defrecord NodeCache [state max-bytes hits misses evictions])
 
 (defn cache? [value] (instance? NodeCache value))
 
 (defn create [max-bytes]
-  (->NodeCache (atom (c/lru-cache-factory {} :threshold (max 16 (quot (long max-bytes) 4096))))
-               max-bytes (atom 0) (atom 0)))
+  (->NodeCache (atom {:nodes {} :order (sorted-map) :tick 0 :total 0})
+               max-bytes (atom 0) (atom 0) (atom 0)))
+
+(defn- touch
+  "State s with address a moved to the newest end of the order."
+  [s a]
+  (let [[node t w] (get (:nodes s) a) t' (inc (:tick s))]
+    (-> s (assoc :tick t') (update :order dissoc t) (update :order assoc t' a)
+        (assoc-in [:nodes a] [node t' w]))))
+
+(defn- drop-entry [s a]
+  (if-let [[_ t w] (get (:nodes s) a)]
+    (-> s (update :nodes dissoc a) (update :order dissoc t) (update :total - w))
+    s))
+
+(defn- shrink
+  "State s with its oldest entries evicted until its total is within max-bytes: [s' evicted]."
+  [s max-bytes]
+  (loop [s s n 0]
+    (if (and (> (:total s) max-bytes) (seq (:order s)))
+      (recur (drop-entry s (val (first (:order s)))) (inc n))
+      [s n])))
 
 (defn lookup [cache address]
-  (let [v (get @(:state cache) address)]
-    (if (some? v)
-      (do (swap! (:hits cache) inc) (swap! (:state cache) c/hit address) v)
-      (do (swap! (:misses cache) inc) nil))))
+  (if-let [[node] (get-in @(:state cache) [:nodes address])]
+    (do (swap! (:hits cache) inc) (swap! (:state cache) touch address) node)
+    (do (swap! (:misses cache) inc) nil)))
 
-(defn put! [cache address node] (swap! (:state cache) c/miss address node) nil)
-(defn evict! [cache address] (swap! (:state cache) c/evict address) nil)
+(defn put!
+  "Hold node at address, weighed by node-bytes; a node heavier than the whole budget is not
+   held (as Caffeine refuses one)."
+  [cache address node]
+  (let [w (node-bytes node) max-bytes (:max-bytes cache)]
+    (when (<= w max-bytes)
+      (let [n (volatile! 0)]
+        (swap! (:state cache)
+               (fn [s] (let [s (drop-entry s address) t (inc (:tick s))
+                             s (-> s (assoc :tick t) (assoc-in [:nodes address] [node t w])
+                                   (update :order assoc t address) (update :total + w))
+                             [s e] (shrink s max-bytes)]
+                         (vreset! n e) s)))
+        (swap! (:evictions cache) + @n))))
+  nil)
+
+(defn evict! [cache address] (swap! (:state cache) drop-entry address) nil)
 
 (defn stats [cache]
-  {:nodes (count @(:state cache)) :max-bytes (:max-bytes cache)
-   :weighted-bytes (* 4096 (count @(:state cache)))
-   :hits @(:hits cache) :misses @(:misses cache) :evictions 0})
+  (let [s @(:state cache)]
+    {:nodes (count (:nodes s)) :max-bytes (:max-bytes cache) :weighted-bytes (:total s)
+     :hits @(:hits cache) :misses @(:misses cache) :evictions @(:evictions cache)}))
