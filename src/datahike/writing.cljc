@@ -849,7 +849,7 @@
   before it carried them) is its record. O(branches) small reads, no index loaded."
   [store]
   (transduce (map (fn [b] (let [stored (k/get store b nil {:sync? true})]
-                            (if (and (compact-head? stored) (contains? stored :max-eid))
+                            (if (and (compact-head? stored) (some? (:max-eid stored)))
                               stored
                               (resolve-head store b stored)))))
              (completing (fn [acc head] (merge-with max acc (select-keys head [:max-eid :max-tx]))))
