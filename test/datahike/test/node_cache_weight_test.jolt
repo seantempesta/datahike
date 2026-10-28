@@ -40,3 +40,12 @@
     (index/cache-put! cache :new node)
     (is (some? (index/cache-get cache 0)) "0 was touched, so 1 went first")
     (is (nil? (index/cache-get cache 1)))))
+
+(deftest an-in-line-value-is-weighed-by-what-it-retains
+  ;; persistent-set's in-line caches an out-of-line value's [generation value-key] under its
+  ;; datom, which is no index node: it is weighed as a value, and held
+  (let [cache (index/make-node-cache {:store-cache-bytes 1000000})
+        v [3 #uuid "00000000-0000-0000-0000-000000000001"]]
+    (index/cache-put! cache :d v)
+    (is (= v (index/cache-get cache :d)))
+    (is (< 0 (nodes/node-bytes v) 1000))))
