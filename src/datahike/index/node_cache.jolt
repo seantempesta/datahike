@@ -28,11 +28,15 @@
     :else 64))
 
 (defn node-bytes
-  "Estimated bytes a cached node retains: an entry, its key array and what its keys retain,
-   without following children into other nodes."
+  "Estimated bytes a cached entry retains: for an index node, an entry, its key array and what
+   its keys retain, without following children into other nodes; for anything else the cache
+   holds (an out-of-line value's [generation value-key] under its datom, persistent-set's
+   in-line), an entry and what the value retains."
   [node]
-  (let [ks (.keys node)]
-    (+ entry-bytes 64 (* 8 (count ks)) (reduce + 0 (map value-bytes ks)))))
+  (if (or (vector? node) (map? node) (string? node) (nil? node))
+    (+ entry-bytes (value-bytes node))
+    (let [ks (.keys node)]
+      (+ entry-bytes 64 (* 8 (count ks)) (reduce + 0 (map value-bytes ks))))))
 
 (defrecord NodeCache [state max-bytes hits misses evictions])
 
