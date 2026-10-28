@@ -12,16 +12,19 @@
 
 (defn- value-bytes
   "Bytes a key's value retains on Chez: a string is 4 bytes a character (Chez strings are
-   UTF-32) and a header; keywords and symbols are interned and shared."
+   UTF-32) and a header; a Datom is an 80-byte record; a symbol read from the store is a
+   record of its own with its name's text (Jolt does not intern symbols); keywords are
+   interned and shared. Calibrated against a once-counted walk of a root's cache, where
+   Datoms weighed at 48 and symbols at 0 left the leaves 1.26x over their weight."
   [v]
   (cond
     (nil? v) 0
     (string? v) (+ 16 (* 4 (count v)))
     (keyword? v) 0
-    (symbol? v) 0
+    (symbol? v) (+ 64 (* 4 (+ (count (name v)) (count (or (namespace v) "")))))
     (boolean? v) 0
     (number? v) 16
-    (instance? datahike.datom.Datom v) (+ 48 (value-bytes (:v v)))
+    (instance? datahike.datom.Datom v) (+ 80 (value-bytes (:v v)))
     (vector? v) (+ 32 (* 8 (count v)) (reduce + 0 (map value-bytes v)))
     (map? v) (reduce-kv (fn [n k x] (+ n 32 (value-bytes k) (value-bytes x))) 64 v)
     (coll? v) (+ 32 (* 16 (count v)) (reduce + 0 (map value-bytes v)))
@@ -29,14 +32,16 @@
 
 (defn node-bytes
   "Estimated bytes a cached entry retains: for an index node, an entry, its key array and what
-   its keys retain, without following children into other nodes; for anything else the cache
-   holds (an out-of-line value's [generation value-key] under its datom, persistent-set's
-   in-line), an entry and what the value retains."
+   its keys retain, and for a branch each child's address (a uuid) and slot, without following
+   children into other nodes; for anything else the cache holds (an out-of-line value's
+   [generation value-key] under its datom, persistent-set's in-line), an entry and what the
+   value retains."
   [node]
   (if (or (vector? node) (map? node) (string? node) (nil? node))
     (+ entry-bytes (value-bytes node))
     (let [ks (.keys node)]
-      (+ entry-bytes 64 (* 8 (count ks)) (reduce + 0 (map value-bytes ks))))))
+      (+ entry-bytes 64 (* 8 (count ks)) (reduce + 0 (map value-bytes ks))
+         (if (pos? (.level node)) (* 72 (count ks)) 0)))))
 
 (defrecord NodeCache [state max-bytes hits misses evictions])
 

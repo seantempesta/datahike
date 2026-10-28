@@ -3,7 +3,8 @@
   (:require [clojure.test :refer [deftest is]]
             [datahike.index.interface :as index]
             [datahike.index.node-cache :as nodes]
-            [datahike.datom :as datom])
+            [datahike.datom :as datom]
+            [jolt.scheme :as scm])
   (:import [org.replikativ.persistent_sorted_set Leaf Settings]))
 
 (defn- leaf [datoms] (Leaf. (count datoms) (object-array datoms) (Settings. 128 nil 0)))
@@ -13,6 +14,28 @@
         big (leaf (mapv #(datom/datom % :value (apply str (repeat 1000 "x")) 1) (range 10)))]
     (is (< (nodes/node-bytes small) 1000))
     (is (< 40000 (nodes/node-bytes big)) "ten 1,000-character strings at 4 bytes a character")))
+
+(def ^:private retained
+  ;; Chez's own count of the bytes x reaches (compute-size), the shared parts included
+  (do (scm/eval-string "(define (dh-retained x) (compute-size x))")
+      (fn [x] (scm/call "dh-retained" x))))
+
+(deftest a-node-weighs-what-it-retains
+  ;; a leaf as a store reads one: 64 datoms, a third with a symbol value (a ref by name, as
+  ;; :form/refs carries), the rest strings and numbers. What its 61 datoms past the first three
+  ;; add is weighed within a tenth of what they add retained (the three hold what every leaf
+  ;; shares: the record types, the settings); Datoms at 48 bytes and symbols at 0 weighed it at
+  ;; about 0.6
+  (let [ds (mapv (fn [i] (datom/datom i :value (case (mod i 3)
+                                                     0 (symbol (str "seon.demo" (mod i 7)) (str "a-name-" i))
+                                                     1 (str "text of datom " i " in its leaf")
+                                                     2 (* 1000 i))
+                                      536870913))
+                 (range 64))
+        node (leaf ds) base (leaf (subvec ds 0 3))
+        real (- (retained node) (retained base))
+        w (- (nodes/node-bytes node) (nodes/node-bytes base))]
+    (is (< (* 0.9 real) w (* 1.1 real)) (str "weighed " w ", retains " real))))
 
 (deftest the-cache-stays-within-its-bytes-and-evicts-the-oldest
   (let [cache (index/make-node-cache {:store-cache-bytes 100000})
