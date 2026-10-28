@@ -398,3 +398,34 @@
     (-> rschema
         (assoc :db/attrTuples (attrTuples schema rschema))
         (assoc :db.secondary/index (secondary-index-mapping schema)))))
+
+(defn rschema-update
+  "rschema after the schema entry of attr changed to what schema holds: the reverse schema of the whole
+  schema (rschema), found by changing only attr's membership of each property (every property is a set
+  of attributes), not by building it again from every attribute, which was O(schema) for each schema
+  datom of a transaction and so quadratic in the attributes it declared. The tuple and secondary
+  mappings depend on other attributes' entries: an entry that has a part in either (before or
+  after the change) rebuilds the whole."
+  [old-rschema schema attr]
+  (let [entry (get schema attr)
+        tuple-or-secondary? (fn [e] (and (map? e) (or (contains? e :db/tupleAttrs) (contains? e :db.secondary/type)
+                                                        (contains? e :db.secondary/attrs) (= :db.type/tuple (:db/valueType e)))))
+        in-mapping? (or (contains? (:db/attrTuples old-rschema) attr)
+                        (contains? (:db.secondary/index old-rschema) attr)
+                        (contains? (:db.type/tuple old-rschema) attr)
+                        (some #(contains? (set %) attr) (vals (:db.secondary/index old-rschema))))]
+    (if (or (tuple-or-secondary? entry) in-mapping?)
+      (rschema schema)
+      (let [without (reduce-kv (fn [m prop attrs]
+                                 (if (and (set? attrs) (contains? attrs attr))
+                                   (let [attrs' (disj attrs attr)]
+                                     (if (empty? attrs') (dissoc m prop) (assoc m prop attrs')))
+                                   m))
+                               old-rschema old-rschema)]
+        (if (map? entry)
+          (reduce-kv (fn [m key value]
+                       (reduce (fn [m prop] (assoc m prop (conj (get m prop #{}) attr)))
+                               m (attr->properties key value)))
+                     (update without :db/ident (fn [coll] (if coll (conj coll attr) #{attr})))
+                     entry)
+          without)))))

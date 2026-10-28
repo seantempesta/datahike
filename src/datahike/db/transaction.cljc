@@ -181,8 +181,33 @@
           (assoc-in db [:schema e a-ident] v-ident))
         (assoc-in db [:schema e] (hash-map a-ident v-ident))))))
 
-(defn update-rschema [db]
-  (assoc db :rschema (dbu/rschema (:schema db))))
+(defn schema-attr-of
+  "The attribute the schema datom is about: the ident it adds or retracts, else the ident of its entity
+  in db's schema; nil when db names none."
+  [db datom]
+  (if (= :db/ident (:a datom))
+    (:v datom)
+    (let [i (get-in db [:schema (:e datom)])] (when (keyword? i) i))))
+
+(defn update-rschema
+  "db with its reverse schema brought up to the schema entry of attr, which changed: for that attribute
+  alone (dbu/rschema-update), or rebuilt from the whole schema when there is none to name. Every schema
+  datom of a transaction rebuilt it whole, which was O(schema) a datom: transacting a schema of n
+  attributes was quadratic in n (459 attributes: 600 MB, a store's creation)."
+  ([db] (assoc db :rschema (dbu/rschema (:schema db))))
+  ([db attr]
+   (if (and attr (:rschema db))
+     (assoc db :rschema (dbu/rschema-update (:rschema db) (:schema db) attr))
+     (update-rschema db))))
+
+(declare remove-schema)
+
+(defn- retract-schema
+  "db without the schema datom's property, its reverse schema brought up to the attribute it was about
+  (read before the removal: a retracted :db/ident takes its entry away)."
+  [db datom]
+  (let [attr (schema-attr-of db datom)]
+    (-> db (remove-schema datom) (update-rschema attr))))
 
 (defn- reject-schema-removal-with-current-data [db attr entity]
   (when (seq (dbi/-datoms db :aevt [attr] (dbi/-search-context db)))
@@ -511,7 +536,7 @@
         true (advance-max-eid (.-e datom))
         true (update :hash + (hash prim))
         schema? (-> (update-schema datom)
-                    update-rschema)
+                    (update-rschema (schema-attr-of db datom)))
         true (update :op-count inc)
         additive-index-attr (backfill-avet additive-index-attr))
 
@@ -522,7 +547,7 @@
           indexing? (update :avet #(di/-remove % removing :avet op-count))
           has-secondary? (update-secondary-indices a-ident datom false)
           true (update :hash - (hash removing))
-          schema? (-> (remove-schema datom) update-rschema)
+          schema? (retract-schema datom)
           keep-history? (update :temporal-eavt #(di/-temporal-insert % removing :eavt op-count))
           keep-history? (update :temporal-eavt #(di/-temporal-insert % prim :eavt (inc op-count)))
           keep-history? (update :temporal-aevt #(di/-temporal-insert % removing :aevt op-count))
@@ -552,7 +577,7 @@
       ;; event so they drop the purged datom. Skip when the datom was only
       ;; in history (already retracted earlier — never reached the secondary).
       (and current? has-secondary?) (update-secondary-indices a-ident current-datom false)
-      (and current? schema?) (-> (remove-schema datom) update-rschema)
+      (and current? schema?) (retract-schema datom)
       history? (update :temporal-eavt #(di/-remove % history-datom :eavt op-count))
       history? (update :temporal-aevt #(di/-remove % history-datom :aevt op-count))
       (and history? indexing?) (update :temporal-avet #(di/-remove % history-datom :avet op-count))
@@ -608,7 +633,7 @@
             ;; Optimistic removal of the schema entry (because we don't know whether it is already present or not)
       (and schema? (not= :db/index a-ident))
       (try
-        (-> db (remove-schema datom) update-rschema)
+        (retract-schema db datom)
         (catch ExceptionInfo _e
           db))
 
@@ -629,7 +654,7 @@
       true    (advance-max-eid (.-e datom))
       true    (update :hash + (hash prim))
       schema? (-> (update-schema datom)
-                  update-rschema)
+                  (update-rschema (schema-attr-of db datom)))
       additive-index-attr (backfill-avet additive-index-attr))))
 
 ;; conj onto a report's ::effective-tx-data, made once: built per datom, the fnil was ~900 B of
