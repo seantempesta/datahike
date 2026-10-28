@@ -45,13 +45,23 @@
         (let [side (d/connect (assoc config :branch :side))]
           (try
             (d/transact side [{:item/name "a"} {:item/name "b"}])
+            ;; :later renames an entity it holds: its head has the highest tx and :side's the highest
+            ;; eid, so no one head answers both and the walk must take each id's max over the heads
+            (d/branch! connection :db :later)
+            (let [later-conn (d/connect (assoc config :branch :later))]
+              (d/transact later-conn [{:db/id (d/q '[:find ?e . :where [?e :item/name "source"]] @later-conn) :item/name "renamed"}])
+              (d/release later-conn))
             (let [store (:store @connection)
                   head (k/get store :side nil {:sync? true})
-                  {:keys [max-eid max-tx]} @side]
+                  later (k/get store :later nil {:sync? true})
+                  max-eid (:max-eid head)
+                  max-tx (:max-tx later)]
               (is (writing/compact-head? head))
-              (is (= [max-eid max-tx] [(:max-eid head) (:max-tx head)]) "the head carries its commit's ids")
-              ;; the commit record gone, the walk still answers: it never reads one
+              (is (= [(:max-eid @side) (:max-tx @side)] [(:max-eid head) (:max-tx head)]) "the head carries its commit's ids")
+              (is (and (< (:max-eid later) max-eid) (< (:max-tx head) max-tx)) "each id's highest is on a different head")
+              ;; the commit records gone, the walk still answers: it never reads one
               (k/dissoc store (get-in head [:meta :datahike/commit-id]) {:sync? true})
+              (k/dissoc store (get-in later [:meta :datahike/commit-id]) {:sync? true})
               (let [reached (atom {})
                     ids (reify datahike.ids/IIds
                           (-take! [_ _] 0)
