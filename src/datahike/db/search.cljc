@@ -55,7 +55,9 @@
                   ;; Allow 2-element vectors for lookup refs (when attr is ref type)
                   (and (vector? v) (= 2 (count v)))
                   ;; Allow any-length vectors for tuple values
-                  (and (vector? v) a (dbu/tuple? db a)))
+                  (and (vector? v) a (dbu/tuple? db a))
+                  ;; Allow any vector for a :db.type/data attribute, whose value is whole plain data
+                  (and (vector? v) a (dbu/data? db a)))
       (log/raise "Bad format for value in pattern, must be a scalar, nil or a vector of two elements."
                  {:error :search/pattern :v v :pattern pattern}))
 
