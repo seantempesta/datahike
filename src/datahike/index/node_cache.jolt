@@ -7,11 +7,20 @@
    allocates nothing (a branch keeps no child it restored, so every step of a seek is a hit:
    a persistent-map update on each cost a seek 1.8x); the queue is a sorted map from a tick to
    the address, and an eviction takes the oldest, moving it to the newest end once if it was hit
-   since."
+   since.
+   A large value (a string or byte array) a node's Datom holds is one object every node that
+   read it holds (a value stored out of line is read once by its key, and :eavt and :aevt, and
+   :avet, hold that object): it is weighed once, while any cached node holds it, not once in each
+   (a root's leaves weighed 112 MB and retained 69 MB counted by node)."
   (:require [datahike.datom]))
 
 (def ^:private entry-bytes 200)
 
+
+(defn- value-weight
+  "Bytes a string (4 a character: Chez strings are UTF-32) or a byte array retains."
+  [v]
+  (if (string? v) (+ 16 (* 4 (count v))) (+ 16 (alength ^bytes v))))
 
 (defn- value-bytes
   "Bytes a key's value retains on Chez: a string is 4 bytes a character (Chez strings are
@@ -22,7 +31,7 @@
   [v]
   (cond
     (nil? v) 0
-    (string? v) (+ 16 (* 4 (count v)))
+    (or (string? v) (bytes? v)) (value-weight v)
     (keyword? v) 0
     (symbol? v) (+ 64 (* 4 (+ (count (name v)) (count (or (namespace v) "")))))
     (boolean? v) 0
@@ -33,38 +42,91 @@
     (coll? v) (+ 32 (* 16 (count v)) (reduce + 0 (map value-bytes v)))
     :else 64))
 
+(def ^:private shared-min
+  "Characters or bytes from which a Datom's value is weighed once for all the nodes holding it."
+  256)
+
+(defn- shared-value
+  "The value of Datom d when it is large (a string or byte array), else nil."
+  [d]
+  (when (instance? datahike.datom.Datom d)
+    (let [v (:v d)]
+      (when (or (and (string? v) (>= (count v) shared-min)) (and (bytes? v) (>= (alength ^bytes v) shared-min)))
+        v))))
+
+(defn- node-keys [node] (when-not (or (vector? node) (map? node) (string? node) (nil? node)) (.keys node)))
+
+(defn- shared-values
+  "The large values node's keys hold, one per key."
+  [node]
+  (into [] (keep shared-value) (node-keys node)))
+
 (defn node-bytes
   "Estimated bytes a cached entry retains: for an index node, an entry, its key array and what
    its keys retain, and for a branch each child's address (a uuid) and slot, without following
    children into other nodes; for anything else the cache holds (an out-of-line value's
    [generation value-key] under its datom, persistent-set's in-line), an entry and what the
-   value retains."
+   value retains. A large value is counted whole, as if no other node held it (the cache
+   counts it once)."
   [node]
-  (if (or (vector? node) (map? node) (string? node) (nil? node))
-    (+ entry-bytes (value-bytes node))
-    (let [ks (.keys node)]
-      (+ entry-bytes 64 (* 8 (count ks)) (reduce + 0 (map value-bytes ks))
-         (if (pos? (.level node)) (* 72 (count ks)) 0)))))
+  (if-let [ks (node-keys node)]
+    (+ entry-bytes 64 (* 8 (count ks)) (reduce + 0 (map value-bytes ks))
+       (if (pos? (.level node)) (* 72 (count ks)) 0))
+    (+ entry-bytes (value-bytes node))))
+
+(defn- own-bytes
+  "node-bytes without its large values vs, which the cache counts once across nodes."
+  [node vs]
+  (- (node-bytes node) (reduce + 0 (map value-weight vs))))
 
 (defrecord NodeCache [state max-bytes hits misses evictions])
 
 (defn cache? [value] (instance? NodeCache value))
 
 (defn create [max-bytes]
-  (->NodeCache (atom {:nodes {} :order (sorted-map) :tick 0 :total 0})
+  (->NodeCache (atom {:nodes {} :order (sorted-map) :tick 0 :total 0 :shared {}})
                max-bytes (atom 0) (atom 0) (atom 0)))
+
+(defn- slot
+  "Index of the pair holding v itself in bucket, or nil."
+  [bucket v]
+  (loop [i 0]
+    (when (< i (count bucket))
+      (if (identical? v (first (nth bucket i))) i (recur (inc i))))))
+
+(defn- share
+  "State s with large value v held by one more node: its weight joins the total when no
+   other held it. :shared maps a value's identity hash to the [value holders] pairs of that hash."
+  [s v]
+  (let [h (System/identityHashCode v) bucket (get (:shared s) h [])]
+    (if-let [i (slot bucket v)]
+      (assoc-in s [:shared h] (update-in bucket [i 1] inc))
+      (-> s (assoc-in [:shared h] (conj bucket [v 1])) (update :total + (value-weight v))))))
+
+(defn- unshare
+  "State s with large value v held by one node fewer: its weight leaves the total with the last."
+  [s v]
+  (let [h (System/identityHashCode v) bucket (get (:shared s) h) i (slot bucket v)
+        n (second (nth bucket i))]
+    (if (> n 1)
+      (assoc-in s [:shared h] (update-in bucket [i 1] dec))
+      (let [bucket' (into (subvec bucket 0 i) (subvec bucket (inc i)))]
+        (-> s (update :total - (value-weight v))
+            (assoc :shared (if (empty? bucket') (dissoc (:shared s) h) (assoc (:shared s) h bucket'))))))))
 
 (defn- requeue
   "State s with address a moved to the newest end of the order, its hit flag cleared."
   [s a]
-  (let [[node t w hit] (get (:nodes s) a) t' (inc (:tick s))]
+  (let [[node t w hit vs] (get (:nodes s) a) t' (inc (:tick s))]
     (vreset! hit false)
     (-> s (assoc :tick t') (update :order dissoc t) (update :order assoc t' a)
-        (assoc-in [:nodes a] [node t' w hit]))))
+        (assoc-in [:nodes a] [node t' w hit vs]))))
 
 (defn- drop-entry [s a]
-  (if-let [[_ t w] (get (:nodes s) a)]
-    (-> s (update :nodes dissoc a) (update :order dissoc t) (update :total - w))
+  (if-let [[_ t w _ vs] (get (:nodes s) a)]
+    (reduce unshare
+            (-> s (update :nodes dissoc a) (update :order dissoc t) (update :total - w))
+            vs)
     s))
 
 (defn- shrink
@@ -85,16 +147,17 @@
     (do (swap! (:misses cache) inc) nil)))
 
 (defn put!
-  "Hold node at address, weighed by node-bytes; a node heavier than the whole budget is not
-   held (as Caffeine refuses one)."
+  "Hold node at address, weighed by node-bytes (its large values once across the nodes
+   holding them); a node heavier than the whole budget is not held (as Caffeine refuses one)."
   [cache address node]
-  (let [w (node-bytes node) max-bytes (:max-bytes cache)]
-    (when (<= w max-bytes)
-      (let [n (volatile! 0)]
+  (let [max-bytes (:max-bytes cache)]
+    (when (<= (node-bytes node) max-bytes)
+      (let [n (volatile! 0) vs (shared-values node) w (own-bytes node vs)]
         (swap! (:state cache)
                (fn [s] (let [s (drop-entry s address) t (inc (:tick s))
-                             s (-> s (assoc :tick t) (assoc-in [:nodes address] [node t w (volatile! false)])
+                             s (-> s (assoc :tick t) (assoc-in [:nodes address] [node t w (volatile! false) vs])
                                    (update :order assoc t address) (update :total + w))
+                             s (reduce share s vs)
                              [s e] (shrink s max-bytes)]
                          (vreset! n e) s)))
         (swap! (:evictions cache) + @n))))
