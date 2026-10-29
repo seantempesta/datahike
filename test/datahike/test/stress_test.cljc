@@ -22,7 +22,10 @@
                    :db/index       avet?
                    :db/valueType   :db.type/long}]
 
-          cfg {:store  {:backend :file :path "/tmp/dh-stress"
+          ;; a path of this run's own: parallel runs of the suite (and the Seon forks step on a shared
+          ;; machine) must not delete-database each other's store
+          path (str #?(:clj (System/getProperty "java.io.tmpdir") :cljs "/tmp") "/dh-stress-" (random-uuid))
+          cfg {:store  {:backend :file :path path
                         :id #uuid "57e55000-0000-0000-0000-000000000001"
                         :config {:sync-blob? true :in-place? false}}
                :keep-history? false
