@@ -68,6 +68,17 @@
   [db attr]
   (is-attr? db attr :db.type/tuple))
 
+(defn #?@(:clj  [^Boolean data?]
+          :cljs [^boolean data?])
+  "Returns true if 'attr' is of type ':db.type/data', whose value is whole plain data (a vector included).
+   Read from the schema: the persisted rschema holds no key for the type."
+  [db attr]
+  (let [a-ident (if (and (:attribute-refs? (dbi/-config db))
+                         (number? attr))
+                  (dbi/ident-for db attr :error-on-missing)
+                  attr)]
+    (= :db.type/data (:db/valueType (get (dbi/-schema db) a-ident)))))
+
 (defn #?@(:clj [^Boolean reverse-ref?]
           :cljs [^boolean reverse-ref?])
   [ident]
