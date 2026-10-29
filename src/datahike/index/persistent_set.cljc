@@ -791,7 +791,10 @@
   #?(:jolt
      (let [store-id (or (get-in config [:store :id]) (:id config))
            bf       (get-in config [:index-config :branching-factor] DEFAULT_BRANCHING_FACTOR)
-           settings (psset/default-settings bf)
+           ;; :weak when nodes are cached by their bytes: a branch then keeps no child it
+           ;; restored, so the cache is the one holder and its weight is what the nodes retain
+           ref-type (when (:store-cache-bytes config) :weak)
+           settings (psset/default-settings bf ref-type)
            ;; proto/core: a JVM-written store (Fressian nodes, E9's tags) opens with E4a's
            ;; real nodes, each tag building what the EDN readers below build. The root
            ;; handler needs the storage, which needs the store: a cell breaks the cycle.
@@ -828,7 +831,7 @@
                                                       address storage nil (or count -1) settings 0)
                                 meta))})))
        (assoc store :storage storage :datahike/store-id store-id
-              :datahike/branching-factor bf :datahike/diff-buf-size 0 :datahike/ref-type nil))
+              :datahike/branching-factor bf :datahike/diff-buf-size 0 :datahike/ref-type ref-type))
      :default (add-konserve-handlers-clj config store)))
 
 (defn- add-konserve-handlers-clj [config store]

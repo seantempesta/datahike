@@ -3,8 +3,11 @@
    weighed bytes are under max-bytes. Each node is weighed by an estimate of what its keys
    retain on Chez (node-bytes), not counted at a fixed size: a decoded node held about 12.4 KB,
    so the former count of max-bytes / 4096 nodes let the cache hold three times its budget.
-   The recency order is a sorted map from a tick to the address, so a hit or a put costs a
-   log of the size and an eviction takes the oldest first."
+   Recency is a second chance (a clock): a hit sets the entry's flag and nothing else, so a hit
+   allocates nothing (a branch keeps no child it restored, so every step of a seek is a hit:
+   a persistent-map update on each cost a seek 1.8x); the queue is a sorted map from a tick to
+   the address, and an eviction takes the oldest, moving it to the newest end once if it was hit
+   since."
   (:require [datahike.datom]))
 
 (def ^:private entry-bytes 200)
@@ -51,12 +54,13 @@
   (->NodeCache (atom {:nodes {} :order (sorted-map) :tick 0 :total 0})
                max-bytes (atom 0) (atom 0) (atom 0)))
 
-(defn- touch
-  "State s with address a moved to the newest end of the order."
+(defn- requeue
+  "State s with address a moved to the newest end of the order, its hit flag cleared."
   [s a]
-  (let [[node t w] (get (:nodes s) a) t' (inc (:tick s))]
+  (let [[node t w hit] (get (:nodes s) a) t' (inc (:tick s))]
+    (vreset! hit false)
     (-> s (assoc :tick t') (update :order dissoc t) (update :order assoc t' a)
-        (assoc-in [:nodes a] [node t' w]))))
+        (assoc-in [:nodes a] [node t' w hit]))))
 
 (defn- drop-entry [s a]
   (if-let [[_ t w] (get (:nodes s) a)]
@@ -64,16 +68,20 @@
     s))
 
 (defn- shrink
-  "State s with its oldest entries evicted until its total is within max-bytes: [s' evicted]."
+  "State s with its oldest entries evicted until its total is within max-bytes: [s' evicted].
+   An oldest entry hit since it was queued goes to the newest end instead, once."
   [s max-bytes]
   (loop [s s n 0]
     (if (and (> (:total s) max-bytes) (seq (:order s)))
-      (recur (drop-entry s (val (first (:order s)))) (inc n))
+      (let [a (val (first (:order s)))]
+        (if @(nth (get (:nodes s) a) 3)
+          (recur (requeue s a) n)
+          (recur (drop-entry s a) (inc n))))
       [s n])))
 
 (defn lookup [cache address]
-  (if-let [[node] (get-in @(:state cache) [:nodes address])]
-    (do (swap! (:hits cache) inc) (swap! (:state cache) touch address) node)
+  (if-let [[node _ _ hit] (get (:nodes @(:state cache)) address)]
+    (do (swap! (:hits cache) inc) (vreset! hit true) node)
     (do (swap! (:misses cache) inc) nil)))
 
 (defn put!
@@ -85,7 +93,7 @@
       (let [n (volatile! 0)]
         (swap! (:state cache)
                (fn [s] (let [s (drop-entry s address) t (inc (:tick s))
-                             s (-> s (assoc :tick t) (assoc-in [:nodes address] [node t w])
+                             s (-> s (assoc :tick t) (assoc-in [:nodes address] [node t w (volatile! false)])
                                    (update :order assoc t address) (update :total + w))
                              [s e] (shrink s max-bytes)]
                          (vreset! n e) s)))
