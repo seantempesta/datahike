@@ -12,6 +12,10 @@
    [datahike.test.core-test])
   (:import [java.util Date]))
 
+;; a path prefix of this run's own: parallel runs (two worktrees' Seon forks steps) must not
+;; delete-database each other's stores (as stress-test, fc2136b4)
+(def ^:private run-dir (str #?(:clj (System/getProperty "java.io.tmpdir") :cljs "/tmp") "/dh-gc-" (random-uuid)))
+
 #?(:cljs (def Throwable js/Error))
 
 (defn- count-store [db]
@@ -35,7 +39,7 @@
               :db/valueType   :db.type/long}])
 
 (deftest datahike-gc-test
-  (let [cfg (assoc-in cfg [:store :path] "/tmp/dh-gc-test")
+  (let [cfg (assoc-in cfg [:store :path] (str run-dir "-test"))
         conn (do
                (d/delete-database cfg)
                (d/create-database cfg)
@@ -78,7 +82,7 @@
     (d/release conn)))
 
 (deftest datahike-gc-versioning-test
-  (let [cfg          (assoc-in cfg [:store :path] "/tmp/dh-gc-versioning-test")
+  (let [cfg          (assoc-in cfg [:store :path] (str run-dir "-versioning-test"))
         conn         (do
                        (d/delete-database cfg)
                        (d/create-database cfg)
@@ -107,7 +111,7 @@
     (d/release conn-branch2)
 
     (testing "Removed branch and after gc check."
-      (let [cfg          (assoc-in cfg [:store :path] "/tmp/dh-gc-versioning-test")
+      (let [cfg          (assoc-in cfg [:store :path] (str run-dir "-versioning-test"))
             conn         (d/connect cfg)
             ;; create two more branches
             cfg1         (assoc cfg :branch :branch1)
@@ -121,7 +125,7 @@
         (d/release conn-branch1)))))
 
 (deftest datahike-gc-range-test
-  (let [cfg           (assoc-in cfg [:store :path] "/tmp/dh-gc-range-test")
+  (let [cfg           (assoc-in cfg [:store :path] (str run-dir "-range-test"))
         conn          (do
                         (d/delete-database cfg)
                         (d/create-database cfg)
@@ -174,7 +178,7 @@
   ;; it does not share with the first, and the union equals the separate marks.
   (let [cfg (-> cfg
                 (assoc :store {:backend :file
-                               :path "/tmp/dh-gc-shared-seen-test"
+                               :path (str run-dir "-shared-seen-test")
                                :id #uuid "9c000000-0000-0000-0000-00000000005e"})
                 (assoc :keep-history? false))
         _ (d/delete-database cfg)
