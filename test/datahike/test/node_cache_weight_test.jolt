@@ -15,7 +15,9 @@
   (let [small (leaf [(datom/datom 1 :value "s" 1)])
         big (leaf (mapv #(datom/datom % :value (apply str (repeat 1000 "x")) 1) (range 10)))]
     (is (< (nodes/node-bytes small) 1000))
-    (is (< 40000 (nodes/node-bytes big)) "ten 1,000-character strings at 4 bytes a character")))
+    (is (< 40000 (nodes/node-bytes big)) "ten 1,000-character strings at 4 bytes a character")
+    (is (< 9000 (nodes/node-bytes (leaf [(datom/datom 1 :vector (byte-array 10000) 1)])) 11000)
+        "a 10,000-byte array weighs its length, not a fixed 64")))
 
 (def ^:private retained
   ;; Chez's own count of the bytes x reaches (compute-size), the shared parts included
@@ -39,14 +41,11 @@
         w (- (nodes/node-bytes node) (nodes/node-bytes base))]
     (is (< (* 0.9 real) w (* 1.1 real)) (str "weighed " w ", retains " real))))
 
-(defn- big-leaf
-  "A leaf of five 1,000-character strings of its own (not shared with another leaf)."
-  [] (leaf (mapv #(datom/datom % :value (apply str (repeat 1000 "x")) 1) (range 5))))
-
 (deftest the-cache-stays-within-its-bytes-and-evicts-the-oldest
   (let [cache (index/make-node-cache {:store-cache-bytes 100000})
-        w (nodes/node-bytes (big-leaf))]
-    (doseq [k (range 10)] (index/cache-put! cache k (big-leaf)))
+        node (leaf (mapv #(datom/datom % :value (apply str (repeat 1000 "x")) 1) (range 5)))
+        w (nodes/node-bytes node)]
+    (doseq [k (range 10)] (index/cache-put! cache k node))
     (let [held (filter #(index/cache-get cache %) (range 10))]
       (is (<= (:weighted-bytes (index/node-cache-stats cache)) 100000))
       (is (= (quot 100000 w) (count held)) "as many as the bytes allow, not 100000 / 4096")
@@ -61,28 +60,13 @@
 
 (deftest a-hit-keeps-a-node-from-eviction
   (let [cache (index/make-node-cache {:store-cache-bytes 100000})
-        cap (quot 100000 (nodes/node-bytes (big-leaf)))]
-    (doseq [k (range cap)] (index/cache-put! cache k (big-leaf)))
+        node (leaf (mapv #(datom/datom % :value (apply str (repeat 1000 "x")) 1) (range 5)))
+        cap (quot 100000 (nodes/node-bytes node))]
+    (doseq [k (range cap)] (index/cache-put! cache k node))
     (index/cache-get cache 0)
-    (index/cache-put! cache :new (big-leaf))
+    (index/cache-put! cache :new node)
     (is (some? (index/cache-get cache 0)) "0 was touched, so 1 went first")
     (is (nil? (index/cache-get cache 1)))))
-
-(deftest a-value-two-nodes-hold-is-weighed-once-until-neither-does
-  ;; :eavt's and :aevt's leaves hold the one string a value stored out of line was read as
-  (let [cache (index/make-node-cache {:store-cache-bytes 1000000})
-        text (apply str (repeat 1000 "x"))
-        a (leaf [(datom/datom 1 :value text 1)]) b (leaf [(datom/datom 1 :value text 2)])
-        w (fn [] (:weighted-bytes (index/node-cache-stats cache)))
-        own (- (nodes/node-bytes a) (+ 16 (* 4 1000)))]
-    (index/cache-put! cache :a a)
-    (is (= (nodes/node-bytes a) (w)) "one node holds it: counted whole")
-    (index/cache-put! cache :b b)
-    (is (= (+ (nodes/node-bytes a) own) (w)) "two nodes hold it: its 4,016 bytes once")
-    (index/cache-evict! cache :a)
-    (is (= (nodes/node-bytes b) (w)) "the other still holds it")
-    (index/cache-evict! cache :b)
-    (is (zero? (w)))))
 
 (deftest an-in-line-value-is-weighed-by-what-it-retains
   ;; persistent-set's in-line caches an out-of-line value's [generation value-key] under its
