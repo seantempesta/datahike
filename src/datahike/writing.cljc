@@ -347,6 +347,15 @@
                         (when-let [schema-meta (k/get store schema-meta-key nil {:sync? true})]
                           (sc/cache-miss schema-meta-key schema-meta)
                           schema-meta))
+        ;; The db below takes these five members from schema-meta itself, and
+        ;; schema-meta-key is their content uuid: the next serialization of this
+        ;; db (or of one a data transaction makes from it) reuses the key
+        ;; (schema-meta-content-key) instead of hashing the schema again, in
+        ;; every process that opens a db, not only the one that wrote it.
+        _ (when (and (map? schema-meta) schema-meta-key
+                     (= #{:schema :rschema :system-entities :ident-ref-map :ref-ident-map} (set (keys schema-meta)))
+                     (not (identical? schema-meta (first @last-schema-meta))))
+            (reset! last-schema-meta [schema-meta schema-meta-key (immutable-schema-value? schema-meta)]))
         effective-schema (or (:schema schema-meta) schema)
         effective-ident-ref-map (or (:ident-ref-map schema-meta) ident-ref-map)
         sec-indices (when secondary-indices?
