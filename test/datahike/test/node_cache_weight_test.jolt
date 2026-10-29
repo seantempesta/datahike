@@ -4,10 +4,12 @@
             [datahike.index.interface :as index]
             [datahike.index.node-cache :as nodes]
             [datahike.datom :as datom]
+            [datahike.api :as d]
+            [datahike.connections :as connections]
             [jolt.scheme :as scm])
-  (:import [org.replikativ.persistent_sorted_set Leaf Settings]))
+  (:import [org.replikativ.persistent_sorted_set Leaf Branch Settings]))
 
-(defn- leaf [datoms] (Leaf. (count datoms) (object-array datoms) (Settings. 128 nil 0)))
+(defn- leaf [datoms] (Leaf. (count datoms) (object-array datoms) (Settings. 128 nil 0 :weak)))
 
 (deftest a-node-weighs-what-its-keys-retain
   (let [small (leaf [(datom/datom 1 :value "s" 1)])
@@ -72,3 +74,40 @@
     (index/cache-put! cache :d v)
     (is (= v (index/cache-get cache :d)))
     (is (< 0 (nodes/node-bytes v) 1000))))
+
+(deftest a-cache-weighs-what-the-nodes-it-holds-retain
+  ;; a store read through a cache a third of its size: reading the indexes evicts nodes, and the
+  ;; cache's weighed total is within a tenth of what the nodes it still holds retain (Chez's
+  ;; compute-size of them), the shared parts counted once. Branches that held the children they
+  ;; restored kept the evicted nodes alive, so the weight was 0.7 of what was retained and fell
+  ;; as the cache turned over (a root's cache: 125.7 MB weighed, 204-226 MB retained)
+  (let [id (random-uuid)
+        path (str (System/getProperty "java.io.tmpdir") "/node-cache-weigh-" id)
+        cfg {:store {:backend :file :path path :id id} :store-cache-bytes 400000 :index-config {:branching-factor 64}
+             :schema-flexibility :read :keep-history? false}
+        text (fn [i] (str "form " i " " (apply str (repeat 40 (str "w" (mod i 97) " ")))))]
+    (d/create-database cfg)
+    (let [c (d/connect cfg)]
+      (doseq [part (partition-all 500 (range 6000))]
+        (d/transact c (mapv (fn [i] {:db/id (- (inc i)) :n i :text (text i) :ref (symbol "seon.demo" (str "v" (mod i 50)))}) part)))
+      (d/release c))
+    (let [c (d/connect cfg)
+          entry (some (fn [[_ e]] (when (:node-cache e) e)) @connections/*connections*)
+          cache (:node-cache entry)]
+      (doseq [idx [:eavt :aevt]] (is (pos? (count (d/datoms @c idx)))))
+      (doseq [i (range 0 6000 7)] (is (seq (d/datoms @c :eavt (inc i)))))
+      (let [held (mapv first (vals (:nodes @(:state cache))))
+            stats (index/node-cache-stats cache)
+            ;; what the process keeps of the store: the cache's nodes and the roots the db value
+            ;; holds (a root is no cache entry), every node they reach counted once
+            roots (remove (fn [r] (some #(identical? r %) held)) (map #(.root %) [(:eavt @c) (:aevt @c)]))
+            ;; the first leaf and the first branch bring in what every node shares (their record
+            ;; types and code), which is no node's own: left out of both sides
+            base (vec (concat (take 1 (filter #(instance? Leaf %) held)) (take 1 (filter #(instance? Branch %) held))))
+            weighed (- (+ (:weighted-bytes stats) (reduce + (map nodes/node-bytes roots))) (reduce + (map nodes/node-bytes base)))
+            real (- (retained (into held roots)) (retained base))]
+        (is (pos? (:evictions stats)) "the cache turned over, or this proves nothing")
+        (is (< 10 (count held)) "it holds more than a few nodes")
+        (is (< (* 0.9 real) weighed (* 1.1 real)) (str "weighed " weighed ", retains " real)))
+      (d/release c))
+    (d/delete-database cfg)))
