@@ -23,6 +23,32 @@
 (defn get-time [d]
   (.getTime ^Date d))
 
+(defn- require-branches
+  "The roster's branches, or a refusal to collect: a store that holds a database names
+  at least one branch, so a roster read back empty is a failed read, and a sweep against
+  it would keep only the roster and delete every head, commit and node (upstream
+  51cf69d3, #1117)."
+  [branches]
+  (if (seq branches)
+    branches
+    (log/raise "Store names no branches; refusing to collect, as an empty mark would sweep the whole store."
+               {:type :gc-branches-unreadable :branches branches})))
+
+(defn- require-complete-mark
+  "`marked`, one mark per branch, or a refusal to sweep. A walk that threw comes back
+  as its exception (go-try-), which is raised as it is; a walk whose go block died
+  yields nothing, so the merge holds one mark fewer than the branches: unchecked,
+  either one's whole tree is missing from what the sweep keeps (upstream 51cf69d3,
+  #1117)."
+  [branches marked]
+  (let [marked (vec marked)]
+    (when-let [e (some #(when (instance? #?(:clj Throwable :cljs js/Error) %) %) marked)]
+      (throw e))
+    (when-not (and (= (count branches) (count marked)) (every? map? marked))
+      (log/raise "Garbage collection mark is incomplete; refusing to sweep."
+                 {:type :gc-incomplete-mark :branches (count branches) :marked (count marked)}))
+    marked))
+
 (defn- reachable-in-branch
   "The keys `branch` reaches from its head through commits newer than
   `after-date`, and the secondary-index key maps those commits record:
@@ -93,8 +119,13 @@
                     ;; narrower window, or the store runs :commit-graph? false
                     ;; and never persisted it. Lineage ends here — nothing to
                     ;; mark. (Without this guard the nil destructure NPEs at
-                    ;; get-time.)
-                    (recur r reachable key-maps)))
+                    ;; get-time.) The seed is the branch's head, which the roster
+                    ;; promises: absent, the read failed, and marking the key alone
+                    ;; would sweep the head's whole tree (upstream 51cf69d3, #1117).
+                    (if (= to-check branch)
+                      (log/raise "Branch head unreadable during garbage collection mark; refusing to sweep."
+                                 {:type :gc-branch-head-unreadable :branch branch})
+                      (recur r reachable key-maps))))
                 {:reachable reachable :key-maps key-maps}))))))
 
 (defn gc-storage!
@@ -168,15 +199,17 @@
                                    {:writer (:backend (:writer config))
                                     :note "collecting a store this process does not write: in-flight commits elsewhere are invisible and may be swept"}))
                      _ (sc/clear-write-cache (:store config))
-                     branches (roster store)
+                     branches (require-branches (roster store))
                      _ (log/trace :datahike/gc-retain-branches {:branches branches})
                      visited (atom #{})
                      seen (atom #{})
-                     marked (if sync?
-                              (mapv #(reachable-in-branch store % remove-before config visited seen true) branches)
-                              (<?- (async/into [] (async/merge
-                                                   (map #(reachable-in-branch store % remove-before config visited seen false)
-                                                        branches)))))
+                     marked (require-complete-mark
+                             branches
+                             (if sync?
+                               (mapv #(reachable-in-branch store % remove-before config visited seen true) branches)
+                               (<?- (async/into [] (async/merge
+                                                    (map #(reachable-in-branch store % remove-before config visited seen false)
+                                                         branches))))))
                      native-reachable (into #{} (mapcat :reachable) marked)
                      retained-key-maps (into #{} (mapcat :key-maps) marked)
                      extension
