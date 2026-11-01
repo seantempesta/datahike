@@ -13,7 +13,9 @@
    NullPointerException from a background collection, blamed on an unrelated
    transaction, roughly one CI run in many.
 
-   These are deterministic where that one is statistical."
+   This one is a threaded race too, but a dense one: 8 threads x 20000 cache calls
+   against a continuous evictor lose the has?/lookup window thousands of times a run
+   (measured on the JVM and seen on Jolt), where the GC test loses it once in many runs."
   (:require [clojure.test :refer [deftest testing is]]
             [datahike.schema-cache :as sc]))
 
