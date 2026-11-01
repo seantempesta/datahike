@@ -655,8 +655,9 @@
       ;; the superseded value's term goes when it survives nowhere: with no history
       ;; for it (keep-history? false: none kept, or :db/noHistory) it is in no index,
       ;; and an equal value replaced the datom in place, so nothing was added
-      ;; (upstream 7c849d15, #940)
-      (and old-datom (or (not keep-history?) (= (hash old-datom) (hash prim))))
+      ;; (upstream 7c849d15, #940; [e a] is the same, so an equal value is an equal
+      ;; term, and comparing values hashes nothing on the history path)
+      (and old-datom (or (not keep-history?) (= (.-v ^Datom old-datom) (.-v prim))))
       (update :hash - (hash old-datom))
       true    (update :hash + (hash prim))
       schema? (-> (update-schema datom)
