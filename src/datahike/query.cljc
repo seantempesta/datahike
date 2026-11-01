@@ -2311,14 +2311,20 @@
      (let [[_ vars & clauses] clause]
        (when (all-bound? context vars)
          (let [join-rel (reduce hash-join (:rels context))
-               negation-context (-> context
-                                    (assoc :rels [join-rel])
-                                    (assoc :stats [])
-                                    (limit-context vars)
-                                    (resolve-context clauses)
-                                    (limit-context vars))
-               negation-join-rel (reduce hash-join (:rels negation-context))
-               negation (subtract-rel join-rel negation-join-rel)]
+               resolved (-> context
+                            (assoc :rels [join-rel])
+                            (assoc :stats [])
+                            (limit-context vars)
+                            (resolve-context clauses))
+               ;; whether the body has a solution is read off the whole body, before
+               ;; projecting it to the join vars: limit-context drops the empty
+               ;; relation that makes it unsolvable, and a negation whose body has
+               ;; no solution excludes nothing (upstream 7f39cccc, #1092)
+               unsatisfiable? (some #(zero? (count (:tuples %))) (:rels resolved))
+               negation-context (limit-context resolved vars)
+               negation (if unsatisfiable?
+                          join-rel
+                          (subtract-rel join-rel (reduce hash-join (:rels negation-context))))]
            (cond-> (assoc context :rels [negation])
              (:stats context) (assoc :tmp-stats {:type :not
                                                  :branches (:stats negation-context)})))))
