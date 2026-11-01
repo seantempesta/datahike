@@ -4,6 +4,7 @@
    Supports fused scan+merge for entity groups, hash-probe value joins,
    anti-merge NOT, and direct-to-HashSet output."
   (:require
+   [clojure.set]
    [datahike.constants :refer [e0 tx0 emax txmax]]
    [datahike.datom :as datom :refer [datom]]
    [datahike.db.interface :as dbi]
@@ -2124,6 +2125,29 @@
     (or (some #{var-sym} scan-clause)
         (some (fn [mc] (some #{var-sym} mc)) merge-clauses))))
 
+(declare sub-plan-bound-vars)
+
+(defn- op-bound-vars
+  "Vars one op of a not-join's sub-plan binds on its own: a scan its vars (an optional
+  scan, a fused get-else, not its entity var), a function its binding's vars, a
+  disjunction what every branch binds; any other op nothing, so the plan falls back to
+  the Relation engine (upstream e4e26c68, #905)."
+  [op]
+  (case (:op op)
+    (:entity-group :pattern-scan)
+    (if (or (:optional? op) (some :optional? (:merge-ops op)))
+      (remove #{(first (:clause op))} (:vars op))
+      (:vars op))
+    :function (filter analyze/free-var? (analyze/extract-vars (:binding op)))
+    (:or :or-join) (let [branch-vars (map sub-plan-bound-vars (:branches op))]
+                     (if (seq branch-vars) (reduce clojure.set/intersection branch-vars) #{}))
+    nil))
+
+(defn- sub-plan-bound-vars
+  "Vars a not-join's sub-plan binds on its own (op-bound-vars of each op)."
+  [sub-plan]
+  (into #{} (mapcat op-bound-vars) (:ops sub-plan)))
+
 (defn- can-direct-fuse?
   "Check if a plan can use the direct-to-HashSet execution path.
    Delegates structural checks (op types, post-op eligibility, source exclusion)
@@ -2161,6 +2185,20 @@
        (every? #(or (and consts (contains? consts %))
                     (contains? all-available-vars %))
                find-vars))
+     ;; A not-join's join vars on both sides of the anti-join: post-filter-not-joins
+     ;; reads each from the wide tuple (group vars) or the consts, and runs the
+     ;; sub-plan with no outer relations, so the sub-plan binds each itself. A join
+     ;; var a function binds outside, or one the body only reads, came back unbound:
+     ;; the negation relation was empty and excluded nothing (upstream e4e26c68, #905;
+     ;; found by 7f39cccc's test, #1092)
+     (let [group-vars (into #{} (mapcat :vars) groups)]
+       (every? (fn [op]
+                 (or (not= :not-join (:op op))
+                     (let [inner (sub-plan-bound-vars (:sub-plan op))]
+                       (every? #(or (and consts (contains? consts %))
+                                    (and (contains? group-vars %) (contains? inner %)))
+                               (:join-vars op)))))
+               ops))
          ;; Multi-group: probe vars resolvable; find-vars from any group or consts
      (every? (fn [[gi {:keys [producer-idx probe-vars]}]]
                (let [consumer-g (nth groups gi)
@@ -3272,7 +3310,13 @@
           join-rel (reduce rel/hash-join (:rels ctx))
           limited-ctx (rel/limit-context (assoc ctx :rels [join-rel]) join-vars)
           neg-ctx (execute-plan (:sub-plan op) limited-ctx db)
-          neg-ctx (when neg-ctx (rel/limit-context neg-ctx join-vars))
+          ;; whether the body has a solution is read off the whole body, before
+          ;; projecting it to the join vars: limit-context drops a relation with
+          ;; no join-var column, the empty one that makes the body unsolvable
+          ;; included, and a negation whose body has no solution excludes nothing
+          ;; (upstream 7f39cccc, #1092)
+          unsatisfiable? (and neg-ctx (some #(zero? (count (:tuples %))) (:rels neg-ctx)))
+          neg-ctx (when (and neg-ctx (not unsatisfiable?)) (rel/limit-context neg-ctx join-vars))
           neg-join (when (and neg-ctx (seq (:rels neg-ctx)))
                      (reduce rel/hash-join (:rels neg-ctx)))
           result (if neg-join (rel/subtract-rel join-rel neg-join) join-rel)]
