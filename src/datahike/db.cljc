@@ -175,30 +175,70 @@
   [pred db]
   (filter (tx-kept? pred db)))
 
+(defn- live-at?
+  "Does db's current eavt hold [e a v] of datom d at d's own tx? (Datom = compares
+  [e a v] only, so the tx is compared here.)"
+  [db ^Datom d]
+  (let [e (.-e d) a (.-a d) v (.-v d)
+        ^Datom c (first (di/-slice (:eavt db) (datom e a v tx0) (datom e a v txmax) :eavt))]
+    (boolean (and c (= (datom-tx c) (datom-tx d))))))
+
+(defn- run-value
+  "The datom of one [e a v] run (two datoms or more, in either order) held at the
+  run's last tx, or nil. The run folds a tx at a time, ascending: a tx with only
+  assertions holds the value, one with only retractions drops it, and one with both
+  holds it only if the value was held before that tx (a retraction closed the older
+  assertion and the value was asserted again; otherwise it was asserted and retracted
+  within the tx: upstream cbdbd242, #950). The stored history keeps one copy of a
+  datom, so add, retract and add again in one tx reads as asserted-and-retracted:
+  at the run's last tx, db's current eavt holding it at that tx says otherwise."
+  [db run]
+  (let [run (if (> (datom-tx (nth run 0)) (datom-tx (peek run))) (rseq run) (seq run))]
+    (loop [ds run held nil]
+      (if-let [^Datom d (first ds)]
+        (let [t (datom-tx d)
+              [a r ds] (loop [ds ds a nil r false]
+                         (let [^Datom x (first ds)]
+                           (if (and x (= t (datom-tx x)))
+                             (if (datom-added x) (recur (rest ds) x r) (recur (rest ds) a true))
+                             [a r ds])))
+              held (cond (nil? a) nil
+                         (not r) a
+                         (some? held) a
+                         (and (empty? ds) (live-at? db a)) a
+                         :else nil)]
+          (recur ds held))
+        held))))
+
 (defn current-datoms-xform
   "Of each run of datoms holding one [e a v] (adjacent in every index, which orders tx after
-  them), the one with the greatest tx, an assertion over a retraction of the same tx, kept
-  when it is an assertion: the value held at the time point. A replaced card-one value's
-  retraction is recorded, so this is the [e a] group's current value too. Keeps the input's
-  order, ascending or descending, and reads one datom past each run."
-  []
+  them), the assertion held at the time point, if any: the run's one datom when it is an
+  assertion, else run-value. A replaced card-one value's retraction is recorded, so this is
+  the [e a] group's current value too. Keeps the input's order, ascending or descending, and
+  reads one datom past each run; a run of one datom, the common case, allocates nothing."
+  [db]
   (fn [rf]
     (let [held (volatile! nil)
-          later? (fn [^Datom d ^Datom h]
-                   (let [t (datom-tx d) u (datom-tx h)]
-                     (or (> t u) (and (= t u) (datom-added d)))))]
+          more (volatile! nil)
+          value (fn [^Datom h]
+                  (if-let [m @more]
+                    (do (vreset! more nil) (run-value db (persistent! m)))
+                    (when (datom-added h) h)))]
       (fn
         ([] (rf))
-        ([acc] (let [h @held]
+        ([acc] (let [h @held
+                     v (when h (value h))]
                  (vreset! held nil)
-                 (rf (if (and h (datom-added h)) (unreduced (rf acc h)) acc))))
+                 (rf (if v (unreduced (rf acc v)) acc))))
         ([acc ^Datom d]
          (let [h @held]
            (cond
              (nil? h) (do (vreset! held d) acc)
-             (zero? (dd/cmp-datoms-eavt-prefix h d)) (do (when (later? d h) (vreset! held d)) acc)
-             :else (do (vreset! held d)
-                       (if (datom-added h) (rf acc h) acc)))))))))
+             (zero? (dd/cmp-datoms-eavt-prefix h d))
+             (do (vreset! more (conj! (or @more (transient [h])) d)) acc)
+             :else (let [v (value h)]
+                     (vreset! held d)
+                     (if v (rf acc v) acc)))))))))
 
 (defn post-process-datoms
   "Datoms read through context: its time predicate (as-of, since) keeps the datoms of the
@@ -214,7 +254,7 @@
       (let [time-xform (temporal-datom-filter time-pred db)]
         (if (dbi/context-historical? context)
           (into [] (dbi/nil-comp time-xform xform) datoms)
-          (sequence (dbi/nil-comp (comp time-xform (current-datoms-xform)) xform) datoms)))
+          (sequence (dbi/nil-comp (comp time-xform (current-datoms-xform db)) xform) datoms)))
 
       xform (into [] xform datoms)
 
