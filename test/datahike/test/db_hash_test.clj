@@ -64,3 +64,13 @@
       (let [[h s] (hash-after false txs)]
         (is (= s h) (str label ": :hash must equal the sum over :eavt"))))))
 
+
+(deftest with-history-a-same-value-overwrite-leaves-the-hash
+  (testing "an equal value replaces the datom in place, so :hash moves by the
+            transaction's own :db/txInstant datom and nothing else"
+    (with-conn true
+      (fn [conn]
+        (d/transact conn [{:db/id -1 :name "a" :score 1}])
+        (let [{:keys [db-before db-after tx-data]} (d/transact conn [{:db/id [:name "a"] :score 1}])
+              tx-instant (reduce + 0 (map hash (filter #(= :db/txInstant (:a %)) tx-data)))]
+          (is (= tx-instant (- (:hash db-after) (:hash db-before)))))))))
