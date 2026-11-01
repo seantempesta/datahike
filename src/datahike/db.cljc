@@ -212,32 +212,59 @@
 
 (defn current-datoms-xform
   "Of each run of datoms holding one [e a v] (adjacent in every index, which orders tx after
-  them), the assertion held at the time point, if any: the run's one datom when it is an
-  assertion, else run-value. A replaced card-one value's retraction is recorded, so this is
-  the [e a] group's current value too. Keeps the input's order, ascending or descending, and
-  reads one datom past each run; a run of one datom, the common case, allocates nothing."
+  them), the assertion held at the time point, if any: a run of one datom, the common case,
+  its datom when an assertion, as before; a longer ascending run folds a tx at a time as its
+  datoms arrive, by run-value's rule, allocating nothing; a descending one (rseek) is
+  collected and handed to run-value. A replaced card-one value's retraction is recorded, so
+  this is the [e a] group's current value too. Keeps the input's order and reads one datom
+  past each run."
   [db]
   (fn [rf]
-    (let [held (volatile! nil)
-          more (volatile! nil)
+    ;; one run: its first datom; nil while it is one datom, else :asc or a descending run's
+    ;; datoms; the current tx, its assertion and its retraction; the assertion held before
+    (let [head (volatile! nil) mode (volatile! nil)
+          gt (volatile! 0) ga (volatile! nil) gr (volatile! nil) prior (volatile! nil)
+          group (fn [last?]
+                  (let [a @ga]
+                    (cond (nil? a) nil
+                          (nil? @gr) a
+                          (some? @prior) a
+                          (and last? (live-at? db a)) a
+                          :else nil)))
+          tx! (fn [^Datom d]
+                (if (datom-added d)
+                  (do (vreset! ga d) (vreset! gr nil))
+                  (do (vreset! ga nil) (vreset! gr d)))
+                (vreset! gt (datom-tx d)))
           value (fn [^Datom h]
-                  (if-let [m @more]
-                    (do (vreset! more nil) (run-value db (persistent! m)))
-                    (when (datom-added h) h)))]
+                  (let [m @mode]
+                    (cond (nil? m) (when (datom-added h) h)
+                          (keyword? m) (group true)
+                          :else (run-value db (persistent! m)))))]
       (fn
         ([] (rf))
-        ([acc] (let [h @held
-                     v (when h (value h))]
-                 (vreset! held nil)
+        ([acc] (let [h @head v (when h (value h))]
+                 (vreset! head nil)
                  (rf (if v (unreduced (rf acc v)) acc))))
         ([acc ^Datom d]
-         (let [h @held]
+         (let [h @head]
            (cond
-             (nil? h) (do (vreset! held d) acc)
+             (nil? h) (do (vreset! head d) (vreset! mode nil) acc)
              (zero? (dd/cmp-datoms-eavt-prefix h d))
-             (do (vreset! more (conj! (or @more (transient [h])) d)) acc)
+             (let [m @mode]
+               (when (nil? m) (vreset! prior nil) (tx! h) (vreset! mode :asc))
+               (let [m @mode t (datom-tx d) g @gt]
+                 (cond
+                   (not (keyword? m)) (vreset! mode (conj! m d))
+                   (== t g) (if (datom-added d) (vreset! ga d) (vreset! gr d))
+                   (> t g) (do (vreset! prior (group false)) (tx! d))
+                   :else (vreset! mode (cond-> (transient [])
+                                         @ga (conj! @ga)
+                                         @gr (conj! @gr)
+                                         true (conj! d)))))
+               acc)
              :else (let [v (value h)]
-                     (vreset! held d)
+                     (vreset! head d) (vreset! mode nil)
                      (if v (rf acc v) acc)))))))))
 
 (defn post-process-datoms
