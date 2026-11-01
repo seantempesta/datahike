@@ -3221,9 +3221,13 @@
 
 (defn- execute-or [db op ctx]
   (let [or-vars (:vars op)
+        ;; each branch gets only the relations it shares a variable with, as
+        ;; execute-or-join does: a branch folds what it is handed with hash-join,
+        ;; a Cartesian product on relations sharing no attribute, and nested ors
+        ;; multiplied by it once per level (upstream 8028d1f4, #956)
+        branch-ctx (rel/limit-context ctx or-vars)
         branch-rels (mapv (fn [sub-plan]
-                            (let [branch-ctx (assoc ctx :rels (:rels ctx))
-                                  result-ctx (execute-plan sub-plan branch-ctx db)]
+                            (let [result-ctx (execute-plan sub-plan branch-ctx db)]
                               (when result-ctx
                                 (let [joined (reduce rel/hash-join (:rels result-ctx))]
                                   ;; Project to OR's visible vars — critical for rules where
