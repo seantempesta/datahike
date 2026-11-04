@@ -526,14 +526,14 @@
 
 (defn abandon-pending!
   "Drop the connection's run-ahead value without committing it, so the connection's committed
-  value is the truth again. Answers {:tx-count n}, the transactions dropped, or nil when nothing
-  was pending. `:last-cid` stays the last commit that succeeded, so the next commit starts from
+  value is the truth again. Answers {:tx-count n :reports reports}, the transactions dropped and their reports, or nil
+  when nothing was pending. `:last-cid` stays the last commit that succeeded, so the next commit starts from
   it. Only on a :sync writer."
   [connection]
   (let [writer (:writer @(:wrapped-atom connection))]
     (when-let [{:keys [reports]} @(:pending writer)]
       (vreset! (:pending writer) nil)
-      {:tx-count (count reports)})))
+      {:tx-count (count reports) :reports reports})))
 
 ;; Note: :kabel backend is implemented in datahike.kabel.writer
 ;; Require that namespace to register the defmethod
