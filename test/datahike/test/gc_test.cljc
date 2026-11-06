@@ -61,11 +61,11 @@
     (testing "Delete old db with roots."
       ;; the old empty current roots are still the temporal indexes' roots
       ;; (an empty index's address is its content), so only the old commit
-      ;; record and its graph record go
-      (is (= 3 (count (<?? S (d/gc-storage conn (Date.))))))
+      ;; record goes, and its graph record stays: a merge base is walked over it
+      (is (= 2 (count (<?? S (d/gc-storage conn (Date.))))))
       ;; and the collection's generation key is written (700c473: a value key a cache found
       ;; before a sweep is asked of the store again after it)
-      (is (= (+ 1 history-count fresh-count num-roots) (count-store @conn))))
+      (is (= (+ 2 history-count fresh-count num-roots) (count-store @conn))))
     (testing "Try to run on dirty index and fail."
       (is (thrown-with-msg? Throwable #"Index needs to be properly flushed before marking."
                             (-mark (:eavt

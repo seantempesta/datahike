@@ -62,7 +62,7 @@
    (go-try-
           (let [head-cid (<?- (k/get-in store [branch :meta :datahike/commit-id] nil {:sync? sync?}))]
             (loop [[to-check & r] [branch]
-                   reachable      #{branch head-cid}
+                   reachable      (hash-set branch head-cid)
                    key-maps       #{}]
               (if to-check
                 (if (contains? (first (swap-vals! visited conj to-check)) to-check) ;; claimed: skip
@@ -128,11 +128,33 @@
                       (recur r reachable key-maps))))
                 {:reachable reachable :key-maps key-maps}))))))
 
+(defn- graph-keys
+  "The store keys of the commit graph records that `seeds` (branch names and commit
+  ids) reach: small, and what a merge base is walked over, so they outlive the
+  snapshots a cutoff sweeps."
+  [store seeds sync?]
+  (async+sync sync? *default-sync-translation*
+   (go-try-
+    (loop [todo (vec seeds) seen #{} keys #{}]
+      (if-let [x (peek todo)]
+        (let [todo (pop todo)
+              c (if (keyword? x) (<?- (k/get-in store [x :meta :datahike/commit-id] nil {:sync? sync?})) x)]
+          (if (or (nil? c) (seen c))
+            (recur todo seen keys)
+            (let [k (commit-graph-key c)
+                  record (<?- (k/get store k nil {:sync? sync?}))]
+              (recur (into todo (:datahike/parents record)) (conj seen c) (cond-> keys record (conj k))))))
+        keys)))))
+
 (defn gc-storage!
   "Invokes garbage collection on the database by whitelisting currently known branches.
   All db snapshots on these branches before remove-before date will also be
   erased (defaults to beginning of time [no erasure]). The branch heads will
   always be retained.
+
+  Opts `:datahike.gc/keep-commits` is a set of commit ids kept whole whatever their
+  age. Every commit's graph record stays whatever the cutoff, so a merge base is
+  found after any sweep.
 
   The sweep result is passed through unchanged. In `:datahike.gc/sweep-opts`,
   `:konserve.gc/report? true` requests the candidate and pre-sweep observed
@@ -203,14 +225,20 @@
                      _ (log/trace :datahike/gc-retain-branches {:branches branches})
                      visited (atom #{})
                      seen (atom #{})
+                     keep (<?- (async+sync sync? *default-sync-translation*
+                                 (go-try- (loop [[c & r] (seq (:datahike.gc/keep-commits opts)) acc []]
+                                            (if c
+                                              (recur r (if (<?- (k/exists? store c {:sync? sync?})) (conj acc c) acc))
+                                              acc)))))
+                     seeds (into (vec branches) keep)
                      marked (require-complete-mark
-                             branches
+                             seeds
                              (if sync?
-                               (mapv #(reachable-in-branch store % remove-before config visited seen true) branches)
+                               (mapv #(reachable-in-branch store % remove-before config visited seen true) seeds)
                                (<?- (async/into [] (async/merge
                                                     (map #(reachable-in-branch store % remove-before config visited seen false)
-                                                         branches))))))
-                     native-reachable (into #{} (mapcat :reachable) marked)
+                                                         seeds))))))
+                     native-reachable (into (<?- (graph-keys store seeds sync?)) (mapcat :reachable) marked)
                      retained-key-maps (into #{} (mapcat :key-maps) marked)
                      extension
                      (if-let [extend-reachable (:datahike.gc/reachable-extension opts)]
