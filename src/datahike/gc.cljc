@@ -300,11 +300,13 @@
                           default nil keeps all history.
 
    Errors in a cycle are logged and the loop continues; stop with the
-   returned function."
+   returned function, which answers a channel that delivers :stopped once the
+   loop, and any cycle it was running, has ended."
   ([conn] (start-background-gc! conn {}))
   ([conn {:keys [interval-ms history-window-ms]
           :or {interval-ms 300000}}]
-   (let [stop-ch (async/chan)]
+   (let [stop-ch (async/chan)
+         done
      (go-loop []
        (let [[_ ch] (async/alts! [stop-ch (async/timeout interval-ms)])]
          (when-not (= ch stop-ch)
@@ -318,5 +320,7 @@
              (if (instance? #?(:clj Throwable :cljs js/Error) res)
                (log/warn :datahike/background-gc-error {:error res})
                (log/debug :datahike/background-gc-cycle {:swept (count res)})))
-           (recur))))
-     (fn stop-background-gc! [] (async/close! stop-ch) :stopped))))
+           (recur))))]
+     ;; answers once the loop has ended, so a cycle in flight when stop is called has finished (a caller
+     ;; deleting the store after it no longer races the cycle's sweep)
+     (fn stop-background-gc! [] (async/close! stop-ch) (async/go (async/<! done) :stopped)))))

@@ -83,8 +83,7 @@
     (testing "start-background-gc! is invocable, runs cycles, and stops cleanly"
       (let [stop (gc/start-background-gc! conn {:interval-ms 30})]
         (<! (a/timeout 150))  ;; let a few cycles fire
-        (is (= :stopped (stop)) "stop function returns :stopped")
-        (<! (a/timeout 60)))  ;; let any in-flight cycle finish before teardown
+        (is (= :stopped (<! (stop))) "stop answers :stopped once any in-flight cycle has finished"))
       (is (= n (d/q '[:find (count ?e) . :where [?e :id _]] @conn))
           "data intact after background collection cycles"))
     (d/release conn)
@@ -224,7 +223,7 @@
                                 (.release inflight))))
                    (recur (inc i))))
                (.acquire inflight 64)
-               (stop-gc)
+               (a/<!! (stop-gc))  ;; its last cycle has ended before the final sweep below
                (is (nil? @tx-error) "no transact failed during concurrent collection")
                ;; a final full sweep contains the store (writes are quiesced now)
                (<?? S (gc/gc-storage! @conn (java.util.Date.)))
