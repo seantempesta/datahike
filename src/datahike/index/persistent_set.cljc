@@ -16,6 +16,7 @@
             [konserve.serializers :refer [fressian-serializer]]
             #?(:cljs [fress.api :as fress])
             [hasch.core :refer [uuid squuid]]
+            #?@(:jolt [[konserve.jolt.fasl-store :as fasl-store]])
             [replikativ.logging :as log])
   #?(:cljs (:require-macros [datahike.index.persistent-set :refer [generate-slice-comparator-constructor]]))
   #?(:clj (:import [datahike.datom Datom]
@@ -387,9 +388,12 @@
       (uuid addrs))))
 
 (defn- leaf-content-uuid
-  "Content-addressed UUID of a Leaf: hash of its datoms in vector form."
+  "Content-addressed UUID of a Leaf: on Jolt the SHA-256 of its datoms' stored bytes, else hash of its datoms in vector form."
   [node]
-  (uuid (mapv (comp vec seq) #?(:clj (.keys ^Leaf node) :cljs (.-keys node)))))
+  #?(:jolt (let [d (java.nio.ByteBuffer/wrap (.digest (java.security.MessageDigest/getInstance "SHA-256")
+                                                      (fasl-store/serialize (mapv (comp vec seq) (.keys ^Leaf node)))))]
+             (java.util.UUID. (.getLong d) (.getLong d)))
+     :default (uuid (mapv (comp vec seq) #?(:clj (.keys ^Leaf node) :cljs (.-keys node))))))
 
 (defn- gen-address [#?(:clj ^ANode node :cljs node) crypto-hash?]
   (if crypto-hash?
