@@ -261,8 +261,8 @@
          ;; adopted on a fresh connect (adopt-create-time-fixed), so an existing
          ;; connection may carry adopted keys the caller's config omits;
          ;; conflicts are guarded on the fresh-connect path, not here.
-         (dissoc :writer :store :store-cache-size :store-cache-bytes :search-cache-size
-                 :index-config :fuse-index-roots? :commit-graph? :keep-history?))
+         (dissoc :writer :store :store-cache-size :store-cache-bytes :search-cache-size :index-config)
+         (#(apply dissoc % store-fixed-record-keys)))
       writer-key (assoc :writer writer-key))))
 
 (defn close-secondary-indices
