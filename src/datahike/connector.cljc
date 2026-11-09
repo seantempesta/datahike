@@ -198,10 +198,11 @@
   "Top-level config keys that describe how records in the store are laid out
    and are therefore fixed when the database is created: :fuse-index-roots?
    (index roots inlined into the db record) and :commit-graph? (whether each
-   commit persists an immutable cid record), and :keep-history? (whether
-   temporal indexes are retained). Adopted at connect like the
+   commit persists an immutable cid record), :keep-history? (whether
+   temporal indexes are retained) and :crypto-hash? (whether index nodes are
+   addressed by their content). Adopted at connect like the
    create-time-fixed :index-config sub-keys."
-  #{:fuse-index-roots? :commit-graph? :keep-history?})
+  #{:fuse-index-roots? :commit-graph? :keep-history? :crypto-hash?})
 
 (defn- adopt-create-time-fixed
   "Adopt store-fixed settings from the stored config into `config`: the
@@ -495,7 +496,8 @@
                       (map? config) config
                       :else config)
          loaded (cond-> (dissoc (dc/load-config normalized) :initial-tx :remote-peer :name)
-                  (not (contains? normalized :keep-history?)) (dissoc :keep-history?))]
+                  (not (contains? normalized :keep-history?)) (dissoc :keep-history?)
+                  (not (contains? normalized :crypto-hash?)) (dissoc :crypto-hash?))]
      (-connect* loaded opts))))
 
 (defn release
