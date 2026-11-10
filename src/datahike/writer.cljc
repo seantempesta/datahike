@@ -399,7 +399,16 @@
     (throw (ex-info "Transactions applied run-ahead are pending: commit-pending! or abandon-pending! them first."
                     {:type :run-ahead-pending :tx-count (count reports)}))))
 
-(defn- sync-apply! [connection write-fn-map last-cid {:keys [op args]}]
+;; a :sync writer keeps, beside its last commit id, that commit's generation as
+;; {commit-id generation}: its next commit's graph record is built on it, not on
+;; the parent's record read back from storage (`w/commit-graph-writes`)
+(defn- known-generation
+  "{commit-id generation} of the commit `stored`, commit!'s answer; nil when it has no generation."
+  [stored]
+  (when-let [g (:datahike/generation (meta stored))]
+    {(get-in stored [:meta :datahike/commit-id]) g}))
+
+(defn- sync-apply! [connection write-fn-map last-cid known-gen {:keys [op args]}]
   (refuse-while-pending! (:writer @(:wrapped-atom connection)))
   (let [old @(:wrapped-atom connection)
         res (apply (write-fn-map op) old args)
@@ -411,7 +420,8 @@
         modified-attrs (w/batch-cache-revision-attributes [res])
         stored (w/commit! db (not-empty merge-parents) true @last-cid
                           {:prior (:cache-context parent-db) :modified-attrs modified-attrs
-                           :unsafe? (boolean (seq merge-parents))})
+                           :unsafe? (boolean (seq merge-parents))}
+                          @known-gen)
         commit-id (get-in stored [:meta :datahike/commit-id])
         commit-db (assoc stored :cache-context
                          (some-> (:cache-context parent-db)
@@ -421,6 +431,7 @@
                    (assoc :db-after commit-db)
                    (assoc :datahike/commit {:commit-id commit-id :tx-count 1 :duration-ms (- (get-time-ms) start-ts)}))]
     (vreset! last-cid commit-id)
+    (vreset! known-gen (known-generation stored))
     #?(:jolt (reset! (.-wrapped-atom connection) commit-db) :clj (reset! connection commit-db))
     (committed-report/offer-committed! commit-db report)
     report))
@@ -434,13 +445,13 @@
 
 (declare commit-pending!)
 
-(defrecord SyncWriter [connection write-fn-map last-cid pending streaming?]
+(defrecord SyncWriter [connection write-fn-map last-cid known-generation pending streaming?]
   PWriter
   (-dispatch! [_ arg-map]
     (let [p (promise-chan)]
       (put! p (try (if (= 'gc-storage! (:op arg-map))
                      (sync-collect! connection write-fn-map arg-map)
-                     (sync-apply! connection write-fn-map last-cid arg-map))
+                     (sync-apply! connection write-fn-map last-cid known-generation arg-map))
                    (catch #?(:clj Throwable :cljs js/Error) e e)))
       p))
   ;; a release drains: what was applied run-ahead and not committed yet is committed before
@@ -476,13 +487,15 @@
       (let [start-ts (get-time-ms)
             modified-attrs (w/batch-cache-revision-attributes ok)
             stored (w/commit! db nil true @(:last-cid writer)
-                              {:prior (:cache-context parent-db) :modified-attrs modified-attrs :unsafe? false})
+                              {:prior (:cache-context parent-db) :modified-attrs modified-attrs :unsafe? false}
+                              @(:known-generation writer))
             commit-id (get-in stored [:meta :datahike/commit-id])
             commit-db (assoc stored :cache-context
                              (some-> (:cache-context parent-db)
                                      (q/advance-query-cache-context commit-id modified-attrs false)))
             commit {:commit-id commit-id :tx-count (count ok) :duration-ms (- (get-time-ms) start-ts)}]
         (vreset! (:last-cid writer) commit-id)
+        (vreset! (:known-generation writer) (known-generation stored))
         #?(:jolt (reset! (.-wrapped-atom connection) commit-db) :clj (reset! connection commit-db))
         (mapv (fn [r]
                 (if (map? r)
@@ -494,7 +507,7 @@
 
 (defmethod create-writer :sync
   [{:keys [write-fn-map streaming?]} connection]
-  (->SyncWriter connection (merge default-write-fn-map write-fn-map) (volatile! nil) (volatile! nil) streaming?))
+  (->SyncWriter connection (merge default-write-fn-map write-fn-map) (volatile! nil) (volatile! nil) (volatile! nil) streaming?))
 
 ;; seon (lane A1): run-ahead writes at the serial caller. The caller owns its branch alone (an
 ;; agent process): each transaction is applied to the value ahead of the committed one and
@@ -555,12 +568,14 @@
       (let [parent-db committed
             modified-attrs (w/batch-cache-revision-attributes reports)
             stored (w/commit! db nil true @(:last-cid writer)
-                              {:prior (:cache-context parent-db) :modified-attrs modified-attrs :unsafe? false})
+                              {:prior (:cache-context parent-db) :modified-attrs modified-attrs :unsafe? false}
+                              @(:known-generation writer))
             commit-id (get-in stored [:meta :datahike/commit-id])
             commit-db (assoc stored :cache-context
                              (some-> (:cache-context parent-db)
                                      (q/advance-query-cache-context commit-id modified-attrs false)))]
         (vreset! (:last-cid writer) commit-id)
+        (vreset! (:known-generation writer) (known-generation stored))
         (vreset! (:pending writer) nil)
         #?(:jolt (reset! (.-wrapped-atom connection) commit-db) :clj (reset! connection commit-db))
         {:commit-id commit-id :tx-count (count reports) :db commit-db}))))
@@ -678,7 +693,7 @@
   (let [p (throwable-promise)
         writer (:writer @(:wrapped-atom connection))]
     (if (instance? SyncWriter writer)
-      (let [tx-report (try (sync-apply! connection (:write-fn-map writer) (:last-cid writer) {:op 'transact! :args [arg-map]})
+      (let [tx-report (try (sync-apply! connection (:write-fn-map writer) (:last-cid writer) (:known-generation writer) {:op 'transact! :args [arg-map]})
                            (catch #?(:clj Throwable :cljs js/Error) e e))]
         (when (map? tx-report) (notify-listeners! connection (some-> (:listeners (meta connection)) deref) tx-report))
         (#?(:jolt (fn [p v] (p v)) :clj deliver :cljs put!) p tx-report)
@@ -728,7 +743,7 @@
     (if (instance? SyncWriter writer)
       ;; a :sync writer merges on the calling thread, as its transact! does: no go block, so
       ;; it works in a process with no scheduler threads (a forked agent; seon lane A1)
-      (let [tx-report (try (sync-apply! connection (:write-fn-map writer) (:last-cid writer) {:op 'merge! :args [arg-map]})
+      (let [tx-report (try (sync-apply! connection (:write-fn-map writer) (:last-cid writer) (:known-generation writer) {:op 'merge! :args [arg-map]})
                            (catch #?(:clj Throwable :cljs js/Error) e e))]
         (when (map? tx-report) (notify-listeners! connection (some-> (:listeners (meta connection)) deref) tx-report))
         (#?(:jolt (fn [p v] (p v)) :clj deliver :cljs put!) p tx-report)

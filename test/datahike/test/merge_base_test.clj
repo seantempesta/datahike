@@ -5,6 +5,7 @@
             [clojure.test :refer [deftest is testing]]
             [datahike.api :as d]
             [datahike.versioning :as v]
+            [datahike.writer :as writer]
             [datahike.writing :as w]
             [konserve.core :as k]
             [superv.async :refer [<?? S]])
@@ -56,6 +57,57 @@
                 (is (= :chain (:datahike/branch (graph-record main c))))
                 (is (= :chain (:datahike/branch (graph-record main m))))
                 (is (= #{c c1} (:datahike/parents (graph-record main m))))))))))))
+
+(defn- graph-reads
+  "f's answer, and the commits whose graph record f read from the store, in order."
+  [f]
+  (let [reads (atom []) real k/get]
+    (with-redefs [k/get (fn [store key & more]
+                          (when (and (vector? key) (= :datahike/commit-graph (first key)))
+                            (swap! reads conj (second key)))
+                          (apply real store key more))]
+      [(f) @reads])))
+
+(defn- generation [conn cid] (:datahike/generation (graph-record conn cid)))
+
+(deftest a-sync-writer-builds-each-record-on-the-generation-it-wrote-last
+  (let [c (assoc (cfg) :writer {:backend :sync})]
+    (with-store c
+      (fn [main]
+        (let [commit! (fn [f]
+                        (let [parent (d/commit-id @main)
+                              [_ reads] (graph-reads f)
+                              cid (d/commit-id @main)]
+                          (is (not= parent cid))
+                          (is (= (inc (generation main parent)) (generation main cid)))
+                          reads))]
+          (testing "the first commit after a connect reads its parent's record"
+            (let [parent (d/commit-id @main)]
+              (is (= [parent] (commit! #(tx! main 0))))))
+          (testing "every later commit reads none"
+            (dotimes [i 4] (is (= [] (commit! #(tx! main (inc i))))))
+            (is (= [] (commit! #(writer/transact-batch! main [{:tx-data [{:k/n 5}]} {:tx-data [{:k/n 6}]}])))))
+          (testing "nor after a run-ahead value is abandoned, or committed"
+            (writer/apply! main {:tx-data [{:k/n 7}]} {:show? true})
+            (writer/abandon-pending! main)
+            (is (= [] (commit! #(tx! main 8))))
+            (is (= [] (commit! #(do (writer/apply! main {:tx-data [{:k/n 9}]})
+                                    (writer/commit-pending! main))))))
+          (testing "a merge reads the record of the parent its writer did not write"
+            (v/branch! main :db :chain)
+            (let [chain (d/connect (assoc c :branch :chain))]
+              (try
+                (tx! chain 10)
+                (dotimes [i 2] (is (= [] (commit! #(tx! main (+ 11 i))))))
+                (let [own (d/commit-id @chain)
+                      other (d/commit-id @main)
+                      [_ reads] (graph-reads #(forward-merge! chain main 13))
+                      m (d/commit-id @chain)]
+                  (is (= [other] reads))
+                  (is (< (generation main own) (generation main other)))
+                  (is (= (inc (max (generation main own) (generation main other)))
+                         (generation main m))))
+                (finally (d/release chain))))))))))
 
 (deftest the-merge-base-follows-the-chain-lifecycle
   (with-store (cfg)

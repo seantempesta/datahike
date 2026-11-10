@@ -521,16 +521,22 @@
    graph record.
 
    They hold the records derived for ancestors without a complete record,
-   parents first, then the record of `cid` with `parents`."
-  [store cid parents branch]
-  (let [{:keys [stored derived]} (commit-graph-records store parents)
-        gen (fn [p] (:datahike/generation (or (get stored p) (get derived p))))
-        record {:datahike/parents (set parents)
-                :datahike/generation (inc (reduce max 0 (keep gen parents)))
-                :datahike/branch branch}]
-    ;; parents first: a torn batch never leaves a record whose ancestors lack theirs
-    (conj (mapv (fn [[c r]] [(commit-graph-key c) r]) (sort-by (comp :datahike/generation val) derived))
-          [(commit-graph-key cid) record])))
+   parents first, then the record of `cid` with `parents`.
+
+   `known-generations` is an optional {commit-id generation} map of commits
+   the caller already knows the generation of (a writer, of the commit it
+   wrote last): those parents' graph records are not read back from storage."
+  ([store cid parents branch] (commit-graph-writes store cid parents branch {}))
+  ([store cid parents branch known-generations]
+   (let [{:keys [stored derived]} (commit-graph-records store (remove #(contains? known-generations %) parents))
+         gen (fn [p] (or (get known-generations p)
+                         (:datahike/generation (or (get stored p) (get derived p)))))
+         record {:datahike/parents (set parents)
+                 :datahike/generation (inc (reduce max 0 (keep gen parents)))
+                 :datahike/branch branch}]
+     ;; parents first: a torn batch never leaves a record whose ancestors lack theirs
+     (conj (mapv (fn [[c r]] [(commit-graph-key c) r]) (sort-by (comp :datahike/generation val) derived))
+           [(commit-graph-key cid) record]))))
 
 (defn- audit-grade?
   "Audit-grade cids require :crypto-hash? on a persistent backend,
@@ -634,7 +640,13 @@
    (commit! db parents sync? known-head-cid nil))
   ;; `revision-change` is `{:prior context :modified-attrs set :unsafe? bool}`:
   ;; the writer's committed context before this commit and what it changes.
-  ([db parents sync? known-head-cid {:keys [prior modified-attrs unsafe?]}]
+  ([db parents sync? known-head-cid revision-change]
+   (commit! db parents sync? known-head-cid revision-change nil))
+  ;; `known-generations` is the writer's {commit-id generation} of the commit it
+  ;; wrote last (`commit-graph-writes`). The returned db carries this commit's
+  ;; generation as `:datahike/generation` in its metadata, for the writer to
+  ;; hand to its next commit.
+  ([db parents sync? known-head-cid {:keys [prior modified-attrs unsafe?]} known-generations]
    (async+sync sync? *default-sync-translation*
                (go-try-
                 ;; Contain fatal ERRORS (AssertionError, OOM, ...): go-try- catches
@@ -720,7 +732,8 @@
                         ;; written in the same ordered batch, before the
                         ;; commit record, so no commit exists without it.
                           graph-writes  (when commit-graph?
-                                          (commit-graph-writes store cid parents (commit-branch db-to-store)))]
+                                          (commit-graph-writes store cid parents (commit-branch db-to-store)
+                                                               known-generations))]
 
                       (if (multi-key-capable? store)
                         (let [[meta-key meta-val] schema-meta-kv-to-write
@@ -787,7 +800,9 @@
                       (when (get-in config [:online-gc :enabled?])
                         (<?- (online-gc/online-gc! store (assoc (:online-gc config) :sync? false))))
 
-                      db)
+                      ;; nil without a commit graph, so no generation outlives its commit
+                      (vary-meta db assoc :datahike/generation
+                                 (:datahike/generation (second (peek graph-writes)))))
                     (catch #?(:clj Error :cljs :default) e
                       #?(:clj  (throw (ex-info "Fatal error during commit."
                                                {:type :fatal-commit-error}
