@@ -67,7 +67,11 @@
                           (-take! [_ _] 0)
                           (-reach! [_ kind id] (swap! reached update kind (fnil max 0) id) nil))]
                 (writing/set-ids! store (random-uuid) ids)
-                (is (= {:eid max-eid :tx max-tx} @reached) "moved past the highest head's ids")))
+                (is (= {:eid max-eid :tx max-tx} @reached) "moved past the highest head's ids")
+                ;; a source its caller says is already past the heads is made the store's as it is: no head read, nothing moved
+                (reset! reached {})
+                (writing/set-ids! store (random-uuid) ids {:past-heads? true})
+                (is (= {} @reached) "past-heads? reads no head and moves nothing")))
             (finally (d/release side))))
         (finally
           (d/release connection)

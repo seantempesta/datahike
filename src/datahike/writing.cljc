@@ -867,13 +867,21 @@
 (defn set-ids!
   "Make `ids` (datahike.ids/IIds) the id source of the store with id `store-id` in this
   process, moved past every branch head's ids: the source every process writing the store
-  shares (one mapped across fork, in a file beside the store). Answers ids."
-  [store store-id ids]
-  #?(:clj (let [{:keys [max-eid max-tx]} (roster-max store)]
-            (datahike.ids/-reach! ids :eid max-eid)
-            (datahike.ids/-reach! ids :tx max-tx)
-            (.put ^java.util.concurrent.ConcurrentHashMap id-sources store-id ids)))
-  ids)
+  shares (one mapped across fork, in a file beside the store). Answers ids.
+
+  With `{:past-heads? true}` it is made the source without reading the heads (`roster-max`,
+  O(branches) reads): the caller says `ids` is already past every id any head of the store
+  holds. Claim it only for a source every writer of the store takes its ids from, which has
+  not been lost or made apart from the store since it was last moved past the heads (Seon's
+  shared page, stamped with the boot and file it was moved in)."
+  ([store store-id ids] (set-ids! store store-id ids nil))
+  ([store store-id ids {:keys [past-heads?]}]
+   #?(:clj (do (when-not past-heads?
+                 (let [{:keys [max-eid max-tx]} (roster-max store)]
+                   (datahike.ids/-reach! ids :eid max-eid)
+                   (datahike.ids/-reach! ids :tx max-tx)))
+               (.put ^java.util.concurrent.ConcurrentHashMap id-sources store-id ids)))
+   ids))
 
 (defn ids
   "The id source of `db`'s store (set-ids!, or this process's own, made on first use past
