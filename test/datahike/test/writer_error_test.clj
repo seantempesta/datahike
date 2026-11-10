@@ -75,36 +75,28 @@
             (d/release conn)
             (d/delete-database cfg)))))))
 
-(deftest committed-results-are-realized-before-blocked-listeners-return
+;; The order is upstream's: a caller has its committed result once every listener has been told
+;; (the optimistic overlay's listener must have run when the result arrives). Until 2026-11-10 this
+;; fork answered the caller first (e11845ba, "Fix listener failures stranding committed writes"): a
+;; listener that threw, or blocked, could not hold a committed result. The first of those is kept
+;; another way (notify-listeners! tells each listener in its own try: the test above); the second is
+;; given up: a listener that blocks holds the caller of that transaction, as upstream's does.
+(deftest a-committed-result-arrives-after-its-listeners-were-told
   (doseq [operation [:transact :merge]]
     (testing (name operation)
       (let [cfg {:store {:backend :memory :id (random-uuid)}
                  :schema-flexibility :read}
             _ (d/create-database cfg)
             conn (d/connect cfg)
-            entered (java.util.concurrent.CountDownLatch. 1)
-            release (java.util.concurrent.CountDownLatch. 1)
-            finished (java.util.concurrent.CountDownLatch. 1)]
+            told (atom nil)]
         (try
           (prepare-listener-operation! operation conn)
-          (core/listen!
-           conn ::blocked
-           (fn [_]
-             (.countDown entered)
-             (try
-               (.await release 10 java.util.concurrent.TimeUnit/SECONDS)
-               (finally
-                 (.countDown finished)))))
-          (let [pending (listener-operation! operation conn 1)]
-            (is (.await entered 10 java.util.concurrent.TimeUnit/SECONDS)
-                "the listener entered its bounded block")
-            (is (map? (deref pending 10000 ::timeout))
-                "the committed result is available before listener release"))
+          (core/listen! conn ::told (fn [report] (Thread/sleep 50) (reset! told report)))
+          (let [result (deref (listener-operation! operation conn 1) 10000 ::timeout)]
+            (is (map? result) "the committed result")
+            (is (map? @told) "the listener was told before the caller had it"))
           (finally
-            (.countDown release)
-            (is (.await finished 10 java.util.concurrent.TimeUnit/SECONDS)
-                "the listener exits after release")
-            (core/unlisten! conn ::blocked)
+            (core/unlisten! conn ::told)
             (d/release conn)
             (d/delete-database cfg)))))))
 

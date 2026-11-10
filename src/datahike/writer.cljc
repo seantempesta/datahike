@@ -637,8 +637,8 @@
     (if (instance? SyncWriter writer)
       (let [tx-report (try (sync-apply! connection (:write-fn-map writer) (:last-cid writer) {:op 'transact! :args [arg-map]})
                            (catch #?(:clj Throwable :cljs js/Error) e e))]
-        (#?(:jolt (fn [p v] (p v)) :clj deliver :cljs put!) p tx-report)
         (when (map? tx-report) (notify-listeners! connection (some-> (:listeners (meta connection)) deref) tx-report))
+        (#?(:jolt (fn [p v] (p v)) :clj deliver :cljs put!) p tx-report)
         p)
     (do (go
       (let [tx-report (<! (dispatch! writer
@@ -646,7 +646,6 @@
                                               :args [arg-map]}
                                        applied (assoc :applied applied))))
             listeners (some-> (:listeners (meta connection)) deref)]
-        (#?(:jolt (fn [p v] (p v)) :clj deliver :cljs put!) p tx-report)
         (when (map? tx-report) ;; not error
           ;; Dispatch backfill for any newly created secondary indices
           #?(:clj
@@ -660,7 +659,10 @@
                    (when (map? build-result)
                      (dispatch! writer {:op 'install-secondary-index!
                                         :args [build-result]}))))))
-          (notify-listeners! connection listeners tx-report))))
+          (notify-listeners! connection listeners tx-report))
+        ;; upstream's order: the caller has its result once every listener has been told (each
+        ;; told independently: a listener that throws is caught in notify-listeners!)
+        (#?(:jolt (fn [p v] (p v)) :clj deliver :cljs put!) p tx-report)))
     p)))))
 
 (defn load-entities [connection entities]
@@ -685,17 +687,17 @@
       ;; it works in a process with no scheduler threads (a forked agent; seon lane A1)
       (let [tx-report (try (sync-apply! connection (:write-fn-map writer) (:last-cid writer) {:op 'merge! :args [arg-map]})
                            (catch #?(:clj Throwable :cljs js/Error) e e))]
-        (#?(:jolt (fn [p v] (p v)) :clj deliver :cljs put!) p tx-report)
         (when (map? tx-report) (notify-listeners! connection (some-> (:listeners (meta connection)) deref) tx-report))
+        (#?(:jolt (fn [p v] (p v)) :clj deliver :cljs put!) p tx-report)
         p)
       (do (go
             (let [tx-report (<! (dispatch! writer
                                            {:op 'merge!
                                             :args [arg-map]}))
                   listeners (some-> (:listeners (meta connection)) deref)]
-              (#?(:jolt (fn [p v] (p v)) :clj deliver :cljs put!) p tx-report)
               (when (map? tx-report)
-                (notify-listeners! connection listeners tx-report))))
+                (notify-listeners! connection listeners tx-report))
+              (#?(:jolt (fn [p v] (p v)) :clj deliver :cljs put!) p tx-report)))
           p))))
 
 (defn gc-storage! [conn & args]
