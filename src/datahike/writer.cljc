@@ -485,20 +485,37 @@
 ;; agent process): each transaction is applied to the value ahead of the committed one and
 ;; answered at once; the applied value is committed once, later (when the caller is idle, at
 ;; a turn's end, or at the flush window). Entity ids come from the store's allocator as in
-;; any transact, so the ids a caller saw when it applied are the ids committed.
+;; any transact, so the ids a caller saw when it applied are the ids committed. A caller
+;; may also show the applied value on the connection (`{:show? true}`); the shown value has
+;; no commit id, since no commit holds it yet: it names the commit it was applied on as
+;; :datahike/uncommitted-parent, and the commit is made from the unmarked value.
 
 (defn apply!
   "Apply arg-map to the connection's run-ahead value (its pending value, else its committed
   one) with `w/transact!`, without committing. Answers the report (its :db-after is the new
-  run-ahead value), or the exception, leaving the value as it was. Only on a :sync writer."
-  [connection arg-map]
-  (let [writer (:writer @(:wrapped-atom connection))
-        _ (assert (instance? SyncWriter writer) "apply! needs a :sync writer")
-        tx! (get (:write-fn-map writer) 'transact!)
-        {:keys [db reports]} (or @(:pending writer) {:db @(:wrapped-atom connection) :reports []})
-        r (try (tx! db arg-map) (catch #?(:clj Throwable :cljs js/Error) e e))]
-    (when (map? r) (vreset! (:pending writer) {:db (:db-after r) :reports (conj reports r)}))
-    r))
+  run-ahead value), or the exception, leaving the value as it was. With `{:show? true}` the
+  new run-ahead value is also made the connection's value, with no :datahike/commit-id in
+  its :meta and the committed value's commit id as :datahike/uncommitted-parent. Only on a
+  :sync writer."
+  ([connection arg-map] (apply! connection arg-map nil))
+  ([connection arg-map {:keys [show?]}]
+   (let [writer (:writer @(:wrapped-atom connection))
+         _ (assert (instance? SyncWriter writer) "apply! needs a :sync writer")
+         tx! (get (:write-fn-map writer) 'transact!)
+         {:keys [db reports committed shown?]} (or @(:pending writer)
+                                                   (let [db @(:wrapped-atom connection)]
+                                                     {:db db :reports [] :committed db}))
+         r (try (tx! db arg-map) (catch #?(:clj Throwable :cljs js/Error) e e))]
+     (when (map? r)
+       (vreset! (:pending writer) {:db (:db-after r) :reports (conj reports r)
+                                   :committed committed :shown? (boolean (or shown? show?))})
+       (when show?
+         (let [shown (update (:db-after r) :meta
+                             #(-> (dissoc % :datahike/commit-id)
+                                  (assoc :datahike/uncommitted-parent
+                                         (get-in committed [:meta :datahike/commit-id]))))]
+           #?(:jolt (reset! (.-wrapped-atom connection) shown) :clj (reset! connection shown)))))
+     r)))
 
 (defn pending?
   "Has the connection applied transactions not committed yet?"
@@ -507,11 +524,13 @@
 
 (defn commit-pending!
   "Commit the connection's run-ahead value once (as transact-batch! commits a batch) and make
-  it the committed value. Answers {:commit-id :tx-count :db}, or nil when nothing is pending."
+  it the committed value. Answers {:commit-id :tx-count :db}, or nil when nothing is pending.
+  The parent is the value committed when run-ahead began, whether or not a value was shown;
+  a commit that throws leaves the pending value, and any value shown, as they were."
   [connection]
   (let [writer (:writer @(:wrapped-atom connection))]
-    (when-let [{:keys [db reports]} @(:pending writer)]
-      (let [parent-db @(:wrapped-atom connection)
+    (when-let [{:keys [db reports committed]} @(:pending writer)]
+      (let [parent-db committed
             modified-attrs (w/batch-cache-revision-attributes reports)
             stored (w/commit! db nil true @(:last-cid writer)
                               {:prior (:cache-context parent-db) :modified-attrs modified-attrs :unsafe? false})
@@ -526,13 +545,15 @@
 
 (defn abandon-pending!
   "Drop the connection's run-ahead value without committing it, so the connection's committed
-  value is the truth again. Answers {:tx-count n :reports reports}, the transactions dropped and their reports, or nil
+  value is the truth again (a value shown by apply! is replaced by it). Answers {:tx-count n :reports reports}, the transactions dropped and their reports, or nil
   when nothing was pending. `:last-cid` stays the last commit that succeeded, so the next commit starts from
   it. Only on a :sync writer."
   [connection]
   (let [writer (:writer @(:wrapped-atom connection))]
-    (when-let [{:keys [reports]} @(:pending writer)]
+    (when-let [{:keys [reports committed shown?]} @(:pending writer)]
       (vreset! (:pending writer) nil)
+      (when shown?
+        #?(:jolt (reset! (.-wrapped-atom connection) committed) :clj (reset! connection committed)))
       {:tx-count (count reports) :reports reports})))
 
 ;; Note: :kabel backend is implemented in datahike.kabel.writer
