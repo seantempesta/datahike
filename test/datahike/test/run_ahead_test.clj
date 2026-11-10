@@ -139,3 +139,23 @@
         (d/transact conn [{:name "c"}])
         (is (= #{"a" "b" "c"} (names @conn) (names (stored conn)))))
       (finally (d/release conn)))))
+
+;; A :sync writer that is its branch's only writer streams: its commits set the connection's
+;; value, so a deref answers that value and reads no head from the store. By default it does
+;; not stream, since another process may commit to the branch, and a deref reads the head.
+(deftest a-sole-writers-deref-is-the-connections-own-value
+  (let [conn (fresh-conn "streaming")
+        cfg (:config (value conn))]
+    (try
+      (d/transact conn {:tx-data [{:name "a"}]})
+      (is (not (identical? @conn (value conn))) "by default a deref builds its value from the store's head")
+      (is (= #{"a"} (names @conn)))
+      (finally (d/release conn)))
+    (let [conn (d/connect (assoc-in cfg [:writer :streaming?] true))]
+      (try
+        (is (identical? @conn (value conn)) "a streaming :sync writer's deref is the connection's own value")
+        (d/transact conn {:tx-data [{:name "b"}]})
+        (is (identical? @conn (value conn)) "and still after its own commit")
+        (is (= #{"a" "b"} (names @conn)))
+        (is (= #{"a" "b"} (names (stored conn))) "which is what the store holds")
+        (finally (d/release conn))))))

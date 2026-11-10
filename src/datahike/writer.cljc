@@ -434,7 +434,7 @@
 
 (declare commit-pending!)
 
-(defrecord SyncWriter [connection write-fn-map last-cid pending]
+(defrecord SyncWriter [connection write-fn-map last-cid pending streaming?]
   PWriter
   (-dispatch! [_ arg-map]
     (let [p (promise-chan)]
@@ -447,7 +447,11 @@
   ;; the writer answers its shutdown, so releasing a connection never drops an accepted write
   (-shutdown [_] (go (try (commit-pending! connection) true
                           (catch #?(:clj Throwable :cljs js/Error) e e))))
-  (-streaming? [_] false))
+  ;; every commit of this writer sets the connection's value, so where it is the only writer
+  ;; of its branch (`:streaming? true` in its config) the connection is never behind the
+  ;; store and a deref need not read the head; by default another process may commit to
+  ;; the branch, and a deref reads it
+  (-streaming? [_] (boolean streaming?)))
 
 (defn transact-batch!
   "proto (lane F2): group commit at the serial caller. Applies each arg-map with
@@ -489,8 +493,8 @@
               rs)))))
 
 (defmethod create-writer :sync
-  [{:keys [write-fn-map]} connection]
-  (->SyncWriter connection (merge default-write-fn-map write-fn-map) (volatile! nil) (volatile! nil)))
+  [{:keys [write-fn-map streaming?]} connection]
+  (->SyncWriter connection (merge default-write-fn-map write-fn-map) (volatile! nil) (volatile! nil) streaming?))
 
 ;; seon (lane A1): run-ahead writes at the serial caller. The caller owns its branch alone (an
 ;; agent process): each transaction is applied to the value ahead of the committed one and
