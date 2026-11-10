@@ -209,24 +209,31 @@
                 (when-let [db-idents (:db/ident (dbi/-rschema db))]
                   (not (db-idents (if (reverse-ref? a) (reverse-ref a) a)))))))
 
+(defn- attr-ident-problem
+  "Why a-ident is no attribute a datom of db may name, or nil: :syntax (not a keyword or
+  string), :undefined (not in db's schema on write), :no-schema."
+  [a-ident db]
+  (cond (not (ident-name? a-ident)) :syntax
+        (not (schema-checked? a-ident db)) nil
+        :else (if-let [db-idents (:db/ident (dbi/-rschema db))]
+                (when-not (db-idents (if (reverse-ref? a-ident) (reverse-ref a-ident) a-ident)) :undefined)
+                :no-schema)))
+
 (defn validate-attr-ident [a-ident at db]
-  (when-not (ident-name? a-ident)
-    (log/raise "Bad entity attribute " a-ident " at " at ", expected keyword or string"
-               {:error :transact/syntax, :attribute a-ident, :context at}))
-  (when (schema-checked? a-ident db)
-    (if-let [db-idents (:db/ident (dbi/-rschema db))]
-      (let [attr (if (reverse-ref? a-ident)
-                   (reverse-ref a-ident)
-                   a-ident)]
-        (when-not (db-idents attr)
-          (log/raise "Bad entity attribute " a-ident " at " at ", not defined in current schema"
-                     {:error :transact/schema :attribute a-ident :context at})))
-      (log/raise "No schema found in db."
-                 {:error :transact/schema :attribute a-ident :context at}))))
+  (case (attr-ident-problem a-ident db)
+    nil nil
+    :syntax (log/raise "Bad entity attribute " a-ident " at " at ", expected keyword or string"
+                       {:error :transact/syntax, :attribute a-ident, :context at})
+    :undefined (log/raise "Bad entity attribute " a-ident " at " at ", not defined in current schema"
+                          {:error :transact/schema :attribute a-ident :context at})
+    :no-schema (log/raise "No schema found in db."
+                          {:error :transact/schema :attribute a-ident :context at})))
 
 (defn resolve-datom [db e a v t default-e default-tx]
   (let [{a-ident :ident a-db :ref} (attr-info db a :allow-missing)]
-    (when a-ident (validate-attr-ident a-ident (list 'resolve-datom 'db e a v t) db))
+    ;; where it failed, built only when it did
+    (when (and a-ident (attr-ident-problem a-ident db))
+      (validate-attr-ident a-ident (list 'resolve-datom 'db e a v t) db))
     (datom
      (or (entid-some db e) default-e)                       ;; e
      a-db                                                   ;; a
@@ -245,6 +252,22 @@
       (datom (:e resolved) (:a resolved) (:v resolved)
              (datom-tx resolved) added?)
       resolved)))
+
+(defn pattern-upper
+  "The upper bound of components cs on index, from its lower bound `from` (components->pattern
+  with e0 and tx0): the components resolved once, the open entity and tx at emax and txmax."
+  [index [c0 c1 c2 c3 added?] ^Datom from]
+  (let [e (if (nil? (case index :eavt c0 :aevt c1 :avet c2)) emax (.-e from))
+        tx (if (nil? c3) txmax (datom-tx from))]
+    (if (some? added?)
+      (datom e (.-a from) (.-v from) tx added?)
+      (datom e (.-a from) (.-v from) tx))))
+
+(defn unique-value?
+  "Are components cs on index an attribute and a value of a unique attribute ([a v] on :avet)?
+  The current index holds at most one datom for them."
+  [db index cs]
+  (and (= :avet index) (== 2 (count cs)) (some? (nth cs 1)) (is-attr? db (nth cs 0) :db/unique)))
 
 (defn merge-datoms [index-type a b]
   (if index-type
@@ -286,7 +309,7 @@
   (let [index (get db index-type)
         temporal-index (get db (keyword (str "temporal-" (name index-type))))
         from (components->pattern db index-type cs e0 tx0)
-        to (components->pattern db index-type cs emax txmax)]
+        to (pattern-upper index-type cs from)]
     (distinct-datoms db
                      index-type
                      (di/-slice index from to index-type)

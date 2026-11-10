@@ -396,10 +396,16 @@
           (class-order v1 v2))))))
 
 (defn- safe-compare [a b]
-  (try
-    (compare-value a b)
-    (catch #?(:clj Exception :cljs js/Error) _e
-      (class-order a b))))
+  ;; jolt: a pair of one scalar kind cannot throw, so it enters no try (the handler cost
+  ;; ~176 B a comparison, every comparison of a slice's comparator through cmp-nil)
+  #?(:jolt (if (one-scalar-kind? a b)
+             (compare a b)
+             (try (compare-value a b) (catch Exception _e (class-order a b))))
+     :default
+     (try
+       (compare-value a b)
+       (catch #?(:clj Exception :cljs js/Error) _e
+         (class-order a b)))))
 
 (defn cmp-nil [o1 o2]
   (if (nil? o1) nil

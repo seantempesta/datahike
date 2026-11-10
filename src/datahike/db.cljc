@@ -343,11 +343,12 @@
     []
     (-> (case (dbi/context-temporal? context)
           true (dbu/temporal-datoms db index-type cs)
-          false (di/-slice
-                 (get db index-type)
-                 (dbu/components->pattern db index-type cs e0 tx0)
-                 (dbu/components->pattern db index-type cs emax txmax)
-                 index-type))
+          false (let [index (get db index-type)
+                      from (dbu/components->pattern db index-type cs e0 tx0)]
+                  (if (dbu/unique-value? db index-type cs)
+                    ;; at most one datom: one descent, no slice cursor
+                    (when-some [d (di/-lookup index from dd/cmp-datoms-av-only)] (list d))
+                    (di/-slice index from (dbu/pattern-upper index-type cs from) index-type))))
         (post-process-datoms db context))))
 
 #?(:clj
