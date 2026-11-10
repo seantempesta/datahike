@@ -352,21 +352,43 @@
         (post-process-datoms db context))))
 
 #?(:clj
+   (defn- merge-diff
+     "`[only-a only-b]` of two datom sequences sorted by `cmp`: one pass, each a vector in `cmp` order."
+     [as bs cmp]
+     (loop [as (seq as) bs (seq bs) only-a (transient []) only-b (transient [])]
+       (cond
+         (and (nil? as) (nil? bs)) [(persistent! only-a) (persistent! only-b)]
+         (nil? bs) (recur (next as) nil (conj! only-a (first as)) only-b)
+         (nil? as) (recur nil (next bs) only-a (conj! only-b (first bs)))
+         :else (let [c (cmp (first as) (first bs))]
+                 (cond
+                   (zero? c) (recur (next as) (next bs) only-a only-b)
+                   (neg? c) (recur (next as) bs (conj! only-a (first as)) only-b)
+                   :else (recur as (next bs) only-a (conj! only-b (first bs)))))))))
+
+#?(:clj
    (defn datoms-diff
-     "The current datoms of `index-type` matching `components` (as `datoms` takes
-     them) held by exactly one of two database values: `[only-a only-b]`, each in
-     index order; a datom is compared whole (e, a, v and tx). A pure function of the
-     two values: the stored subtrees both share are skipped, so the work follows
-     what differs between them, on any two branches or commits of one store. An
-     attribute in `components` that only db-b's schema declares (a branch whose schema
-     grew since the other) is resolved by db-b: db-a holds none of its datoms."
+     "The datoms of `index-type` matching `components` (as `datoms` takes them) held by
+     exactly one of two database values: `[only-a only-b]`, each in index order; a datom
+     is compared whole (e, a, v and tx). A pure function of the two values. For two plain
+     values the stored subtrees both share are skipped, so the work follows what differs
+     between them, on any two branches or commits of one store. For a view (as-of, since,
+     history, filtered) each side's `datoms` is merged in one pass, so the work follows
+     the range, not the difference. An attribute in `components` that only db-b's schema
+     declares (a branch whose schema grew since the other) is resolved by db-b: db-a
+     holds none of its datoms."
      [db-a db-b index-type components]
-     (let [a (if (= :eavt index-type) (second components) (first components))
-           declares? (fn [db] (contains? (:db/ident (dbi/-rschema db)) a))
-           db (if (and (some? a) (not (declares? db-a)) (declares? db-b)) db-b db-a)]
-       (psi/diff (get db-a index-type) (get db-b index-type) index-type
-                 (dbu/components->pattern db index-type components e0 tx0)
-                 (dbu/components->pattern db index-type components emax txmax)))))
+     (if (and (identical? (dbi/-search-context db-a) dbi/base-context)
+              (identical? (dbi/-search-context db-b) dbi/base-context))
+       (let [a (if (= :eavt index-type) (second components) (first components))
+             declares? (fn [db] (contains? (:db/ident (dbi/-rschema db)) a))
+             db (if (and (some? a) (not (declares? db-a)) (declares? db-b)) db-b db-a)]
+         (psi/diff (get db-a index-type) (get db-b index-type) index-type
+                   (dbu/components->pattern db index-type components e0 tx0)
+                   (dbu/components->pattern db index-type components emax txmax)))
+       ;; each `datoms` reads its range through the index, which records it as a read
+       (merge-diff (dbi/datoms db-a index-type components) (dbi/datoms db-b index-type components)
+                   (dd/index-type->cmp-quick index-type)))))
 
 (defn contextual-seek-datoms [db index-type cs context]
   (-> (case (dbi/context-temporal? context)
