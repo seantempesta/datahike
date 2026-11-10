@@ -350,15 +350,60 @@
         (if (identical? rules rules') args (assoc av idx rules')))
       args)))
 
+(def ^:private form-analysis-cache
+  "LRU memo for per-call work that is a pure function of the query FORM
+   (normalization, component analysis, clause-binding validation,
+   :in-shape seeds, BigDecimal-key checks). A parameterized workload
+   repeats one form with varying args; before this cache each call
+   re-ran all of it — ~25% of point-query dispatch CPU. Same
+   volatile+lru discipline as query-cache/plan-cache."
+  (volatile! (datahike.lru/lru lru-cache-size)))
+
+#?(:clj (declare ^:private key-has-bigdec?))
+(declare scale-sensitive-key)
+
+(defn- form-memo [k f]
+  ;; Clojure's =/hash on BigDecimal are scale-INSENSITIVE, so forms
+  ;; differing only in constant scale (1.0M vs 1.00M) would alias one
+  ;; memo entry. Canonicalize such keys with scale-sensitive-key. The
+  ;; bigdec presence check is itself memoized under the scale-insensitive
+  ;; key — that collision is harmless because scale variants answer it
+  ;; identically. CLJS has no BigDecimal.
+  #?(:clj
+     (let [k (if (if-some [clean? (get @form-analysis-cache [::bd-free k] nil)]
+                   clean?
+                   (let [clean? (not (key-has-bigdec? k))]
+                     (vswap! form-analysis-cache assoc [::bd-free k] clean?)
+                     clean?))
+               k
+               (scale-sensitive-key k))]
+       (if-some [v (get @form-analysis-cache k nil)]
+         v
+         (let [v (f)]
+           (vswap! form-analysis-cache assoc k v)
+           v)))
+     :cljs
+     (if-some [v (get @form-analysis-cache k nil)]
+       v
+       (let [v (f)]
+         (vswap! form-analysis-cache assoc k v)
+         v))))
+
 (defn normalize-q-input
   "Turns input to q into a map with :query and :args fields.
    Also normalizes the query into a map representation."
   [query-input arg-inputs]
-  (let [query (-> query-input
-                  (#(or (and (map? %) (:query %)) %))
-                  (#(if (string? %) (edn/read-string %) %))
-                  (#(if (= 'quote (first %)) (second %) %))
-                  (#(if (sequential? %) (dpi/query->map %) %)))
+  (let [;; Memo key is the query FORM only — map-form inputs carry :args
+        ;; (including the DB value); keying on the whole input would pin
+        ;; database snapshots in the memo LRU and make every lookup hash
+        ;; the argument values.
+        qform (or (and (map? query-input) (:query query-input)) query-input)
+        query (form-memo
+               [::qnorm qform]
+               #(-> qform
+                    ((fn [q] (if (string? q) (edn/read-string q) q)))
+                    ((fn [q] (if (= 'quote (first q)) (second q) q)))
+                    ((fn [q] (if (sequential? q) (dpi/query->map q) q)))))
         args (if (and (map? query-input) (contains? query-input :args))
                (do (when (seq arg-inputs)
                      (log/warn :datahike/query-input-ignored {:query query}))
@@ -1192,6 +1237,19 @@
       (reduce prod-rel
               (map #(in->rel %1 %2) (:bindings binding) coll)))))
 
+(def ^:dynamic *fold-scalar-ins*
+  "When true (default), a scalar :in binding becomes a constant folded
+   into the where clauses before planning: plans specialize on the value
+   (best for one-off queries and value-dependent estimates), but the
+   plan cache then misses for every distinct value. Bind false for
+   parameterized workloads that repeat one query SHAPE with varying
+   scalars (SQL prepared statements): the scalar binds as a 1-row
+   relation instead, the clauses stay in var form, and the plan cache
+   hits across values (measured ~4x faster novel-value dispatch on an
+   indexed point lookup). Function-valued bindings always fold — they
+   are invoked in clause position and cannot live in a relation."
+  true)
+
 (defn resolve-in [context [binding value]]
   (cond
     (and (instance? BindScalar binding)
@@ -1204,7 +1262,9 @@
     (update context :rules merge (parse-rules value))
     (and (instance? BindScalar binding)
          (instance? Variable (:variable binding)))
-    (assoc-in context [:consts (get-in binding [:variable :symbol])] value)
+    (if (or *fold-scalar-ins* (fn? value))
+      (assoc-in context [:consts (get-in binding [:variable :symbol])] value)
+      (update context :rels conj (in->rel binding value)))
     #_(instance? BindColl binding)                          ;; TODO: later
     :else
     (update context :rels conj (in->rel binding value))))
@@ -1706,6 +1766,14 @@
                         :clause clause})
            rel (rel/->Relation final-attrs-map [])
            tmp-stats []]
+      ;; The relational rule solver expands subgoals top-down and had no
+      ;; cancellation check, so a rule with no finite proof tree — a cycle plus
+      ;; an unbounded counter, say — could not be interrupted. That matters more
+      ;; now: the planner DECLINES rules whose recursion it cannot bound to this
+      ;; solver, so this is where such a rule ends up.
+      (when-let [c (:cancel context)]
+        (when @c
+          (log/raise "query canceled" {:error :query/canceled})))
       (if-some [frame (first stack)]
         (let [[clauses [rule-clause & next-clauses]] (split-with #(not (rule? context %)) (:clauses frame))]
           (if (nil? rule-clause)
@@ -3510,6 +3578,16 @@
                      state)))))
       @found)))
 
+(def ^:dynamic *result-cache-min-weight*
+  "Results with tuple-weight BELOW this are executed but not cached.
+   Default 0 caches everything (existing behavior). A point lookup's
+   1-row result costs more to insert (key build, swap!, LRU generation
+   bookkeeping — ~200us measured) than to recompute once the plan and
+   form-analysis caches are warm, so parameterized OLTP callers bind
+   this to a small positive value and keep the result cache for the
+   queries it actually helps."
+  0)
+
 (defn- result-cache-put!
   "Store a query result when every source generation remains admitted."
   [result-key scope-key cache-key result dependency-plan source-contexts
@@ -3734,6 +3812,62 @@
     (try (dbu/entid db v)
          (catch #?(:clj Exception :cljs :default) _ nil))))
 
+(declare substitute-consts-with-lookup-refs*)
+
+#?(:clj
+   (def ^:private prepared-execution-var
+     (delay (requiring-resolve 'datahike.query.execute/*prepared-execution*))))
+
+(defn- prepared-execution?
+  "Current value of datahike.query.execute/*prepared-execution* (see its
+   docstring). Resolved lazily on the JVM to keep the load order the rest
+   of this namespace uses for the execute namespace."
+  []
+  #?(:clj (deref (deref prepared-execution-var))
+     :cljs execute/*prepared-execution*))
+
+(defn- clauses-have-lookup-candidates?
+  "Structure-only pre-scan: could `resolve-pattern-lookup-refs` change anything
+   in these clauses? True when any data-pattern e/v/tx slot holds a keyword or
+   collection (ident / lookup-ref candidate). Conservative on unknown forms.
+   Schema-independent, so the answer is memoizable per clause form."
+  [clauses]
+  (letfn [(pattern? [c] (and (vector? c) (not (sequential? (first c)))))
+          (candidate-e? [x] (not (or (nil? x) (symbol? x) (number? x))))
+          (candidate-v? [x] (or (keyword? x) (coll? x)))
+          (scan-pattern [c]
+            (let [c (if (and (symbol? (first c)) (= \$ (first (name (first c)))))
+                      (vec (rest c))
+                      c)]
+              (or (candidate-e? (get c 0))
+                  (candidate-v? (get c 2))
+                  (coll? (get c 3)))))
+          (scan-clause [c]
+            (cond
+              (pattern? c) (scan-pattern c)
+              ;; [[:ident v] :attr ?v] — inline lookup-ref in e position IS a
+              ;; data pattern (vector first element); only a SEQ first element
+              ;; ((f …) call form) marks a predicate/function clause.
+              (and (vector? c) (vector? (first c))) true
+              ;; predicate/function vector [(f …) …] — untouched by the walk
+              (vector? c) false
+              (sequential? c)
+              (let [h (first c)]
+                (cond
+                  (not (symbol? h)) true
+                  (#{'not 'and} h) (boolean (some scan-clause (rest c)))
+                  (#{'not-join 'or-join} h) (boolean (some scan-clause (drop 2 c)))
+                  (= 'or h) (boolean (some (fn [b]
+                                             (if (and (sequential? b) (sequential? (first b)))
+                                               (some scan-clause b)
+                                               (scan-clause b)))
+                                           (rest c)))
+                  (= \$ (first (name h))) (scan-pattern (vec c))
+                  ;; rule call — const substitution only, no-op with empty consts
+                  :else false))
+              :else true))]
+    (boolean (some scan-clause clauses))))
+
 (defn- substitute-consts-with-lookup-refs
   "Like substitute-consts but also resolves lookup refs in pattern positions.
    Used by the query planner which needs patterns normalized before planning.
@@ -3741,11 +3875,26 @@
    For multi-source queries, pass sources so each source-prefixed clause resolves
    against its own db."
   ([db where-clauses consts] (substitute-consts-with-lookup-refs db where-clauses consts nil nil))
+  ([db where-clauses consts sources] (substitute-consts-with-lookup-refs db where-clauses consts sources nil))
   ([db where-clauses consts sources rules]
-   (letfn [(resolve-clause
-             ([clause] (resolve-clause db clause))
-             ([resolve-db clause]
-              (cond
+   (if (and (prepared-execution?)
+            (empty? consts) (nil? sources)
+            ;; ours: a rule call's literal lookup ref resolves at an entity position
+            ;; (rule-entity-positions) even with no consts, so rules take the walk
+            (empty? rules)
+            (not (and (dbu/db? db) (:attribute-refs? (dbi/-config db))))
+            (not (form-memo [::lookup-candidates where-clauses]
+                            #(clauses-have-lookup-candidates? where-clauses))))
+     ;; Nothing to substitute and nothing resolvable — the walk is an identity.
+     where-clauses
+     (substitute-consts-with-lookup-refs* db where-clauses consts sources rules))))
+
+(defn- substitute-consts-with-lookup-refs*
+  [db where-clauses consts sources rules]
+  (letfn [(resolve-clause
+            ([clause] (resolve-clause db clause))
+            ([resolve-db clause]
+             (cond
               ;; Source-prefixed clauses ($source pattern...) — must be checked BEFORE
               ;; data patterns because [$1 ?e :attr ?v] is also a vector.
                 (and (sequential? clause) (symbol? (first clause))
@@ -3761,60 +3910,60 @@
                     (cons src-sym resolved-inner)))
 
               ;; Data pattern: [e a v ...]
-                (and (vector? clause) (not (sequential? (first clause))))
-                (let [had-consts? (some #(and (symbol? %) (contains? consts %)) clause)
-                      substituted (if had-consts?
-                                    (mapv (fn [x]
-                                            (if (and (symbol? x) (contains? consts x))
-                                              (get consts x)
-                                              x))
-                                          clause)
-                                    clause)
+               (and (vector? clause) (not (sequential? (first clause))))
+               (let [had-consts? (some #(and (symbol? %) (contains? consts %)) clause)
+                     substituted (if had-consts?
+                                   (mapv (fn [x]
+                                           (if (and (symbol? x) (contains? consts x))
+                                             (get consts x)
+                                             x))
+                                         clause)
+                                   clause)
                     ;; Use lenient resolution when consts were substituted (values might be invalid),
                     ;; UNLESS the entity position is a lookup ref — those should throw on missing entities.
-                      has-lookup-ref-entity? (and had-consts?
-                                                  (let [e (first substituted)]
-                                                    (and (sequential? e) (= 2 (count e)) (keyword? (first e)))))
-                      resolved (if (or (not had-consts?) has-lookup-ref-entity?)
-                                 (resolve-pattern-lookup-refs resolve-db substituted)
-                                 (resolve-pattern-lookup-refs-or-nil resolve-db substituted))]
-                  (or resolved substituted))
+                     has-lookup-ref-entity? (and had-consts?
+                                                 (let [e (first substituted)]
+                                                   (and (sequential? e) (= 2 (count e)) (keyword? (first e)))))
+                     resolved (if (or (not had-consts?) has-lookup-ref-entity?)
+                                (resolve-pattern-lookup-refs resolve-db substituted)
+                                (resolve-pattern-lookup-refs-or-nil resolve-db substituted))]
+                 (or resolved substituted))
 
               ;; Data pattern where first elem is a lookup ref
               ;; e.g., [[:name "Ivan"] :age ?v]
-                (and (vector? clause) (vector? (first clause))
-                     (= 2 (count (first clause))))
+               (and (vector? clause) (vector? (first clause))
+                    (= 2 (count (first clause))))
               ;; Inline lookup refs use strict resolution (should throw on missing entities)
-                (resolve-pattern-lookup-refs resolve-db clause)
+               (resolve-pattern-lookup-refs resolve-db clause)
 
               ;; (not ...) / (not-join [...] ...)
-                (and (sequential? clause) (symbol? (first clause))
-                     (#{'not 'not-join} (first clause)))
-                (if (= 'not (first clause))
-                  (cons 'not (mapv (partial resolve-clause resolve-db) (rest clause)))
-                  (let [[_ join-vars & body] clause]
-                    (list* 'not-join join-vars (mapv (partial resolve-clause resolve-db) body))))
+               (and (sequential? clause) (symbol? (first clause))
+                    (#{'not 'not-join} (first clause)))
+               (if (= 'not (first clause))
+                 (cons 'not (mapv (partial resolve-clause resolve-db) (rest clause)))
+                 (let [[_ join-vars & body] clause]
+                   (list* 'not-join join-vars (mapv (partial resolve-clause resolve-db) body))))
 
               ;; (or ...) / (or-join [...] ...)
-                (and (sequential? clause) (symbol? (first clause))
-                     (#{'or 'or-join} (first clause)))
-                (if (= 'or (first clause))
-                  (cons 'or (map (fn [branch]
-                                   (if (and (sequential? branch) (sequential? (first branch)))
-                                     (mapv (partial resolve-clause resolve-db) branch)
-                                     (resolve-clause resolve-db branch)))
-                                 (rest clause)))
-                  (let [[_ join-vars & branches] clause]
-                    (list* 'or-join join-vars
-                           (map (fn [branch]
+               (and (sequential? clause) (symbol? (first clause))
+                    (#{'or 'or-join} (first clause)))
+               (if (= 'or (first clause))
+                 (cons 'or (map (fn [branch]
                                   (if (and (sequential? branch) (sequential? (first branch)))
                                     (mapv (partial resolve-clause resolve-db) branch)
                                     (resolve-clause resolve-db branch)))
-                                branches))))
+                                (rest clause)))
+                 (let [[_ join-vars & branches] clause]
+                   (list* 'or-join join-vars
+                          (map (fn [branch]
+                                 (if (and (sequential? branch) (sequential? (first branch)))
+                                   (mapv (partial resolve-clause resolve-db) branch)
+                                   (resolve-clause resolve-db branch)))
+                               branches))))
 
               ;; (and ...)
-                (and (sequential? clause) (= 'and (first clause)))
-                (cons 'and (mapv (partial resolve-clause resolve-db) (rest clause)))
+               (and (sequential? clause) (= 'and (first clause)))
+               (cons 'and (mapv (partial resolve-clause resolve-db) (rest clause)))
 
               ;; Source-prefixed: already handled at top of cond
 
@@ -3822,10 +3971,10 @@
               ;; Only substitute data values (numbers, strings, keywords, booleans),
               ;; NOT function references (IFn), since those are used as higher-order args
               ;; in rules like (match ?pred ?x ?y) and must resolve at execution time.
-                (and (sequential? clause) (not (vector? clause))
-                     (symbol? (first clause))
+               (and (sequential? clause) (not (vector? clause))
+                    (symbol? (first clause))
                    ;; Not a known special form
-                     (not (#{'not 'not-join 'or 'or-join 'and} (first clause)))
+                    (not (#{'not 'not-join 'or 'or-join 'and} (first clause)))
                    ;; Not source-prefixed
                      (not (and (string? (name (first clause)))
                                (= \$ (first (name (first clause)))))))
@@ -3853,28 +4002,28 @@
               ;; since context-resolve-val already handles consts lookup at execution time.
               ;; Only substitute data-position args (non-function variables) so the plan
               ;; can use ground values for index selection.
-                :else
-                (if (and (vector? clause) (not (vector? (first clause))))
-                  (mapv (fn [x]
-                          (cond
-                            (and (symbol? x) (contains? consts x))
-                            (get consts x)
+               :else
+               (if (and (vector? clause) (not (vector? (first clause))))
+                 (mapv (fn [x]
+                         (cond
+                           (and (symbol? x) (contains? consts x))
+                           (get consts x)
                           ;; Recurse into predicate/function call lists like (> ?s ?min_s)
                           ;; but don't substitute the fn name (first element)
-                            (sequential? x)
-                            (let [substituted (map-indexed
-                                               (fn [i y]
-                                                 (if (and (pos? i)
-                                                          (symbol? y)
-                                                          (contains? consts y))
-                                                   (get consts y)
-                                                   y))
-                                               x)]
-                              (if (list? x) (apply list substituted) (vec substituted)))
-                            :else x))
-                        clause)
-                  clause))))]
-     (mapv resolve-clause where-clauses))))
+                           (sequential? x)
+                           (let [substituted (map-indexed
+                                              (fn [i y]
+                                                (if (and (pos? i)
+                                                         (symbol? y)
+                                                         (contains? consts y))
+                                                  (get consts y)
+                                                  y))
+                                              x)]
+                             (if (list? x) (apply list substituted) (vec substituted)))
+                           :else x))
+                       clause)
+                 clause))))]
+    (mapv resolve-clause where-clauses)))
 
 ;; ---------------------------------------------------------------------------
 ;; Pre-fold clause-binding validation (the planner's shared oracle).
@@ -4214,12 +4363,35 @@
         ;; but it distinguishes bindings the bound-var SET cannot — e.g. a tuple
         ;; [?a ?b] (#{?a ?b}, card 1) from a relation [[?a ?b]] (#{?a ?b}, many)
         ;; — which would otherwise collide on identical clauses + bound-vars.
-        cache-key (scale-sensitive-key [clauses bound-vars (when rules rules)
-                                        (not-empty in-cards) schema-hash
-                                        (size-class (dbi/-max-eid db))])]
+        ;; scale-sensitive-key walks the whole key looking for BigDecimals.
+        ;; The [clauses bound-vars rules in-cards] prefix is form-shaped and
+        ;; stable across calls — memoize its cleanliness and only rebuild
+        ;; when it actually contains BigDecimals (folded constants). The key
+        ;; also carries the store's size class (ours): a plan is chosen for
+        ;; the scale it was costed at.
+        key-prefix [clauses bound-vars (when rules rules) (not-empty in-cards)]
+        key-tail [schema-hash (size-class (dbi/-max-eid db))]
+        cache-key #?(:cljs (into key-prefix key-tail)
+                     :clj (if (form-memo [::bigdec-free key-prefix]
+                                         #(not (key-has-bigdec? key-prefix)))
+                            (into key-prefix key-tail)
+                            (scale-sensitive-key (into key-prefix key-tail))))]
     (if-some [cached (get @plan-cache cache-key nil)]
       cached
-      (let [plan (create-plan-via-ir db clauses bound-vars rules in-cards)]
+      (let [plan (-> (create-plan-via-ir db clauses bound-vars rules in-cards)
+                     ;; per-plan compiled-program slot: the direct executor
+                     ;; caches its per-[find-vars consts-keys] compilation here
+                     ;; (see execute/direct-program), so repeated executions of
+                     ;; a cached plan skip fuse checks and shape analysis.
+                     ;; metadata, not a map key: plans are VALUES (compared,
+                     ;; printed, potentially serialized) and the compiled-
+                     ;; program cache is an identity-scoped accelerator.
+                     ;; Attached only in prepared mode so stock plans stay
+                     ;; bit-identical (an atom in meta is not serializable);
+                     ;; a plan cached while OFF simply compiles uncached if
+                     ;; the flag flips later.
+                     (cond-> (prepared-execution?)
+                       (vary-meta assoc :datahike.query.execute/program-cache (atom {}))))]
         (vswap! plan-cache assoc cache-key plan)
         plan))))
 
@@ -4378,7 +4550,7 @@
                clauses (substitute-consts-with-lookup-refs db (:where query) (:consts context-in) nil (:rules context-in))
                ;; The SAME cached plan execution will use — create-plan-via-ir
                ;; here could diverge from a previously cached plan.
-               plan (get-or-create-plan plan-db clauses bound-vars rules (in-card-seed qin))
+               plan (get-or-create-plan plan-db clauses bound-vars rules (form-memo [::in-cards qin] #(in-card-seed qin)))
                find-elements (dpip/find-elements qfind)
                has-aggs? (some #(instance? Aggregate %) find-elements)
                has-pull? (some #(instance? Pull %) find-elements)
@@ -4438,6 +4610,51 @@
               [op]))
           (:ops plan)))
 
+(def ^:private secondary-index-unsupported-modifiers
+  "Op attributes that CHANGE WHAT A PLAN MEANS and that the secondary-index
+   aggregate path does not implement.
+
+   That path flattens the plan (`plan-sub-ops`) and reads each sub-op's attr
+   and ground value, i.e. it treats every sub-op as a positive equality
+   constraint. Anything that negates, defaults, filters or re-sources a sub-op
+   is therefore invisible to it, and silently changes the answer:
+
+     :anti?          a folded negation became a POSITIVE `[:= col v]`, so
+                     `(min ?s)` with `(not [?e :dept \"eng\"])` aggregated over
+                     exactly the EXCLUDED rows;
+     :optional?      a `get-else` lost its default;
+     :default-value  ditto;
+     :pushdown-preds a range predicate folded into the scan is neither a
+                     standalone :predicate op nor in :attached-preds, so the
+                     filter was dropped and `(min ?s)` with `[(> ?s 60000)]`
+                     answered 50000;
+     :source         a clause against a NAMED source was read as if it were
+                     against this one;
+     :join-vars      the op was dropped outright.
+
+   Declining is free: the caller falls back to the ordinary aggregate paths,
+   which implement all of these. The list is deliberately about MEANING, not
+   about performance hints — an attribute that only affects HOW a sub-op is
+   evaluated does not belong here."
+  #{:anti? :optional? :default-value :pushdown-preds :source :join-vars})
+
+(defn- secondary-index-plan-supported?
+  "True when every op in `plan` is a shape the secondary-index aggregate path
+   actually implements. See `secondary-index-unsupported-modifiers`.
+
+   Also rejects op TYPES the flattening cannot represent at all: a negation,
+   disjunction or rule op is not a positive constraint on a column, and
+   `plan-sub-ops` passes it through as if it were one."
+  [plan]
+  (let [ops (:ops plan)
+        sub-ops (plan-sub-ops plan)]
+    (and (every? #(#{:entity-group :pattern-scan :predicate} (:op %)) ops)
+         (not-any? (fn [op]
+                     (some (fn [k] (let [v (get op k)]
+                                     (if (coll? v) (seq v) (some? v))))
+                           secondary-index-unsupported-modifiers))
+                   sub-ops))))
+
 #?(:clj
    (def ^:private pred-sym->stratum-op
      "Map from Clojure predicate symbols to stratum WHERE operators."
@@ -4481,7 +4698,12 @@
      [db plan find-elements]
      (try
        (let [sec-indices (:secondary-indices db)]
-         (when (seq sec-indices)
+         (when (and (seq sec-indices)
+                    ;; Decline any plan carrying meaning this path does not
+                    ;; implement, instead of flattening it into positive
+                    ;; equality constraints and answering confidently. The
+                    ;; caller falls back to the ordinary aggregate paths.
+                    (secondary-index-plan-supported? plan))
            (let [ref->ident (:ref-ident-map db)
                  resolve-attr (fn [a] (if (and ref->ident (number? a))
                                         (get ref->ident a a)
@@ -5107,7 +5329,8 @@
   "Direct HashSet path: write tuples directly, no Relations.
    Returns result set or nil if not eligible."
   [plan db qfind find-elements context-in query order-spec offset limit stats? qreturnmaps]
-  (let [direct-eligible? (and (instance? FindRel qfind)
+  (let [prepared? (prepared-execution?)
+        direct-eligible? (and (instance? FindRel qfind)
                               (not stats?)
                               ;; the fused HashSet path applies fns via post-apply-fns,
                               ;; which doesn't accumulate :fn-counts — route counting
@@ -5117,19 +5340,32 @@
                               (not (:with query))
                               (not-any? #(instance? Aggregate %) find-elements)
                               (not-any? #(instance? Pull %) find-elements)
-                              (empty? (:rels context-in)))]
+                              ;; Stock mode: input relations disqualify the
+                              ;; direct path (they need the relation engine's
+                              ;; joins). Prepared mode absorbs single-tuple
+                              ;; rels as per-call consts instead.
+                              (or prepared? (empty? (:rels context-in))))]
     (when direct-eligible?
       ;; requiring-resolve is cheap after first call: just a ns-map lookup via resolve,
       ;; since the namespace is already loaded. No need to cache the resolved var.
-      (let [exec-direct #?(:clj (requiring-resolve 'datahike.query.execute/execute-plan-direct)
-                           :cljs execute/execute-plan-direct)
-            find-var-syms (mapv (fn [^Variable el] (.-symbol el)) (:elements qfind))]
-        ;; pass the context so a NOT-JOIN sub-plan keeps its sources and cancel flag
-        (exec-direct plan db find-var-syms
-                     (when (and (not order-spec) limit (pos? limit))
-                       (+ (or offset 0) limit))
-                     (:consts context-in) (:cancel context-in)
-                     context-in)))))
+      (let [find-var-syms (mapv (fn [^Variable el] (.-symbol el)) (:elements qfind))
+            ;; ours: with no order to apply, the direct path stops at offset + limit
+            max-results (when (and (not order-spec) limit (pos? limit))
+                          (+ (or offset 0) limit))]
+        (if prepared?
+          ;; Scalar/tuple :in bindings kept as single-tuple rels (so the plan
+          ;; cache key stays value-free) are absorbed as per-call consts inside
+          ;; execute-plan-prepared — the prepared-query path: one cached plan
+          ;; (and one compiled program), any parameter value, still direct.
+          (let [exec-prepared #?(:clj (requiring-resolve 'datahike.query.execute/execute-plan-prepared)
+                                 :cljs execute/execute-plan-prepared)]
+            ;; pass the context so a NOT-JOIN sub-plan keeps its sources and cancel flag
+            (exec-prepared plan db find-var-syms (:rels context-in) (:consts context-in)
+                           max-results (:cancel context-in) context-in))
+          (let [exec-direct #?(:clj (requiring-resolve 'datahike.query.execute/execute-plan-direct)
+                               :cljs execute/execute-plan-direct)]
+            (exec-direct plan db find-var-syms max-results (:consts context-in) (:cancel context-in)
+                         context-in)))))))
 
 (defn- post-process-result
   "Shared post-processing pipeline for both planned-relation and legacy paths.
@@ -5282,8 +5518,12 @@
           [context-in nil])
         ;; Before the const fold and before the Cartesian split, so the whole
         ;; query is judged once with the bindings the user supplied.
+        ;; Memoized on [where bound-var-set]: the check either raises or
+        ;; passes, and both are pure functions of form + binding shape.
         _ (when use-planner?
-            (validate-clause-bindings (:where query) (context-bound-vars context-in)))]
+            (let [bv (context-bound-vars context-in)]
+              (form-memo [::validated (:where query) bv]
+                         #(do (validate-clause-bindings (:where query) bv) true))))]
 
     (if (and limit (zero? limit))
       #{}
@@ -5321,8 +5561,12 @@
                                                    (filter #(> (count %) 1)))
                                              (:rels context-in))
                        {:keys [components post-filters]}
-                       (connected-components (:where query) in-bound-vars find-var-syms
-                                             in-rel-var-sets)]
+                       ;; Pure function of form + binding SHAPE — memoized:
+                       ;; ran on every call before (12% of point-query CPU).
+                       (form-memo [::components (:where query) in-bound-vars
+                                   find-var-syms in-rel-var-sets]
+                                  #(connected-components (:where query) in-bound-vars
+                                                         find-var-syms in-rel-var-sets))]
                    (when (> (count components) 1)
                      ;; Recursively run each component as its own query.
                      ;; Sub-queries with one component will fall through to
@@ -5416,13 +5660,18 @@
                                                             (when multi-source? (:sources context-in))
                                                             (:rules context-in))
                 rules (not-empty (:rules context-in))
-                plan (get-or-create-plan plan-db clauses bound-vars rules (in-card-seed qin))]
+                plan (get-or-create-plan plan-db clauses bound-vars rules (form-memo [::in-cards qin] #(in-card-seed qin)))]
 
           ;; Try paths in order of preference:
           ;; 1. Direct HashSet (non-aggregate simple queries)
-            (if-let [direct-result (execute-planned-direct
-                                    plan db qfind find-elements context-in query
-                                    order-spec offset limit stats? qreturnmaps)]
+            ;; Lookup-ref :in bindings were rewritten to eids in the rels
+            ;; (resolve-lookup-ref-bindings); only the relation path knows to
+            ;; project the ORIGINAL lookup-ref value back out via
+            ;; lookup-ref-reverse-map. The direct paths would leak raw eids.
+            (if-let [direct-result (when-not lookup-ref-reverse-map
+                                     (execute-planned-direct
+                                      plan db qfind find-elements context-in query
+                                      order-spec offset limit stats? qreturnmaps))]
               (let [result (apply-result-transforms direct-result order-spec offset limit qreturnmaps)]
                 #?(:clj
                    (when *profile?*
@@ -5533,7 +5782,7 @@
                                         (resolve-ins qin args))
                          clauses (substitute-consts-with-lookup-refs db (:where query) (:consts context-in))
                          bound-vars (context-bound-vars context-in)
-                         plan (get-or-create-plan db clauses bound-vars nil (in-card-seed qin))]
+                         plan (get-or-create-plan db clauses bound-vars nil (form-memo [::in-cards qin] #(in-card-seed qin)))]
                      (when (and (empty? (:rels context-in))
                                 (seq (:ops plan)))
                        (when-let [result (try-secondary-index-aggregate db plan find-elements)]

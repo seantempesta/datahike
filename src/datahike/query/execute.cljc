@@ -2753,6 +2753,291 @@
     (vec (or (:output-vars group) (:vars group)))
     target-vars))
 
+(def ^:dynamic *prepared-execution*
+  "Master switch for the prepared-execution machinery (value-free plan
+   reuse for parameterized queries: single-tuple-rel absorption, per-call
+   plan rebinding, compiled point programs, and the point fast path inside
+   the fused executor). Default FALSE — every path behaves exactly as it
+   did before this machinery existed. Parameterized-workload servers (the
+   pgwire surrogate) bind it true together with *fold-scalar-ins* false."
+  false)
+
+;; ---------------------------------------------------------------------------
+;; Prepared-plan rebinding: plans are cached value-free (scalar :in vars stay
+;; symbols in the clauses so one plan serves every parameter value). The fused
+;; executors, however, derive all grounding from the clause literals
+;; (compute-slice-bounds, build-common-merge-arrays, merge-eq-slots). These
+;; helpers substitute the per-call constants into a copy of the plan's op
+;; clauses so the cached plan can take the direct path.
+
+(defn- subst-slot [consts x]
+  (if (and (symbol? x) (analyze/free-var? x) (contains? consts x))
+    (get consts x)
+    x))
+
+(defn- subst-clause
+  "Substitute consts into a clause vector. The first element of a fn/pred
+   clause is a seq (the call form) — substitute inside it, preserving seq-ness."
+  [consts clause]
+  (mapv (fn [el]
+          (if (seq? el)
+            (apply list (map #(subst-slot consts %) el))
+            (subst-slot consts el)))
+        clause))
+
+(defn- upgrade-scan-index
+  "After substitution a scan whose value slot became ground on an AVET-covered
+   attr should point-seek AVET instead of walking the whole attr on AEVT —
+   the index the planner would have chosen had the value been inline."
+  [op]
+  (let [{:keys [clause index]} op
+        [e _ v] clause]
+    (if (and (= index :aevt)
+             (symbol? e) (analyze/free-var? e)
+             (some? v) (not (symbol? v))
+             (:indexed? (:schema-info op)))
+      (assoc op :index :avet)
+      op)))
+
+(defn- bind-pattern-op [consts op scan?]
+  (let [op (if (:clause op) (assoc op :clause (subst-clause consts (:clause op))) op)]
+    (if scan? (upgrade-scan-index op) op)))
+
+(defn bind-plan-consts
+  "Rebind a cached value-free plan with per-call constants: substitute `consts`
+   into every op clause (scan, merges, predicates, functions, pipeline steps),
+   upgrading scans whose value slot became ground to AVET where covered.
+   Returns the rebound plan, or nil when the plan contains ops the rebinding
+   cannot reach soundly (not-join sub-plans, a function whose output var is
+   itself a const, a const landing in an e/tx slot as a non-number) — callers
+   fall back to the relation path."
+  [plan consts]
+  (let [sound? (volatile! true)
+        pattern-ok? (fn [clause]
+                      ;; e and tx slots must stay symbols or numbers — idents /
+                      ;; lookup-refs are resolved on the relation path only.
+                      (let [e (get clause 0) tx (get clause 3)]
+                        (and (or (symbol? e) (nil? e) (number? e))
+                             (or (symbol? tx) (nil? tx) (number? tx)))))
+        bind-op
+        (fn bind-op [op]
+          (case (:op op)
+            :entity-group
+            (let [scan-op' (bind-pattern-op consts (:scan-op op) true)
+                  merge-ops' (mapv #(bind-pattern-op consts % false) (:merge-ops op))
+                  preds' (mapv #(assoc % :clause (subst-clause consts (:clause %))
+                                       :args (map (fn [a] (subst-slot consts a)) (:args %)))
+                               (:attached-preds op))
+                  pipeline (:pipeline op)
+                  steps' (when pipeline
+                           (mapv (fn [step]
+                                   (cond-> step
+                                     (:clause step) (assoc :clause (subst-clause consts (:clause step)))
+                                     (:index step)  (assoc :index (:index scan-op'))))
+                                 (:steps pipeline)))]
+              (when-not (and (pattern-ok? (:clause scan-op'))
+                             (every? #(pattern-ok? (:clause %)) merge-ops'))
+                (vreset! sound? false))
+              (cond-> (assoc op :scan-op scan-op' :merge-ops merge-ops' :attached-preds preds')
+                pipeline (assoc :pipeline (assoc pipeline :steps steps'))))
+
+            :pattern-scan
+            (let [op' (bind-pattern-op consts op true)]
+              (when-not (pattern-ok? (:clause op')) (vreset! sound? false))
+              op')
+
+            :predicate
+            (assoc op :clause (subst-clause consts (:clause op))
+                   :args (map #(subst-slot consts %) (:args op)))
+
+            :function
+            (let [binding-vars (filter analyze/free-var? (analyze/extract-vars (:binding op)))]
+              (when (some #(contains? consts %) binding-vars)
+                (vreset! sound? false))
+              (assoc op :clause (subst-clause consts (:clause op))
+                     :args (map #(subst-slot consts %) (:args op))))
+
+            :not-join
+            (do (vreset! sound? false) op)
+
+            op))
+        ops' (mapv bind-op (:ops plan))]
+    (when @sound?
+      (assoc plan :ops ops'))))
+
+(defn single-tuple-rel-consts
+  "When every rel binds exactly one tuple (scalar/tuple :in bindings kept as
+   rels to keep plan-cache keys value-free), return their bindings as a
+   var→value const map; nil when any rel is not single-tuple or binds nil
+   (nil can't round-trip through contains?-based const checks soundly for
+   clause grounding)."
+  [rels]
+  (reduce
+   (fn [m rel]
+     (let [tuples (:tuples rel)
+           n #?(:clj (if (instance? java.util.Collection tuples)
+                       (.size ^java.util.Collection tuples)
+                       (count tuples))
+                :cljs (count tuples))]
+       (if (not= 1 n)
+         (reduced nil)
+         (let [t #?(:clj (if (instance? java.util.List tuples)
+                           (.get ^java.util.List tuples 0)
+                           (first tuples))
+                    :cljs (first tuples))
+               cell (fn [i]
+                      #?(:clj (cond (instance? clojure.lang.Indexed t) (.nth ^clojure.lang.Indexed t (int i))
+                                    (.isArray (class t)) (aget ^objects t (int i))
+                                    (sequential? t) (nth t i)
+                                    :else (get t i))
+                         :cljs (cond (array? t) (aget t i)
+                                     (sequential? t) (nth t i)
+                                     :else (get t i))))
+               entries (map (fn [[var idx]] [var (cell idx)]) (:attrs rel))]
+           (if (some (fn [[_ v]] (nil? v)) entries)
+             (reduced nil)
+             (into m entries))))))
+   {}
+   rels))
+
+(defn- finalize-direct-result
+  "Convert a filled result-list into the final query result under the given
+   dedup strategy (:hash, :adjacent, or nil for the no-duplicates fast path)."
+  [result-list dedup-strategy]
+  #?(:clj
+     (case dedup-strategy
+       :hash
+       (let [n (result-list-size result-list)]
+         (persistent!
+          (loop [i (int 0) s (transient #{})]
+            (if (< i n)
+              (recur (unchecked-inc-int i)
+                     (conj! s (adopt-vector (result-list-get result-list i))))
+              s))))
+
+       :adjacent
+       ;; Adjacent dedup: history card-one duplicates are adjacent in scan order.
+       ;; Returns PHS for consistent set behavior and iteration order.
+       (let [n (result-list-size result-list)]
+         (persistent!
+          (loop [i (int 0)
+                 ^objects prev nil
+                 s (transient #{})]
+            (if (< i n)
+              (let [^objects cur (result-list-get result-list i)]
+                (if (or (nil? prev)
+                        (not (java.util.Arrays/equals prev cur)))
+                  (recur (unchecked-inc-int i) cur
+                         (conj! s (adopt-vector cur)))
+                  (recur (unchecked-inc-int i) cur s)))
+              s))))
+
+       ;; nil — Fast path: no duplicates, use QueryResult
+       (let [n (result-list-size result-list)
+             out (object-array n)]
+         (loop [i (int 0)]
+           (when (< i n)
+             (aset out i (adopt-vector (result-list-get result-list i)))
+             (recur (unchecked-inc-int i))))
+         ;; Jolt has no QueryResult class (ours, 97a8c72e): a set of the tuples
+         #?(:jolt (into #{} out) :clj (datahike.java.QueryResult. out n))))
+     :cljs
+     (let [n (result-list-size result-list)]
+       (persistent!
+        (loop [i 0 s (transient #{})]
+          (if (< i n)
+            (recur (inc i) (conj! s (adopt-vector (result-list-get result-list i))))
+            s))))))
+
+(defn- try-point-group
+  "Point-shape fast path: a single entity group whose (rebound) scan is an
+   AVET ground-value seek and whose merges are all card-one same-entity EAVT
+   point lookups. Fills `result-list` with tuples in `emit-vars` order and
+   returns true; returns false to fall back to the generic fused executor.
+   The generic path compiles per-call merge/eq/find arrays — for a unique
+   point lookup that compilation dwarfs the index work itself."
+  [db g emit-vars consts result-list max-results cancel]
+  (let [scan-op (entity-group-scan-op g)
+        merge-ops (entity-group-merge-ops g)
+        [se sa sv stx] (:clause scan-op)
+        avet (:avet db)
+        eavt (:eavt db)
+        merge-vars (into #{} (comp (map #(get (:clause %) 2))
+                                   (filter #(and (symbol? %) (analyze/free-var? %))))
+                         merge-ops)]
+    (if-not (and (= :avet (:index scan-op))
+                 (every? #(or (= % se)
+                              (contains? merge-vars %)
+                              (and consts (contains? consts %)))
+                         emit-vars)
+                 (keyword? sa)
+                 (symbol? se) (analyze/free-var? se)
+                 (some? sv) (not (symbol? sv))
+                 (nil? stx)
+                 avet eavt
+                 (pss-instance? avet) (pss-instance? eavt)
+                 #?(:clj (not (:attribute-refs? (dbi/-config db))) :cljs true)
+                 (seq emit-vars)
+                 (empty? (get scan-op :pushdown-preds))
+                 (every? (fn [op]
+                           (let [[me ma mv mtx] (:clause op)]
+                             (and (= me se) (keyword? ma) (nil? mtx)
+                                  (not (:anti? op))
+                                  (get-in op [:schema-info :card-one?] false)
+                                  (empty? (get op :pushdown-preds))
+                                  ;; optional (get-else) merges must bind a var
+                                  (or (not (:optional? op))
+                                      (and (symbol? mv) (analyze/free-var? mv))))))
+                         merge-ops))
+      false
+      (let [from (datom e0 sa sv tx0)
+            to (datom emax sa sv txmax)
+            n-merges (count merge-ops)]
+        (loop [ds (seq (di/-slice avet from to :avet))
+               emitted 0]
+          (if (or (nil? ds)
+                  (and max-results (>= emitted (long max-results))))
+            true
+            (let [_ (check-cancel! cancel)
+                  ^Datom d (first ds)
+                  e (.-e d)
+                  ;; resolve merges: var bindings accumulate; ground values check
+                  binds (loop [i 0 binds {se e}]
+                          (if (>= i n-merges)
+                            binds
+                            (let [op (nth merge-ops i)
+                                  [_ ma mv] (:clause op)
+                                  md (first (di/-slice eavt (datom e ma nil tx0)
+                                                       (datom e ma nil txmax) :eavt))
+                                  var? (and (symbol? mv) (analyze/free-var? mv))]
+                              (cond
+                                ;; ground value: existence + equality check
+                                (not var?)
+                                (when (and md (val-eq? (.-v ^Datom md) mv))
+                                  (recur (inc i) binds))
+
+                                ;; missing, non-optional → entity fails
+                                (and (nil? md) (not (:optional? op)))
+                                nil
+
+                                :else
+                                (let [v (if md (.-v ^Datom md) (:default-value op))]
+                                  (if (contains? binds mv)
+                                    (when (val-eq? (get binds mv) v)
+                                      (recur (inc i) binds))
+                                    (recur (inc i) (assoc binds mv v))))))))]
+              (if (nil? binds)
+                (recur (next ds) emitted)
+                (let [n (count emit-vars)
+                      ^objects out #?(:clj (object-array n) :cljs (make-array n))]
+                  (dotimes [vi n]
+                    (let [var (nth emit-vars vi)]
+                      (if (contains? binds var)
+                        (aset out vi (get binds var))
+                        (aset out vi (get consts var)))))
+                  (result-list-add result-list out)
+                  (recur (next ds) (inc emitted)))))))))))
+
 (defn execute-plan-direct
   "Execute a fully-fusable plan directly to a PersistentHashSet.
    Supports single-group and multi-group (value join via hash-probe) plans.
@@ -2790,7 +3075,10 @@
                              (vec (distinct (mapcat :vars groups))))
             emit-vars (if has-post-ops? all-group-vars find-vars)
             n-groups (count groups)
-            result-list (make-result-list 4000)]
+            ;; Prepared mode: ArrayList grows amortized-O(1), so a small
+            ;; initial capacity avoids a 4000-slot backing array per point
+            ;; query. Stock mode keeps the historical pre-sizing.
+            result-list (make-result-list (if *prepared-execution* 64 4000))]
 
         (if (= 1 n-groups)
           ;; Single group — fused scan+merge
@@ -2801,11 +3089,14 @@
                 g-emit (if (seq g-attached)
                          (group-emit-vars g emit-vars)
                          emit-vars)]
-            (execute-group-direct db scan-op merge-ops g-emit consts
-                                  result-list nil 0 nil 0 -1
-                                  max-results
-                                  :temporal temporal :pipeline (:pipeline g)
-                                  :cancel cancel)
+            (when-not (and *prepared-execution*
+                           (nil? temporal)
+                           (try-point-group db g g-emit consts result-list max-results cancel))
+              (execute-group-direct db scan-op merge-ops g-emit consts
+                                    result-list nil 0 nil 0 -1
+                                    max-results
+                                    :temporal temporal :pipeline (:pipeline g)
+                                    :cancel cancel))
             (when (seq g-attached)
               (apply-attached-preds result-list g-attached
                                     (vec (or (:output-vars g) (:vars g)))
@@ -2833,7 +3124,15 @@
                 has-post-ops? (or (seq pred-ops) (seq fn-ops))
                 all-group-vars (when has-post-ops?
                                  (vec (distinct (mapcat :vars groups))))
-                emit-vars (if has-post-ops? all-group-vars find-vars)]
+                emit-vars (if has-post-ops? all-group-vars find-vars)
+                ;; The layout of the tuples that actually reach result-list.
+                ;; It is NOT always `emit-vars`: a consumer group emits its own
+                ;; wide var vector whenever it carries attached-preds or feeds a
+                ;; probe-map, and the probe-map combine re-lays the tuples out
+                ;; again. Post-processing must index the tuples it really has,
+                ;; so the emitting site records the layout here. Written once
+                ;; per group, never per tuple.
+                emit-layout (volatile! emit-vars)]
             (loop [gi 0
                    probe-sets    {} ;; {[producer-idx probe-var] → HashSet of join-var values}
                    probe-maps    {} ;; {[producer-idx probe-var] → {:map HashMap :p-all-vars [...]}}
@@ -2873,6 +3172,7 @@
                                    c-all-vars
                                    emit-vars)]
                       (when (and pinfo probe-set)
+                        (vreset! emit-layout c-emit)
                         (execute-group-direct db scan-op merge-ops c-emit consts
                                               result-list probe-set
                                               (int (:consumer-scan-field pinfo))
@@ -2913,7 +3213,8 @@
                                                      :else [:const nil]))
                                                  target-vars)
                                 n-consumer (result-list-size result-list)
-                                combined (make-result-list (* 2 n-consumer))]
+                                combined (make-result-list (* 2 n-consumer))
+                                _ (vreset! emit-layout target-vars)]
                             (dotimes [ci n-consumer]
                               (let [^objects c-tuple (result-list-get result-list ci)
                                     probe-val (aget c-tuple c-probe-idx)
@@ -3155,14 +3456,31 @@
                                    probe-sets)
                                  probe-maps
                                  consumed-cgi))))))))
-            ;; Post-processing for multi-group: use potentially augmented pred-ops
-            (when has-post-ops?
-              (let [var-index (into {} (map-indexed (fn [i v] [v i])) all-group-vars)]
-                (when (seq pred-ops)
-                  (post-filter-preds result-list pred-ops var-index))
-                (let [var-index (if (seq fn-ops)
-                                  (post-apply-fns result-list fn-ops var-index)
-                                  var-index)]
+            ;; Post-processing for multi-group. There are TWO independent reasons
+            ;; the tuples sitting in result-list are not the answer yet:
+            ;;
+            ;;   * post-ops (predicates hoisted off producer groups, functions)
+            ;;     still have to be evaluated, and
+            ;;   * the consumer emitted WIDE. It does that whenever it carries
+            ;;     attached-preds or feeds a probe-map — conditions independent
+            ;;     of has-post-ops?, since `extra-preds` harvests attached-preds
+            ;;     from PRODUCER groups only. So the tuples can carry the
+            ;;     consumer's own var order (a `vec` of its :output-vars SET)
+            ;;     while :find asks for something else.
+            ;;
+            ;; Gating the projection on has-post-ops? alone therefore returned
+            ;; the raw wide tuple: `[:find ?e ?en]` came back as [?en ?e], and
+            ;; with a get-else in the consumer group as a 3-tuple from a 2-var
+            ;; :find. Both silent. Project whenever the layout is not already
+            ;; the find layout, and index by the layout the tuples REALLY have.
+            (let [layout @emit-layout
+                  var-index (into {} (map-indexed (fn [i v] [v i])) layout)]
+              (when (and has-post-ops? (seq pred-ops))
+                (post-filter-preds result-list pred-ops var-index))
+              (let [var-index (if (and has-post-ops? (seq fn-ops))
+                                (post-apply-fns result-list fn-ops var-index)
+                                var-index)]
+                (when (or has-post-ops? (not= layout find-vars))
                   (project-tuples result-list find-vars var-index consts))))))
         ;; Post-processing: apply predicates, functions, NOT-JOINs, then project
         ;; (single-group standalone post-ops only — multi-group handled above)
@@ -3201,49 +3519,176 @@
                                has-card-many-dupes? :hash
                                is-historical? :adjacent
                                :else nil)]
-          #?(:clj
-             (case dedup-strategy
-               :hash
-               (let [n (result-list-size result-list)]
-                 (persistent!
-                  (loop [i (int 0) s (transient #{})]
-                    (if (< i n)
-                      (recur (unchecked-inc-int i)
-                             (conj! s (adopt-vector (result-list-get result-list i))))
-                      s))))
+          (finalize-direct-result result-list dedup-strategy))))))
 
-               :adjacent
-               ;; Adjacent dedup: history card-one duplicates are adjacent in scan order.
-               ;; Returns PHS for consistent set behavior and iteration order.
-               (let [n (result-list-size result-list)]
-                 (persistent!
-                  (loop [i (int 0)
-                         ^objects prev nil
-                         s (transient #{})]
-                    (if (< i n)
-                      (let [^objects cur (result-list-get result-list i)]
-                        (if (or (nil? prev)
-                                (not (java.util.Arrays/equals prev cur)))
-                          (recur (unchecked-inc-int i) cur
-                                 (conj! s (adopt-vector cur)))
-                          (recur (unchecked-inc-int i) cur s)))
-                      s))))
+;; ---------------------------------------------------------------------------
+;; Compiled direct programs — the prepared-query execution record.
+;;
+;; A cached plan is value-free; everything the direct executor derives from it
+;; per call (fuse verdict, shape analysis, merge specs, emit resolution) is a
+;; pure function of (plan, find-vars, const KEYSET) and is compiled once into
+;; a program stored on the plan's :datahike.query.execute/program-cache atom.
+;; Per call only the constant VALUES differ: the point program seeks AVET with
+;; (get consts var) directly — no plan rebinding, no per-call eligibility work.
 
-               ;; nil — Fast path: no duplicates, use QueryResult
-               (let [n (result-list-size result-list)
-                     out (object-array n)]
-                 (loop [i (int 0)]
-                   (when (< i n)
-                     (aset out i (adopt-vector (result-list-get result-list i)))
-                     (recur (unchecked-inc-int i))))
-                 #?(:jolt (into #{} out) :clj (datahike.java.QueryResult. out n))))
-             :cljs
-             (let [n (result-list-size result-list)]
-               (persistent!
-                (loop [i 0 s (transient #{})]
-                  (if (< i n)
-                    (recur (inc i) (conj! s (adopt-vector (result-list-get result-list i))))
-                    s))))))))))
+(defn- compile-point-program
+  "Compile a value-free single-entity-group plan into a point-execution
+   program for `find-vars` under the given const keyset. Returns nil when the
+   shape doesn't qualify (caller falls back to the generic direct executor)."
+  [plan find-vars consts-keys]
+  (let [ops (:ops plan)]
+    (when (and (:structurally-fusable? plan)
+               (not (:has-passthrough? plan))
+               (empty? (:group-joins plan))
+               (= 1 (count ops))
+               (= :entity-group (:op (first ops))))
+      (let [g (first ops)
+            scan-op (entity-group-scan-op g)
+            merge-ops (entity-group-merge-ops g)
+            [se sa sv stx] (:clause scan-op)
+            ck (set consts-keys)
+            free? #(and (symbol? %) (analyze/free-var? %))
+            sv-src (cond
+                     (free? sv) (when (contains? ck sv) [:const sv])
+                     (some? sv) [:lit sv]
+                     :else nil)]
+        (when (and (keyword? sa) (free? se) (nil? stx) sv-src
+                   (:indexed? (:schema-info scan-op))
+                   (empty? (get scan-op :pushdown-preds)))
+          (let [merges
+                (reduce
+                 (fn [acc op]
+                   (let [[me ma mv mtx] (:clause op)
+                         spec (when (and (= me se) (keyword? ma) (nil? mtx)
+                                         (not (:anti? op))
+                                         (get-in op [:schema-info :card-one?] false)
+                                         (empty? (get op :pushdown-preds)))
+                                (cond
+                                  (and (free? mv) (:optional? op))
+                                  (when-not (contains? ck mv)
+                                    {:attr ma :mode :optional :var mv
+                                     :default (:default-value op)})
+                                  (and (free? mv) (contains? ck mv))
+                                  {:attr ma :mode :cval :var mv}
+                                  (free? mv) {:attr ma :mode :bind :var mv}
+                                  (some? mv) {:attr ma :mode :lit :val mv}
+                                  :else nil))]
+                     (if spec (conj acc spec) (reduced nil))))
+                 [] merge-ops)]
+            (when merges
+              (let [find-vars (vec find-vars)
+                    bind-vars (into #{} (keep #(when (#{:bind :optional} (:mode %)) (:var %))) merges)
+                    g-attached (not-empty (:attached-preds g))
+                    group-vars (vec (or (:output-vars g) (:vars g)))
+                    emit-vars (if g-attached group-vars find-vars)
+                    resolvable? (every? #(or (= % se)
+                                             (contains? bind-vars %)
+                                             (contains? ck %))
+                                        emit-vars)]
+                (when (and resolvable?
+                           (can-direct-fuse? plan find-vars
+                                             (zipmap consts-keys (repeat true))))
+                  {:se se :sa sa :sv-src sv-src :merges merges
+                   :attached g-attached :group-vars group-vars
+                   :emit-vars emit-vars :find-vars find-vars
+                   :dedup (if (some #{se} find-vars) nil :hash)})))))))))
+
+(defn- run-point-program
+  "Execute a compiled point program with per-call consts: one AVET ground-value
+   seek plus card-one same-entity EAVT lookups, straight into the final result."
+  [prog db consts max-results cancel]
+  (let [{:keys [se sa sv-src merges attached group-vars emit-vars find-vars dedup]} prog
+        [src x] sv-src
+        sv (if (= :lit src) x (get consts x))
+        result-list (make-result-list 8)]
+    (when (some? sv)
+      (let [avet (:avet db)
+            eavt (:eavt db)
+            n-merges (count merges)
+            from (datom e0 sa sv tx0)
+            to (datom emax sa sv txmax)]
+        (loop [ds (seq (di/-slice avet from to :avet))
+               emitted 0]
+          (when-not (or (nil? ds)
+                        (and max-results (>= emitted (long max-results))))
+            (let [_ (check-cancel! cancel)
+                  ^Datom d (first ds)
+                  e (.-e d)
+                  binds
+                  (loop [i 0 binds {se e}]
+                    (if (>= i n-merges)
+                      binds
+                      (let [{:keys [attr mode var val default]} (nth merges i)
+                            md (first (di/-slice eavt (datom e attr nil tx0)
+                                                 (datom e attr nil txmax) :eavt))]
+                        (case mode
+                          :lit (when (and md (val-eq? (.-v ^Datom md) val))
+                                 (recur (inc i) binds))
+                          :cval (let [cv (get consts var)]
+                                  (when (and md (some? cv)
+                                             (val-eq? (.-v ^Datom md) cv))
+                                    (recur (inc i) binds)))
+                          :bind (when md
+                                  (let [v (.-v ^Datom md)]
+                                    (if (contains? binds var)
+                                      (when (val-eq? (get binds var) v)
+                                        (recur (inc i) binds))
+                                      (recur (inc i) (assoc binds var v)))))
+                          :optional (let [v (if md (.-v ^Datom md) default)]
+                                      (if (contains? binds var)
+                                        (when (val-eq? (get binds var) v)
+                                          (recur (inc i) binds))
+                                        (recur (inc i) (assoc binds var v))))))))]
+              (when binds
+                (let [n (count emit-vars)
+                      ^objects out #?(:clj (object-array n) :cljs (make-array n))]
+                  (dotimes [vi n]
+                    (let [vv (nth emit-vars vi)]
+                      (if (contains? binds vv)
+                        (aset out vi (get binds vv))
+                        (aset out vi (get consts vv)))))
+                  (result-list-add result-list out)))
+              (recur (next ds) (if binds (inc emitted) emitted)))))))
+    (when attached
+      (apply-attached-preds result-list attached group-vars find-vars consts))
+    (finalize-direct-result result-list dedup)))
+
+(defn- direct-program
+  "Look up (or compile and cache) the plan's point program for
+   [find-vars consts-keys]. Returns the program, or ::none."
+  [plan find-vars consts-keys]
+  (let [cache (::program-cache (meta plan))
+        k [find-vars consts-keys]]
+    (if cache
+      (or (get @cache k)
+          (let [p (or (compile-point-program plan find-vars consts-keys) ::none)]
+            (when (< (count @cache) 8)
+              (swap! cache assoc k p))
+            p))
+      (or (compile-point-program plan find-vars consts-keys) ::none))))
+
+(defn execute-plan-prepared
+  "Prepared-execution entry for raw-q*: absorb single-tuple rels (scalar/tuple
+   :in bindings kept value-free for the plan cache) as per-call consts, run the
+   plan's compiled point program when it applies, else rebind the plan and run
+   the generic direct executor. Returns the result, or nil when this binding
+   shape must fall back to the relation engine."
+  [plan db find-vars rels base-consts max-results cancel outer-ctx]
+  (let [rel-consts (when (seq rels) (single-tuple-rel-consts rels))]
+    (when (or (empty? rels) (seq rel-consts))
+      (let [consts (if (seq rel-consts) (merge base-consts rel-consts) base-consts)
+            ckeys (into #{} (keys consts))
+            prog (direct-program plan find-vars ckeys)]
+        (if (and (not (identical? ::none prog))
+                 (pss-instance? (:avet db))
+                 (pss-instance? (:eavt db))
+                 #?(:clj (not (:attribute-refs? (dbi/-config db))) :cljs true))
+          (do (check-cancel! cancel)
+              (run-point-program prog db consts max-results cancel))
+          (let [plan' (if (seq rel-consts) (bind-plan-consts plan rel-consts) plan)]
+            (when plan'
+              (execute-plan-direct plan' db find-vars max-results consts
+                                   cancel outer-ctx))))))))
 
 (defn execute-plan-direct-rel
   "Execute a fusable plan using the fast direct path, but return a Relation
@@ -3743,6 +4188,45 @@
 ;; 63c8e244's rule that a scan carrying a predicate is not a bare scan. Could break:
 ;; query-rules-test, cljs-recursive-rule-test, query-planner-temporal-test recursion
 ;; cases written against ours' engine. Seon's src calls no Datalog rule.
+(defn- tuple-nth
+  "Read position `i` of a relation tuple, whichever shape it has.
+
+   Tuples are arrays on most paths but VECTORS out of the fused scan+merge
+   path (the scan datom's fields, extended by `conj` per merge). On the JVM
+   reading the wrong shape throws; on JS `aget` of a PersistentVector is
+   `undefined`, so it silently yields nil — which is how #917 turned a
+   recursive rule into a row of nils. Dispatch, always."
+  [tuple i]
+  #?(:clj (if (instance? object-array-class tuple)
+            (aget ^objects tuple (int i))
+            (nth tuple i))
+     :cljs (if (array? tuple)
+             (aget tuple i)
+             (nth tuple i))))
+
+(defn- ctx-demand-tuples
+  "Distinct value tuples that `ctx` currently binds for `demand-vars`, or nil
+   when it does not bind all of them.
+
+   This is the demand a `:rule-lookup` is about to place on the accumulator:
+   by the time the op runs, the ops before it in the branch have bound its
+   call arguments, so the tuple it is ASKING FOR is already in the context.
+   That is the whole trick — the magic-set supplementary rule
+   `magic(inputs') :- magic(inputs), body-prefix` is already being evaluated
+   as part of the branch, so its result can simply be read off rather than
+   derived a second time."
+  [rels demand-vars]
+  (let [needed (set demand-vars)
+        carrying (filterv (fn [r] (some needed (keys (:attrs r)))) rels)]
+    (when (seq carrying)
+      (let [joined (reduce rel/hash-join carrying)
+            attrs (:attrs joined)]
+        (when (every? #(contains? attrs %) demand-vars)
+          (let [idxs (mapv #(get attrs %) demand-vars)]
+            (into #{}
+                  (map (fn [t] (mapv (fn [i] (tuple-nth t i)) idxs)))
+                  (:tuples joined))))))))
+
 (defn- rel-dedup-into!
   "Add tuples from rel (projected to head-vars) into seen-set.
    Returns a new Relation containing only the NEW tuples (not already in seen).
@@ -3771,14 +4255,16 @@
                                                   (aget ^objects tuple idx)
                                                   (nth tuple idx)))))
                                 arr)
-                         :cljs (let [arr (make-array n-vars)]
+                         ;; Dispatch on the tuple's shape as the JVM branch
+                         ;; does: a fused scan+merge branch body emits VECTOR
+                         ;; tuples, and `aget` of a PersistentVector on JS is
+                         ;; `undefined` rather than an error, so the whole
+                         ;; accumulator would fill with nils.
+                         :cljs (let [arr (make-array n-vars)
+                                     arr? (array? tuple)]
                                  (dotimes [j n-vars]
-                                   ;; relations built by legacy fns can carry
-                                   ;; persistent vectors: mirror the CLJ array?/nth split
                                    (let [idx (nth indices j)]
-                                     (aset arr j (if (array? tuple)
-                                                   (aget tuple idx)
-                                                   (nth tuple idx)))))
+                                     (aset arr j (if arr? (aget tuple idx) (nth tuple idx)))))
                                  arr))
             wrapper #?(:clj (ArrayWrapper. projected (java.util.Arrays/hashCode projected))
                        :cljs projected)]
@@ -3893,6 +4379,22 @@
                           (doto #?(:clj (object-array 1) :cljs (make-array 1))
                             (aset 0 v)))
                         values)))
+
+(defn- tuples-rel
+  "Relation binding `vars` positionally to each tuple in `tuples`.
+
+   The n-column sibling of `values-rel`: array tuples, because that is what the
+   join path expects. Used to inject a DEMAND relation over a rule's input head
+   vars, so a branch body evaluates once per demanded input tuple instead of
+   once for the caller's single binding."
+  [vars tuples]
+  (rel/->Relation (zipmap vars (range))
+                  (mapv (fn [t]
+                          (let [n (count t)
+                                a #?(:clj (object-array n) :cljs (make-array n))]
+                            (dotimes [i n] (aset a i (nth t i)))
+                            a))
+                        tuples)))
 
 (defn- call-arg-rel
   "The caller's binding for a rule head var, as a one-column Relation named by
@@ -4107,6 +4609,20 @@
   [db op ctx]
   (let [{:keys [scc-rule-plans scc-rule-names call-args head-vars rule-name
                 base-scan-attr magic-demand-sound? delta-driven-sound?]} op
+        ;; Bound OUTSIDE the fixpoint loop (see `check-cancel!`): the loop then
+        ;; costs one deref per round.
+        ;;
+        ;; The fixpoint had no cancellation check at all, so a rule whose
+        ;; recursion is unbounded could not be interrupted by anything —
+        ;; `d/q`'s `:cancel` reaches every other scan in this namespace but not
+        ;; this loop. That matters most for rules the engine accepts but
+        ;; Datalog would not: a head var no body binds (#897) makes the rule
+        ;; UNSAFE (its relation is infinite in that argument), and a body that
+        ;; CONSTRUCTS the value it recurses on — `[(dec ?budget) ?b2]` — can
+        ;; derive new values forever. Termination is then undecidable in
+        ;; general, so the honest guarantee is not "we always finish" but
+        ;; "you can always stop us".
+        cancel (:cancel ctx)
         ;; Head vars no branch body binds take their value from the call site
         ;; (#897). When one has no caller binding either, the fixpoint cannot
         ;; produce a well-formed tuple for it — hand the whole rule to the
@@ -4114,8 +4630,44 @@
         ;; call args.
         pass-rels (when scc-rule-plans
                     (resolve-pass-through-rels ctx scc-rule-plans rule-name
-                                               call-args head-vars))]
-    (if (or (nil? scc-rule-plans) (= :unresolvable pass-rels))
+                                               call-args head-vars))
+        ;; #918. A pass-through head var is bound from the call site, so the
+        ;; accumulator's column for it holds exactly the value the caller
+        ;; supplied. When a self-call passes a DIFFERENT value at that position
+        ;; — `(reachable ?head ?prev ?b2)` where `?b2` is `(dec ?budget)` — the
+        ;; lookup asks the accumulator for a value it was never filled with, so
+        ;; it matches nothing and the recursion stops. Measured: at most ONE
+        ;; level unrolls, whatever the data.
+        ;;
+        ;; The rule is unsafe Datalog (a head var in no body atom), so its
+        ;; relation is infinite in that argument and a bottom-up evaluator can
+        ;; only compute a DEMAND-driven slice of it. So for these rules the
+        ;; pass-through vars stop being a fixed binding and become demand: the
+        ;; call site supplies the FIRST demand tuple, each lookup contributes
+        ;; the next, and the base branches are re-seeded per demand tuple.
+        demand-lookup (when scc-rule-plans
+                        (some (fn [rn]
+                                (some (fn [plan]
+                                        (some (fn [op]
+                                                (when (:demand-transformed? op) op))
+                                              (:ops plan)))
+                                      (:rec-clause-versions (get scc-rule-plans rn))))
+                              scc-rule-names))
+        demand-head-vars (:demand-head-vars demand-lookup)
+        demand-driven? (boolean (seq demand-head-vars))
+        ;; A self-call that transforms an input var with NOTHING bounding it has
+        ;; no terminating bottom-up evaluation: demand grows forever, long after
+        ;; the facts stop. The relational engine is goal-directed, so its proof
+        ;; tree is bounded by the DATA (every step needs a real edge) and it
+        ;; answers such a rule correctly. Decline instead of returning a subset.
+        demand-unbounded? (boolean
+                           (when scc-rule-plans
+                             (some (fn [rn]
+                                     (some (fn [plan]
+                                             (some :demand-unbounded? (:ops plan)))
+                                           (:rec-clause-versions (get scc-rule-plans rn))))
+                                   scc-rule-names)))]
+    (if (or (nil? scc-rule-plans) (= :unresolvable pass-rels) demand-unbounded?)
       ;; No pre-built plans — fall back to legacy
       (let [clause (:clause op)]
         (binding [rel/*implicit-source* (get (:sources ctx) '$)]
@@ -4179,6 +4731,41 @@
             ;; The demand delta produced while seeding, consumed by iteration 1
             init-batch (when magic-demand
                          #?(:clj (java.util.ArrayList. 16) :cljs nil))
+            ;; #918 demand seeding. The caller's binding for the transformed
+            ;; input vars is the FIRST demand tuple; every later one is harvested
+            ;; at a `:rule-lookup` (see `ctx-demand-tuples`).
+            demand-seen (when demand-driven?
+                          (volatile!
+                           (or (some-> (ctx-demand-tuples
+                                        (into [] (keep #(get pass-rels %)) demand-head-vars)
+                                        demand-head-vars))
+                               #{})))
+            demand-sink (when demand-driven? (volatile! #{}))
+            ;; Pass-through no longer supplies the demand vars: it would join the
+            ;; branch back down to the caller's single value and undo the whole
+            ;; mechanism. The demand relation supplies them instead.
+            eff-pass-rels (if demand-driven?
+                            (apply dissoc pass-rels demand-head-vars)
+                            pass-rels)
+            demand-ctx (fn [c tuples]
+                         (if (and demand-driven? (seq tuples))
+                           (-> c
+                               ;; The caller's CONSTS must not reach a demand var.
+                               ;; #915 cleared the caller's :rels from a branch body
+                               ;; but left :consts, and a rule's head vars are its
+                               ;; own — so a caller that happens to name an :in var
+                               ;; `?budget`, like the rule's head var, had 8 folded
+                               ;; in as a constant everywhere inside the body. The
+                               ;; demand relation was then joined against a constant
+                               ;; and collapsed straight back to the call-site value:
+                               ;; the recursion advanced one level and stopped, which
+                               ;; looks exactly like the bug being fixed. Rename the
+                               ;; caller's var and it worked — the tell of a name
+                               ;; collision, not a demand failure.
+                               (update :consts #(apply dissoc % demand-head-vars))
+                               (update :rels rel/collapse-rels (tuples-rel demand-head-vars tuples))
+                               (assoc :rule-demand-sink demand-sink))
+                           (cond-> c demand-driven? (assoc :rule-demand-sink demand-sink))))
             ;; Execute base branches for each SCC rule
             ;; With magic sets: use demand-driven base scan (point lookups only)
             rule-states
@@ -4204,9 +4791,15 @@
                                           (or (magic-base-scan-general db base-plans head-vars magic-ground-pos
                                                                        seed-batch body-ctx pass-rels)
                                               (rel/->Relation (zipmap head-vars (range)) []))
-                                  ;; No magic: full base branch plan execution
+                                  ;; No magic: full base branch plan execution.
+                                  ;; Demand-driven (#918): the base runs once per
+                                  ;; demanded input tuple, so it is evaluated with
+                                  ;; the demand relation injected rather than with
+                                  ;; the caller's single pass-through binding.
                                           :else
-                                          (execute-branch-plans db base-plans body-ctx head-vars pass-rels))
+                                          (execute-branch-plans db base-plans
+                                                                (demand-ctx body-ctx (when demand-seen @demand-seen))
+                                                                head-vars eff-pass-rels))
                                delta-rel (rel-dedup-into! base-rel head-vars (get seen-sets rn))]
                   ;; Propagate magic demand from base results
                            (when (and magic-demand (= rn rule-name))
@@ -4236,7 +4829,40 @@
             (loop [states rule-states
                    batch init-batch
                    demand-tuples init-demand-tuples]
-              (let [any-delta? (some (fn [[_ s]] (seq (:tuples (:delta-rel s)))) states)]
+              (let [_ (check-cancel! cancel)
+                    ;; Demand harvested during the previous round that is new.
+                    ;; A round with no fact delta may still have produced demand
+                    ;; whose base facts are not derived yet, so the fixpoint has
+                    ;; to iterate on demand growth too — stopping on `any-delta?`
+                    ;; alone would truncate exactly the answers #918 loses.
+                    fresh-demand (when demand-driven?
+                                   (let [drained @demand-sink
+                                         new (into #{} (remove @demand-seen) drained)]
+                                     (vreset! demand-sink #{})
+                                     (when (seq new)
+                                       (vswap! demand-seen into new)
+                                       new)))
+                    any-delta? (some (fn [[_ s]] (seq (:tuples (:delta-rel s)))) states)
+                    ;; Base facts for the newly demanded input tuples. Without
+                    ;; these the next round's lookup has nothing to match.
+                    states (if (seq fresh-demand)
+                             (into {}
+                                   (map (fn [[rn st]]
+                                          (let [{:keys [head-vars base-plans]} (get scc-rule-plans rn)
+                                                seeded (execute-branch-plans
+                                                        db base-plans
+                                                        (demand-ctx body-ctx fresh-demand)
+                                                        head-vars eff-pass-rels)
+                                                d (rel-dedup-into! seeded head-vars (get seen-sets rn))]
+                                            [rn (if (seq (:tuples d))
+                                                  (-> st
+                                                      (update :main-rel rel/sum-rel d)
+                                                      (update :delta-rel rel/sum-rel d))
+                                                  st)])))
+                                   states)
+                             states)
+                    any-delta? (or any-delta?
+                                   (some (fn [[_ s]] (seq (:tuples (:delta-rel s)))) states))]
                 (if (not any-delta?)
                   states
                   (let [;; The demand delta produced this round, consumed next round
@@ -4251,7 +4877,9 @@
                                             :delta (:delta-rel s)
                                             :output-vars hv}])))
                               states)
-                        base-aug-ctx (assoc body-ctx :rule-accumulators acc-map)
+                        base-aug-ctx (-> body-ctx
+                                         (assoc :rule-accumulators acc-map)
+                                         (demand-ctx (when demand-seen @demand-seen)))
                         ;; Push the accumulated demand into the recursive scan so
                         ;; the ground var is pruned BEFORE expansion (not filtered
                         ;; after). O(1) to wrap the incrementally grown tuples.
@@ -4372,8 +5000,14 @@
                                             ;; Normal: full branch plan execution
                                             ;; (ground var already pruned by the
                                             ;; injected demand in aug-ctx).
+                                                     ;; `eff-pass-rels`, not `pass-rels`: for a
+                                                     ;; demand var the caller's binding is a SINGLE
+                                                     ;; value, so joining it in here would collapse
+                                                     ;; the injected demand back to that value and
+                                                     ;; the recursion would advance exactly one
+                                                     ;; level — the #918 symptom, half-fixed.
                                                      (execute-branch-plans db rec-clause-versions aug-ctx head-vars
-                                                                           pass-rels))
+                                                                           eff-pass-rels))
                                   ;; Union base and rec results
                                            new-rel (if (and magic-base-rel (seq (:tuples magic-base-rel)))
                                                      (rel/sum-rel magic-base-rel rec-rel)
@@ -4415,7 +5049,9 @@
                                      (= #?(:clj (if (instance? object-array-class tuple)
                                                   (aget ^objects tuple (int i))
                                                   (nth tuple i))
-                                           :cljs (aget tuple i))
+                                           :cljs (if (array? tuple)
+                                                   (aget tuple i)
+                                                   (nth tuple i)))
                                         expected))
                                    const-filters))
                          (:tuples main-rel))))
@@ -4440,9 +5076,21 @@
                                       (let [idx (aget output-indices j)]
                                         (aset a j (if oa? (aget ^objects tuple idx) (nth tuple idx)))))
                                     a)
-                             :cljs (let [a (make-array n-out)]
+                             ;; Tuples reach here in BOTH shapes, so the read has
+                             ;; to dispatch on the shape exactly as the JVM branch
+                             ;; does. A single-clause branch body emits array
+                             ;; tuples, but the fused scan+merge path builds a
+                             ;; VECTOR (`[(.-e scan-d) …]` extended by `conj` per
+                             ;; merge), and on JS `aget` of a PersistentVector is
+                             ;; `undefined`, not an error — so a recursive rule
+                             ;; whose branch body had more than one clause
+                             ;; projected every head var to nil and answered
+                             ;; `[[nil nil]]` instead of its relation.
+                             :cljs (let [a (make-array n-out)
+                                         arr? (array? tuple)]
                                      (dotimes [j n-out]
-                                       (aset a j (aget tuple (nth output-indices j))))
+                                       (let [idx (nth output-indices j)]
+                                         (aset a j (if arr? (aget tuple idx) (nth tuple idx)))))
                                      a))
                       wrapper #?(:clj (ArrayWrapper. arr (java.util.Arrays/hashCode arr))
                                  :cljs (str (vec arr)))]
@@ -5116,7 +5764,15 @@
                 :not-join (recur (execute-not-join op-db op ctx) plan (inc idx))
 
                 :rule-lookup
-                (let [acc-map (get-in ctx [:rule-accumulators (:rule-name op)])
+                (let [;; Harvest the demand this lookup places on the accumulator
+                      ;; (see `ctx-demand-tuples`). The sink is installed by
+                      ;; `execute-recursive-rule` only when some input position is
+                      ;; transformed, so an unaffected rule pays one map lookup.
+                      _ (when-let [sink (:rule-demand-sink ctx)]
+                          (when-let [dvars (:demand-vars op)]
+                            (when-let [ts (ctx-demand-tuples (:rels ctx) dvars)]
+                              (vswap! sink into ts))))
+                      acc-map (get-in ctx [:rule-accumulators (:rule-name op)])
                       acc-rel (when acc-map
                                 (get acc-map (:mode op)))
                     ;; Map accumulator output-vars to call-args vars

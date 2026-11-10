@@ -548,6 +548,61 @@
        (is (= #{2 3} (run '[:find [?b ...] :in $ % :where (rr 1 ?b)]))
            "…and with a ground argument"))))
 
+(deftest test-recursive-rule-branch-body-with-several-clauses
+  ;; A recursive rule whose BRANCH BODY has more than one clause takes the
+  ;; fused scan+merge path, which emits its tuples as VECTORS (the scan
+  ;; datom's five fields, extended by `conj` per merge) rather than as arrays
+  ;; like a single-clause body does. The JVM projection dispatches on the
+  ;; tuple's shape; the ClojureScript one used `aget` unconditionally, and
+  ;; `aget` of a PersistentVector on JS is `undefined` rather than an error.
+  ;; So on cljs every head var projected to nil and the rule answered
+  ;; `[[nil nil]]` — a silent wrong answer on the DEFAULT engine there, since
+  ;; the planner is on by default in ClojureScript.
+  ;;
+  ;; The clause count is what matters, not the encoding: a reified edge
+  ;; (`[?e :edge/from ?x] [?e :edge/to ?y]`) and two independent clauses fail
+  ;; identically, while the one-clause direct edge was always fine — which is
+  ;; why this shape survived so long. Asserted on both platforms, against
+  ;; hand-written closures.
+  (let [db (d/db-with (db/empty-db {:sym {:db/cardinality :db.cardinality/one}
+                                    :direct {:db/valueType :db.type/ref
+                                             :db/cardinality :db.cardinality/many}
+                                    :edge/from {:db/valueType :db.type/ref
+                                                :db/cardinality :db.cardinality/one}
+                                    :edge/to {:db/valueType :db.type/ref
+                                              :db/cardinality :db.cardinality/one}})
+                      [{:db/id 1 :sym "a" :direct [2]}
+                       {:db/id 2 :sym "b" :direct [3]}
+                       {:db/id 3 :sym "c" :direct [4]}
+                       {:db/id 4 :sym "d"}
+                       {:db/id 11 :edge/from 1 :edge/to 2}
+                       {:db/id 12 :edge/from 2 :edge/to 3}
+                       {:db/id 13 :edge/from 3 :edge/to 4}])
+        closure #{[1 2] [1 3] [1 4] [2 3] [2 4] [3 4]}
+        run (fn [q rules]
+              (binding [dq/*disable-planner* false]
+                (set (d/q q db rules))))]
+    (testing "a two-clause (reified) branch body projects its head vars"
+      (is (= closure
+             (run '[:find ?a ?b :in $ % :where (r ?a ?b)]
+                  '[[(r ?x ?y) [?e :edge/from ?x] [?e :edge/to ?y]]
+                    [(r ?x ?y) [?e :edge/from ?x] [?e :edge/to ?m] (r ?m ?y)]]))))
+    (testing "…with a ground argument, which post-filters the projected tuples"
+      (is (= #{2 3 4}
+             (run '[:find [?b ...] :in $ % :where (r 1 ?b)]
+                  '[[(r ?x ?y) [?e :edge/from ?x] [?e :edge/to ?y]]
+                    [(r ?x ?y) [?e :edge/from ?x] [?e :edge/to ?m] (r ?m ?y)]]))))
+    (testing "two INDEPENDENT clauses fail the same way — it is the count, not reification"
+      (is (= closure
+             (run '[:find ?a ?b :in $ % :where (r ?a ?b)]
+                  '[[(r ?x ?y) [?x :direct ?y] [?x :sym _]]
+                    [(r ?x ?y) [?x :direct ?m] (r ?m ?y)]]))))
+    (testing "the one-clause body that always worked still does"
+      (is (= closure
+             (run '[:find ?a ?b :in $ % :where (r ?a ?b)]
+                  '[[(r ?x ?y) [?x :direct ?y]]
+                    [(r ?x ?y) [?x :direct ?m] (r ?m ?y)]]))))))
+
 (deftest test-recursive-rule-does-not-inherit-caller-relations
   ;; A rule's fixpoint computes the rule's relation INDEPENDENTLY of its call
   ;; site — the caller joins on the output vars afterwards. Letting a caller
@@ -612,15 +667,14 @@
                          r)
                   :cljs (binding [dq/*disable-planner* false]
                           (set (d/q q db rules)))))]
-    ;; The reified-edge encoding is asserted on the JVM only. On cljs the
-    ;; planner answers a reified-edge recursive rule with a single all-nil
-    ;; tuple — `(r ?a ?b)` over a→b→c→d gives `[[nil nil]]` where the base
-    ;; engine gives the six correct pairs — and that is PRE-EXISTING, not
-    ;; something this fix introduces: it reproduces identically on the parent
-    ;; commit. The direct-edge encoding below is asserted on both platforms and
-    ;; covers the same fault, so nothing about #911 goes untested on cljs.
+    ;; Both encodings are asserted on both platforms. The reified one was
+    ;; JVM-only for a while: on cljs the planner answered a reified-edge
+    ;; recursive rule with a single all-nil tuple, because a branch body with
+    ;; more than one clause emits VECTOR tuples and the cljs projection read
+    ;; them with `aget` (which is `undefined`, not an error, on a
+    ;; PersistentVector). Fixed — see `execute-recursive-rule`.
     (doseq [[label rules] [["direct edge" direct-rules]
-                           #?@(:clj [["reified edge" reified-rules]])]]
+                           ["reified edge" reified-rules]]]
       (testing label
         ;; the caller's ?x collides with the rule's head var ?x
         (is (= #{"b" "c" "d"}
@@ -716,3 +770,121 @@
                        :where [?x :sym "a"] (r ?x ?y) (s ?x ?b) [?b :sym ?s]]
                      two-rules))
             "the second rule computes its own relation")))))
+
+(deftest test-recursive-rule-fixpoint-is-cancelable
+  ;; The semi-naive fixpoint had no cancellation check, so `:cancel` — which
+  ;; every other scan in `query.execute` consults — could not stop a recursive
+  ;; rule. Nothing could: a rule whose recursion is unbounded wedged the caller
+  ;; with no way out.
+  ;;
+  ;; That matters because the engine accepts rules Datalog would reject. A head
+  ;; var no body binds (#897) makes a rule UNSAFE — its relation is infinite in
+  ;; that argument — and a body that CONSTRUCTS the value it recurses on
+  ;; (`[(dec ?budget) ?b2]`) can derive new values forever. Termination is then
+  ;; undecidable, so the guarantee cannot be "we always finish"; it has to be
+  ;; "you can always stop us".
+  ;;
+  ;; Asserted with a pre-set flag rather than a racing watchdog so it cannot
+  ;; flake in CI. (Interruption mid-fixpoint was verified separately: a closure
+  ;; taking 189 ms warm was cancelled at 8 ms and raised in 9 ms.)
+  (let [db (d/db-with (db/empty-db {:next {:db/valueType :db.type/ref
+                                           :db/cardinality :db.cardinality/many}})
+                      (mapv (fn [i] {:db/id (inc i) :next (+ i 2)}) (range 8)))
+        rules '[[(tc ?a ?b) [?a :next ?b]]
+                [(tc ?a ?b) [?a :next ?m] (tc ?m ?b)]]
+        q '[:find (count ?b) :in $ % :where (tc ?a ?b)]
+        pairs-q '[:find ?a ?b :in $ % :where (tc ?a ?b)]]
+    (testing "a pre-set cancel flag stops the fixpoint"
+      ;; Asserted on BOTH engines. The planner's semi-naive fixpoint and the
+      ;; relational engine's top-down rule solver each had no cancellation
+      ;; check, and both need one: the planner declines rules whose recursion it
+      ;; cannot bound TO the relational solver, so an uninterruptible solver
+      ;; would just move the wedge rather than remove it.
+      (doseq [disable-planner? [false true]]
+        (is (thrown-with-msg?
+             #?(:clj clojure.lang.ExceptionInfo :cljs js/Error) #"canceled"
+             (binding [dq/*disable-planner* disable-planner?]
+               (dq/q {:query q :args [db rules] :cancel (volatile! true)})))
+            (str "cancelable with *disable-planner* " disable-planner?))))
+    (testing "…and without one the rule still answers"
+      ;; chain of 9 nodes ⇒ the transitive closure is every ordered pair
+      ;; i<j, i.e. C(9,2) = 36. (`(count ?b)` alone would count DISTINCT
+      ;; ?b values — 8 — since a bare aggregate projects onto its own var.)
+      (is (= 36 (count (dq/q {:query pairs-q :args [db rules]}))))
+      (is (= [[8]] (dq/q {:query q :args [db rules]}))
+          "…and the bare aggregate counts the 8 distinct reachable nodes"))))
+
+(deftest test-recursive-rule-transformed-caller-arg
+  ;; #918. A head var no rule body binds takes its value from the call site
+  ;; (#897), so the fixpoint accumulator's column for it holds exactly the one
+  ;; value the caller passed. A self-call that passes a DIFFERENT value there —
+  ;; `(reachable ?head ?prev ?b2)` with `?b2` = `(dec ?budget)` — asks the
+  ;; accumulator for a value it was never filled with, so the recursion advanced
+  ;; AT MOST ONE level whatever the data, and answered with a silent subset.
+  ;;
+  ;; Such a var is now demand: the call site supplies the first value, each
+  ;; lookup contributes the next, base branches are re-seeded per demanded
+  ;; value. Expectations are hand-written closures — `reachable(h,l,b)` iff
+  ;; `dist(h,l) <= b` — because the wrong answer is a subset with no error, and
+  ;; because the *caller's* variables are deliberately named like the rule's own
+  ;; head vars here: that name collision const-folded the budget into the body
+  ;; and defeated the demand relation until `:consts` were scoped out too, so a
+  ;; test using different names would pass while the bug remained.
+  (let [db (d/db-with (db/empty-db {:next {:db/valueType :db.type/ref
+                                           :db/cardinality :db.cardinality/many}})
+                      ;; 1 -> 2 -> 3 -> 4, plus a branch 1 -> 5
+                      [{:db/id 1 :next [2 5]} {:db/id 2 :next [3]} {:db/id 3 :next [4]}])
+        rules '[[(reachable ?head ?link ?budget) [(identity ?head) ?link]]
+                [(reachable ?head ?link ?budget) [(> ?budget 0)] [(dec ?budget) ?b2]
+                 [?prev :next ?link] (reachable ?head ?prev ?b2)]]
+        reach (fn [budget]
+                (binding [dq/*disable-planner* false]
+                  (set (d/q '[:find [?link ...] :in $ % ?head ?budget
+                              :where (reachable ?head ?link ?budget)]
+                            db rules 1 budget))))]
+    (testing "the recursion reaches as far as the budget allows"
+      (is (= #{1} (reach 0)) "no hops")
+      (is (= #{1 2 5} (reach 1)) "one hop")
+      (is (= #{1 2 5 3} (reach 2)) "two hops")
+      (is (= #{1 2 5 3 4} (reach 3)) "three hops — the whole graph")
+      (is (= #{1 2 5 3 4} (reach 9)) "a budget past the diameter adds nothing"))))
+
+(deftest test-recursive-rule-demand-across-scc-and-non-linear-bodies
+  ;; The demand is harvested where a self-call reads the accumulator, so it has
+  ;; to be complete for bodies with MORE than one self-call and for rules whose
+  ;; recursion crosses an SCC boundary — otherwise the fix would trade one
+  ;; silent subset for a subtler one.
+  (let [db (d/db-with (db/empty-db {:next {:db/valueType :db.type/ref
+                                           :db/cardinality :db.cardinality/many}})
+                      [{:db/id 1 :next [2]} {:db/id 2 :next [3]}
+                       {:db/id 3 :next [4]} {:db/id 4 :next [5]}])
+        run (fn [q rules args]
+              (binding [dq/*disable-planner* false]
+                (set (apply d/q q db rules args))))]
+    (testing "mutual recursion: transformed in one rule, passed through in the other"
+      (is (= #{1 2 3 4 5}
+             (run '[:find [?l ...] :in $ % ?h ?bud :where (p ?h ?l ?bud)]
+                  '[[(p ?head ?link ?budget) [(identity ?head) ?link]]
+                    [(p ?head ?link ?budget) [(> ?budget 0)] [(dec ?budget) ?b2]
+                     (q ?head ?link ?b2)]
+                    [(q ?head ?link ?budget) [?prev :next ?link] (p ?head ?prev ?budget)]]
+                  [1 4]))))
+    (testing "non-linear: two self-calls in one body, composing half-budget paths"
+      ;; base = one edge, step = two paths of budget-1, so budget b covers
+      ;; 1..2^b hops. b=2 covers the 4-edge chain.
+      (is (= #{2 3 4 5}
+             (run '[:find [?l ...] :in $ % ?h ?bud :where (r ?h ?l ?bud)]
+                  '[[(r ?head ?link ?budget) [?head :next ?link]]
+                    [(r ?head ?link ?budget) [(> ?budget 0)] [(dec ?budget) ?b2]
+                     (r ?head ?mid ?b2) (r ?mid ?link ?b2)]]
+                  [1 2]))))
+    (testing "an unbounded transformed arg is answered, not silently truncated"
+      ;; Nothing constrains ?budget, so no bottom-up evaluation of this rule
+      ;; terminates — demand would grow forever after the facts stop. It is
+      ;; handed to the relational engine, whose top-down search the DATA bounds.
+      (is (= #{1 2 3 4 5}
+             (run '[:find [?l ...] :in $ % ?h ?bud :where (u ?h ?l ?bud)]
+                  '[[(u ?head ?link ?budget) [(identity ?head) ?link]]
+                    [(u ?head ?link ?budget) [(dec ?budget) ?b2]
+                     [?prev :next ?link] (u ?head ?prev ?b2)]]
+                  [1 9]))))))
