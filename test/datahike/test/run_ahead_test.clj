@@ -123,7 +123,7 @@
   (let [conn (fresh-conn "refused")]
     (try
       (writer/apply! conn {:tx-data [{:name "a"}]} {:show? true})
-      (writer/apply! conn {:tx-data [{:name "b"}]})
+      (writer/apply! conn {:tx-data [{:name "b"}]} {:show? true})
       (let [e (try (d/transact conn [{:name "c"}]) nil
                    (catch Throwable e e))]
         (is (= {:type :run-ahead-pending :tx-count 2} (select-keys (ex-data e) [:type :tx-count]))))
