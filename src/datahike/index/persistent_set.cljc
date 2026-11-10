@@ -401,7 +401,10 @@
 (defn- leaf-content-uuid
   "Content-addressed UUID of a Leaf: on Jolt the SHA-256 of its datoms' stored bytes, else hash of its datoms in vector form."
   [node]
-  #?(:jolt (sha256-uuid (fasl-store/serialize (mapv (comp vec seq) (.keys ^Leaf node))))
+  ;; Jolt: each datom's vector built from its fields, the same value (vec (seq d)) is
+  ;; without the list and the seq walk between
+  #?(:jolt (sha256-uuid (fasl-store/serialize (mapv (fn [^Datom d] [(.-e d) (.-a d) (.-v d) (dd/datom-tx d) (dd/datom-added d)])
+                                                    (.keys ^Leaf node))))
      :default (uuid (mapv (comp vec seq) #?(:clj (.keys ^Leaf node) :cljs (.-keys node))))))
 
 (defn- gen-address [#?(:clj ^ANode node :cljs node) crypto-hash?]
