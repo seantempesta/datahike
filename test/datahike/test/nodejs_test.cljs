@@ -21,6 +21,7 @@
             [datahike.audit :as audit]
             [datahike.online-gc :as online-gc]
             [konserve.core :as k]
+            [fress.impl.bigdec :as fbd] ;; cljs BigDecimal — :db.type/bigdec value type
             [konserve.node-filestore :as nfs] ;; Register :file backend for Node.js
             [cljs.nodejs :as nodejs]
             ;; Sibling test namespaces — included so `bb node-cljs-test`
@@ -54,7 +55,10 @@
             ;; Weighted LRU query-cache — the cljs WeightedLRU deftype has its
             ;; own implementation, so cover it (unit + test.check property) here.
             [datahike.test.lru-weighted-test]
-            [datahike.test.lru-weighted-property-test]))
+            [datahike.test.lru-weighted-property-test]
+            ;; Attribute-value constraints — registry resolution (pure, here)
+            ;; and an async enforcement test below.
+            [datahike.test.attr-preds-test]))
 
 ;; Hook cljs.test's end-of-run callback so the Node process exits with
 ;; status 0 only when all tests pass.
@@ -138,6 +142,35 @@
       (finally
         (await (d/delete-database cfg))
         (dq/clear-query-cache!)))))
+
+(deftest bigdec-roundtrip-test
+  ;; :db.type/bigdec must accept a fress `Bigdec` (unscaled js/BigInt + scale) in
+  ;; cljs and round-trip it. The spec was `(complement any?)` — it rejected EVERY
+  ;; value, so a browser datahike could not store a decimal at all. Requires fress
+  ;; ≥ 0.4.317 (BIGDEC handlers), arriving transitively via konserve.
+  (async done
+         (go
+           (let [cfg    {:store {:backend :memory :id (random-uuid)}
+                         :schema-flexibility :write}
+                 amount (fbd/bigdec (js/BigInt "12345") 2)] ;; 123.45
+             (try
+               (<! (d/create-database cfg))
+               (let [conn (d/connect cfg)]
+                 (<! (d/transact! conn [{:db/ident :price
+                                         :db/valueType :db.type/bigdec
+                                         :db/cardinality :db.cardinality/one}]))
+                 (let [report (<! (d/transact! conn [{:price amount}]))
+                       eid    (d/q '[:find ?e . :where [?e :price _]] @conn)]
+                   (is (:db-after report) "a :db.type/bigdec value is accepted + transacted in cljs")
+                   (is (some? eid) "the bigdec-bearing entity committed")
+                   (is (fbd/bigdec? (:price (d/pull @conn [:price] eid)))
+                       "the stored value reads back as a fress Bigdec")
+                   (is (= amount (:price (d/pull @conn [:price] eid)))
+                       "the :db.type/bigdec value round-trips unchanged")))
+               (catch js/Error e
+                 (is false (str "bigdec roundtrip error: " (.-message e)))))
+             (<! (d/delete-database cfg))
+             (done)))))
 
 (deftest ^:async roundtrip-test
   (let [dir (tmp-dir)
@@ -695,4 +728,5 @@
                'datahike.test.experimental.graph-test
                'datahike.test.experimental.anomaly-test
                'datahike.test.lru-weighted-test
-               'datahike.test.lru-weighted-property-test))
+               'datahike.test.lru-weighted-property-test
+               'datahike.test.attr-preds-test))

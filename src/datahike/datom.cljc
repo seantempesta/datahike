@@ -337,10 +337,10 @@
   "Compare two values with cross-platform UUID compatibility.
    CLJS UUID comparison is adjusted to match CLJ's signed comparison,
    ensuring consistent ordering when indices are built on CLJ and queried on CLJS.
-   Byte arrays are compared element-wise via datahike.array/compare-arrays,
-   since byte[] does not implement Comparable. Two lists (vectors, map entries
-   and the java.util.List storage reads them back as) order element-wise
-   (`compare-lists`)."
+   Byte/float/double arrays are compared element-wise via
+   datahike.array/compare-arrays, since primitive arrays do not implement
+   Comparable. Two lists (vectors, map entries and the java.util.List storage
+   reads them back as) order element-wise (`compare-lists`)."
   [v1 v2]
   #?(:jolt (cond
              (one-scalar-kind? v1 v2) (compare v1 v2)
@@ -351,7 +351,7 @@
                             (catch Exception e
                               (if (= (class-name v1) (class-name v2)) (throw e) (class-order v1 v2))))))
      :clj (cond
-            (and (da/bytes? v1) (da/bytes? v2))
+            (and (da/value-array? v1) (da/value-array? v2))
             (da/compare-arrays v1 v2)
 
             (and (instance? java.util.List v1) (instance? java.util.List v2))
@@ -386,7 +386,7 @@
            (and neg2 (not neg1)) 1   ;; v2 "negative", v1 "positive" → v1 > v2
            :else (compare s1 s2)))   ;; same sign → string compare works
 
-       (and (da/bytes? v1) (da/bytes? v2))
+       (and (da/value-array? v1) (da/value-array? v2))
        (da/compare-arrays v1 v2)
 
        :else (compare v1 v2))

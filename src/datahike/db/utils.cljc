@@ -334,20 +334,32 @@
     :db.type/ref [:db.type/ref :db/index]
     :db.type/tuple [:db.type/tuple]
 
+    ;; string/bytes/float-array/double-array attrs are candidates for the
+    ;; value-size resource model (default cap resolved at enforcement); mark them
+    ;; so the transactor's O(1) :db.attr/constrained gate fires.
+    :db.type/string [:db.attr/constrained]
+    :db.type/bytes [:db.attr/constrained]
+    :db.type/float-array [:db.attr/constrained]
+    :db.type/double-array [:db.attr/constrained]
+
     :db.type/valueType [:db/systemAttribRef]
     :db.type/cardinality [:db/systemAttribRef]
     :db.type/unique [:db/systemAttribRef]
 
-    (if (= k :db/ident)
-      [:db/ident]
-      (when (true? v)
-        (case k
-          :db/isComponent [:db/isComponent]
-          :db/index [:db/index]
-          :db/noHistory [:db/noHistory]
-          :db.secondary/only [:db.secondary/only]
-          :db/contentId [:db/contentId]
-          [])))))
+    (cond
+      (= k :db/ident) [:db/ident]
+      ;; attribute-value constraints — mark the attr constrained so the
+      ;; transactor can gate enforcement on an O(1) rschema lookup.
+      (= k :db/maxLength) [:db.attr/constrained]
+      (= k :db.attr/preds) [:db.attr/constrained]
+      (true? v)
+      (case k
+        :db/isComponent [:db/isComponent]
+        :db/index [:db/index]
+        :db/noHistory [:db/noHistory]
+        :db.secondary/only [:db.secondary/only]
+        :db/contentId [:db/contentId]
+        []))))
 
 (defn reduce-indexed
   "Same as reduce, but `f` takes [acc el idx]"

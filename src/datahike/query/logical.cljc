@@ -51,21 +51,41 @@
 ;; ---------------------------------------------------------------------------
 ;; NOT → anti-scan folding
 
+(defn- anti-fold-vars-local?
+  "The anti-merge drops everything but the entity: `(not [?e :tag ?t])` folds
+   to \"?e has no :tag datom\". That is only what the clause MEANS while ?t is
+   local to the negation. Bind ?t outside — `:in [?t ...]`, or another clause
+   — and the clause means \"?e has no :tag whose value is ?t\", a per-binding
+   test the fused anti-merge cannot express: it would exclude every entity
+   holding ANY value of the attribute. The merge also contributes no column
+   for ?t, so the group advertises one it never writes and the all-nil column
+   annihilates the join against the outer binding."
+  [sub-ci not-idx bound-vars var->clause-idxs]
+  (every? (fn [v]
+            (and (not (contains? bound-vars v))
+                 (empty? (disj (get var->clause-idxs v #{}) not-idx))))
+          (->> (:vars sub-ci)
+               (filter analyze/free-var?)
+               (remove #{(:e sub-ci)}))))
+
 (defn- foldable-not?
   "A NOT clause can fold into an entity group's anti-scans when:
    1. It is a plain NOT (not NOT-JOIN)
    2. It has exactly one sub-clause that is a data pattern
    3. The pattern's entity var has a scan group
-   4. No source prefix (same default source)"
-  [not-entry scan-groups]
-  (let [{:keys [ci type source]} not-entry]
+   4. No source prefix (same default source)
+   5. Its non-entity vars are local to the negation (see above)"
+  [not-entry scan-groups bound-vars var->clause-idxs]
+  (let [{:keys [ci type source source-idx]} not-entry]
     (and (= type :not)
          (nil? source)
          (= 1 (count (:sub-clauses ci)))
          (let [sub-ci (analyze/classify-clause (first (:sub-clauses ci)))]
            (and (= :pattern (:type sub-ci))
                 (analyze/free-var? (:e sub-ci))
-                (contains? scan-groups [(:e sub-ci) nil]))))))
+                (contains? scan-groups [(:e sub-ci) nil])
+                (anti-fold-vars-local? sub-ci source-idx bound-vars
+                                       var->clause-idxs))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Main builder
@@ -164,7 +184,26 @@
                            ;; default is rejected at runtime with
                            ;; "get-else: nil default value is not supported".
                            ;; Fall through to LBind so that check still fires.
-                           (some? (nth (:args ci) 3 nil)))
+                           (some? (nth (:args ci) 3 nil))
+                           ;; A VARIABLE default (e.g. `[(get-else $ ?e :a ?d) ?v]`)
+                           ;; is not a compile-time constant: it must be resolved
+                           ;; per-row from ?d's binding. The fused LOptionalScan
+                           ;; plants :default-value into result tuples VERBATIM, so
+                           ;; a var default would leak as the raw symbol (the base
+                           ;; engine, going through -call-fn arg resolution, returns
+                           ;; the bound value — the two engines diverge). Fall
+                           ;; through to LBind, whose generic fn-call path resolves
+                           ;; the default var exactly like the base engine.
+                           (not (analyze/free-var? (nth (:args ci) 3 nil)))
+                           ;; A GROUND entity — written literally, or a var the
+                           ;; :in fold replaced with its value — leaves the scan
+                           ;; with no entity var, so it lowers to a STANDALONE
+                           ;; pattern-scan instead of an entity-group merge. Only
+                           ;; the merge path honours :optional?, so a miss emitted
+                           ;; nothing where the default was due. Fall through to
+                           ;; LBind, whose generic path defaults like the base
+                           ;; engine.
+                           (analyze/free-var? (nth (:args ci) 1 nil)))
                     ;; Recognize get-else as an optional scan:
                     ;; [(get-else $ ?e :attr default) ?v]
                     ;; args = ($ ?e :attr default), binding = ?v
@@ -180,13 +219,34 @@
                     ;; eids, and the index lookup returns 0 datoms (datoms are
                     ;; stored with eid attributes in this mode).
                     (let [args (:args ci)
+                          ;; get-else's first arg names the SOURCE. Carry a
+                          ;; named source ($data) onto the LOptionalScan so the
+                          ;; lowered op resolves the right db and the executor's
+                          ;; synthetic fn-clause names a resolvable source —
+                          ;; dropping it ran the scan against the default db and
+                          ;; (via the '$-hardcoded reconstruction) silently lost
+                          ;; the left-outer semantics for named-source queries
+                          ;; (issue #884).
+                          src (let [s (first args)]
+                                (when (and (symbol? s) (not= '$ s)
+                                           (= \$ (first (name s))))
+                                  s))
                           e-var (second args)
                           raw-attr (nth args 2)
                           attr (if (and (keyword? raw-attr)
                                         (:attribute-refs? (dbi/-config db)))
                                  (dbi/-ref-for db raw-attr)
                                  raw-attr)
-                          default-val (nth args 3)
+                          ;; (quote x) defaults unwrap to their constant here —
+                          ;; matching -call-fn's arg resolution on the legacy
+                          ;; path — because the fused merge paths plant
+                          ;; :default-value into tuples VERBATIM. Without this
+                          ;; the engines diverge: base returns x, planner the
+                          ;; literal (quote x) list. The bind-by-fn fallback
+                          ;; sites re-wrap seq defaults in (quote …) when they
+                          ;; reconstruct the fn-clause.
+                          default-val (let [d (nth args 3)]
+                                        (if (analyze/quote-form? d) (second d) d))
                           bind-var (:binding ci)
                           scan-vars (cond-> #{bind-var}
                                       (and (symbol? e-var)
@@ -197,7 +257,7 @@
                                         [e-var attr bind-var]  ;; synthetic clause
                                         scan-vars
                                         e-var attr bind-var nil ;; e a v tx
-                                        nil                     ;; source
+                                        src                     ;; source (nil = default $)
                                         default-val             ;; default value
                                         bind-var)               ;; binding var
                                        idx)))
@@ -271,18 +331,29 @@
 
          ;; Identify foldable NOTs (single-pattern NOT on a grouped entity var).
          ;; An anti-merge compares only its own group's vars: a NOT naming a
-         ;; var some other clause or input binds stays a standalone negation.
+         ;; var some other clause or input binds stays a standalone negation
+         ;; (ours, 5d7459d9; kept beside upstream's anti-fold-vars-local?, #904,
+         ;; which states the same rule: both must hold, and a NOT neither admits
+         ;; runs as a standalone negation, which is always correct).
          clauses-naming (frequencies (mapcat (comp set analyze/extract-vars) where-clauses))
          compared-in-group? (fn [sub-ci]
                               (let [group-vars (into #{} (mapcat :vars) (get scan-groups [(:e sub-ci) nil]))]
                                 (not-any? (fn [v] (and (not (contains? group-vars v))
                                                        (or (contains? bound-vars v) (> (get clauses-naming v 0) 1))))
                                           (analyze/extract-vars (:clause sub-ci)))))
+         ;; var → indices of the clauses that mention it, so a fold candidate
+         ;; can tell its own local vars from ones the query shares.
+         var->clause-idxs
+         (reduce (fn [m [idx ci]]
+                   (reduce (fn [m v] (update m v (fnil conj #{}) idx))
+                           m (filter analyze/free-var? (:vars ci))))
+                 {}
+                 (map-indexed vector classified))
          foldable-nots
          (reduce
           (fn [acc not-entry]
             (if (and (nil? (:ir-node not-entry))  ;; not already an IR node from AND flattening
-                     (foldable-not? not-entry scan-groups)
+                     (foldable-not? not-entry scan-groups bound-vars var->clause-idxs)
                      (compared-in-group? (analyze/classify-clause (first (:sub-clauses (:ci not-entry))))))
               (let [sub-ci (analyze/classify-clause (first (:sub-clauses (:ci not-entry))))
                     anti-scan (make-scan sub-ci nil)]

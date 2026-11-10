@@ -432,3 +432,48 @@
                 (and (= #{"A" "B"} #{(nm source) (nm target)}) (= 1 score)))
               cands)
         "(A,B) scored 1 by common neighbors")))
+
+;; ---------------------------------------------------------------------------
+;; BFS distances, lowest common ancestor
+;; ---------------------------------------------------------------------------
+
+;; Git-shaped history over parent edges (child :e/to parent):
+;;   c0 <- c1 <- c2 <- c3        (main line)
+;;               ^
+;;               \-- b1 <- b2    (branch off c1)
+(def hist (build [["c1" "c0"] ["c2" "c1"] ["c3" "c2"]
+                  ["b1" "c1"] ["b2" "b1"]]))
+
+(deftest test-bfs-distances
+  (let [[gr db] (g-of dag) id (:id dag) nm (:name dag)]
+    (is (= {"A" 0 "B" 1 "C" 1 "D" 2}
+           (into {} (map (fn [[e d]] [(nm e) d])) (g/bfs-distances gr db (id "A"))))
+        "start at 0; A→C→D is 2 hops, the short A→C not A→B→C")
+    (is (= {"D" 0} (into {} (map (fn [[e d]] [(nm e) d])) (g/bfs-distances gr db (id "D"))))
+        "a sink reaches only itself"))
+  (let [[gr db] (g-of cyc) id (:id cyc) nm (:name cyc)]
+    (is (= {"X" 0 "Y" 1 "Z" 2}
+           (into {} (map (fn [[e d]] [(nm e) d])) (g/bfs-distances gr db (id "X"))))
+        "start stays at 0 despite the cycle back to it")))
+
+;; Criss-cross: m1 and m2 each merge a1 and a2 (in opposite parent order);
+;; ours descends from m1, theirs from m2. Both a1 and a2 are genuine merge
+;; bases — neither is an ancestor of the other.
+(def criss (build [["m1" "a1"] ["m1" "a2"] ["m2" "a2"] ["m2" "a1"]
+                   ["ours" "m1"] ["theirs" "m2"]]))
+
+(deftest test-lowest-common-ancestors
+  (let [[gr db] (g-of hist) id (:id hist) nm (:name hist)
+        lcas (fn [a b] (set (map nm (g/lowest-common-ancestors gr db (id a) (id b)))))]
+    (is (= #{"c1"} (lcas "c3" "b2")) "the divergence point; the older c0 is dominated by c1")
+    (is (= #{"c1"} (lcas "c2" "b1")) "nearest, not oldest, common ancestor")
+    (is (= #{"c1"} (lcas "c1" "b2")) "an endpoint is its own ancestor at distance 0"))
+  (let [[gr db] (g-of dag) id (:id dag)]
+    (is (empty? (g/lowest-common-ancestors gr db (id "A") (id "E")))
+        "disjoint components share no ancestor"))
+  (let [[gr db] (g-of criss) id (:id criss) nm (:name criss)]
+    (is (= #{"a1" "a2"}
+           (set (map nm (g/lowest-common-ancestors gr db (id "ours") (id "theirs")))))
+        "a criss-cross has two genuine merge bases — both are returned")
+    (is (empty? (g/lowest-common-ancestors gr db (id "a1") (id "a2")))
+        "two roots share no ancestor")))

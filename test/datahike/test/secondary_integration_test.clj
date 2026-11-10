@@ -7,11 +7,13 @@
    [datahike.db :as db]
    [datahike.index.secondary :as sec]
    [datahike.index.entity-set :as es]
+   [datahike.query :as q]
    [datahike.index.secondary.scriptum]
    [datahike.index.secondary.stratum]
    [datahike.versioning :as dv]
    [datahike.writing :as dw]
-   [konserve.core :as k]))
+   [konserve.core :as k]
+   [datahike.test.query-aggregates-test :refer [aggregate-contract]]))
 
 ;; Proximum requires Java 22+ (class file version 66.0).
 ;; Load lazily so the test file compiles on older JVMs.
@@ -824,6 +826,47 @@
           (is (es/entity-bitset-contains? results 1))
           (is (es/entity-bitset-contains? results 2)))))))
 
+(deftest test-proximum-knn-clause
+  ;; KNN as a first-class Datalog :where clause via the external-engine
+  ;; query-spec-fn. Planner-only (the base engine has no external-engine op).
+  (when-not proximum-available?
+    (is (not proximum-available?) "SKIP: proximum requires Java 22+"))
+  (when proximum-available?
+    (binding [q/*disable-planner* false]
+      (let [cfg {:store {:backend :memory :id (random-uuid)} :schema-flexibility :write}]
+        (d/create-database cfg)
+        (try
+          (let [conn (d/connect cfg)]
+            (d/transact conn [{:db/ident :doc/name :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+                              {:db/ident :doc/embedding :db/valueType :db.type/float-array
+                               :db/cardinality :db.cardinality/one :db.secondary/only true}])
+            (d/transact conn [{:db/ident :idx/emb :db.secondary/type :proximum :db.secondary/attrs [:doc/embedding]
+                               :db.secondary/config {:dim 4 :distance :cosine :capacity 100
+                                                     :store-config {:backend :memory :id (random-uuid)}}}])
+            (Thread/sleep 800)
+            (d/transact conn [{:doc/name "east"  :doc/embedding (float-array [1.0 0.0 0.0 0.0])}
+                              {:doc/name "east2" :doc/embedding (float-array [0.9 0.1 0.0 0.0])}
+                              {:doc/name "north" :doc/embedding (float-array [0.0 1.0 0.0 0.0])}])
+            (Thread/sleep 500)
+            (testing "retrieval: [[?e ?distance]] binds entity + cosine distance and joins to a scalar attr"
+              (let [rows (d/q '[:find ?name ?distance :in $ ?qvec
+                                :where [(datahike.index.secondary.proximum/knn :idx/emb ?qvec 3) [[?e ?distance]]]
+                                [?e :doc/name ?name]]
+                              @conn (float-array [1.0 0.0 0.0 0.0]))
+                    m (into {} (map (fn [[n d]] [n d]) rows))]
+                (is (= #{"east" "east2" "north"} (set (keys m))))
+                (is (< (m "east") (m "east2") (m "north")) "distances present and ordered")
+                (is (== 0.0 (m "east")))))
+            (testing "filter: [?e ...] composes with a Datalog predicate"
+              (let [names (d/q '[:find [?name ...] :in $ ?qvec
+                                 :where [(datahike.index.secondary.proximum/knn :idx/emb ?qvec 3) [?e ...]]
+                                 [?e :doc/name ?name]
+                                 [(clojure.string/starts-with? ?name "east")]]
+                               @conn (float-array [1.0 0.0 0.0 0.0]))]
+                (is (= #{"east" "east2"} (set names)))))
+            (d/release conn))
+          (finally (d/delete-database cfg)))))))
+
 ;; ---------------------------------------------------------------------------
 ;; Stratum Entity-Filter Aggregate Tests
 
@@ -1101,3 +1144,115 @@
         (finally
           (d/release conn)
           (d/delete-database cfg))))))
+
+;; ---------------------------------------------------------------------------
+;; Columnar aggregate delegate: same contract as the reference implementation
+
+(deftest test-stratum-aggregate-contract
+  (testing "the columnar path answers datahike's aggregate contract"
+    ;; A fast path may only claim an aggregate it provably computes to the
+    ;; contract in `query-aggregates-test/aggregate-contract`. Mapping by NAME
+    ;; alone is what let this path return the SAMPLE variance (÷n−1) where the
+    ;; reference returns the population one, and ##NaN for a one-element group.
+    ;; stratum's population ops are named :variance-pop / :stddev-pop, so the
+    ;; adapter must translate rather than pass the name through.
+    ;; Keep this test honest. Asserting that the MAPPING TABLE claims these
+    ;; aggregates is not enough — it says nothing about whether the query
+    ;; reaches the delegate. It did not: the query below was written with a
+    ;; `.` (FindScalar) and `columnar-eligible?` requires a FindRel, so both
+    ;; bindings ran the reference engine and every assertion compared it to
+    ;; itself. Record the delegate's actual invocations instead.
+    (is (datahike.index.secondary.stratum/stratum-compatible-aggs?
+         [[:variance :num/v] [:stddev :num/v] [:median :num/v] [:avg :num/v]])
+        "the columnar path must claim these aggregates")
+    (doseq [{:keys [agg in expect note]} aggregate-contract]
+      (let [schema {:num/v {}
+                    :idx/analytics {:db.secondary/type :stratum
+                                    :db.secondary/attrs [:num/v]}}
+            empty-db (db/empty-db schema)
+            stratum-idx (sec/create-index :stratum {:attrs #{:num/v}} empty-db)
+            db (-> (assoc empty-db :secondary-indices {:idx/analytics stratum-idx})
+                   (d/db-with (vec (map-indexed (fn [i v] {:db/id (inc i) :num/v v}) in))))
+            ;; FindRel, NOT FindScalar: `columnar-eligible?` declines a `.`
+            ;; find, which would route this straight past the delegate.
+            query {:find [(list agg '?x)] :where '[[?e :num/v ?x]]}
+            label (str "(" agg " " (pr-str in) ")" (when note (str " — " note)))
+            used (atom [])
+            real-agg datahike.index.secondary.stratum/columnar-aggregate
+            real-maps datahike.index.secondary.stratum/columnar-aggregate-from-maps
+            ;; The result cache MUST be off. The two calls below are the same
+            ;; query against the same data, so the second one is a cache hit
+            ;; that never executes — the "reference" value would just be the
+            ;; columnar result handed back, and the comparison would again be
+            ;; the fast path against itself.
+            columnar (binding [q/*query-result-cache?* false]
+                       (with-redefs [datahike.index.secondary.stratum/columnar-aggregate
+                                     (fn [& args] (swap! used conj :cols) (apply real-agg args))
+                                     datahike.index.secondary.stratum/columnar-aggregate-from-maps
+                                     (fn [& args] (swap! used conj :maps) (apply real-maps args))]
+                         (ffirst (binding [q/*disable-planner* false] (d/q query db)))))
+            reference (binding [q/*query-result-cache?* false]
+                        (ffirst (binding [q/*disable-planner* true] (d/q query db))))]
+        (is (seq @used)
+            (str label " — the delegate must actually run, or this compares "
+                 "the reference engine to itself"))
+        (is (and (number? columnar)
+                 (< (abs (- (double expect) (double columnar))) 1e-9))
+            (str label " columnar"))
+        (is (= (double reference) (double columnar))
+            (str label " — columnar and reference must agree"))
+        ;; a truncating median or an integral avg passes tolerance while still
+        ;; being the wrong answer, so pin the type too
+        (is (= (double? reference) (double? columnar))
+            (str label " — same numeric type on both paths"))))))
+
+(deftest test-stratum-aggregate-eligibility-gates
+  (testing "the columnar path declines what it cannot compute to the contract"
+    ;; Two entry points reach the columnar aggregate and they did not share
+    ;; guards: the fused one (execute-columnar-aggregate) checks arity and column
+    ;; type, while the secondary-index one (try-secondary-index-aggregate)
+    ;; checked neither, so it answered a different function than the query asked
+    ;; for. Both gates now live on both paths.
+    (let [mk (fn [vals]
+               (let [schema {:num/v {}
+                             :idx/analytics {:db.secondary/type :stratum
+                                             :db.secondary/attrs [:num/v]}}
+                     e (db/empty-db schema)
+                     idx (sec/create-index :stratum {:attrs #{:num/v}} e)]
+                 (-> (assoc e :secondary-indices {:idx/analytics idx})
+                     (d/db-with (vec (map-indexed (fn [i v] {:db/id (inc i) :num/v v}) vals))))))
+          agree? (fn [db query]
+                   ;; the cache must be off, or the second call is a hit that
+                   ;; returns the first engine's answer
+                   (binding [q/*query-result-cache?* false]
+                     (let [c (binding [q/*disable-planner* false] (d/q query db))
+                           r (binding [q/*disable-planner* true] (d/q query db))]
+                       [(= c r) c r])))]
+
+      (testing "an aggregate with a count argument is a different function"
+        ;; `(min 2 ?x)` returns the two smallest as a COLLECTION. Only the last
+        ;; argument was read, so the count was dropped and a scalar returned.
+        (doseq [q ['[:find (min 2 ?x) :where [?e :num/v ?x]]
+                   '[:find (max 2 ?x) :where [?e :num/v ?x]]]]
+          (let [[ok? c r] (agree? (mk [10 15 20 35 75]) q)]
+            (is ok? (str q " — columnar " (pr-str c) " vs reference " (pr-str r))))))
+
+      (testing "an aggregate applies to the DEDUPLICATED find projection"
+        ;; A Datalog aggregate applies to the answer set. Aggregating inside the
+        ;; index counts a repeated value once per datom, so `(count ?x)` over
+        ;; 10,10,40 answered 3 where the projection has two members.
+        (doseq [q ['[:find (count ?x) :where [?e :num/v ?x]]
+                   '[:find (sum ?x) :where [?e :num/v ?x]]
+                   '[:find (avg ?x) :where [?e :num/v ?x]]
+                   '[:find (variance ?x) :where [?e :num/v ?x]]
+                   '[:find (median ?x) :where [?e :num/v ?x]]]]
+          (let [[ok? c r] (agree? (mk [10 10 40]) q)]
+            (is ok? (str q " over duplicates — columnar " (pr-str c)
+                         " vs reference " (pr-str r))))))
+
+      (testing "duplicate-insensitive aggregates keep the fast path"
+        (doseq [q ['[:find (min ?x) :where [?e :num/v ?x]]
+                   '[:find (max ?x) :where [?e :num/v ?x]]
+                   '[:find (count-distinct ?x) :where [?e :num/v ?x]]]]
+          (let [[ok? c r] (agree? (mk [10 10 40]) q)]
+            (is ok? (str q " — columnar " (pr-str c) " vs reference " (pr-str r)))))))))

@@ -927,7 +927,18 @@
 (defn -create-database* [config deprecated-config]
   (go-try-
    (let [opts {:sync? false}
-         {:keys [keep-history?] :as config} (dc/load-config config deprecated-config)
+         ;; Value-size caps are OPT-IN. Resolve the `:value-caps :default` preset
+         ;; and drop the selector at create only; an unconfigured database is left
+         ;; unbounded. Warn once so the choice is conscious rather than silent.
+         loaded-config (dc/load-config config deprecated-config)
+         _ (when-not (dc/value-caps-configured? loaded-config)
+             (log/warn :datahike/value-caps-unset
+                       (str "No value-size caps set — large :db.type/string / :db.type/bytes / "
+                            ":db.type/float-array / :db.type/double-array values can bloat the "
+                            "index and hit backend limits. Pass :value-caps :default for the "
+                            "default caps (or set :max-string-length etc. explicitly) to bound "
+                            "them, or :max-string-length 0 to stay unbounded and silence this.")))
+         {:keys [keep-history?] :as config} (dc/apply-default-value-caps loaded-config)
          store-config (:store config)
          store (ds/add-cache-and-handlers (<?- (ks/create-store store-config opts)) config)
          stored-db (<?- (k/get store :db nil opts))
@@ -1018,21 +1029,14 @@
   (go-try-
    (let [config (dc/load-config config {})
          config-store-id (ds/store-identity (:store config))
-         ;; An overlay's deletion drops only its own frontend, so only its own
-         ;; connections hold it; the shared store's refuses while ANY
-         ;; connection, overlays included, still reads it.
-         overlay (ds/overlay-marker config)
-         active-conns (filter (fn [[store-id :as conn-id]]
-                                (and (= store-id config-store-id)
-                                     (or (nil? overlay)
-                                         (some #{overlay} conn-id))))
+         active-conns (filter (fn [[store-id]] (= store-id config-store-id))
                               (keys @*connections*))]
      (when (seq active-conns)
        (log/raise "Cannot delete a database with active connections. Release them first."
                   {:type :database-has-active-connections
                    :connections (vec active-conns)}))
      (sc/clear-write-cache (:store config))
-     #?(:clj (when (nil? overlay) (.remove ^java.util.concurrent.ConcurrentHashMap id-sources config-store-id)))
+     #?(:clj (.remove ^java.util.concurrent.ConcurrentHashMap id-sources config-store-id))
      ;; Await the backend deletion. Konserve >= 0.9.357 makes every backend
      ;; honour the async delete-store contract, including tiered stores.
      (<?- (ks/delete-store (:store config))))))

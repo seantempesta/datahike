@@ -155,6 +155,45 @@
           (contains? seen n) (recur seen (pop q))
           :else (recur (conj seen n) (into (pop q) (gs/out-neighbors g db n))))))))
 
+(defn ^{:datahike/output-cardinality node-set-card
+        :datahike/cost linear-exec-cost} bfs-distances
+  "Map {node hop-count} for `start` (at distance 0) and every node reachable
+   from it via out-edges, measured in edges. Single-source unweighted BFS — the
+   whole-frontier companion to `path-length` (which is one target). Unlike
+   `transitive-closure`, `start` is always present at 0, since a distance map is
+   keyed by cost-to-reach and reaching `start` costs nothing."
+  [g db start]
+  (loop [q (conj gu/empty-queue start)
+         dist {start 0}]
+    (if (empty? q)
+      dist
+      (let [n (peek q)
+            d (inc (long (dist n)))
+            nbrs (remove #(contains? dist %) (gs/out-neighbors g db n))]
+        (recur (into (pop q) nbrs)
+               (reduce (fn [m nb] (assoc m nb d)) dist nbrs))))))
+
+(defn ^{:datahike/output-cardinality node-set-card
+        :datahike/cost quadratic-exec-cost} lowest-common-ancestors
+  "The lowest common ancestors of `a` and `b` over out-edges: the common
+   ancestors — each of `a`, `b` counting as its own ancestor — that are
+   *minimal*, i.e. no other common ancestor is reachable from them. This is the
+   graph-theoretic LCA set, and the true merge-base set when out-edges are parent
+   edges; a DAG can have several (a criss-cross). Empty when `a` and `b` share no
+   ancestor."
+  [g db a b]
+  (let [a-anc (conj (transitive-closure g db a) a)
+        b-anc (conj (transitive-closure g db b) b)
+        common (set/intersection a-anc b-anc)]
+    (if (empty? common)
+      #{}
+      ;; A common node is dominated (not lowest) when it is an ancestor of
+      ;; another common node — i.e. it appears in that node's out-closure.
+      (let [dominated (into #{}
+                            (mapcat (fn [c] (set/intersection (transitive-closure g db c) common)))
+                            common)]
+        (set/difference common dominated)))))
+
 ;; ===========================================================================
 ;; Path enumeration
 ;; ===========================================================================

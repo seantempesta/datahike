@@ -1,15 +1,19 @@
 (ns datahike.gc
   (:require [clojure.set :as set]
+            [datahike.config :as dc]
+            [datahike.constants :as c]
+            [datahike.datom :as dd]
             [datahike.gc-guard :as guard]
-            [datahike.index.interface :refer [-mark -seed-root! with-storage collection-key]]
+            [datahike.index.interface :refer [-mark -seed-root! -slice with-storage collection-key]]
             [datahike.index.secondary :as sec]
             [datahike.writing :refer [read-head commit-graph-key]]
             [datahike.roster :refer [roster roster-store-keys]]
+            [datahike.schema :as schema]
             [konserve.core :as k]
             [konserve.gc :refer [sweep!]]
             [replikativ.logging :as log]
             [superv.async :refer [<? S go-try <<? go-try- <?-]]
-            [konserve.utils :refer [#?(:clj async+sync) *default-sync-translation*]
+            [konserve.utils :as ku :refer [#?(:clj async+sync) *default-sync-translation*]
              #?@(:cljs [:refer-macros [async+sync]])]
             ;; go-loop drives start-background-gc!'s scheduler; it's a MACRO, so
             ;; cljs needs it via :require-macros (mirrors datahike.versioning).
@@ -49,24 +53,74 @@
                  {:type :gc-incomplete-mark :branches (count branches) :marked (count marked)}))
     marked))
 
+(defn- attr-store-refs
+  "The object ids named by the VALUES of `attr` in the AEVT index `aevt`. For a
+   key-bearing value type THE VALUE IS THE KEY, so this is just the attribute's
+   values.
+
+   Slices exactly the attribute's range, so the cost is O(its datoms), not O(the
+   database)."
+  [aevt attr]
+  (into #{}
+        (map :v)
+        (-slice aevt
+                (dd/datom c/e0 attr nil c/tx0)
+                (dd/datom c/emax attr nil c/txmax)
+                :aevt)))
+
+(defn- store-refs
+  "The object ids this record's datom VALUES name — what a `:db.type/store-ref`
+   keeps alive (`datahike.schema/key-bearing-value-types`).
+
+   THE MARK DOES NOT SEE THESE OTHERWISE. It walks the index TREES and collects
+   node addresses; it never looks inside a datom's value. So an object named only
+   by a value is unreachable from the mark's point of view, and the sweep deletes
+   it. That is the whole reason this exists.
+
+   ZERO COST WHEN UNUSED: if the schema declares no attribute of a key-bearing
+   type — which is every database that does not use the feature — this returns
+   immediately, having sliced nothing.
+
+   Under `:keep-history?` the TEMPORAL index is scanned too: a retracted store-ref
+   datom is still readable `as-of` an earlier tx, so the object it names must
+   outlive the retraction. (`:db/noHistory` attributes are NOT retained there, which
+   is why `schema/key-bearing-misuse` refuses to combine the two.)"
+  [config schema ident-ref-map aevt taevt]
+  (let [attrs (into []
+                    (keep (fn [[ident attr-def]]
+                            (when (contains? schema/key-bearing-value-types
+                                             (:db/valueType attr-def))
+                              ;; With :attribute-refs? the datoms hold the attribute's
+                              ;; EID, not its ident — slice by what is actually stored.
+                              (if (:attribute-refs? config)
+                                (get ident-ref-map ident)
+                                ident))))
+                    schema)]
+    (if (empty? attrs)
+      #{}
+      (reduce (fn [acc attr]
+                (cond-> (set/union acc (attr-store-refs aevt attr))
+                  taevt (set/union (attr-store-refs taevt attr))))
+              #{} attrs))))
+
 (defn- reachable-in-branch
   "The keys `branch` reaches from its head through commits newer than
-  `after-date`, and the secondary-index key maps those commits record:
-  `{:reachable keys :key-maps key-maps}`. `visited` (commit keys) and `seen`
+  `after-date`, and the object ids their datom values name (`store-refs`,
+  upstream #881): `{:reachable keys :store-refs refs}`. `visited` (commit keys) and `seen`
   (index node addresses) are atoms shared by every branch of one collection: a commit another branch
   already claimed is walked there, and a node already marked had its whole
   subtree marked, so the mark costs the store's distinct commits and nodes,
   not branches times commits times tree size."
-  [store branch after-date config visited seen sync?]
+  [store branch after-date config visited seen schema-cache sync?]
   (async+sync sync? *default-sync-translation*
    (go-try-
           (let [head-cid (<?- (k/get-in store [branch :meta :datahike/commit-id] nil {:sync? sync?}))]
             (loop [[to-check & r] [branch]
                    reachable      (hash-set branch head-cid)
-                   key-maps       #{}]
+                   refs           #{}]
               (if to-check
                 (if (contains? (first (swap-vals! visited conj to-check)) to-check) ;; claimed: skip
-                  (recur r reachable key-maps)
+                  (recur r reachable refs)
                   (if-let [record (<?- (read-head store to-check {:sync? sync?}))]
                     (let [{:keys                         [eavt-key avet-key aevt-key
                                                           temporal-eavt-key temporal-avet-key temporal-aevt-key
@@ -94,27 +148,48 @@
                           ;; index, which may be shared through the store's
                           ;; cache (mirrors stored->db) — so walk-addresses
                           ;; uses it and only its children are fetched.
-                            mark (fn [idx root]
-                                   (-mark (cond-> (with-storage (:index config) idx (:storage store))
-                                            root (-seed-root! root))
-                                          seen))
+                          ;;
+                          ;; `bind` returns that copy so the SAME seeded instance
+                          ;; serves both -mark (walk the tree) and -slice (read the
+                          ;; datoms, for store-refs).
+                            bind (fn [idx root]
+                                   (cond-> (with-storage (:index config) idx (:storage store))
+                                     root (-seed-root! root)))
+                            mark (fn [idx] (-mark idx seen))
+                            aevt'  (bind aevt-key aevt-root)
+                            taevt' (when (:keep-history? config)
+                                     (bind temporal-aevt-key temporal-aevt-root))
+                            ;; The schema names which attributes can hold store-refs;
+                            ;; content-addressed and rarely changed, so memoized across
+                            ;; the whole collection (upstream #881).
+                            schema-meta (when schema-meta-key
+                                          (if-let [cached (get @schema-cache schema-meta-key)]
+                                            cached
+                                            (let [sm (<?- (k/get store schema-meta-key nil {:sync? sync?}))]
+                                              (swap! schema-cache assoc schema-meta-key sm)
+                                              sm)))
+                            schema (or (:schema schema-meta) (:schema record))
+                            record-refs (if schema
+                                          (store-refs config schema
+                                                      (:ident-ref-map schema-meta) aevt' taevt')
+                                          #{})
                             cid (get-in record [:meta :datahike/commit-id])
                             new-reachable (cond-> (set/union reachable #{to-check}
                                                              ;; the commit's graph record lives and dies with it
                                                              (when cid #{(commit-graph-key cid)})
                                                              (when schema-meta-key #{schema-meta-key})
-                                                             (mark eavt-key eavt-root)
-                                                             (mark aevt-key aevt-root)
-                                                             (mark avet-key avet-root))
+                                                             (mark (bind eavt-key eavt-root))
+                                                             (mark aevt')
+                                                             (mark (bind avet-key avet-root)))
                                             (:keep-history? config)
-                                            (set/union (mark temporal-eavt-key temporal-eavt-root)
-                                                       (mark temporal-aevt-key temporal-aevt-root)
-                                                       (mark temporal-avet-key temporal-avet-root))
+                                            (set/union (mark (bind temporal-eavt-key temporal-eavt-root))
+                                                       (mark taevt')
+                                                       (mark (bind temporal-avet-key temporal-avet-root)))
                                             sec-reachable
                                             (set/union sec-reachable))]
                         (recur (concat r (when in-range? parents))
                                new-reachable
-                               (into key-maps (vals secondary-index-keys)))))
+                               (set/union refs record-refs))))
                     ;; Record absent: already swept by an earlier pass with a
                     ;; narrower window, or the store runs :commit-graph? false
                     ;; and never persisted it. Lineage ends here — nothing to
@@ -125,8 +200,8 @@
                     (if (= to-check branch)
                       (log/raise "Branch head unreadable during garbage collection mark; refusing to sweep."
                                  {:type :gc-branch-head-unreadable :branch branch})
-                      (recur r reachable key-maps))))
-                {:reachable reachable :key-maps key-maps}))))))
+                      (recur r reachable refs))))
+                {:reachable reachable :store-refs refs}))))))
 
 (defn- graph-keys
   "The store keys of the commit graph records that `seeds` (branch names and commit
@@ -209,7 +284,11 @@
                          :datahike.gc-guard/maintenance-receipt
                          (:datahike.gc/maintenance-receipt opts)}))]
              (try
-               (let [now #?(:clj (Date.) :cljs (js/Date.))
+               (let [;; Cutoff from konserve's monotonic write clock, the SAME
+                     ;; source that stamps :last-write (upstream #885): strictly
+                     ;; increasing, so a wall-clock retreat cannot classify an
+                     ;; in-flight commit's objects as old.
+                     now (ku/now)
                      ;; Capture `now` before reading the safe point. Ordinary
                      ;; prior-head commits do not take the reachability gate and
                      ;; remain protected by this values-before-pointer cutoff.
@@ -225,6 +304,8 @@
                      _ (log/trace :datahike/gc-retain-branches {:branches branches})
                      visited (atom #{})
                      seen (atom #{})
+                     ;; shared across branches: the schema is content-addressed
+                     schema-cache (atom {})
                      keep (<?- (async+sync sync? *default-sync-translation*
                                  (go-try- (loop [[c & r] (seq (:datahike.gc/keep-commits opts)) acc []]
                                             (if c
@@ -234,12 +315,16 @@
                      marked (require-complete-mark
                              seeds
                              (if sync?
-                               (mapv #(reachable-in-branch store % remove-before config visited seen true) seeds)
+                               (mapv #(reachable-in-branch store % remove-before config visited seen schema-cache true) seeds)
                                (<?- (async/into [] (async/merge
-                                                    (map #(reachable-in-branch store % remove-before config visited seen false)
+                                                    (map #(reachable-in-branch store % remove-before config visited seen schema-cache false)
                                                          seeds))))))
-                     native-reachable (into (<?- (graph-keys store seeds sync?)) (mapcat :reachable) marked)
-                     retained-key-maps (into #{} (mapcat :key-maps) marked)
+                     ;; Store-refs (upstream #881) are unioned into the whitelist: an
+                     ;; object in THIS store is spared until no datom names it; one
+                     ;; elsewhere is a harmless no-op (`reachable-store-refs`).
+                     native-reachable (-> (<?- (graph-keys store seeds sync?))
+                                          (into (mapcat :reachable) marked)
+                                          (into (mapcat :store-refs) marked))
                      extension
                      (if-let [extend-reachable (:datahike.gc/reachable-extension opts)]
                        (or (extend-reachable
@@ -257,12 +342,6 @@
                                   sync? (assoc :konserve.gc/sync-io? true))]
                  (log/trace :datahike/gc-reachable {:reachable-count (count reachable)
                                                     :cutoff cutoff})
-                 ;; Datahike decides reachability for secondary storage too:
-                 ;; each index type collects its own store from the key maps
-                 ;; of exactly the commits this collection retains, so a
-                 ;; deleted branch's secondary state goes with its commits.
-                 (doseq [[index-type key-maps] (group-by :type retained-key-maps)]
-                   (sec/sweep-from-key-maps! index-type key-maps cutoff))
                  (let [swept (if sync?
                                (async/<!! (sweep! store reachable cutoff batch-size sweep-opts))
                                (<?- (sweep! store reachable cutoff batch-size sweep-opts)))]
@@ -274,6 +353,100 @@
                    swept))
                (finally
                  (guard/release-reachability-permit! sweep-permit)))))))))
+
+(defn reachable-store-refs
+  "The set of `:db.type/store-ref` values the database still names — its live blob
+   ids — across ALL branches, honouring `remove-before` and `:keep-history?`.
+
+   THE MARK, WITHOUT THE SWEEP. A store-ref names an object; it does not say where
+   the bytes live, and that is deliberate:
+
+     - IN THIS KONSERVE STORE — `gc-storage!` already spares and reclaims them.
+       Portable across every backend, and `delete-database` erases them with the
+       database. konserve frames a binary value as [header][meta][payload], so the
+       bytes are not raw at that key: reads and writes go through `k/bget`/`k/bassoc`.
+       Streamable (e.g. `:file`), so heap stays flat even for large files — but the
+       bytes proxy through your JVM (client → server → store) and you forgo S3-native
+       range, resumable multipart, and CDN. Fine at moderate size; S3-direct is the
+       only thing that scales.
+
+     - ANYWHERE ELSE — a raw S3 prefix the browser PUTs to with a presigned URL and
+       a content-type, a CDN, another bucket. The bytes never transit your JVM,
+       which is the whole point. Datahike cannot delete from there and does not
+       pretend to: it hands you the live set, and you sweep.
+
+   That is the entire contract for external blobs — datahike owns the hard half (what
+   is still referenced, including from retained history and other branches); you own
+   the easy half (list your prefix, delete what is not in this set):
+
+     (let [live (<?? S (gc/reachable-store-refs @conn))]
+       (doseq [obj (list-objects bucket (str \"tenant/\" tid \"/blobs/\"))]
+         (when-not (live (blob-id obj))
+           (delete-object bucket obj))))
+
+   Retention comes for free: pass `remove-before` and objects named only by commits
+   older than it drop out of the set, exactly as index nodes do."
+  ([db] (reachable-store-refs db (#?(:clj Date. :cljs js/Date.) 0)))
+  ([db remove-before]
+   (go-try S
+           (let [{:keys [config store]} db
+                 ;; the branches are the roster's (ours, c0f9149), not a :branches key
+                 branches (require-branches (roster store))
+                 visited (atom #{})
+                 seen (atom #{})
+                 schema-cache (atom {})
+                 walked (->> branches
+                             (map #(reachable-in-branch store % remove-before config visited seen schema-cache false))
+                             async/merge
+                             (<<? S))]
+             (apply set/union (map :store-refs walked))))))
+
+(defn record-store-refs
+  "The store-ref blob keys named by the datom VALUES in a SINGLE stored-db record —
+   its AEVT, plus temporal AEVT when history is retained. This is the `store-refs`
+   slice `gc-storage!` runs, exposed for one branch head.
+
+   WHY IT IS PUBLIC. A reachability walker — the garbage collector here, and
+   `konserve-sync`'s replication walker equally — discovers keys by walking the index
+   TREES; it never looks inside a datom's value. So a blob named only by a
+   `:db.type/store-ref` value is invisible to it: the collector would sweep it (fixed
+   by `store-refs`), and the sync walker would never SHIP it — a subscriber ends up
+   with a live datom pointing at an object that never replicated. The datahike sync
+   walker unions this in per branch head to close that gap, exactly as the mark does.
+
+   PER-RECORD, not per-history: it returns the refs in THIS head's index — precisely
+   the set a walker ships for that head (under `:keep-history?` the temporal index
+   already carries the retained ones). `reachable-store-refs` is the other shape — it
+   walks the commit graph for GC retention. Don't confuse them: sync wants this one.
+
+   Needs only the store and the record — no connection. The record carries its own
+   `:config` (`:index`, `:attribute-refs?`), so nothing is inferred: under
+   `:attribute-refs?` the datoms hold attribute EIDs and the slice keys off the
+   `:ident-ref-map` accordingly. Schema comes from the record's `:schema-meta-key`
+   (falling back to an inline `:schema`); the temporal index is sliced when the record
+   retains one. `index-type` overrides the record's index if given."
+  ([store stored-db] (record-store-refs store stored-db nil))
+  ([store stored-db index-type]
+   (go-try S
+           (let [rec-config    (:config stored-db)
+                 index-type    (or index-type (:index rec-config) dc/*default-index*)
+                 schema-meta   (when-let [k (:schema-meta-key stored-db)]
+                                 (<? S (k/get store k)))
+                 schema        (or (:schema schema-meta) (:schema stored-db))
+                 ident-ref-map (:ident-ref-map schema-meta)
+                 config        {:index index-type
+                                :attribute-refs? (:attribute-refs? rec-config)}
+                 storage       (:storage store)
+                 bind          (fn [idx root]
+                                 (cond-> (with-storage index-type idx storage)
+                                   root (-seed-root! root)))
+                 aevt          (bind (:aevt-key stored-db) (:aevt-root stored-db))
+                 taevt         (when (:temporal-aevt-key stored-db)
+                                 (bind (:temporal-aevt-key stored-db)
+                                       (:temporal-aevt-root stored-db)))]
+             (if schema
+               (store-refs config schema ident-ref-map aevt taevt)
+               #{})))))
 
 (defn start-background-gc!
   "Runs `gc-storage!` on `conn`'s database periodically in the background and
@@ -310,10 +483,15 @@
      (go-loop []
        (let [[_ ch] (async/alts! [stop-ch (async/timeout interval-ms)])]
          (when-not (= ch stop-ch)
+           ;; MERGE-REVIEW(deep-fixes): upstream #885 reads konserve's monotonic write
+           ;; clock here (`ku/monotonic-now-ms`, konserve 0.9.362, replikativ/konserve#156).
+           ;; Our konserve fork (24be381b) has neither it nor the hybrid logical clock:
+           ;; its `ku/now` is the wall clock, so this reads that. Every #885 read in this
+           ;; merge (gc cutoff, gc-guard/now, online-gc, persistent-set) is therefore
+           ;; still wall-clock until the konserve fork takes #156.
            (let [remove-before (if history-window-ms
                                  (#?(:clj Date. :cljs js/Date.)
-                                  (- #?(:clj (System/currentTimeMillis)
-                                        :cljs (.getTime (js/Date.)))
+                                  (- (long (.getTime ^java.util.Date (ku/now)))
                                      (long history-window-ms)))
                                  (#?(:clj Date. :cljs js/Date.) 0))
                  res (async/<! (gc-storage! @conn remove-before))]

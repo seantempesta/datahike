@@ -1,10 +1,13 @@
 (ns ^:no-doc datahike.index.persistent-set
   (:require [clojure.string]
+            [konserve.utils :as ku]
             [org.replikativ.persistent-sorted-set :as psset]
             #?(:cljs [org.replikativ.persistent-sorted-set.btset :refer [BTSet]])
             #?(:cljs [org.replikativ.persistent-sorted-set.branch :as branch :refer [Branch]])
             #?(:cljs [org.replikativ.persistent-sorted-set.leaf :refer [Leaf]])
             #?(:cljs [org.replikativ.persistent-sorted-set.impl.storage :refer [IStorage]])
+            #?(:cljs [is.simm.partial-cps.async :refer-macros [async]])
+            #?(:cljs [clojure.core.async :as async])
             [org.replikativ.persistent-sorted-set.arrays :as arrays]
             [datahike.datom :as dd :refer [index-type->cmp-quick]]
             [org.replikativ.persistent-sorted-set.fressian :as pss-fress]
@@ -632,6 +635,20 @@
                    (di/cache-put! cache d' [g vk]))))))
          node))))
 
+;; Upstream's cljs async storage seam (#886) is not kept: ours' node read (Jolt
+;; in-line values, di/cache-get) resolves its conflict, and this adapter has no
+;; caller here; kept for the next upstream merge.
+#?(:cljs
+   (defn- chan->async-expr
+     "Adapt a konserve async-op channel to a partial-cps async expression.
+      konserve delivers errors as values on the channel (js/Error instances)."
+     [ch]
+     (fn [resolve reject]
+       (async/take! ch (fn [v]
+                         (if (instance? js/Error v)
+                           (reject v)
+                           (resolve v)))))))
+
 (defrecord CachedStorage [store config cache stats pending-writes freed-addresses freed-set freelist cost-center-fn]
   IStorage
   (store [_ node #?(:cljs opts)]
@@ -677,7 +694,9 @@
           node))))
   (markFreed [_ address]
     (when address
-      (let [now #?(:clj (java.util.Date.) :cljs (js/Date.))]
+      ;; Monotonic stamp (konserve's write clock) — compared against
+      ;; online-GC's grace cutoff, which reads the same source.
+      (let [now (ku/now)]
         (log/trace :datahike/index-freed {:address address})
         (swap! freed-set conj address)
         (swap! freed-addresses conj [address now]))))

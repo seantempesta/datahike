@@ -32,6 +32,24 @@
 ;; plan.cljc helpers expect classified clause maps. These converters
 ;; reconstruct them from IR record fields.
 
+(defn- scan-schema-info
+  "Schema facts for a scan's attribute, as seen by the database the scan will
+   actually run against.
+
+   A source-prefixed scan (`[$2 ?e :name \"x\"]`) runs against a DIFFERENT
+   database, whose schema this pass cannot see: the plan is built from — and
+   cached per — the primary db. Reading `:indexed?` off the primary picked
+   :avet for an attribute unique HERE but not indexed THERE, and the scan then
+   read an index that does not exist on that source: zero rows, silently.
+   Assume the weakest schema for a foreign source instead — no AVET, no
+   uniqueness, cardinality-many — which is valid against any database. Costs
+   an index choice on multi-source scans; those are off the fused path anyway
+   (`structurally-fusable?` rejects any op carrying a :source)."
+  [db ci source]
+  (let [info (analyze/pattern-schema-info db ci)]
+    (cond-> info
+      (and info source) (assoc :indexed? false :unique? false :card-one? false))))
+
 (defn- scan->classified
   "Convert an LScan or LOptionalScan back to a classified clause map for
    plan helpers. Shared pattern fields are read via keyword access; the
@@ -224,6 +242,137 @@
               :estimated-card nil}
        join-vars? (assoc :join-vars join-vars)))))
 
+(defn- canonical-body
+  "Body clauses as a comparable set: `subst` is applied first, head vars are
+   renumbered POSITIONALLY, every other variable is renumbered by first
+   appearance, and clause order is discarded.
+
+   Head vars go by position rather than by name because each branch declares its
+   own — `[(p ?a ?b) …]` and `[(p ?x ?y) …]` are the same rule, and comparing
+   them by name would reject an ordinary transitive closure written with
+   different variable names in its two branches.
+
+   Returns nil if the body contains a map or set literal: those are not
+   traversed, so their variables would keep raw names and two unrelated bodies
+   could collide. Refusing to answer is the safe direction."
+  [clauses head-vars subst]
+  (let [head-pos (into {} (map-indexed (fn [i v] [v (symbol (str "?__h" i))])) head-vars)
+        ren (volatile! {})
+        n (volatile! 0)
+        bail (volatile! false)
+        cv (fn cv [x]
+             (cond
+               (symbol? x)
+               (let [x (get subst x x)]
+                 (or (get head-pos x)
+                     (when-not (analyze/free-var? x) x)
+                     (get @ren x)
+                     (let [s (symbol (str "?__l" (vswap! n inc)))]
+                       (vswap! ren assoc x s)
+                       s)))
+               (or (map? x) (set? x)) (do (vreset! bail true) x)
+               (vector? x) (mapv cv x)
+               (seq? x) (apply list (map cv x))
+               :else x))
+        out (into #{} (map cv) clauses)]
+    (when-not @bail out)))
+
+(defn- recursive-link-body
+  "For a LINEAR recursive branch, the body that produces the recursive call's
+   own argument, rewritten as if it produced the head's output var — i.e. the
+   single \"step\" the recursion takes, stated in the base case's vocabulary.
+
+   `[?a :friend ?x] (reach ?x ?b)` -> `[?a :friend ?b]`, which is exactly the
+   base branch of a transitive closure. The propagated local is renamed to the
+   call's OTHER (threaded) argument, since both name the far end of one step.
+
+   nil when the shape cannot be identified, which the caller must read as
+   \"cannot prove anything\". That includes two conditions on the rename, without
+   which the result would not denote the step at all:
+     * the propagated local must OCCUR in the body — otherwise the branch takes
+       no step, and `[(p ?a ?b) [?a :e ?b] (p ?x ?b)]` (whose ?x is unconstrained)
+       would canonicalize to the base branch and claim to be a closure of it;
+     * the threaded arg must NOT occur in the body — otherwise the rename merges
+       two distinct live variables, as in
+       `[(p ?a ?b) [?a :e ?x] [?a :e ?b] (p ?x ?b)]`.
+   Both shapes are contrived, but both silently produced wrong answers."
+  [branch scc-call?]
+  (let [[[_ & rule-args] & body] branch
+        head-var? (set rule-args)
+        calls (filterv scc-call? body)]
+    (when (and (= 2 (count rule-args)) (= 1 (count calls)))
+      (let [args (vec (rest (first calls)))
+            locals (into [] (remove head-var?) args)
+            threaded (into [] (filter head-var?) args)
+            rest-body (remove scc-call? body)
+            body-vars (into #{} (filter analyze/free-var?) (tree-seq coll? seq rest-body))]
+        (when (and (= 1 (count locals))
+                   (= 1 (count threaded))
+                   (contains? body-vars (first locals))
+                   (not (contains? body-vars (first threaded))))
+          (canonical-body rest-body rule-args {(first locals) (first threaded)}))))))
+
+(defn- base-bodies
+  "Canonical forms of the rule's base branches — the relation the base case
+   derives between the head vars."
+  [base-branches]
+  (into #{}
+        (keep (fn [b]
+                (let [[[_ & rule-args] & body] b]
+                  (when (= 2 (count rule-args))
+                    (canonical-body body rule-args {})))))
+        base-branches))
+
+;; Two recursive-rule fast paths assume the rule is a linear transitive closure,
+;; i.e. that the base case and the recursive step traverse the SAME relation.
+;; They need DIFFERENT strengths of that assumption, so they get one predicate
+;; each rather than sharing the stricter one:
+;;
+;;   demand-covered-by-base? — magic-set demand is harvested from the derived
+;;     head tuples at the head's other position. It only has to be a SUPERSET of
+;;     the demand the recursion actually needs: a superset costs work, a disjoint
+;;     set loses answers. So it suffices that the step's edges are among the base
+;;     case's edges, which syntactically means the base body's clauses are a
+;;     SUBSET of the step's (more constraints = fewer edges). That keeps the
+;;     common filtered traversal
+;;       [(p ?a ?b) [?a :e ?b]]
+;;       [(p ?a ?b) [?a :e ?x] [?x :active true] (p ?x ?b)]
+;;     on the fast path, where an equality test would needlessly reject it.
+;;
+;;   step-equals-base? — delta-driven expansion REPLACES the recursive step with
+;;     a reverse index scan of `base-scan-attr`, so here the step must be exactly
+;;     the base relation, not merely contained in it.
+;;
+;; Both require a single-rule SCC. Under mutual recursion the step is restated
+;; around a call to a DIFFERENT rule and compared against this rule's base
+;; branches, which says nothing at all; both consumers independently require a
+;; single-rule SCC today, so this only makes the flag honest on its own terms.
+
+(defn- demand-covered-by-base?
+  "May magic-set demand be harvested from the derived head tuples? See above."
+  [base-branches rec-branches scc-call? scc-rule-names]
+  (let [bases (base-bodies base-branches)]
+    (boolean
+     (and (= 1 (count scc-rule-names))
+          (seq bases)
+          (seq rec-branches)
+          (every? (fn [b]
+                    (when-let [link (recursive-link-body b scc-call?)]
+                      (some (fn [base] (every? link base)) bases)))
+                  rec-branches)))))
+
+(defn- step-equals-base?
+  "May the recursive step be replaced by a reverse scan of the base attribute?
+   See above."
+  [base-branches rec-branches scc-call? scc-rule-names]
+  (let [bases (base-bodies base-branches)]
+    (boolean
+     (and (= 1 (count scc-rule-names))
+          (seq bases)
+          (seq rec-branches)
+          (every? #(contains? bases (recursive-link-body % scc-call?))
+                  rec-branches)))))
+
 (defn- rename-branch-vars
   "Rename variables in a rule branch body, substituting rule-args with call-args.
    Constant call-args get synthetic variables with identity-binding preamble so they
@@ -306,137 +455,13 @@
     ;; Put const-bindings first so synthetic vars are bound before body uses them
     (into const-bindings renamed)))
 
-(defn- simple-binary-pattern
-  "If `op` is a bare pattern scan over `[?e :attr ?v]` — free entity and
-   value vars, ground attribute, no predicate pushed into it or attached to it
-   (a two-var comparison like `[(< ?e ?y)]` is attached, :attached-preds), not
-   optional —
-   return {:e ?e :attr attr :v ?v}. Otherwise nil.
-
-   Used to derive the structural topology info that gates the fixpoint
-   executor's delta-driven and magic-set shortcuts (see
-   `execute-recursive-rule`). Anything richer than this shape (predicates,
-   functions, entity groups, ground endpoints) must take the plain plan
-   path, so returning nil is always safe."
-  [op]
-  (when (and (= :pattern-scan (:op op))
-             (empty? (:pushdown-preds op))
-             (empty? (:attached-preds op))
-             (not (:optional? op)))
-    (let [clause (:clause op)]
-      (when (and (sequential? clause) (= 3 (count clause)))
-        (let [[e a v] clause]
-          (when (and (analyze/free-var? e)
-                     (analyze/free-var? v)
-                     (not= e v)
-                     (some? a)
-                     (not (analyze/free-var? a)))
-            {:e e :attr a :v v}))))))
-
-(defn- base-scan-info
-  "Structural info for the magic-set demand-driven base scan.
-
-   Applicable only when the rule has EXACTLY ONE base branch whose plan is
-   a single simple binary pattern over both head vars. Returns
-   {:attr attr :e-head-pos 0|1} — `:e-head-pos` is the head position whose
-   var sits at the pattern's ENTITY slot, which tells the executor whether
-   a demanded head value is looked up forward (EAVT, demand var at E) or
-   reverse (AVET, demand var at V). Nil disables the magic base scan
-   (plain base-plan execution, always correct)."
-  [head-vars base-plans]
-  (when (and (= 1 (count base-plans))
-             (= 2 (count head-vars)))
-    (let [ops (vec (:ops (first base-plans)))]
-      (when (= 1 (count ops))
-        (when-let [{:keys [e v] :as info} (simple-binary-pattern (first ops))]
-          (when (= (set head-vars) #{e v})
-            {:attr (:attr info)
-             :e-head-pos (if (= e (nth head-vars 0)) 0 1)}))))))
-
-(defn- rec-expand-info
-  "Structural topology of ONE recursive clause version, when it is exactly
-   `[pattern] (rule ?c0 ?c1)` — one simple binary pattern plus one
-   rule-lookup — linked by a single fresh var. Returns
-
-     {:attr             pattern attribute
-      :link-pattern-pos :e | :v   — where the link var sits in the pattern
-      :link-call-pos    0 | 1     — where the link var sits in the call
-      :pattern-head-pos 0 | 1     — head position the pattern's OTHER var
-                                    (a head var) occupies}
-
-   or nil for any other shape. The delta-driven expansion solves the
-   pattern's head var from a delta tuple's link value: `:v` means the link
-   is the pattern VALUE (reverse AVET lookup of entities pointing at it,
-   e.g. `[?x :edge ?z] (reach ?z ?y)`), `:e` means the link is the pattern
-   ENTITY (forward EAVT lookup of its attr values, e.g.
-   `[?m :parent ?a] (descendant ?m ?d)`). The two forms recurse in
-   opposite directions — this info is what makes the executor's shortcuts
-   direction-aware instead of assuming the `:v` form (2026-07-11)."
-  [head-vars cv-plan]
-  (let [ops (vec (:ops cv-plan))]
-    (when (= 2 (count ops))
-      (let [rl (first (filter #(= :rule-lookup (:op %)) ops))
-            ps (first (filter #(= :pattern-scan (:op %)) ops))]
-        (when (and rl ps)
-          (when-let [{:keys [e attr v]} (simple-binary-pattern ps)]
-            (let [call-args (:call-args rl)]
-              (when (and (= 2 (count call-args))
-                         (every? analyze/free-var? call-args)
-                         (apply distinct? call-args))
-                (let [head-set (set head-vars)
-                      pattern-vars #{e v}
-                      links (filterv #(and (pattern-vars %)
-                                           (not (head-set %)))
-                                     call-args)]
-                  (when (= 1 (count links))
-                    (let [link (first links)
-                          link-call-pos (if (= link (nth call-args 0)) 0 1)
-                          pass (nth call-args (- 1 link-call-pos))
-                          pattern-head-var (if (= link e) v e)]
-                      (when (head-set pattern-head-var)
-                        (let [p (if (= pattern-head-var (nth head-vars 0)) 0 1)]
-                          ;; the call's pass-through arg must be the OTHER
-                          ;; head var — then a delta tuple fully determines
-                          ;; the emitted head tuple
-                          (when (= pass (nth head-vars (- 1 p)))
-                            {:attr attr
-                             :link-pattern-pos (if (= link e) :e :v)
-                             :link-call-pos link-call-pos
-                             :pattern-head-pos p}))))))))))))))
-
-(defn- rec-expand-infos
-  "Per-version `rec-expand-info` for ALL recursive clause versions, or nil
-   if ANY version doesn't conform. All-or-nothing: the delta-driven
-   shortcut replaces the whole rec-branch execution, so it may only fire
-   when every version is expandable."
-  [head-vars rec-clause-versions]
-  (when (and (= 2 (count head-vars))
-             (seq rec-clause-versions))
-    (let [infos (mapv #(rec-expand-info head-vars %) rec-clause-versions)]
-      (when (every? some? infos)
-        infos))))
-
-(defn- invariant-head-positions
-  "Positions of `rule-name`'s head that every recursive call in each branch
-   passes that branch's own head var at, and whose call arg is a free var named
-   once in `call-args`: an outer binding of such a call arg binds every tuple
-   the fixpoint derives."
-  [rule-name branches call-args]
-  (let [once? (fn [arg] (= 1 (count (filter #{arg} call-args))))
-        passes-through? (fn [i [[_ & head] & body]]
-                          (let [hv (nth (vec head) i nil)]
-                            (and (analyze/free-var? hv)
-                                 (every? #(= hv (nth (vec (rest %)) i nil))
-                                         (filter #(and (seq? %) (= rule-name (first %)))
-                                                 (tree-seq sequential? seq body))))))]
-    (into #{}
-          (filter (fn [i]
-                    (let [arg (nth call-args i)]
-                      (and (analyze/free-var? arg)
-                           (once? arg)
-                           (every? #(passes-through? i %) branches)))))
-          (range (count call-args)))))
-
+;; MERGE-REVIEW(deep-fixes): plan-rule-op is upstream's at f29c9e9c (recursive rules: demand
+;; soundness flags, pass-through head vars, positional base-scan-attr). Ours' recursive
+;; planning (1598a824 base-scan-info / rec-expand-info(s) / simple-binary-pattern, 84790323
+;; invariant-head-positions) fixed the same bugs another way and is dropped with the executor
+;; it fed (see execute-recursive-rule). Kept: 63c8e244's predicate gate, in the base-scan-attr
+;; case below. Could break: recursion tests written against ours (query-rules-test,
+;; cljs-recursive-rule-test, query-planner-test's recursive cases).
 (defn plan-rule-op [db clause-info bound-vars rules scc-info]
   (let [[rule-name & call-args] (:clause clause-info)
         ;; Validate: non-var rule args must be scalars (not collections/maps)
@@ -475,23 +500,11 @@
                       (map (fn [rn]
                              (let [rn-branches (get rules rn)
                                    head-vars (vec (rest (first (first rn-branches))))
-                                   ;; The fixpoint keeps every outer relation sharing a var
-                                   ;; with the branch plans. A head position may take the
-                                   ;; call arg's name, so the caller's values restrict the
-                                   ;; closure, only when every recursive call passes that
-                                   ;; head var through unchanged (`invariant-head-positions`);
-                                   ;; every other head var gets a name private to this rule
-                                   ;; op. The result is joined back by call-arg position.
-                                   invariant (if (and (= rn rule-name) (= 1 (count scc-rule-names)))
-                                               (invariant-head-positions rn rn-branches call-args)
-                                               #{})
-                                   free-call-args (vec (map-indexed
-                                                        (fn [i hv]
-                                                          (if (contains? invariant i)
-                                                            (nth call-args i)
-                                                            (symbol (str (if (analyze/free-var? hv) (name hv) (str "?" (name hv)))
-                                                                         "__head__" seqid))))
-                                                        head-vars))
+                                   free-call-args (mapv (fn [hv]
+                                                          (if (analyze/free-var? hv)
+                                                            hv
+                                                            (symbol (str "?" (name hv)))))
+                                                        head-vars)
                                    is-base? (fn [branch]
                                               (let [[_head & body] branch]
                                                 (not (some is-scc-call? body))))
@@ -527,6 +540,26 @@
                           ;; as free (worst-case attribute-total estimate)
                           ;; until the body's own producer op binds them with
                           ;; a known card.
+                          ;;
+                          ;; …but the OUTER scope's bound vars are not the
+                          ;; branch's to assume either. A body is renamed so the
+                          ;; only names it can share with the caller are the head
+                          ;; vars, and on this path those are the RULE's own
+                          ;; declared ones (see `rename-branch-vars` below) — an
+                          ;; outer var spelled the same is a DIFFERENT variable.
+                          ;; Believing it bound put `[(str ?y) ?t]` ahead of the
+                          ;; pattern that binds ?y, which raised "Cannot resolve
+                          ;; any more clauses" at execute time once the branch
+                          ;; stopped inheriting the caller's relations (#911).
+                          ;; This is the plan-time half of that same capture.
+                          ;;
+                          ;; What the call site DOES supply is the pass-through
+                          ;; head vars (#897) — and those are known only after
+                          ;; planning, since they are the head vars the body
+                          ;; turns out not to produce. Hence two passes below:
+                          ;; plan once to learn them, then re-plan believing
+                          ;; exactly those (and nothing else) are bound. Only the
+                          ;; second plan is kept.
                                    branch-bound bound-vars
                                    ;; Rule branch bodies go through the
                                    ;; shared IR-pipeline helper — same
@@ -538,10 +571,47 @@
                                    ;; LOptionalScan that binds `?e`)
                                    ;; apply uniformly inside rule
                                    ;; bodies.
+                          ;; Pass-through head vars: head vars this branch's
+                          ;; body never binds. Range-restricted datalog forbids
+                          ;; them, but a rule that threads a caller-supplied
+                          ;; parameter through the recursion —
+                          ;;
+                          ;;   [(reachable ?anchor ?eps ?n) ...base, no ?eps...]
+                          ;;   [(reachable ?anchor ?eps ?o) ... [(contains? ?eps ?ep)]
+                          ;;                                (reachable ?anchor ?eps ?s)]
+                          ;;
+                          ;; — is accepted by the relational engine, which
+                          ;; renames head vars to the CALL args, so the caller's
+                          ;; binding simply flows into the body. The planner
+                          ;; renames to the rule's own head vars instead (so
+                          ;; constant call-args can be filtered after the
+                          ;; fixpoint rather than restricting the accumulator),
+                          ;; which cuts that path: nothing binds ?eps, the
+                          ;; branch relation comes back without it, and
+                          ;; `rel-dedup-into!` NPEs on the missing :attrs entry.
+                          ;; Record them per branch so `execute-recursive-rule`
+                          ;; can bind them from the call site (#897).
+                                   with-pass-through
+                                   (fn [p]
+                                     (let [produced (plan/branch-produced-vars p)
+                                           missing (into #{} (remove produced) free-call-args)]
+                                       (cond-> p
+                                         (seq missing) (assoc :pass-through-vars missing))))
                                    plan-branch (fn plan-branch
                                                  [branch-clauses guarded]
-                                                 (plan-via-ir db branch-clauses branch-bound
-                                                              rules guarded))
+                                                 ;; Pass 1 only to learn which head vars the body
+                                                 ;; produces itself; its plan is discarded unless
+                                                 ;; the bound set turns out to be right already.
+                                                 (let [p0 (plan-via-ir db branch-clauses branch-bound
+                                                                       rules guarded)
+                                                       produced (plan/branch-produced-vars p0)
+                                                       pass-through (into #{} (remove produced)
+                                                                          free-call-args)]
+                                                   (with-pass-through
+                                                     (if (= pass-through (set branch-bound))
+                                                       p0
+                                                       (plan-via-ir db branch-clauses pass-through
+                                                                    rules guarded)))))
                                    base-ps (mapv (fn [b]
                                                    (let [renamed (rename-branch-vars b free-call-args seqid db)]
                                                      (plan-branch (vec renamed) nil)))
@@ -568,7 +638,19 @@
                                          rec-bs))]
                                [rn {:head-vars free-call-args
                                     :base-plans base-ps
-                                    :rec-clause-versions rec-cvs}])))
+                                    :rec-clause-versions rec-cvs
+                                    ;; Computed from the branch CLAUSES, before
+                                    ;; renaming: `canonical-body` renumbers head
+                                    ;; vars positionally and locals by first
+                                    ;; appearance, so the comparison does not
+                                    ;; depend on what either branch calls its
+                                    ;; variables.
+                                    :magic-demand-sound?
+                                    (demand-covered-by-base? base-bs rec-bs is-scc-call?
+                                                             scc-rule-names)
+                                    :delta-driven-sound?
+                                    (step-equals-base? base-bs rec-bs is-scc-call?
+                                                       scc-rule-names)}])))
                       scc-rule-names)
                 ;; Note: an earlier `has-scanless-base?` guard nilled out
                 ;; `scc-rule-plans` whenever a base case lacked an
@@ -585,22 +667,71 @@
                 ;; an empty ctx, `legacy/bind-by-fn` produces a single-tuple
                 ;; Relation, and the recursive branch's `rule-lookup` ops feed
                 ;; off the accumulator as usual. Magic sets are silently
-                ;; skipped when `base-info` is nil (the
-                ;; `magic-direction-ok?` gate in `execute-recursive-rule`).
-                ;; An earlier `has-scanless-base?` guard was redundant and
+                ;; skipped when `base-scan-attr` is nil (the
+                ;; `and magic-demand base-scan-attr …` check in
+                ;; `execute-recursive-rule`). The guard was redundant and
                 ;; introduced a real regression for scanless-base recursion.
+                ;; Extract base scan attribute for magic set optimization.
                 ;;
-                ;; Structural topology info for the executor's shortcuts
-                ;; (magic-set base scan + delta-driven expansion). Nil for
-                ;; any non-conforming shape → plain fixpoint, always correct.
-                base-info
+                ;; magic-base-scan REPLACES the whole base case with single-attr
+                ;; EAVT point lookups from the demand entities, mapping each
+                ;; scanned datom's [entity value] onto the rule's two head vars.
+                ;; That is correct ONLY for a *linear single ref-edge* base —
+                ;; exactly one base branch, that branch a single scan op
+                ;; [?h0 attr ?h1] over the two head vars, with `attr` a ref so the
+                ;; propagated value is itself an entity (re-scanned next iteration).
+                ;;
+                ;; Anything else must leave base-scan-attr nil and fall back to the
+                ;; general fixpoint (execute-branch-plans runs every base branch):
+                ;;   - multiple base branches (only one attr would be scanned);
+                ;;   - a value-join base like [?a :id ?x][?c :id ?x] (?c is a
+                ;;     different entity sharing a value, not attr's value — the old
+                ;;     code grabbed :id off the first pattern and fed the string
+                ;;     value into the entity slot → ClassCastException);
+                ;;   - a non-ref attr (the head value is a scalar, not an entity).
+                base-scan-attr
                 (when scc-rule-plans
-                  (let [{:keys [head-vars base-plans]} (get scc-rule-plans rule-name)]
-                    (base-scan-info head-vars base-plans)))
-                rec-infos
-                (when scc-rule-plans
-                  (let [{:keys [head-vars rec-clause-versions]} (get scc-rule-plans rule-name)]
-                    (rec-expand-infos head-vars rec-clause-versions)))]
+                  (let [rule-plan  (get scc-rule-plans rule-name)
+                        base-plans (:base-plans rule-plan)
+                        head-vars  (:head-vars rule-plan)]
+                    (when (and (= 1 (count base-plans)) (= 2 (count head-vars)))
+                      (let [ops (:ops (first base-plans))]
+                        (when (= 1 (count ops))
+                          (let [op (first ops)
+                                [clause sinfo]
+                                (case (:op op)
+                                  ;; A scan carrying a predicate, pushed into it or
+                                  ;; attached to it (a two-var comparison like
+                                  ;; `[(< ?e ?y)]` is attached), is not a bare scan:
+                                  ;; the magic-set and delta-driven shortcuts read
+                                  ;; the index alone and would skip it (ours, 63c8e244).
+                                  :pattern-scan (when (and (empty? (:pushdown-preds op))
+                                                           (empty? (:attached-preds op))
+                                                           (not (:optional? op)))
+                                                  [(:clause op) (:schema-info op)])
+                                  :entity-group (when (and (empty? (:merge-ops op))
+                                                           (empty? (:attached-preds op))
+                                                           (empty? (:pushdown-preds (:scan-op op)))
+                                                           (empty? (:attached-preds (:scan-op op))))
+                                                  [(:clause (:scan-op op))
+                                                   (:schema-info (:scan-op op))])
+                                  nil)
+                                [e a v] clause]
+                            ;; POSITIONAL, not set-equal. Both consumers of
+                            ;; :base-scan-attr (magic-base-scan and
+                            ;; delta-driven-expand) map a datom's [entity value]
+                            ;; onto [head-vars[0] head-vars[1]]. A set compare
+                            ;; also accepted the reversed base pattern
+                            ;; `[(rev ?a ?b) [?b :follows ?a]]`, and both then
+                            ;; swapped the columns — self-pairs and other
+                            ;; nonsense out of an otherwise ordinary rule.
+                            ;; Requiring head-vars[0] to BE the scanned entity is
+                            ;; also what makes the ground-argument-position test
+                            ;; at the seed site meaningful.
+                            (when (and clause
+                                       (:ref? sinfo)
+                                       (= [e v] (vec head-vars)))
+                              a)))))))]
             {:op :recursive-rule
              :clause (:clause clause-info)
              :rule-name rule-name
@@ -610,8 +741,13 @@
              :scc-rule-plans scc-rule-plans
              :base-plans (when scc-rule-plans (:base-plans (get scc-rule-plans rule-name)))
              :rec-clause-versions (when scc-rule-plans (:rec-clause-versions (get scc-rule-plans rule-name)))
-             :base-scan-info base-info
-             :rec-expand-infos rec-infos
+             :base-scan-attr base-scan-attr
+             ;; Whether demand may be harvested from the derived head tuples at
+             ;; all — see `demand-covered-by-base?`. Without it the fixpoint can
+             ;; terminate with answers still underived. `:delta-driven-sound?` is
+             ;; the stricter form the reverse-scan shortcut needs.
+             :magic-demand-sound? (:magic-demand-sound? (get scc-rule-plans rule-name))
+             :delta-driven-sound? (:delta-driven-sound? (get scc-rule-plans rule-name))
              :vars (:vars clause-info)
              :estimated-card nil})
           ;; Non-recursive — expand to OR
@@ -653,8 +789,6 @@
              :vars (:vars clause-info)
              :estimated-card (max 1 total-est)}))))))
 
-;; ---------------------------------------------------------------------------
-;; Collect all scans from logical plan (including from entity joins)
 
 (defn- collect-all-scans
   "Extract all LScan nodes from the logical plan, including those
@@ -755,7 +889,7 @@
         (reduce
          (fn [acc scan]
            (let [ci (scan->classified scan)
-                 schema-info (analyze/pattern-schema-info db ci)
+                 schema-info (scan-schema-info db ci source)
                  preds (get pushdowns (:clause ci) [])
                  [op consumed-preds] (plan/plan-pattern-op db ci schema-info preds bound-vars)]
              (-> acc
@@ -768,7 +902,7 @@
         anti-ops
         (mapv (fn [anti-scan]
                 (let [ci (scan->classified anti-scan)
-                      schema-info (analyze/pattern-schema-info db ci)
+                      schema-info (scan-schema-info db ci source)
                       [op _] (plan/plan-pattern-op db ci schema-info [] bound-vars)]
                   (assoc op :anti? true)))
               anti-scans)
@@ -788,7 +922,7 @@
   [scan db pushdowns consumed-acc bound-vars]
   (let [ci (scan->classified scan)
         source (:source scan)
-        schema-info (analyze/pattern-schema-info db ci)
+        schema-info (scan-schema-info db ci source)
         preds (get pushdowns (:clause ci) [])
         [op consumed-preds] (plan/plan-pattern-op db ci schema-info preds bound-vars)]
     {:op (cond-> (assoc op :pipeline (plan/build-pipeline op [] db))
@@ -797,6 +931,28 @@
 
 ;; ---------------------------------------------------------------------------
 ;; Main lowering pass
+
+(def ^:dynamic *check-plan*
+  "Function of one plan, called for every plan this pass builds, or nil.
+
+   The only production-side cost of plan checking: a nil test. The checker
+   itself is `datahike.test.query-eqcheck`, which lives under `test/` and
+   installs itself here on load, because it is a hand-derived MODEL of
+   `datahike.query.execute` that must be updated whenever an enforcement
+   mechanism there changes — a maintenance liability worth keeping out of the
+   shipped jar.
+
+   Note the check fires on plan CREATION, and `datahike.query` caches plans, so
+   a caller enabling it must also clear that cache or it will silently examine
+   nothing. `datahike.test.query-eqcheck/with-plan-checks` does both."
+  nil)
+
+(defn- maybe-check!
+  "Hand `plan` to the installed checker, if any. Returns `plan` either way."
+  [plan]
+  (when-let [f *check-plan*]
+    (f plan))
+  plan)
 
 (defn lower
   "Lower a LogicalPlan to a physical plan map.
@@ -1146,9 +1302,10 @@
         ;; Seed the orderer with the externally-bound (:in collection/tuple) vars
         ;; so a producer keyed on a bound root (e.g. a recursive rule, or/not) is
         ;; "ready" from the start and ordered by its cost, not deferred behind a
-        ;; broad attribute scan. (bound-vars excludes $/%/scalar-consts/fn-outputs
-        ;; — only genuine bound relation columns; group DP order is independent of
-        ;; this seed, which only affects non-group op readiness.)
+        ;; broad attribute scan. (bound-vars is every var :in binds — relation
+        ;; columns AND scalar consts, matching the base engine's ctx-bound-vars;
+        ;; it excludes $/% and fn-outputs. Group DP order is independent of this
+        ;; seed, which only affects non-group op readiness.)
         ordered-ops (plan/order-plan-ops all-ops bound-vars db)
 
         ;; ---------------------------------------------------------------
@@ -1157,47 +1314,28 @@
                      (filterv #(#{:entity-group :pattern-scan} (:op %)) ordered-ops))
 
         ;; ---------------------------------------------------------------
-        ;; Step 7: NOT binding validation.
-        ;; Walks the ordered ops in execution order, tracking which vars
-        ;; are bound after each op runs. NOT/NOT-JOIN must have at least
-        ;; one of its vars bound by a prior op (legacy semantics).
+        ;; Step 7 (NOT binding validation) is GONE, deliberately.
         ;;
-        ;; The per-op contribution-set must mirror what the executor
-        ;; will actually bind:
-        ;;  - :entity-group → scan + merge vars
-        ;;  - :pattern-scan → pattern vars
-        ;;  - :function     → the result-binding var (`:binding` from
-        ;;                    plan-function-op). Predicates produce no
-        ;;                    new bindings; or/or-join handle their own
-        ;;                    binding internally.
-        ;; Earlier this case used `(:bind-vars op)` which plan-function-op
-        ;; never sets — function ops looked like they bound nothing, so
-        ;; any subsequent NOT/predicate whose only required var came from
-        ;; a function chain (e.g. `format_type(...)` feeding NOT IN) was
-        ;; falsely rejected with "Insufficient bindings".
-        _ (loop [remaining ordered-ops
-                 vars-so-far bound-vars]
-            (when (seq remaining)
-              (let [op (first remaining)]
-                (when (#{:not :not-join} (:op op))
-                  (let [not-vars (:vars op)]
-                    (when (empty? (clojure.set/intersection not-vars vars-so-far))
-                      (throw (ex-info (str "Insufficient bindings: none of " not-vars
-                                           " is bound in " (:clause op))
-                                      {:error :query/where
-                                       :form (:clause op)})))))
-                (recur (rest remaining)
-                       (into vars-so-far
-                             (case (:op op)
-                               :entity-group (into (:vars (:scan-op op))
-                                                   (mapcat :vars (:merge-ops op)))
-                               :pattern-scan (:vars op)
-                               :function (analyze/extract-vars (:binding op))
-                               nil))))))]
+        ;; It walked the ordered ops and raised when a NOT/NOT-JOIN had no var
+        ;; bound by a prior op. Post-fold it could not tell an unbindable query
+        ;; from a merely mis-ordered one, and worse, it fired
+        ;; NONDETERMINISTICALLY: for `(not [?y :dead true]) [(identity ?zz) ?y]`
+        ;; it raised for 28 of 60 variable NAMES and let the base engine's
+        ;; "Cannot resolve any more clauses" through for the other 32, because
+        ;; order-plan-ops' tie-break sorts a hash-set.
+        ;;
+        ;; Every query it caught is one whose real defect is a function or
+        ;; predicate reading a var nothing binds, which
+        ;; `datahike.query/validate-clause-bindings` now rejects BEFORE the
+        ;; const fold — deterministically, and naming the offending clause.
+        ]
 
-    {:ops ordered-ops
-     :consumed-preds actual-consumed
-     :classified classified
-     :group-joins group-joins
-     :has-passthrough? (boolean (some #(= :passthrough (:op %)) ordered-ops))
-     :structurally-fusable? (plan/structurally-fusable? ordered-ops)}))
+    ;; Dev/test invariant gate: implied-equalities(plan) == enforced-equalities(plan).
+    ;; No-op unless a checker is installed (see `*check-plan*`).
+    (maybe-check!
+     {:ops ordered-ops
+      :consumed-preds actual-consumed
+      :classified classified
+      :group-joins group-joins
+      :has-passthrough? (boolean (some #(= :passthrough (:op %)) ordered-ops))
+      :structurally-fusable? (plan/structurally-fusable? ordered-ops)})))

@@ -1,6 +1,14 @@
 (ns ^:no-doc datahike.schema
   (:require [clojure.spec.alpha :as s]
-            [datahike.datom])
+            [datahike.array :as arr]
+            [datahike.datom]
+            ;; cljs bigdec values are fress `Bigdec` (unscaled js/BigInt + scale) —
+            ;; the same type konserve round-trips via the Fressian BIGDEC (0xC7)
+            ;; handlers. Recognise it so :db.type/bigdec accepts a real decimal in
+            ;; the browser instead of rejecting everything (the previous
+            ;; `(complement any?)` placeholder). Arrives transitively via konserve
+            ;; (≥ the release carrying fress 0.4.317), like `fress.api` already does.
+            #?(:cljs [fress.impl.bigdec :as fbd]))
   #?(:clj (:import [datahike.datom Datom])))
 
 (s/def :db.type/id #?(:clj #(or (= (class %) java.lang.Long) string?)
@@ -9,7 +17,7 @@
                                  string?)))
 
 ;; db types
-(s/def :db.type/bigdec #?(:cljs (complement any?) ; feels more appropriate than hiding key -pat
+(s/def :db.type/bigdec #?(:cljs fbd/bigdec?
                           :clj decimal?))
 (s/def :db.type/bigint #?(:clj integer?
                           :cljs #(or (integer? %)
@@ -31,6 +39,11 @@
 (s/def :db.type/symbol symbol?)
 (s/def :db.type/uuid uuid?)
 (s/def :db.type/tuple vector?)
+;; Primitive numeric arrays — a whole embedding/signal vector as one scalar
+;; value. JVM float[]/double[]; JS Float32Array/Float64Array. Element-wise
+;; compared and value-hashed via datahike.array (see compare-value / a=).
+(s/def :db.type/float-array arr/float-array?)
+(s/def :db.type/double-array arr/double-array?)
 
 (defn plain-data?
   "Is v plain data, all the way down: nil, a boolean, number, character, string, keyword,
@@ -59,13 +72,18 @@
                :db.type/number number? :db.type/instant #(= (class %) java.util.Date)
                :db.type/keyword keyword? :db.type/long #(= (class %) java.lang.Long)
                :db.type/string string? :db.type/symbol symbol? :db.type/uuid uuid?
-               :db.type/tuple vector? :db.type/data plain-data?}))
+               :db.type/tuple vector? :db.type/data plain-data?
+               ;; upstream's (#881, #896), as their specs above
+               :db.type/float-array arr/float-array? :db.type/double-array arr/double-array?
+               :db.type/store-ref uuid?}))
 
-(s/def :db.type/value
+(def builtin-value-types
   #{:db.type/bigdec
     :db.type/bigint
     :db.type/boolean
     :db.type/bytes
+    :db.type/float-array
+    :db.type/double-array
     :db.type/double
     :db.type/float
     :db.type/number
@@ -76,6 +94,7 @@
     :db.type/string
     :db.type/symbol
     :db.type/uuid
+    :db.type/store-ref
     :db.type/value
     :db.type/tuple
     :db.type/data
@@ -83,6 +102,39 @@
     :db.type.install/attribute
     :db.type/valueType
     :db.type/unique})
+
+(s/def :db.type/value builtin-value-types)
+
+;; :db.type/store-ref — a UUID that NAMES AN OBJECT: a blob, an out-of-line payload.
+;; The ONE thing it adds over :db.type/uuid is that the garbage collector MARKS it,
+;; so the object it names is known to be live (`key-bearing-value-types` below).
+;;
+;; It deliberately does NOT say where the bytes are. They may be in this database's
+;; konserve store — then `gc-storage!` spares and reclaims them for you — or in a raw
+;; S3 prefix a browser uploads to with a presigned URL, in which case
+;; `datahike.gc/reachable-store-refs` hands you the live set and you sweep it. Same
+;; type, same mark, two deployments.
+;;
+;; The id must PIN THE CONTENT (`datahike.blob/blob-id`). A store-ref is dereferenced
+;; when you read it — including `as-of` an old transaction — so a mutable pointer
+;; would hand an old read whatever is behind it NOW. See doc/store-refs.md.
+;;
+;; NOT for structured data. A store-ref is for bytes with no queryable structure — a
+;; PDF, an image, model weights. If you would ever filter or join on something INSIDE
+;; the value it is a document, not a blob: transact it as datoms
+;; (`datahike.experimental.unstructured`) or index it with a secondary index. Datoms
+;; are already sparse, so you never had to declare your fields — blobbing structured
+;; data buys no flexibility you did not already have, and costs you the indices.
+(s/def :db.type/store-ref uuid?)
+
+(def key-bearing-value-types
+  "Value types whose values NAME AN OBJECT in a store, so the collector must mark
+   them or the sweep deletes objects a datom still references.
+
+   The GC mark scans the datoms of attributes declared with one of these — and ONLY
+   those, so a database that uses none pays nothing (`datahike.gc/store-refs`). For
+   every type here the VALUE IS THE KEY; nothing more elaborate has been needed."
+  #{:db.type/store-ref})
 
 ;; TODO: add bytes
 
@@ -92,7 +144,7 @@
 ;; only for old datomic compliance, will be part of partioning in the future
 (s/def :db.type.install/_attribute #{:db.part/tx :db.part/db :db.part/user})
 
-(def schema-attributes #{:db/id :db/ident :db/isComponent :db/noHistory :db/valueType :db/cardinality :db/unique :db/index :db.install/_attribute :db/doc :db/tupleAttrs  :db/tupleType :db/tupleTypes :db.secondary/only :db/contentId})
+(def schema-attributes #{:db/id :db/ident :db/isComponent :db/noHistory :db/valueType :db/cardinality :db/unique :db/index :db.install/_attribute :db/doc :db/tupleAttrs  :db/tupleType :db/tupleTypes :db.secondary/only :db/contentId :db/maxLength :db.attr/preds})
 (s/def ::schema-attribute schema-attributes)
 
 (def secondary-index-attributes #{:db.secondary/type :db.secondary/attrs :db.secondary/config :db.secondary/status :db.secondary/building-since-tx})
@@ -109,7 +161,7 @@
 (s/def ::meta-attribute meta-attributes)
 
 (s/def ::schema (s/keys :req [:db/ident :db/valueType :db/cardinality]
-                        :opt [:db/id :db/unique :db/index :db.install/_attribute :db/doc :db/noHistory :db/tupleType :db/tupleTypes :db.secondary/only :db/contentId]))
+                        :opt [:db/id :db/unique :db/index :db.install/_attribute :db/doc :db/noHistory :db/tupleType :db/tupleTypes :db.secondary/only :db/contentId :db/maxLength :db.attr/preds]))
 
 (s/def ::entity-spec (s/keys :opt [:db.entity/attrs :db.entity/preds]))
 
@@ -170,6 +222,17 @@
                                                        :db/cardinality :db.cardinality/one}
                                    :db/contentId {:db/valueType :db.type/boolean
                                                   :db/cardinality :db.cardinality/one}
+                                   ;; Attribute-value constraints (opt-in). :db/maxLength is a
+                                   ;; declarative string-length bound; :db.attr/preds names value
+                                   ;; predicates (registry keywords or, on clj, resolvable symbols),
+                                   ;; many-valued. Both enforced on assertion in transact-add.
+                                   :db/maxLength {:db/valueType :db.type/long
+                                                  :db/cardinality :db.cardinality/one}
+                                   ;; symbol-typed (like :db.entity/preds) so many-valued
+                                   ;; preds stay homogeneous — the datom index compares
+                                   ;; values directly and can't order keyword-vs-symbol.
+                                   :db.attr/preds {:db/valueType :db.type/symbol
+                                                   :db/cardinality :db.cardinality/many}
                                    :db/txInstant {:db/valueType :db.type/instant
                                                   :db/unique :db.unique/identity
                                                   :db/index true
@@ -220,10 +283,10 @@
 
 (def schema-keys #{:db/ident :db/isComponent :db/noHistory :db/valueType :db/cardinality :db/unique :db/index :db.install/_attribute :db/doc :db/tupleType :db/tupleTypes :db/tupleAttrs
                    :db.secondary/type :db.secondary/attrs :db.secondary/config :db.secondary/status :db.secondary/building-since-tx
-                   :db.secondary/only :db/contentId})
+                   :db.secondary/only :db/contentId :db/maxLength :db.attr/preds})
 
 (s/def ::old-schema-val (s/keys :req [:db/valueType :db/cardinality]
-                                :opt [:db/ident :db/unique :db/index :db.install/_attribute :db/doc :db/noHistory]))
+                                :opt [:db/ident :db/unique :db/index :db.install/_attribute :db/doc :db/noHistory :db/maxLength :db.attr/preds]))
 
 (s/def ::old-schema-key keyword?)
 
@@ -294,7 +357,47 @@
   (s/valid? ::schema schema))
 
 (defn describe-type [schema-type]
-  (s/describe schema-type))
+  ;; The "Bad entity value ..." error shows the user the enumeration of legal value
+  ;; types. `:db.type/value` is now defined by reference to `builtin-value-types`, so
+  ;; `s/describe` renders that var rather than the alternatives — build the enum here.
+  (if (= schema-type :db.type/value)
+    (into (sorted-set) builtin-value-types)
+    (s/describe schema-type)))
+
+(defn key-bearing-misuse
+  "Reasons this schema entity would let the collector delete live data, or nil.
+
+   A key-bearing value type (`:db.type/store-ref`) NAMES an object in the store. The
+   collector keeps such an object alive by scanning the datoms of attributes declared
+   with that type. Two shapes defeat that scan, both silently — so they are rejected
+   rather than documented:
+
+   TUPLES. A `:db/tupleType` / `:db/tupleTypes` value is a vector on a
+   `:db.type/tuple` attribute. The attribute's OWN valueType is the builtin tuple, so
+   the mark scans by valueType and the keys nested inside the vector are invisible to
+   it: the objects get swept while the datom still names them.
+
+   :db/noHistory. Retracted values of a `:db/noHistory` attribute are not retained
+   in the temporal indices. Under `:keep-history? true` an `as-of` read can still
+   reach the retracted datom, but the object it names has been collected — a
+   dangling reference in history."
+  [{:keys [db/valueType db/tupleType db/tupleTypes db/noHistory] :as _entity}]
+  (let [key-bearing? (fn [t] (contains? key-bearing-value-types t))
+        nested       (cond-> (set tupleTypes)
+                       tupleType (conj tupleType))]
+    (cond
+      (some key-bearing? nested)
+      (str "a tuple cannot hold " (pr-str (first (filter key-bearing? nested)))
+           ": the collector marks store-naming values by attribute valueType, and a"
+           " tuple's valueType is :db.type/tuple — the keys inside it would be"
+           " invisible to the mark and their objects would be swept while still"
+           " referenced. Give the reference its own attribute.")
+
+      (and noHistory (key-bearing? valueType))
+      (str ":db/noHistory cannot be combined with " (pr-str valueType)
+           ": retracted values are not retained in the temporal indices, so under"
+           " :keep-history? the object a retracted reference names would be"
+           " collected while an as-of read can still reach the datom naming it."))))
 
 (defn find-invalid-schema-updates [entity attr-schema]
   (reduce-kv
@@ -337,6 +440,11 @@
            :db/noHistory m
            :db/isComponent m
 
+           ;; Attribute-value constraints may be added or changed on an
+           ;; existing attribute; they only affect future assertions.
+           :db/maxLength nil
+           :db.attr/preds nil
+
            ;; Secondary index: monotonic status transitions only
            ;; :building → :ready → :disabled (no going back)
            :db.secondary/status
@@ -350,6 +458,158 @@
            (assoc m attr-def [old-value new-value])))))
    {}
    (dissoc entity :db/id)))
+
+(def attr-defining-keys
+  "Schema keys that make an entry define an ATTRIBUTE (as opposed to an enum
+   ident, a doc-only entity, or an entity-spec). An entry carrying any of
+   these must be complete (:db/valueType + :db/cardinality) under
+   :schema-flexibility :write."
+  #{:db/valueType :db/cardinality :db/unique :db/index :db/noHistory
+    :db/tupleAttrs :db/tupleType :db/tupleTypes :db/isComponent})
+
+(def ^:private always-allowed-schema-keys
+  "Schema-entry keys whose change never needs a transition rule or data scan.
+   The value-constraint keys (:db/maxLength, :db.attr/preds) belong here with
+   their sibling :db.entity/preds: they are enforced on assertion only, so
+   adding or changing one never invalidates existing (or history) datoms —
+   it is a valid post-hoc addition to an already-defined attribute."
+  #{:db/doc :db/isComponent :db/noHistory :db/ident
+    :db/maxLength :db.attr/preds
+    :db.entity/attrs :db.entity/preds :db.secondary/building-since-tx})
+
+(defn assess-schema-transition
+  "Assess a schema entry TRANSITION on the RESULTING state: `old-entry` is the
+   entry before the transaction, `new-entry` after it (nil = entry removed).
+   Pure and data-independent — the caller performs the returned data checks
+   against the database.
+
+   This is the state-based successor of `find-invalid-schema-updates`, which
+   compares a transacted DELTA against the pre-tx schema and therefore only
+   guards the entity-map transaction path in the order the datoms happen to
+   arrive. Assessing old→new resulting entries at the end of the transaction
+   loop covers raw datom vectors, partial updates, retracts and adversarial
+   datom order uniformly (the same chokepoint discipline as
+   `key-bearing-misuse` in update-schema and the cross-tx vt-window guard).
+
+   Returns {:invalid {key [old new]}     ;; unconditional violations
+            :data-checks #{...}}         ;; checks the caller runs against data:
+     :attr-used?       — reject when the attribute has current or history
+                         datoms (valueType change, tuple-def change, entry
+                         removal, :db/index enablement)
+     :single-valued?   — reject when some entity has >1 current value
+                         (cardinality many→one)"
+  [old-entry new-entry write-flexibility?]
+  (let [old (or old-entry {})
+        new (or new-entry {})
+        changed? (fn [k] (not= (get old k) (get new k)))
+        ;; A brand-new entry is a DECLARATION, not a transition: the existing
+        ;; create-time semantics (validate-schema, implicit defaults, tuple
+        ;; nil-filling for undeclared refs, unique on card-many) stay as they
+        ;; are, and datoms co-transacted with the declaration are written
+        ;; under it. Transition rules and data checks apply only when the
+        ;; entry existed before the transaction.
+        transition? (some? old-entry)
+        invalid
+        (cond-> {}
+          ;; Completeness (:write): an attribute-defining entry must carry
+          ;; valueType and cardinality once the transaction settles.
+          (and write-flexibility?
+               (some? new-entry)
+               (some #(contains? new %) attr-defining-keys)
+               (not (and (:db/valueType new) (:db/cardinality new))))
+          (assoc :db/valueType-and-cardinality-required
+                 [(select-keys old [:db/valueType :db/cardinality])
+                  (select-keys new [:db/valueType :db/cardinality])])
+
+          ;; one→many under a unique constraint
+          (and transition?
+               (changed? :db/cardinality)
+               (= (:db/cardinality new) :db.cardinality/many)
+               (#{:db.unique/value :db.unique/identity} (:db/unique new)))
+          (assoc :db/cardinality [(:db/cardinality old) (:db/cardinality new)])
+
+          ;; ADDING unique to a cardinality-many attribute. Changing an
+          ;; existing unique (identity↔value) is allowed regardless of
+          ;; cardinality — the long-standing contract (see schema-test
+          ;; "Allow to update :db/unique only if it already exists"). An
+          ;; absent cardinality is implicitly one under :schema-flexibility
+          ;; :read.
+          (and transition?
+               (some? new-entry)
+               (:db/unique new)
+               (not (:db/unique old))
+               (some? (:db/cardinality new))
+               (not= :db.cardinality/one (:db/cardinality new)))
+          (assoc :db/unique [(:db/unique old) (:db/unique new)])
+
+          ;; secondary-index status: monotonic transitions only
+          (and (changed? :db.secondary/status)
+               (contains? old :db.secondary/status)
+               (not (contains? (get {:building #{:ready :disabled}
+                                     :ready    #{:disabled}}
+                                    (:db.secondary/status old))
+                               (:db.secondary/status new))))
+          (assoc :db.secondary/status
+                 [(:db.secondary/status old) (:db.secondary/status new)])
+
+          ;; any other db-namespaced key change is rejected (mirrors
+          ;; find-invalid-schema-updates' strict default)
+          transition?
+          (merge (into {}
+                       (keep (fn [k]
+                               (when (and (keyword? k)
+                                          (re-matches #"db(\..*)?" (or (namespace k) ""))
+                                          (not (contains? always-allowed-schema-keys k))
+                                          (not (contains? attr-defining-keys k))
+                                          (not (#{:db.secondary/status} k))
+                                          (changed? k))
+                                 [k [(get old k) (get new k)]])))
+                       (into #{} (concat (keys old) (keys new))))))
+        data-checks
+        (cond-> #{}
+          ;; entry removed while the attribute may still have datoms
+          (and transition? (nil? new-entry))
+          (conj :attr-used?)
+
+          ;; valueType CHANGE poisons existing (incl. history) datoms with
+          ;; mixed types — comparators and predicates silently misbehave
+          (and transition? (some? new-entry)
+               (:db/valueType old) (changed? :db/valueType))
+          (conj :attr-used?)
+
+          ;; tuple definition change invalidates existing tuple values
+          (and transition? (some? new-entry)
+               (some (fn [k] (and (contains? old k) (changed? k)))
+                     [:db/tupleAttrs :db/tupleType :db/tupleTypes]))
+          (conj :attr-used?)
+
+          ;; Enabling :db/index on a used attribute is NOT data-checked here:
+          ;; this fork's transactor backfills current and temporal AVET for
+          ;; the attribute in the same transaction (db.transaction/backfill-avet,
+          ;; ours 58764d90), so AVET is complete when the value is published.
+          ;; Upstream rejected it as `:attr-used?` (no backfill at f29c9e9c).
+
+          ;; many→one with entities holding multiple values leaves state that
+          ;; q/pull/entity disagree on (entity crashes). Data-checked (not
+          ;; :attr-used?) because card-one enforcement reads EAVT, which
+          ;; covers pre-existing datoms.
+          (and (some? new-entry)
+               (changed? :db/cardinality)
+               (= (:db/cardinality old) :db.cardinality/many)
+               (= (:db/cardinality new) :db.cardinality/one))
+          (conj :single-valued?)
+
+          ;; unique added retroactively is UNENFORCEABLE against existing
+          ;; data: validate-datom checks uniqueness via AVET, and datoms
+          ;; inserted before the attribute was unique/indexed are not in
+          ;; AVET — duplicates of old values would be silently accepted.
+          ;; Like :db/index enablement, requires an unused attribute (until
+          ;; an index-backfill migration exists).
+          (and transition? (some? new-entry)
+               (:db/unique new) (not (:db/unique old)))
+          (conj :attr-used?))]
+    {:invalid invalid
+     :data-checks data-checks}))
 
 (defn is-system-keyword? [value]
   (and (or (keyword? value) (string? value))

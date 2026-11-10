@@ -20,7 +20,16 @@
 (def ^:dynamic *default-schema-flexibility* :write)
 (def ^:dynamic *default-keep-history?* true)
 (def ^:dynamic *default-attribute-refs?* false)
-(def ^:dynamic *default-search-cache-size* 10000)
+;; 0 = disabled. The per-snapshot datom search cache (db.search/memoize-for)
+;; was silently dead from #503 (Nov 2022, key rename) until 2026-07; in the
+;; meantime the default path grew faster layers (PSS in-memory indexes, store
+;; cache, whole-query result cache) that make it a net LOSS on the default
+;; memory/PSS setup (~40% slower repeated entity access: LRU bookkeeping costs
+;; more than the lookup). It still pays on lazy-loading stores (~15% faster on
+;; :file). Disabled by default — matching the long-standing effective behavior
+;; — and opt-in via :search-cache-size / DATAHIKE_SEARCH_CACHE_SIZE for
+;; konserve-backed workloads with hot repeated point lookups.
+(def ^:dynamic *default-search-cache-size* 0)
 (def ^:dynamic *default-store-cache-size* 1000)
 (def ^:dynamic *default-crypto-hash?* false)
 (def ^:dynamic *default-store* :memory)                           ;; store-less = in-memory?
@@ -60,6 +69,15 @@
 
 (s/def ::store map?)
 
+;; Default value-size resource model: per-database caps on the size of
+;; :db.type/string / :db.type/bytes values (and string slots inside tuples).
+;; nat-int? so 0 (explicitly disabled) is valid; nilable/absent = unbounded.
+(s/def ::max-string-length (s/nilable nat-int?))
+(s/def ::max-bytes-length (s/nilable nat-int?))
+(s/def ::max-float-array-length (s/nilable nat-int?))
+(s/def ::max-double-array-length (s/nilable nat-int?))
+(s/def ::max-tuple-string-length (s/nilable nat-int?))
+
 (s/def :datahike/config (s/keys :opt-un [:datahike/store
                                          ::index
                                          ::index-config
@@ -75,7 +93,12 @@
                                          ::initial-tx
                                          ::name
                                          ::branch
-                                         ::writer]))
+                                         ::writer
+                                         ::max-string-length
+                                         ::max-bytes-length
+                                         ::max-float-array-length
+                                         ::max-double-array-length
+                                         ::max-tuple-string-length]))
 
 (s/def :deprecated/schema-on-read boolean?)
 (s/def :deprecated/temporal-index boolean?)
@@ -95,7 +118,8 @@
                  (case backend
                    :memory {:id (or id
                                     (when (or host path)
-                                      #?(:clj (java.util.UUID/nameUUIDFromBytes (.getBytes (str (or host path)) "UTF-8"))
+                                      #?(:clj (java.util.UUID/nameUUIDFromBytes
+                                               (.getBytes ^String (str (or host path)) "UTF-8"))
                                          :cljs (uuid (str (or host path))))))}
                    :pg {:username username
                         :password password
@@ -106,12 +130,14 @@
                    :level {:path path
                            :id (or id
                                    (when path
-                                     #?(:clj (java.util.UUID/nameUUIDFromBytes (.getBytes path "UTF-8"))
+                                     #?(:clj (java.util.UUID/nameUUIDFromBytes
+                                              (.getBytes ^String (str path) "UTF-8"))
                                         :cljs (uuid path))))}
                    :file {:path path
                           :id (or id
                                   (when path
-                                    #?(:clj (java.util.UUID/nameUUIDFromBytes (.getBytes path "UTF-8"))
+                                    #?(:clj (java.util.UUID/nameUUIDFromBytes
+                                             (.getBytes ^String (str path) "UTF-8"))
                                        :cljs (uuid path))))}))
    :index index
    :index-config (di/default-index-config index)
@@ -169,6 +195,47 @@
    :branch *default-db-branch*
    :writer self-writer
    :index-config (di/default-index-config *default-index*)})
+
+(def default-value-caps
+  "The Datomic-parity value-size caps that the `:value-caps :default` preset
+   expands to: `:max-string-length` bounds `:db.type/string` values (chars),
+   `:max-bytes-length` bounds `:db.type/bytes` values (bytes),
+   `:max-float-array-length` / `:max-double-array-length` bound
+   `:db.type/float-array` / `:db.type/double-array` values (element counts), and
+   string slots inside a `:db.type/tuple` are bounded by
+   `:max-tuple-string-length`. Value-size caps are OPT-IN (a `0` disables an
+   individual cap; an unconfigured database is left unbounded — see
+   `apply-default-value-caps`). This map is also the canonical set of value-size
+   config KEYS."
+  {:max-string-length 4096
+   :max-bytes-length 4096
+   :max-float-array-length 4096
+   :max-double-array-length 4096
+   :max-tuple-string-length 256})
+
+(defn value-caps-configured?
+  "True iff the caller made an EXPLICIT value-size choice — any `:max-*-length`
+   key (incl. `0` = disabled) or the `:value-caps` preset selector. Used to warn
+   once at create when neither is present (the database is then left unbounded)."
+  [config]
+  (or (contains? config :value-caps)
+      (boolean (some #(contains? config %) (keys default-value-caps)))))
+
+(defn apply-default-value-caps
+  "Resolve the value-size cap config at `create-database`. Caps are OPT-IN:
+
+     - `:value-caps :default` expands to `default-value-caps` (an explicit
+       `:max-*-length` key still wins over the preset);
+     - otherwise the config passes through UNCHANGED — an unconfigured database
+       is left unbounded (a warning at the create call site nudges the choice).
+
+   The `:value-caps` selector is create-time-only and is dropped from the
+   persisted config."
+  [config]
+  (-> (if (= :default (:value-caps config))
+        (merge default-value-caps config)          ; explicit :max-*-length wins
+        config)
+      (dissoc :value-caps)))
 
 (defn remove-nils
   "Thanks to https://stackoverflow.com/a/34221816"

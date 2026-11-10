@@ -150,9 +150,12 @@
                   :config config}))))
 
 (defn ensure-stored-config-consistency [config stored-config]
-  (let [;; Remove runtime parameters and creation-time parameters
-        config (dissoc config :name :search-cache-size :store-cache-size :store-cache-bytes)
-        stored-config (dissoc stored-config :initial-tx :name :search-cache-size :store-cache-size :store-cache-bytes)
+  (let [;; Remove runtime parameters and creation-time parameters. Value-size
+        ;; caps are creation-time defaults the connect config may lack (or hold a
+        ;; different explicit value for — stored wins), so exclude them here.
+        cap-keys (cons :value-caps (keys dc/default-value-caps))
+        config (apply dissoc config :name :search-cache-size :store-cache-size :store-cache-bytes cap-keys)
+        stored-config (apply dissoc stored-config :initial-tx :name :search-cache-size :store-cache-size :store-cache-bytes cap-keys)
         stored-config (merge {:writer dc/self-writer} stored-config)
         stored-config (if (empty? (:index-config stored-config))
                         (dissoc stored-config :index-config)
@@ -262,7 +265,10 @@
          ;; connection may carry adopted keys the caller's config omits;
          ;; conflicts are guarded on the fresh-connect path, not here.
          (dissoc :writer :store :store-cache-size :store-cache-bytes :search-cache-size :index-config)
-         (#(apply dissoc % store-fixed-record-keys)))
+         (#(apply dissoc % store-fixed-record-keys))
+         ;; The value-size caps live only in the stored config (upstream #861)
+         ;; and are ignored for sharing, as the store-fixed keys are.
+         (#(apply dissoc % :value-caps (keys dc/default-value-caps))))
       writer-key (assoc :writer writer-key))))
 
 (defn close-secondary-indices
@@ -394,6 +400,14 @@
                                [config' store stored-db])))
                          store (kp/-set-write-hooks! store write-hooks)
                          _ (vswap! resources assoc :store store)
+                         ;; The runtime db is built from the connect-time config (below),
+                         ;; but value-size caps live only in the *stored* config (written
+                         ;; at create). Merge them in so enforcement sees them and the
+                         ;; consistency check matches. Absent in the stored config (older
+                         ;; DBs) → nothing merged → unbounded.
+                         config (merge config
+                                       (select-keys (:config stored-db)
+                                                    (keys dc/default-value-caps)))
                          _ (version-check stored-db)
                          _ (when-not (:allow-unsafe-config config)
                              (ensure-stored-config-consistency config (:config stored-db)))

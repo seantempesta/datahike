@@ -7,6 +7,8 @@
    [datahike.datom :as dd :refer [datom datom-tx datom-added datom?]]
    #?(:clj [datahike.db :as db]
       :cljs [datahike.db :as db :refer [HistoricalDB]])
+   [datahike.array :as arr]
+   [datahike.attr-preds :as ap]
    [datahike.db.interface :as dbi]
    [datahike.db.search :as dbs]
    [datahike.db.utils :as dbu]
@@ -162,24 +164,44 @@
                   :entity schema-entry
                   :invalid-updates {:db/index [(get-in schema [schema-entry :db/index])
                                                v-ident]}}))
-    (if (= a-ident :db/ident)
-      (if (schema v-ident)
-        (log/raise (str "Schema with attribute " v-ident " already exists")
-                   {:error :transact/schema :attribute v-ident})
-        (-> (assoc-in db [:schema v-ident] (merge (or (schema e) {}) (hash-map a-ident v-ident)))
-            (assoc-in [:schema e] v-ident)
-            (assoc-in [:ident-ref-map v-ident] e)
-            (assoc-in [:ref-ident-map e] v-ident)))
-      (if-let [schema-entry (schema e)]
-        (if (schema schema-entry)
-          (update-in db [:schema schema-entry a-ident] (fn [old]
-                                                         (if (ds/entity-spec-attr? a-ident)
-                                                           (if old
-                                                             (conj old v-ident)
-                                                             [v-ident])
-                                                           v-ident)))
-          (assoc-in db [:schema e a-ident] v-ident))
-        (assoc-in db [:schema e] (hash-map a-ident v-ident))))))
+    (let [new-db (if (= a-ident :db/ident)
+                   (if (schema v-ident)
+                     (log/raise (str "Schema with attribute " v-ident " already exists")
+                                {:error :transact/schema :attribute v-ident})
+                     (-> (assoc-in db [:schema v-ident] (merge (or (schema e) {}) (hash-map a-ident v-ident)))
+                         (assoc-in [:schema e] v-ident)
+                         (assoc-in [:ident-ref-map v-ident] e)
+                         (assoc-in [:ref-ident-map e] v-ident)))
+                   ;; Many-valued schema attrs (entity-spec preds/attrs, :db.attr/preds)
+                   ;; accumulate into a vector; single-valued overwrite. Applied in EVERY
+                   ;; branch so the result is order-independent — a pred datom arriving
+                   ;; before its entity's :db/ident (map ordering differs across
+                   ;; platforms) must still land as a vector, not a bare value.
+                   (let [accum (fn [old]
+                                 (if (or (ds/entity-spec-attr? a-ident)
+                                         (= a-ident :db.attr/preds))
+                                   (if old (conj old v-ident) [v-ident])
+                                   v-ident))]
+                     (if-let [schema-entry (schema e)]
+                       (if (schema schema-entry)
+                         (update-in db [:schema schema-entry a-ident] accum)
+                         (update-in db [:schema e a-ident] accum))
+                       (update-in db [:schema e a-ident] accum))))]
+      ;; A schema mutation must not produce a shape that lets GC delete a
+      ;; still-referenced object — a :db.type/store-ref inside a tuple, or under
+      ;; :db/noHistory (schema/key-bearing-misuse). check-schema-update rejects the
+      ;; all-in-one declaration, but this is the universal chokepoint every schema
+      ;; datom flows through, so it also catches the shape being COMPLETED by a
+      ;; separate op — an entity-map partial update or a raw
+      ;; `[:db/add e :db/noHistory true]`, neither of which restates :db/valueType.
+      ;; Checked on the RESULTING entry, so whichever datom lands last is the one
+      ;; that trips it, regardless of order.
+      (when (not= a-ident :db/ident)
+        (let [entry (get-in new-db [:schema (get-in new-db [:schema e])])]
+          (when (map? entry)
+            (when-let [why (ds/key-bearing-misuse entry)]
+              (log/raise why {:error :transact/schema :entity-id e :attribute a-ident})))))
+      new-db)))
 
 (defn schema-attr-of
   "The attribute the schema datom is about: the ident it adds or retracts, else the ident of its entity
@@ -381,7 +403,11 @@
               (update :ref-ident-map #(dissoc % e)))))
       (if-let [schema-entry (schema e)]
         (if (schema schema-entry)
-          (update-in db [:schema schema-entry] #(dissoc % a-ident))
+          (if (= a-ident :db.attr/preds)
+            ;; many-valued: drop just the retracted predicate, keep the rest
+            (update-in db [:schema schema-entry a-ident]
+                       (fn [old] (vec (remove #{v-ident} old))))
+            (update-in db [:schema schema-entry] #(dissoc % a-ident)))
           (update-in db [:schema e] #(dissoc % a-ident v-ident)))
         (let [err-msg (str "Schema with entity id " e " does not exist")
               err-map {:error :retract/schema :entity-id e :attribute a :value e}]
@@ -873,6 +899,78 @@
   [a-ident]
   (or (= a-ident :db.valid/from) (= a-ident :db.valid/to)))
 
+(defn- system-ident?
+  "System / meta / entity-spec / secondary-index attribute — exempt from the
+   implicit value-size default (e.g. `:db/doc` is a string but must not be
+   capped)."
+  [a-ident]
+  (or (ds/schema-attr? a-ident) (ds/meta-attr? a-ident)
+      (ds/entity-spec-attr? a-ident) (ds/secondary-index-attr? a-ident)))
+
+(defn- enforce-attr-constraints
+  "Per-value constraints, on assertion only (called from `transact-add`, never on
+   retract), gated on the O(1) `:db.attr/constrained` rschema set so
+   unconstrained attributes pay nothing:
+
+   - Value-size caps: an explicit `:db/maxLength` bounds the value's length —
+     chars for a `:db.type/string`, bytes for a `:db.type/bytes` — and wins over
+     the per-database default; otherwise, under `:write` and for a user
+     attribute, the per-database `:max-string-length` / `:max-bytes-length`
+     applies. `:db.secondary/only` values (stored out-of-line) are exempt.
+     Raises `:transact/max-length`.
+   - `:db.attr/preds` value predicates. Raises `:transact/attr-pred`
+     (`:transact/attr-pred-unresolved` when a named predicate can't be resolved)."
+  [db a-ident v ctx]
+  (when (contains? (get-in db [:rschema :db.attr/constrained]) a-ident)
+    (let [attr    (get (dbi/-schema db) a-ident)
+          config  (dbi/-config db)
+          write?  (= :write (:schema-flexibility config))
+          default? (and write? (not (system-ident? a-ident))
+                        (not (dbu/secondary-only? db a-ident)))]
+      ;; --- value-size caps ---
+      (cond
+        (string? v)
+        (when-let [eff (or (:db/maxLength attr)
+                           (when default? (:max-string-length config)))]
+          (when (and (pos? eff) (> (count v) eff))
+            (log/raise "String value for " a-ident " exceeds max length " eff " (was " (count v) ")"
+                       {:error :transact/max-length :attribute a-ident
+                        :length (count v) :limit eff :unit :chars :context ctx})))
+
+        (arr/bytes? v)
+        (when-let [eff (or (:db/maxLength attr)
+                           (when default? (:max-bytes-length config)))]
+          (when (and (pos? eff) (> (arr/byte-count v) eff))
+            (log/raise "Byte value for " a-ident " exceeds max length " eff " bytes (was " (arr/byte-count v) ")"
+                       {:error :transact/max-length :attribute a-ident
+                        :length (arr/byte-count v) :limit eff :unit :bytes :context ctx})))
+
+        (arr/float-array? v)
+        (when-let [eff (or (:db/maxLength attr)
+                           (when default? (:max-float-array-length config)))]
+          (when (and (pos? eff) (> (arr/value-array-length v) eff))
+            (log/raise "Float-array value for " a-ident " exceeds max length " eff " (was " (arr/value-array-length v) ")"
+                       {:error :transact/max-length :attribute a-ident
+                        :length (arr/value-array-length v) :limit eff :unit :floats :context ctx})))
+
+        (arr/double-array? v)
+        (when-let [eff (or (:db/maxLength attr)
+                           (when default? (:max-double-array-length config)))]
+          (when (and (pos? eff) (> (arr/value-array-length v) eff))
+            (log/raise "Double-array value for " a-ident " exceeds max length " eff " (was " (arr/value-array-length v) ")"
+                       {:error :transact/max-length :attribute a-ident
+                        :length (arr/value-array-length v) :limit eff :unit :doubles :context ctx}))))
+      ;; --- predicates ---
+      (doseq [p (let [ps (:db.attr/preds attr)]      ; tolerate bare or collection
+                  (cond (nil? ps) nil (coll? ps) ps :else [ps]))]
+        (if-let [f (ap/resolve-pred p)]
+          (when-not (true? (f v))
+            (log/raise "Value for " a-ident " failed :db.attr/preds predicate " p
+                       {:error :transact/attr-pred :attribute a-ident :value v :pred p :context ctx}))
+          (log/raise "Unresolved :db.attr/preds predicate " p " for " a-ident
+                     " — register it with datahike.attr-preds/register-attr-pred! (or ensure the symbol is resolvable)"
+                     {:error :transact/attr-pred-unresolved :attribute a-ident :pred p :context ctx}))))))
+
 (defn- transact-add [{:keys [db-after] :as report} [_ e a v tx :as ent]]
   (let [a (dbu/normalize-and-validate-attr a ent db-after)
         _ (validate-val v ent db-after)
@@ -881,6 +979,7 @@
         db db-after
         e (dbu/entid-strict db e)
         a-ident (if attribute-refs? (dbi/ident-for db a :error-on-missing) a)
+        _ (enforce-attr-constraints db a-ident v ent)
         v (if (dbu/ref? db a-ident) (dbu/entid-strict db v) v)
         new-datom (datom e a v tx)
         upsert? (not (dbu/multival? db a))
@@ -1025,6 +1124,10 @@
                (ds/is-system-keyword? (:db/ident entity)))
       (log/raise "Using namespace 'db' for attribute identifiers is not allowed"
                  {:error :transact/schema :entity entity}))
+    ;; Reject shapes that would let GC delete an object a datom still names.
+    ;; Rejected, not documented: both failure modes are silent data loss.
+    (when-let [why (ds/key-bearing-misuse entity)]
+      (log/raise why {:error :transact/schema :entity entity}))
     (if-let [attr-name (get-in db [:schema new-eid])]
       (when-let [invalid-updates (ds/find-invalid-schema-updates entity (get-in db [:schema attr-name]))]
         (when-not (empty? invalid-updates)
@@ -1123,7 +1226,7 @@
       [report []])))
 
 (defn check-tuple [db op-vec]
-  (let [[_ _ a v] op-vec
+  (let [[op _ a v] op-vec
         attr-schema (-> db dbi/-schema (get a))]
     (cond (:db/tupleType attr-schema)
           (cond (> (count v) 8)
@@ -1148,7 +1251,22 @@
           (and (:db/tupleAttrs attr-schema)
                (not (::internal (meta op-vec))))
           (log/raise "Can’t modify tuple attrs directly: " op-vec
-                     {:error :transact/syntax, :tx-data op-vec}))))
+                     {:error :transact/syntax, :tx-data op-vec}))
+    ;; String-slot length cap (Datomic parity, default 256). Assert-only
+    ;; (`:db/add` — never blocks retracting a pre-cap value) and `:write`-only,
+    ;; mirroring the scalar string default. Structural checks above run first.
+    (when (and (= :db/add op)
+               (= :write (:schema-flexibility (dbi/-config db))))
+      (when-let [limit (:max-tuple-string-length (dbi/-config db))]
+        (when (pos? limit)
+          (let [types (cond
+                        (:db/tupleType attr-schema)  (repeat (count v) (:db/tupleType attr-schema))
+                        (:db/tupleTypes attr-schema) (:db/tupleTypes attr-schema))]
+            (doseq [[t slot] (map vector types v)]
+              (when (and (= :db.type/string t) (string? slot) (> (count slot) limit))
+                (log/raise "Tuple string slot for " a " exceeds max length " limit " (was " (count slot) ")"
+                           {:error :transact/max-length :attribute a :length (count slot)
+                            :limit limit :unit :chars :context op-vec})))))))))
 
 (defn- filter-before [datoms ^Date before-date db]
   (let [before-pred (fn [^Datom d]
@@ -1341,6 +1459,118 @@
                        :datahike/validation-refusal refusal}))))
   report)
 
+(defn- schema-attr-current-datoms
+  "Current datoms of schema attribute `ident` on (possibly transient) db.
+   Direct :aevt slice — bypasses the search cache so mid-transaction state
+   never lands in it."
+  [db ident]
+  (let [attr-refs? (:attribute-refs? (dbi/-config db))
+        a (if attr-refs? (get (:ident-ref-map db) ident ident) ident)]
+    (di/-slice (:aevt db)
+               (datom e0 a nil tx0)
+               (datom emax a nil txmax)
+               :aevt)))
+
+(defn- schema-attr-history-datoms
+  [db ident]
+  (when (dbi/-keep-history? db)
+    (let [attr-refs? (:attribute-refs? (dbi/-config db))
+          a (if attr-refs? (get (:ident-ref-map db) ident ident) ident)]
+      (di/-slice (:temporal-aevt db)
+                 (datom e0 a nil tx0)
+                 (datom emax a nil txmax)
+                 :aevt))))
+
+(defn- multi-valued-entity
+  "First entity holding more than one current value of `ident`, or nil.
+   :aevt order sorts by (a, e), so duplicates are adjacent."
+  [db ident]
+  (loop [[^Datom d & ds] (seq (schema-attr-current-datoms db ident)) prev-e nil]
+    (when d
+      (if (= (.-e d) prev-e)
+        (.-e d)
+        (recur ds (.-e d))))))
+
+(defn- validate-schema-changes!
+  "End-of-transaction schema validation on the RESULTING state.
+
+   Compares every changed schema entry of db-after against db-before via
+   ds/assess-schema-transition and runs the data checks it requests. Runs at
+   the same deferred chokepoint as validate-cross-tx-vt-windows!, so it is
+   uniform across the entity-map path, raw datom vectors, retracts, partial
+   updates and any datom order — check-schema-update (entity-map path only)
+   remains as an early, friendlier error for the common case, but this is the
+   guard that actually holds. Costs nothing when the transaction touched no
+   schema (identical? short-circuit).
+
+   Data-backed rules (previously not checked anywhere; used = datoms
+   existed before this transaction):
+   - :db/valueType change / tuple-def change / entry removal / :db/index
+     enablement / :db/unique addition — only while the attribute has NO
+     pre-existing current or history datoms.
+   - cardinality many→one — only while no entity holds >1 value.
+   - :db/unique addition — only while the attribute is unused (retroactive
+     uniqueness is unenforceable: pre-existing datoms are absent from AVET,
+     which validate-datom consults).
+   - composite :db/tupleAttrs must not reference attributes defined as
+     cardinality-many or as tuples (undeclared references are supported —
+     their slots stay nil)."
+  [{:keys [db-before db-after] :as _report}]
+  (let [old-schema (dbi/-schema db-before)
+        new-schema (dbi/-schema db-after)]
+    (when-not (identical? old-schema new-schema)
+      (let [write? (= :write (:schema-flexibility (dbi/-config db-after)))
+            idents (into #{}
+                         (filter keyword?)
+                         (concat (keys old-schema) (keys new-schema)))]
+        (doseq [ident idents]
+          (let [old-entry (let [e (get old-schema ident)] (when (map? e) e))
+                new-entry (let [e (get new-schema ident)] (when (map? e) e))]
+            (when (and (or old-entry new-entry)
+                       (not= old-entry new-entry))
+              (let [{:keys [invalid data-checks]}
+                    (ds/assess-schema-transition old-entry new-entry write?)]
+                (when (seq invalid)
+                  (log/raise (str "Invalid schema state for " ident " after transaction")
+                             {:error :transact/schema :attribute ident
+                              :invalid-updates invalid}))
+                ;; "Used" means datoms existed BEFORE this transaction:
+                ;; datoms co-transacted with the schema change are written
+                ;; under the new definition and are consistent with it.
+                (when (and (contains? data-checks :attr-used?)
+                           (or (seq (schema-attr-current-datoms db-before ident))
+                               (seq (schema-attr-history-datoms db-before ident))))
+                  (log/raise (str "Schema change on " ident " requires the attribute to be unused,"
+                                  " but it has existing (or history) datoms. Migrate the data to a"
+                                  " new attribute instead.")
+                             {:error :transact/schema :attribute ident
+                              :old old-entry :new new-entry}))
+                (when (contains? data-checks :single-valued?)
+                  (when-let [e (multi-valued-entity db-after ident)]
+                    (log/raise (str "Cannot narrow " ident " to :db.cardinality/one: entity " e
+                                    " holds more than one value.")
+                               {:error :transact/schema :attribute ident :entity-id e})))
+                ;; Composite tuple definitions: an UNDECLARED referenced
+                ;; attribute is supported (its slot stays nil until declared
+                ;; and asserted), but a reference to an attribute DEFINED as
+                ;; cardinality-many or as a tuple itself can never index
+                ;; soundly.
+                (when-let [tuple-attrs (and new-entry
+                                            (not= (:db/tupleAttrs old-entry)
+                                                  (:db/tupleAttrs new-entry))
+                                            (:db/tupleAttrs new-entry))]
+                  (doseq [ta tuple-attrs]
+                    (let [entry (get new-schema ta)]
+                      (when (map? entry)
+                        (when (= :db.cardinality/many (:db/cardinality entry))
+                          (log/raise (str ":db/tupleAttrs of " ident " references " ta
+                                          ", which must not have :db.cardinality/many.")
+                                     {:error :transact/schema :attribute ident :tuple-attr ta}))
+                        (when (= :db.type/tuple (:db/valueType entry))
+                          (log/raise (str ":db/tupleAttrs of " ident " references " ta
+                                          ", which is itself a tuple attribute.")
+                                     {:error :transact/schema :attribute ident :tuple-attr ta}))))))))))))))
+
 (defn transact-tx-data [{:keys [db-before] :as initial-report} initial-es]
   (when-not (or (nil? initial-es)
                 (sequential? initial-es))
@@ -1392,6 +1622,10 @@
             ;; the report exits, matching the ::queued-tuples cleanup
             ;; discipline.
             (validate-cross-tx-vt-windows! report)
+            ;; Deferred schema validation on the RESULTING state — covers
+            ;; raw datom vectors, retracts and any datom order uniformly
+            ;; (check-schema-update only sees the entity-map path).
+            (validate-schema-changes! report)
             (-> report
                 (dissoc ::pending-vt-validation ::report-validator ::ids ::tx)
                 (assoc :tx-data (vec (::effective-tx-data report)))

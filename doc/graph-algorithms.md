@@ -94,11 +94,34 @@ are entity ids.
 (graph/all-paths g db a {:target b :max-depth 6})  ; seq of node vectors
 (graph/shortest-path g db a b)      ; [a ... b] with fewest edges, or nil
 (graph/path-length g db a b)        ; number of edges, or nil
+(graph/bfs-distances g db a)        ; {node hop-count} for a (0) and all reachable
+(graph/lowest-common-ancestors g db a b)  ; #{lowest common ancestors} (merge-base set)
 (graph/semi-naive-transitive-closure g db)  ; #{[source target] ...}
 ```
 
 `transitive-closure` and `reachable?` follow at least one edge, so `a` is in its
-own closure exactly when it lies on a cycle.
+own closure exactly when it lies on a cycle. `bfs-distances` is the all-targets
+companion to `path-length` — the same single-source BFS, but it keeps the whole
+distance map and always includes the source at 0 (a distance map is keyed by
+cost-to-reach). `lowest-common-ancestors` is the graph-theoretic LCA set: the
+common ancestors that are *minimal* (none reachable from another) — the true
+merge-base set, which for a criss-cross has more than one member. It is the set
+you compose with in a query:
+
+```clojure
+(d/q '[:find ?id
+       :in $ ?g ?a ?b
+       :where [(graph/lowest-common-ancestors ?g $ ?a ?b) [?base ...]]
+              [?base :geschichte.commit/id ?id]]
+     db (gs/attr-graph :geschichte.commit/parents) a b)
+```
+
+There is deliberately no singular "the LCA": a criss-cross genuinely has several,
+and *which* one to prefer is a caller policy, not a property of the graph. Pick
+from the set where you need one — join it to a stable attribute in the query, or
+`sort-by` a stable key in Clojure (`(first (sort-by stable-key (lowest-common-ancestors …)))`).
+A `str`/entity-id order is deterministic within a database but not stable across
+peers, so it is never a safe default to bake in.
 
 ### Connected components
 

@@ -112,13 +112,6 @@
      Used by GC to mark reachable storage. Indices using external storage
      (e.g., scriptum/Lucene filesystem) return #{}."))
 
-(defprotocol ISecondaryValue
-  "Optional protocol for a secondary index that holds the full value of a
-   `:db.secondary/only` attribute, whose primary datoms carry only the value's
-   content hash."
-  (-value [this eid attr]
-    "The value of `attr` on entity `eid` this index holds, or nil."))
-
 (defprotocol IValidTimeAware
   "Optional protocol for secondary indices that natively understand the
    tx-meta valid-time axis (`:db.valid/from` / `:db.valid/to`).
@@ -270,27 +263,6 @@
       unfiltered)))
 
 ;; ---------------------------------------------------------------------------
-;; Full values of :db.secondary/only datoms
-
-(defn datom-value
-  "The full value of an asserted `datom` in `db`. For a `:db.secondary/only`
-   attribute the primary datom holds the value's content hash, so the value is
-   the one the covering `ISecondaryValue` index holds for the datom's entity;
-   for any other attribute it is the datom's own value. A datom reader that
-   carries datoms between database values (a merge, a diff applied as
-   tx-data) reads values through this."
-  [db datom]
-  (let [a (:a datom)
-        a-ident (if (number? a) (dbi/ident-for db a :error-on-missing) a)]
-    (if (get-in db [:schema a-ident :db.secondary/only])
-      (some (fn [idx-ident]
-              (let [idx (get-in db [:secondary-indices idx-ident])]
-                (when (satisfies? ISecondaryValue idx)
-                  (-value idx (:e datom) a-ident))))
-            (get-in db [:rschema :db.secondary/index a-ident]))
-      (:v datom))))
-
-;; ---------------------------------------------------------------------------
 ;; GC: static key-map marking (avoids loading full index just for GC)
 
 (defmulti mark-from-key-map
@@ -300,15 +272,6 @@
   (fn [key-map store] (:type key-map)))
 
 (defmethod mark-from-key-map :default [_ _] #{})
-
-(defmulti sweep-from-key-maps!
-  "Collect an index type's own storage, given the key maps of every commit a
-   Datahike collection retains (`datahike.gc/gc-storage!`): storage none of
-   them reaches, written before `cutoff`, is deleted. Dispatches on the index
-   type. Indices whose storage Datahike's own sweep covers need nothing."
-  (fn [index-type key-maps cutoff] index-type))
-
-(defmethod sweep-from-key-maps! :default [_ _ _] nil)
 
 ;; ---------------------------------------------------------------------------
 ;; Static branch-from-key-map (for branch! without loading full index)
@@ -328,29 +291,6 @@
   (fn [key-map store from-branch new-branch] (:type key-map)))
 
 (defmethod branch-from-key-map :default [key-map _ _ _] key-map)
-
-;; ---------------------------------------------------------------------------
-;; Static guarded force from key maps
-
-(defmulti check-force-from-key-map
-  "Preflight guarded replacement of an existing native secondary branch."
-  (fn [source-key-map current-key-map store branch]
-    (:type source-key-map)))
-
-(defmethod check-force-from-key-map :default [_ _ _ _] nil)
-
-(defmulti force-from-key-map
-  "Replace an existing native secondary branch with one selected root.
-
-   `current-key-map` is the destination state observed with the primary head
-   and supplies the implementation-specific stale guard. Implementations must
-   return the source root attached to the existing native destination without
-   creating another secondary commit."
-  (fn [source-key-map current-key-map store branch]
-    (:type source-key-map)))
-
-(defmethod force-from-key-map :default [source-key-map _ _ _]
-  source-key-map)
 
 ;; ---------------------------------------------------------------------------
 ;; Registry: index-type keyword → factory function

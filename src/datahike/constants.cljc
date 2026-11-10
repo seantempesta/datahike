@@ -200,7 +200,31 @@
     :db/ident :db/contentId
     :db/valueType :db.type/boolean
     :db/cardinality :db.cardinality/one
-    :db/doc "An identity attribute whose value names its entity's id: every branch mints one entity at the hash of [attribute value]"}])
+    :db/doc "An identity attribute whose value names its entity's id: every branch mints one entity at the hash of [attribute value]"}
+   ;; MERGE-REVIEW(deep-fixes): both sides appended system entity 52 (ours :db/contentId,
+   ;; upstream :db.type/store-ref, then 53/54 for :db/maxLength, :db.attr/preds). Ours keeps
+   ;; 52 (Seon's stores hold it); upstream's three move to 53/54/55. An :attribute-refs?
+   ;; database written by upstream Datahike names store-ref/maxLength/preds by other ids
+   ;; than this fork does: such a store is not portable between the two (Seon uses none).
+   ;; Under :attribute-refs? a :db/valueType is a REF to the entity naming the
+   ;; type, so a builtin value type must have a stable system entity id — without
+   ;; one, `[:db/add <attr> :db/valueType :db.type/store-ref]` resolves to nil and
+   ;; the schema transaction is rejected. APPENDED (never inserted): the ids of
+   ;; existing system entities are on disk in every attribute-refs database.
+   {:db/id 53
+    :db/ident :db.type/store-ref}
+   ;; Attribute-value constraints (opt-in). Full specs inline (like
+   ;; :db.valid/*) so `ref-implicit-schema` conveys cardinality — needed
+   ;; because :db.attr/preds is many-valued and must be recognized as such
+   ;; under :attribute-refs? too. Upstream's ids 53/54 are 54/55 here (see above).
+   {:db/id 54
+    :db/ident :db/maxLength
+    :db/valueType :db.type/long
+    :db/cardinality :db.cardinality/one}
+   {:db/id 55
+    :db/ident :db.attr/preds
+    :db/valueType :db.type/symbol
+    :db/cardinality :db.cardinality/many}])
 
 (def ^:const system-entities
   "Holds the entity IDs of system attributes"
@@ -241,7 +265,8 @@
    :dh.ref/db     {:db/index true}
    :dh.ref/value  {:db/index true}
    :db.entity/attrs {:db/cardinality :db.cardinality/many}
-   :db.entity/preds {:db/cardinality :db.cardinality/many}})
+   :db.entity/preds {:db/cardinality :db.cardinality/many}
+   :db.attr/preds {:db/cardinality :db.cardinality/many}})
 
 (def ^:const ref-implicit-schema
   "Maps attribute names to the attribute's specification"
