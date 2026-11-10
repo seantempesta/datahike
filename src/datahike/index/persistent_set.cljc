@@ -624,12 +624,19 @@
        "node as it is stored: each key whose value is at least `limit` bytes holding a
        ValueRef to the value's content key (value-key). node itself when none is that large."
        [store cache pending-writes limit node]
+       ;; value-bytes' answer, without a call, for what it answers at once: most values
+       ;; are numbers, keywords and short strings, and a written node is ~64 datoms
        (let [ks (.-_keys node) n (.-_len node) gen (generation store pending-writes)
+             scalar-large? (>= 8 limit)
              out (loop [i 0 out nil]
                    (if (< i n)
                      (let [d (aget ks i)
                            v (when (dd/datom? d) (.-v d))]
-                       (if (and (some? v) (>= (value-bytes v limit) limit))
+                       (if (cond (nil? v) false
+                                 (string? v) (>= (count v) limit)
+                                 (bytes? v) (>= (alength ^bytes v) limit)
+                                 (coll? v) (>= (value-bytes v limit) limit)
+                                 :else scalar-large?)
                          (let [vk (value-key store cache pending-writes gen d)
                                out (or out (aclone ^objects ks))]
                            (aset ^objects out i (dd/datom (.-e d) (.-a d) (ValueRef. vk) (dd/datom-tx d) (dd/datom-added d)))

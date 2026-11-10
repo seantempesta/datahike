@@ -1,0 +1,59 @@
+(ns datahike.test.out-of-line-test
+  "On Jolt, with `:index-config {:value-out-of-line-bytes n}`, a written node holds each value
+  of n bytes or more (`value-bytes`: a string's characters, a byte array's length, a
+  collection's elements and one byte each, any other value 8) as a ref to its own key. The
+  node's other values cost the check alone: no walk."
+  (:require [clojure.test :refer [deftest is testing]]
+            [datahike.api :as d]
+            [datahike.datom :as dd]
+            [datahike.index.interface :as di]
+            [konserve.store] [konserve.jolt.store] [konserve.jolt.lmdb])
+  (:import [org.replikativ.persistent_sorted_set Leaf Settings]))
+
+;; a path prefix of this run's own: parallel runs must not delete-database each other's stores
+(def ^:private run-dir (str (System/getProperty "java.io.tmpdir") "/dh-out-of-line-" (random-uuid)))
+
+(def ^:private out-of-line #'datahike.index.persistent-set/out-of-line)
+(def ^:private value-bytes #'datahike.index.persistent-set/value-bytes)
+
+(defn- leaf [values]
+  (let [ds (map-indexed (fn [i v] (dd/datom (inc i) :v v 536870913)) values)]
+    (Leaf. (count ds) (object-array ds) (Settings. 128 nil 0 :weak))))
+
+(defn- stored-out
+  "The indexes of values the stored node holds out of line, and the calls of value-bytes it took."
+  [store limit values]
+  (let [calls (atom 0)
+        vb @value-bytes
+        node (with-redefs [datahike.index.persistent-set/value-bytes (fn [v l] (swap! calls inc) (vb v l))]
+               (out-of-line store (di/make-node-cache {:store-cache-size 16}) (atom []) limit (leaf values)))
+        ks (.-_keys node)]
+    [(set (keep (fn [i] (when-not (identical? (nth values i) (.-v (aget ks i))) i)) (range (count values))))
+     @calls]))
+
+(defn- vb-of [v limit] (@value-bytes v limit))
+
+(defn- s [n] (apply str (repeat n "x")))
+
+(deftest a-node-holds-out-of-line-exactly-its-values-of-limit-bytes-or-more
+  (let [cfg {:store {:backend :lmdb :path (str run-dir "-bound") :default-serializer :FaslSerializer
+                     :id #uuid "9c000000-0000-0000-0000-0000000001b0"}
+             :keep-history? true :schema-flexibility :read}
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)
+        store (:store @conn)]
+    (try
+      (doseq [limit [1000 8]]
+        (testing (str "at a limit of " limit)
+          (let [values [(s (dec limit)) (s limit) (byte-array (dec limit)) (byte-array limit)
+                        [(s (- limit 2))] [(s (dec limit))] {:k (s (- limit 12))} {:k (s (- limit 11))}
+                        [[(s (- limit 3))]] [[(s (- limit 4))]] 5 :keyword-of-a-long-name 2.5 true]
+                expected (set (keep-indexed (fn [i v] (when (>= (vb-of v limit) limit) i)) values))]
+            (is (= expected (first (stored-out store limit values))) "as value-bytes counts them")
+            (is (seq expected)))))
+      (testing "the values that cannot reach the limit cost no walk"
+        (is (= [#{} 0] (stored-out store 1000 [(s 10) 5 :k 2.5 true (s 999) (byte-array 3)]))))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
