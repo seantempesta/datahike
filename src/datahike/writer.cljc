@@ -390,7 +390,17 @@
 ;; a batch of one (w/commit! with the revision change and the advanced query cache
 ;; context). Callers must be serial: two concurrent callers would both commit on the
 ;; same parent. Channel-returning ops (gc, index backfill) are not supported here.
+(defn- refuse-while-pending!
+  "Refuse a write that does not run ahead while the caller has applied transactions not
+  committed yet (apply!): it would build on the committed value, or on the one shown, and
+  its commit would leave the pending transactions out of the branch."
+  [writer]
+  (when-let [{:keys [reports]} @(:pending writer)]
+    (throw (ex-info "Transactions applied run-ahead are pending: commit-pending! or abandon-pending! them first."
+                    {:type :run-ahead-pending :tx-count (count reports)}))))
+
 (defn- sync-apply! [connection write-fn-map last-cid {:keys [op args]}]
+  (refuse-while-pending! (:writer @(:wrapped-atom connection)))
   (let [old @(:wrapped-atom connection)
         res (apply (write-fn-map op) old args)
         parent-db old
@@ -449,6 +459,7 @@
   [connection arg-maps]
   (let [writer (:writer @(:wrapped-atom connection))
         _ (assert (instance? SyncWriter writer) "transact-batch! needs a :sync writer")
+        _ (refuse-while-pending! writer)
         tx! (get (:write-fn-map writer) 'transact!)
         parent-db @(:wrapped-atom connection)
         [db rs] (reduce (fn [[db rs] am]
@@ -489,6 +500,11 @@
 ;; may also show the applied value on the connection (`{:show? true}`); the shown value has
 ;; no commit id, since no commit holds it yet: it names the commit it was applied on as
 ;; :datahike/uncommitted-parent, and the commit is made from the unmarked value.
+
+(defn shown?
+  "Is db a run-ahead value shown on its connection by apply!, not committed yet?"
+  [db]
+  (contains? (:meta db) :datahike/uncommitted-parent))
 
 (defn apply!
   "Apply arg-map to the connection's run-ahead value (its pending value, else its committed

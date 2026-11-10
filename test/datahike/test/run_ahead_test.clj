@@ -28,7 +28,8 @@
   (set (map first (d/q '[:find ?n :where [_ :name ?n]] db))))
 
 ;; the connection's own value: on a writer that does not stream (:sync), a deref
-;; of the connection reads the branch head from the store (`deref-conn`)
+;; of the connection reads the branch head from the store unless a value is shown
+;; (`deref-conn`)
 (defn- value [conn]
   @(:wrapped-atom conn))
 
@@ -46,7 +47,9 @@
       (let [r (writer/apply! conn {:tx-data [{:name "a"}]} {:show? true})]
         (is (map? r))
         (is (= #{"a"} (names (value conn))) "the connection shows the applied datom")
+        (is (= #{"a"} (names @conn)) "and a deref of it answers it")
         (is (nil? (d/commit-id (value conn))) "a shown value answers no commit id")
+        (is (nil? (d/commit-id @conn)))
         (is (= cid (get-in (value conn) [:meta :datahike/uncommitted-parent])))
         (is (nil? (db/committed-value-identity (value conn))) "nor a committed cache identity")
         (is (= cid (d/commit-id (:db-after r))) "the report's value is transact!'s own, unmarked")
@@ -70,6 +73,8 @@
         (is (some? commit-id))
         (is (not= cid commit-id))
         (is (= {:datahike/commit-id commit-id} (mark (value conn))) "the committed value, with no mark")
+        (is (= commit-id (d/commit-id @conn)))
+        (is (= #{"a" "b" "c"} (names @conn)))
         (is (= commit-id (:datahike.value/commit-id (db/committed-value-identity (value conn)))))
         (is (= #{cid} (:datahike/parents (:meta (value conn)))))
         (is (= #{"a" "b" "c"} (names (stored conn))))
@@ -89,6 +94,8 @@
       (is (identical? committed (value conn)) "the connection holds the committed value again")
       (is (= (d/commit-id committed) (d/commit-id (value conn))))
       (is (= #{"kept"} (names (value conn))))
+      (is (= (d/commit-id committed) (d/commit-id @conn)) "a deref answers the committed value")
+      (is (= #{"kept"} (names @conn)))
       (is (not (writer/pending? conn)))
       (testing "a later apply and commit start from it"
         (writer/apply! conn {:tx-data [{:name "c"}]} {:show? true})
@@ -110,4 +117,22 @@
         (let [{:keys [commit-id]} (writer/commit-pending! conn)]
           (is (= #{"a" "b"} (names (value conn))))
           (is (= {:datahike/commit-id commit-id} (mark (value conn))))))
+      (finally (d/release conn)))))
+
+(deftest a-write-that-does-not-run-ahead-is-refused-while-one-is-pending
+  (let [conn (fresh-conn "refused")]
+    (try
+      (writer/apply! conn {:tx-data [{:name "a"}]} {:show? true})
+      (writer/apply! conn {:tx-data [{:name "b"}]})
+      (let [e (try (d/transact conn [{:name "c"}]) nil
+                   (catch Throwable e e))]
+        (is (= {:type :run-ahead-pending :tx-count 2} (select-keys (ex-data e) [:type :tx-count]))))
+      (let [e (try (writer/transact-batch! conn [{:tx-data [{:name "c"}]}]) nil
+                   (catch Throwable e e))]
+        (is (= :run-ahead-pending (:type (ex-data e)))))
+      (is (= #{"a" "b"} (names @conn)) "the refused writes left the shown value as it was")
+      (writer/commit-pending! conn)
+      (testing "once committed, a write goes through"
+        (d/transact conn [{:name "c"}])
+        (is (= #{"a" "b" "c"} (names @conn) (names (stored conn)))))
       (finally (d/release conn)))))

@@ -80,12 +80,17 @@
        (.write w "#datahike/Connection")
        (.write w (pr-str (ds/connection-id config))))))
 
-(defn deref-conn [^Connection conn]
+(defn deref-conn
+  "The connection's db value. On a writer that does not stream, the branch head read from the
+  store, unless the connection holds a run-ahead value shown by apply! (`w/shown?`): that one is
+  newer than anything the store holds for this writer, and is this connection's own."
+  [^Connection conn]
   (let [wrapped-atom (.-wrapped-atom conn)]
     (when (= @wrapped-atom :released)
       (throw (ex-info "Connection has been released."
                       {:type :connection-has-been-released})))
-    (if (not (w/streaming? (get @wrapped-atom :writer)))
+    (if (and (not (w/streaming? (get @wrapped-atom :writer)))
+             (not (w/shown? @wrapped-atom)))
       (let [store  (:store @wrapped-atom)
             stored (dsi/read-head store (:branch (:config @wrapped-atom)) {:sync? true})]
         (log/trace :datahike/db-deref {:config (:config stored)})
