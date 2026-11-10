@@ -1,0 +1,50 @@
+(ns datahike.test.leaf-address-test
+  "On Jolt a leaf's content address (`:crypto-hash? true`) is the SHA-256 of its datoms'
+  fields as the leaf is stored: with `:index-config {:value-out-of-line-bytes n}` a value of
+  n bytes or more is stored as a ref to its own key, and the address is of that stored leaf,
+  so the merkle audit, which reads the stored leaf back, recomputes it."
+  (:require [clojure.test :refer [deftest is]]
+            [datahike.api :as d]
+            [datahike.audit :as audit]
+            [datahike.datom :as dd]
+            [hasch.core :as hasch]
+            [konserve.core :as k]
+            [konserve.store] [konserve.jolt.store] [konserve.jolt.lmdb])
+  (:import [org.replikativ.persistent_sorted_set Leaf Settings]))
+
+;; a path prefix of this run's own: parallel runs must not delete-database each other's stores
+(def ^:private run-dir (str (System/getProperty "java.io.tmpdir") "/dh-leaf-address-" (random-uuid)))
+
+(deftest a-leaf-holding-a-value-out-of-line-passes-the-deep-audit
+  (let [cfg {:store {:backend :lmdb :path (str run-dir "-out-of-line") :default-serializer :FaslSerializer
+                     :id #uuid "9c000000-0000-0000-0000-00000000a0d1"}
+             :crypto-hash? true :keep-history? true :schema-flexibility :write
+             :index-config {:value-out-of-line-bytes 1000}}
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)
+        V (apply str "payload " (repeat 300 "abcd"))]
+    (try
+      (d/transact conn [{:db/ident :big :db/valueType :db.type/string :db/cardinality :db.cardinality/one}])
+      (d/transact conn [{:big V}])
+      (is (k/exists? (:store @conn) (hasch/uuid V) {:sync? true}) "the value is stored under its own key")
+      (let [report (audit/verify-chain @conn nil {:deep? true})]
+        (is (= :ok (:status report)))
+        (is (= {:status :ok :diffs []} (:deep report))))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
+
+(defn- leaf [datoms] (Leaf. (count datoms) (object-array datoms) (Settings. 128 nil 0 :weak)))
+
+(def ^:private address #'datahike.index.persistent-set/leaf-content-uuid)
+
+(deftest equal-leaves-have-one-address
+  (let [datoms #(vector (dd/datom 1 :name "a" 536870913) (dd/datom 2 :name "b" 536870913 false))
+        hashed (datoms)]
+    (run! hash hashed)
+    (is (= (address (leaf (datoms))) (address (leaf hashed)))
+        "a datom's cached hash is no part of its leaf's address")
+    (is (not= (address (leaf (datoms)))
+              (address (leaf [(dd/datom 1 :name "a" 536870913) (dd/datom 2 :name "b" 536870913 true)])))
+        "whether a datom is added is")))

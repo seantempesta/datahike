@@ -399,12 +399,15 @@
                   (uuid addrs)))))
 
 (defn- leaf-content-uuid
-  "Content-addressed UUID of a Leaf: on Jolt the SHA-256 of its datoms' stored bytes, else hash of its datoms in vector form."
+  "Content-addressed UUID of a Leaf: on Jolt the SHA-256 of the fasl bytes of its datoms' fields, else hash of its datoms in vector form."
   [node]
-  ;; Jolt: each datom's vector built from its fields, the same value (vec (seq d)) is
-  ;; without the list and the seq walk between
-  #?(:jolt (sha256-uuid (fasl-store/serialize (mapv (fn [^Datom d] [(.-e d) (.-a d) (.-v d) (dd/datom-tx d) (dd/datom-added d)])
-                                                    (.keys ^Leaf node))))
+  ;; Jolt: one flat vector of each datom's e, a, v and signed tx (its sign is
+  ;; `added`): a vector per datom cost a fifth more. Not the leaf's own fasl
+  ;; bytes: those carry each Datom's lazily cached hash, so equal leaves could
+  ;; differ.
+  #?(:jolt (sha256-uuid (fasl-store/serialize (persistent! (reduce (fn [fields ^Datom d]
+                                                                     (-> fields (conj! (.-e d)) (conj! (.-a d)) (conj! (.-v d)) (conj! (.-tx d))))
+                                                                   (transient []) (.keys ^Leaf node)))))
      :default (uuid (mapv (comp vec seq) #?(:clj (.keys ^Leaf node) :cljs (.-keys node))))))
 
 (defn- gen-address [#?(:clj ^ANode node :cljs node) crypto-hash?]
@@ -654,7 +657,14 @@
           ;; requires the address to match the content)
           reused (when-not (:crypto-hash? config)
                    (freelist-pop! freelist))
-          address (or reused (gen-address node (:crypto-hash? config)))
+          ;; Jolt: the address is of the node as it is stored, its large values
+          ;; out of line, so the merkle audit, which reads the stored node back,
+          ;; recomputes the same address
+          stored #?(:jolt (if-let [limit (get-in config [:index-config :value-out-of-line-bytes])]
+                            (out-of-line store cache pending-writes limit node)
+                            node)
+                    :default node)
+          address (or reused (gen-address stored (:crypto-hash? config)))
           _ (log/trace :datahike/index-write {:address address :reused (boolean reused) :crypto-hash (:crypto-hash? config)})]
       ;; Evict old cached value when reusing an address
       (when reused
@@ -663,10 +673,7 @@
       ;; holds it in memory (its parent's children), and the cache is for nodes read
       ;; back from the store (restore below). Putting every written node cost a
       ;; cache insert per node per commit and displaced nodes that are read.
-      (swap! pending-writes conj [address #?(:jolt (if-let [limit (get-in config [:index-config :value-out-of-line-bytes])]
-                                                      (out-of-line store cache pending-writes limit node)
-                                                      node)
-                                              :default node)])
+      (swap! pending-writes conj [address stored])
       address))
   (accessed [_ address]
     (@cost-center-fn :accessed)
