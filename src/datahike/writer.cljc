@@ -525,7 +525,9 @@
      (when (map? r)
        (vreset! (:pending writer) {:db (:db-after r) :reports (conj reports r)
                                    :committed committed :shown? (boolean (or shown? show?))})
-       (when show?
+       ;; once shown, a run-ahead stays shown: a later apply without the option moves the
+       ;; connection too, so it never shows an older value than the pending one
+       (when (or shown? show?)
          (let [shown (update (:db-after r) :meta
                              #(-> (dissoc % :datahike/commit-id)
                                   (assoc :datahike/uncommitted-parent

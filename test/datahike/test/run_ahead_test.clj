@@ -53,7 +53,10 @@
         (is (= cid (get-in (value conn) [:meta :datahike/uncommitted-parent])))
         (is (nil? (db/committed-value-identity (value conn))) "nor a committed cache identity")
         (is (= cid (d/commit-id (:db-after r))) "the report's value is transact!'s own, unmarked")
-        (is (= #{} (names (stored conn))) "the store holds nothing of it yet"))
+        (is (= #{} (names (stored conn))) "the store holds nothing of it yet")
+        (writer/apply! conn {:tx-data [{:name "b"}]})
+        (is (= #{"a" "b"} (names @conn)) "once shown, a run-ahead stays shown: a later apply without the option moves the connection too")
+        (is (nil? (d/commit-id @conn))))
       (finally (d/release conn)))))
 
 (deftest shown-applies-commit-once
