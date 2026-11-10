@@ -160,6 +160,12 @@
                                   [schema-meta-key schema-meta])]
     (when-not (sc/cache-has? schema-meta-key)
       (sc/cache-miss schema-meta-key schema-meta))
+    ;; The pending-writes queue's metadata is state of one flush (the collection
+    ;; generation its writes were checked against: persistent-set `generation`). A
+    ;; commit that failed after its flush left its queue undrained; its state must
+    ;; not reach this flush, which runs after any collection since.
+    (when flush!
+      (some-> store :storage :pending-writes (swap! with-meta nil)))
     (let [;; Flush primary indices, capturing the post-flush instances so
           ;; we can both serialize their storage keys and ask each for a
           ;; merkle-root via the IAuditable protocol.

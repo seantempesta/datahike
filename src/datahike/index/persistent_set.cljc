@@ -603,16 +603,28 @@
              vk))))
 
      (defn- generation
-       "A delay of the store's collection generation (di/collection-key): read once per
-       node, when a value of it is first looked up."
-       [store]
-       (delay (k/get store di/collection-key 0 {:sync? true})))
+       "A delay of the store's collection generation (di/collection-key), read when a
+       value first looks it up. For a node read back (in-line): one per node. For the
+       writes queued on pending-writes: one for them all. That one rides the queue as
+       metadata, so it lives one flush: a drain (datahike.writing/get-and-clear-pending-kvs!)
+       leaves a fresh [] without it, and a flush starts with none (datahike.writing/db->stored),
+       so the next commit's flush reads the generation again. One read a written node cost
+       a store read for each node holding a large value (9 of a one-datom commit in Seon)."
+       ([store] (delay (k/get store di/collection-key 0 {:sync? true})))
+       ([store pending-writes]
+        (or (::generation (meta @pending-writes))
+            (::generation
+             (meta (swap! pending-writes
+                          (fn [q]
+                            (if (::generation (meta q))
+                              q
+                              (vary-meta q assoc ::generation (generation store))))))))))
 
      (defn- out-of-line
        "node as it is stored: each key whose value is at least `limit` bytes holding a
        ValueRef to the value's content key (value-key). node itself when none is that large."
        [store cache pending-writes limit node]
-       (let [ks (.-_keys node) n (.-_len node) gen (generation store)
+       (let [ks (.-_keys node) n (.-_len node) gen (generation store pending-writes)
              out (loop [i 0 out nil]
                    (if (< i n)
                      (let [d (aget ks i)
