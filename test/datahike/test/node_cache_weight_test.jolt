@@ -94,7 +94,9 @@
         (d/transact c (mapv (fn [i] {:db/id (- (inc i)) :n i :text (text i) :ref (symbol "seon.demo" (str "v" (mod i 50)))}) part)))
       (d/release c))
     (let [c (d/connect cfg)
-          entry (some (fn [[_ e]] (when (:node-cache e) e)) @connections/*connections*)
+          ;; this connection's own entry: the registry is the process's, and another test's
+          ;; connection left open beside this one has a node cache too
+          entry (some (fn [[_ e]] (when (and (:node-cache e) (identical? c (:conn e))) e)) @connections/*connections*)
           cache (:node-cache entry)]
       (doseq [idx [:eavt :aevt]] (is (pos? (count (d/datoms @c idx)))))
       (doseq [i (range 0 6000 7)] (is (seq (d/datoms @c :eavt (inc i)))))
