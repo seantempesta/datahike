@@ -368,6 +368,13 @@
     (sequential? x) (mapv canon x)
     :else x))
 
+#?(:jolt
+   (defn- sha256-uuid
+     "The first 16 bytes of the SHA-256 of `bs`, as a UUID: a node's content address on Jolt."
+     [^bytes bs]
+     (let [d (java.nio.ByteBuffer/wrap (.digest (java.security.MessageDigest/getInstance "SHA-256") bs))]
+       (java.util.UUID. (.getLong d) (.getLong d)))))
+
 (defn- branch-content-uuid
   "Content-addressed UUID of a Branch. Baseline (no diff-buf slots): hash of the
    child-address vector — UNCHANGED from pre-diff-buf stores. With buffered slots,
@@ -377,22 +384,24 @@
    otherwise be invisible to the merkle audit. Slot data is canonicalized via
    `canon` so live and restored nodes hash identically. Representation-dependent
    by design: the same logical content hashes differently under different
-   :diff-buf-size settings (which are create-time-fixed per store)."
+   :diff-buf-size settings (which are create-time-fixed per store).
+   On Jolt, as a Leaf's: the SHA-256 of one fasl serialization of the same
+   value (each child address its 16 bytes, in order): hasch's walk of 64
+   addresses cost about 10x as much there."
   [node]
   (let [addrs #?(:clj (vec (.addresses ^Branch node))
                  :cljs (vec (.-addresses node)))
         slots #?(:clj (.slotsForStorage ^Branch node)
                  :cljs (branch/slots-for-storage node))]
-    (if (seq slots)
-      (uuid [addrs (canon slots)])
-      (uuid addrs))))
+    #?(:jolt (sha256-uuid (fasl-store/serialize (if (seq slots) [addrs (canon slots)] addrs)))
+       :default (if (seq slots)
+                  (uuid [addrs (canon slots)])
+                  (uuid addrs)))))
 
 (defn- leaf-content-uuid
   "Content-addressed UUID of a Leaf: on Jolt the SHA-256 of its datoms' stored bytes, else hash of its datoms in vector form."
   [node]
-  #?(:jolt (let [d (java.nio.ByteBuffer/wrap (.digest (java.security.MessageDigest/getInstance "SHA-256")
-                                                      (fasl-store/serialize (mapv (comp vec seq) (.keys ^Leaf node)))))]
-             (java.util.UUID. (.getLong d) (.getLong d)))
+  #?(:jolt (sha256-uuid (fasl-store/serialize (mapv (comp vec seq) (.keys ^Leaf node))))
      :default (uuid (mapv (comp vec seq) #?(:clj (.keys ^Leaf node) :cljs (.-keys node))))))
 
 (defn- gen-address [#?(:clj ^ANode node :cljs node) crypto-hash?]
@@ -487,7 +496,8 @@
     ;; round-trip undetected — only the in-memory address would still
     ;; look correct. Returns a result map; never throws on mismatch.
     ;; Cross-platform: the walk/recompute (branch-content-uuid + canon +
-    ;; uuid) is shared, so hashes match cross-host.
+    ;; uuid) is shared, so hashes match cross-host. Jolt hashes nodes by
+    ;; SHA-256 of their fasl bytes instead: its addresses match its own.
     (let [address #?(:clj (.-_address ^PersistentSortedSet pset) :cljs (.-address pset))
           storage #?(:clj (.-_storage ^PersistentSortedSet pset) :cljs (.-storage pset))
           store   (some-> storage :store)]
