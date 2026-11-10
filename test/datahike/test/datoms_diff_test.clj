@@ -224,3 +224,76 @@
         (is (= (case index :eavt 0 1) (count (d/datoms @main {:index index :components cs}))) (str index " on the db after it")))
       (is (thrown-with-msg? Throwable #"not defined in current schema" (d/db-with before [{:k/new 1}]))
           "a write naming it is still refused"))))
+
+;; ---------------------------------------------------------------------------
+;; A temporal or filtered value holds no index of its own: its datoms are merged, not tree-diffed.
+
+(defn- shown
+  "The whole datoms `db` shows for the index and components, in index order, as tuples."
+  [db index components]
+  (mapv (juxt :e :a :v :tx) (d/datoms db {:index index :components components})))
+
+(defn- view-diff-is-exact?
+  "datoms-diff answers each side's datoms the other does not show, in the order the side shows them."
+  [a b index components]
+  (let [ta (shown a index components) tb (shown b index components)
+        sa (set ta) sb (set tb)
+        [only-a only-b] (d/datoms-diff a b index components)]
+    (and (= (filterv (complement sb) ta) (mapv (juxt :e :a :v :tx) only-a))
+         (= (filterv (complement sa) tb) (mapv (juxt :e :a :v :tx) only-b)))))
+
+(defn- history-of-changes
+  "A history-keeping db whose five transactions add, update, retract a value and retract an entity.
+  Returns the connection and the :max-tx after each transaction."
+  []
+  (let [cfg (config) _ (d/create-database cfg) conn (d/connect cfg)
+        tx! (fn [data] (:max-tx (:db-after (d/transact conn data))))
+        t1 (tx! (vec (for [i (range 1 7)] {:db/id (- i) :k/n (long i) :k/tags [(str "t" i) "shared"]})))
+        e (:e (first (d/datoms @conn {:index :aevt :components [:k/n]})))
+        t2 (tx! [[:db/add e :k/n 100]])
+        t3 (tx! [[:db/retract e :k/tags "shared"]])
+        t4 (tx! [[:db/retractEntity (:e (second (d/datoms @conn {:index :aevt :components [:k/n]})))]])
+        t5 (tx! [{:k/n 7 :k/tags ["late"]}])]
+    {:conn conn :txs [t1 t2 t3 t4 t5] :e e}))
+
+(deftest the-diff-of-a-temporal-value-is-the-difference-of-the-datoms-it-shows
+  (let [{:keys [conn txs e]} (history-of-changes) db @conn [t1 t2 t3 t4 _] txs
+        a (d/as-of db t2)]
+    (testing "as-of against the current value: nothing thrown, the exact difference"
+      (let [[only-a only-b] (d/datoms-diff a db :eavt [])]
+        (is (seq only-a) "the update and the retractions took datoms away")
+        (is (seq only-b) "the later transactions added datoms")
+        (is (view-diff-is-exact? a db :eavt []))
+        (is (view-diff-is-exact? db a :eavt []))
+        (is (= (set (shown db :eavt [])) (set (shown (d/as-of db (:max-tx db)) :eavt [])))
+            "the sets agree when the view is the whole present")
+        (is (= [[] []] (d/datoms-diff db (d/as-of db (:max-tx db)) :eavt [])) "an as-of the present differs in nothing")))
+    (testing "with components: one entity, one attribute on :aevt"
+      (is (view-diff-is-exact? a db :eavt [e]))
+      (is (view-diff-is-exact? db a :eavt [e]))
+      (is (view-diff-is-exact? a db :aevt [:k/n]))
+      (is (view-diff-is-exact? a db :aevt [:k/tags]))
+      (is (seq (first (d/datoms-diff (d/as-of db t1) (d/as-of db t2) :eavt [e])))
+          "the updated value is only in the earlier value"))
+    (testing "as-of against as-of, two times"
+      (doseq [[x y] [[t1 t2] [t2 t3] [t1 t4] [t4 t1]] index [:eavt :aevt :avet]]
+        (is (view-diff-is-exact? (d/as-of db x) (d/as-of db y) index []))))
+    (testing "since and history values"
+      (doseq [index [:eavt :aevt]]
+        (is (view-diff-is-exact? (d/since db t2) db index []))
+        (is (view-diff-is-exact? (d/since db t2) (d/since db t3) index []))
+        (is (view-diff-is-exact? (d/history db) db index []))
+        (is (view-diff-is-exact? (d/history db) (d/as-of db t2) index []))
+        (is (view-diff-is-exact? (d/history db) (d/since db t3) index [:k/tags]))))
+    (testing "a filtered value"
+      (let [f (d/filter db (fn [_ datom] (not= (:a datom) :k/tags)))]
+        (is (view-diff-is-exact? f db :aevt [:k/tags]))
+        (is (view-diff-is-exact? f db :eavt []))))
+    (d/release conn)))
+
+(deftest a-diff-of-a-temporal-value-records-its-range-as-a-read
+  (let [{:keys [conn txs]} (history-of-changes) db @conn
+        [_ reads] (d/with-reads #(d/datoms-diff (d/as-of db (second txs)) db :aevt [:k/tags]))
+        idx (d/reads-index reads)]
+    (is (contains? idx [:a :k/tags]) "the diffed attribute is a read")
+    (d/release conn)))
