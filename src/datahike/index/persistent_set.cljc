@@ -336,23 +336,31 @@
                       bs (if (== lb level) [[(.-_address b) rb]] [])]
                  (let [[as bs] (unshared as bs)]
                    (if (zero? level)
-                     ;; a datom both sides' unshared leaves hold is in both sets
-                     (let [leaf-datoms (fn [leaves]
-                                         (into [] (cond-> (mapcat (fn [[_ ^Leaf leaf]] (.keys leaf))) (not whole?) (comp (filter within?)))
-                                               leaves))
-                           xs (leaf-datoms as) ys (leaf-datoms bs)
-                           nx (count xs) ny (count ys)]
-                       ;; the comparator called as the function it is, on vectors: on Jolt `.compare` and
-                       ;; ArrayList's `.get` are each a dispatched method call
-                       (loop [i 0 j 0 oa (transient []) ob (transient [])]
-                         (cond (and (< i nx) (< j ny))
-                               (let [x (nth xs i) y (nth ys j) c (long (cmp x y))]
-                                 (cond (zero? c) (recur (inc i) (inc j) oa ob)
-                                       (neg? c) (recur (inc i) j (conj! oa x) ob)
-                                       :else (recur i (inc j) oa (conj! ob y))))
-                               (< i nx) (recur (inc i) j (conj! oa (nth xs i)) ob)
-                               (< j ny) (recur i (inc j) oa (conj! ob (nth ys j)))
-                               :else [(persistent! oa) (persistent! ob)])))
+                     ;; a datom both sides' unshared leaves hold is in both sets. One merge read in
+                     ;; place from the leaves' own key arrays: `.keys` copies a leaf into a new vector,
+                     ;; and that copy was most of a diff's allocation. The comparator is called as the
+                     ;; function it is (on Jolt `.compare` is a dispatched method call)
+                     (let [xks (mapv (fn [[_ ^Leaf leaf]] (.-_keys leaf)) as) xns (mapv (fn [[_ ^Leaf leaf]] (.len leaf)) as)
+                           yks (mapv (fn [[_ ^Leaf leaf]] (.-_keys leaf)) bs) yns (mapv (fn [[_ ^Leaf leaf]] (.len leaf)) bs)
+                           lx (count xks) ly (count yks)]
+                       (loop [xl 0 xk 0 yl 0 yk 0 oa (transient []) ob (transient [])]
+                         (cond
+                           (and (< xl lx) (>= xk (long (nth xns xl)))) (recur (inc xl) 0 yl yk oa ob)
+                           (and (< yl ly) (>= yk (long (nth yns yl)))) (recur xl xk (inc yl) 0 oa ob)
+                           :else
+                           (let [x (when (< xl lx) (aget ^objects (nth xks xl) xk))
+                                 y (when (< yl ly) (aget ^objects (nth yks yl) yk))]
+                             (cond
+                               (and (some? x) (not (within? x))) (recur xl (inc xk) yl yk oa ob)
+                               (and (some? y) (not (within? y))) (recur xl xk yl (inc yk) oa ob)
+                               (and (some? x) (some? y))
+                               (let [c (long (cmp x y))]
+                                 (cond (zero? c) (recur xl (inc xk) yl (inc yk) oa ob)
+                                       (neg? c) (recur xl (inc xk) yl yk (conj! oa x) ob)
+                                       :else (recur xl xk yl (inc yk) oa (conj! ob y))))
+                               (some? x) (recur xl (inc xk) yl yk (conj! oa x) ob)
+                               (some? y) (recur xl xk yl (inc yk) oa (conj! ob y))
+                               :else [(persistent! oa) (persistent! ob)])))))
                      (let [[ea eb] (unshared (children (.-_storage a) as) (children (.-_storage b) bs))
                            below (dec level)]
                        (recur below
