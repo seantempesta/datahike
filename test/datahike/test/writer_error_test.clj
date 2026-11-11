@@ -524,3 +524,25 @@
         (finally
           (d/release conn)
           (d/delete-database cfg))))))
+
+(deftest a-writers-thread-waits-for-its-connection-without-running
+  ;; The processing loop starts once its connection holds the writer. It waited
+  ;; for that in a loop over (timeout 0), which never parks: on a connection
+  ;; whose writer was never set it ran one core for good. Here no writer is set,
+  ;; and no fiber's tick count moves; then the writer is set and the loop goes
+  ;; on to its queue, which is closed, and ends.
+  (let [state (atom {})
+        [transaction-queue commit-queue _ processing]
+        (writer/create-thread {:wrapped-atom state} {} 8 8 0)
+        dump (requiring-resolve 'jolt.host/fiber-dump)
+        ticks (fn [] (into {} (map (fn [[_ fiber n]] [fiber (parse-long n)]))
+                           (re-seq #"fiber (\d+): [^\n]*?(\d+) ticks" (dump))))]
+    (when dump
+      (let [before (do (Thread/sleep 50) (ticks))
+            after  (do (Thread/sleep 50) (ticks))
+            ran    (into {} (filter (fn [[fiber n]] (< 100000 (- n (get before fiber n))))) after)]
+        (is (empty? ran) (str "fibers that ran while every one of them waits: " ran))))
+    (swap! state assoc :writer :set)
+    (async/close! transaction-queue)
+    (async/close! commit-queue)
+    (is (not= ::timeout (take-with-timeout processing)))))

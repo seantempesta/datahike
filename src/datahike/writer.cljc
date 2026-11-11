@@ -158,9 +158,17 @@
         processing-thread
         (go-try S
                 (try
-                  ;; delay processing until the writer we are part of in connection is set
-                  (while (not (:writer @(:wrapped-atom connection)))
-                    (<! (timeout 0))) ; proto: was 10 ms, which every first transact after a connect waited out
+                  ;; delay processing until the writer we are part of in connection is set:
+                  ;; a watch on the connection delivers it, nothing polls. (A loop over
+                  ;; (timeout 0) never parked: on a connection whose writer was never
+                  ;; set it ran one core forever.) The watch first, then the value, so a
+                  ;; writer set between the two is seen by one of them.
+                  (let [state    (:wrapped-atom connection)
+                        attached (promise-chan)]
+                    (add-watch state attached (fn [_ _ _ db] (when (:writer db) (put! attached true))))
+                    (when (:writer @state) (put! attached true))
+                    (<! attached)
+                    (remove-watch state attached))
                   (loop [old @(:wrapped-atom connection)]
                     (if-let [{:keys [op args callback applied] :as invocation} (<?- transaction-queue)]
                     (do
