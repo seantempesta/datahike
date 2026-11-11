@@ -218,6 +218,62 @@
             (is (= (plain x y attribute) (answered x y attribute))))))
       (d/release conn))))
 
+;; ---------------------------------------------------------------------------
+;; What a diff costs: the work follows the children of the branches that differ.
+
+(defn- node-widths
+  "Address -> entry count (children or datoms) of every node of the stored set `s`, its root
+  under the set's own address."
+  [s]
+  (let [storage (.-_storage s)]
+    (loop [level [[(.-_address s) (.root s)]] acc {}]
+      (let [acc (into acc (map (fn [[address node]] [address (.len node)])) level)]
+        (if (or (empty? level) (zero? (.level (second (first level)))))
+          acc
+          (recur (vec (for [[_ node] level i (range (.len node))]
+                        [(.address node (int i)) (.child node storage (int i))]))
+                 acc))))))
+
+(defn- entries-compared
+  "The entries of the nodes one side holds and the other does not: the children and datoms
+  an address-skipping diff of the two sets has to compare."
+  [a b]
+  (let [wa (node-widths a) wb (node-widths b)
+        only (fn [x y] (reduce + 0 (keep (fn [[address n]] (when-not (contains? y address) n)) x)))]
+    (+ (only wa wb) (only wb wa))))
+
+(defn- ticks
+  "The engine ticks `f` runs on Jolt: the work it does, never the time it takes."
+  [f]
+  (let [n (volatile! 0)]
+    (jolt.host/ticks-of (fn [] (let [t0 (jolt.host/ticks)] (f) (vreset! n (- (jolt.host/ticks) t0)))))
+    @n))
+
+(deftest a-diff-costs-the-same-per-entry-it-compares-at-any-size
+  ;; 20, 200 and 2,000 datoms replaced on entities spread over a stored tree of 40,000:
+  ;; the work per entry of the nodes that differ stays flat. Which addresses both sides
+  ;; hold was decided by java.util.HashSet.retainAll, which Jolt answers by scanning its
+  ;; argument for each element: quadratic in the children compared (581, 1,890 and 2,066
+  ;; ticks an entry; 271, 251 and 206 with Clojure sets).
+  (let [cfg (shaped-config (file-store) 32 0)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)
+        n 20000
+        rnd (java.util.Random. 7)]
+    (doseq [part (partition-all 2000 (range n))]
+      (d/transact conn (vec (for [i part] {:k/n (long i) :k/tags [(str "t" i)]}))))
+    (let [es (mapv :e (d/datoms @conn {:index :aevt :components [:k/n]}))
+          per-entry (vec (for [changes [10 100 1000]]
+                           (let [a @conn
+                                 b (:db-after (d/transact conn (vec (for [_ (range changes)]
+                                                                      [:db/add (nth es (.nextInt rnd (int n))) :k/n (.nextLong rnd)]))))
+                                 f #(d/datoms-diff a b :eavt [])]
+                             (f)
+                             (/ (double (ticks f)) (entries-compared (:eavt a) (:eavt b))))))]
+      (is (< (peek per-entry) (* 2 (first per-entry))) (str "ticks per entry compared at 20, 200, 2,000 datoms: " per-entry))
+      (is (< (second per-entry) (* 2 (first per-entry))) (str "ticks per entry compared at 20, 200, 2,000 datoms: " per-entry)))
+    (d/release conn)))
+
 (deftest a-diff-records-the-range-it-read
   ;; A read built on a diff answers from both values over the diffed range, so with-reads
   ;; records that range, as it does a slice's: a datom added in it touches the read, a datom

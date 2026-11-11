@@ -314,11 +314,12 @@
                                                  :let [_ (run! take! (slot-datoms branch i))]]
                                              [(.address branch (int i)) branch i storage]))))
                             level))
-           ;; the entries at an address the other side does not hold; an unstored node (nil address) is never shared
+           ;; the entries at an address the other side does not hold; an unstored node (nil address) is never shared.
+           ;; One hashed lookup an entry, so the test is linear in the entries (Jolt's HashSet.retainAll scans
+           ;; its argument for each element: quadratic, 18.9M of 22.2M ticks at 203 scattered datoms)
            unshared (fn [as bs]
-                      (let [shared (java.util.HashSet. ^java.util.Collection (keep first as))]
-                        (.retainAll shared (java.util.HashSet. ^java.util.Collection (keep first bs)))
-                        [(into [] (remove #(.contains shared (first %))) as) (into [] (remove #(.contains shared (first %))) bs)]))
+                      (let [in-a (into #{} (keep first) as) in-b (into #{} (keep first) bs)]
+                        [(into [] (remove #(contains? in-b (first %))) as) (into [] (remove #(contains? in-a (first %))) bs)]))
            open (fn [entries] (mapv (fn [[address ^Branch branch i ^IStorage storage]] [address (.child branch storage (int i))]) entries))
            ra (.root a) rb (.root b)
            la (.level ^ANode ra) lb (.level ^ANode rb)]
