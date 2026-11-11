@@ -12,9 +12,9 @@
 
 (def ^:private run-dir (str (System/getProperty "java.io.tmpdir") "/dh-commit-at-tx-" (random-uuid)))
 
-(defn- with-conn [label f & {:keys [writer backend] :or {writer {:backend :sync} backend :memory}}]
+(defn- with-conn [label f & {:keys [writer backend history?] :or {writer {:backend :sync} backend :memory history? true}}]
   (let [c {:store (cond-> {:backend backend :id (random-uuid)} (= :file backend) (assoc :path (str run-dir "-" label)))
-           :keep-history? false :schema-flexibility :read :writer writer}]
+           :keep-history? history? :schema-flexibility :read :writer writer}]
     (d/delete-database c)
     (d/create-database c)
     (let [conn (d/connect c)]
@@ -26,10 +26,13 @@
 (defn- refusal [f] (try (f) nil (catch Exception e (select-keys (ex-data e) [:type :branch :tx]))))
 
 (defn- reads
-  "[answer n], n the commit records f read from the store."
+  "[answer n], n the reads of commit keys f made of the store (gets and exists?)."
   [f]
-  (let [n (atom 0) get k/get]
-    [(with-redefs [k/get (fn [& args] (when (uuid? (second args)) (swap! n inc)) (apply get args))] (f)) @n]))
+  (let [n (atom 0) get k/get exists? k/exists?]
+    [(with-redefs [k/get (fn [& args] (when (uuid? (second args)) (swap! n inc)) (apply get args))
+                   k/exists? (fn [& args] (when (uuid? (second args)) (swap! n inc)) (apply exists? args))]
+       (f))
+     @n]))
 
 (deftest a-commit-holds-the-transactions-after-its-base
   (with-conn "range"
@@ -141,10 +144,66 @@
           (Thread/sleep 5)
           (tx! conn 2)
           (tx! conn 3)
+          (is (= old-tx (:t (v/commit-at-tx @conn old-tx))) "known before the collection")
           @(d/gc-storage conn cutoff)
-          (v/forget-commit-points!)
-          (is (= {:type :commit-expired :branch :db :tx old-tx} (refusal #(v/commit-at-tx @conn old-tx)))))))
+          (is (= {:type :commit-expired :branch :db :tx old-tx} (refusal #(v/commit-at-tx @conn old-tx)))
+              "a commit this process collected, though its walk is in memory"))))
     :writer {:backend :self} :backend :file))
+
+(deftest a-point-another-process-removed-is-expired
+  (with-conn "removed"
+    (fn [conn]
+      (let [[c1 t1] (tx! conn 1)
+            _ (tx! conn 2)
+            db @conn]
+        (is (= {:branch :db :commit c1 :t t1} (v/commit-at-tx db t1)))
+        ;; what another process's collection leaves: the key gone behind this process's memory
+        (k/dissoc (:store db) c1 {:sync? true})
+        (is (= {:type :commit-expired :branch :db :tx t1} (refusal #(v/commit-at-tx db t1))))
+        (is (= {:type :commit-expired :branch :db :tx t1} (refusal #(v/commit-at-tx db t1))) "and again")))))
+
+(deftest a-walk-that-meets-a-removed-commit-is-expired
+  (with-conn "gap"
+    (fn [conn]
+      (let [[_ t1] (tx! conn 1)
+            [c2] (tx! conn 2)
+            _ (tx! conn 3)
+            db @conn]
+        (k/dissoc (:store db) c2 {:sync? true})
+        (v/forget-commit-points!)
+        (is (= {:type :commit-expired :branch :db :tx t1} (refusal #(v/commit-at-tx db t1)))
+            "a parent record gone on the way is expired, never the start of the lineage")))))
+
+(deftest a-merges-base-is-the-head-its-db-was-built-on
+  (with-conn "merge-base"
+    (fn [conn]
+      (let [[c1 t1] (tx! conn 1)
+            [h th] (tx! conn 2)]
+        (testing "a branch standing at a newer commit that merges an older one: its base is the newer"
+          (d/branch! conn :db :p)
+          (let [p (d/connect (assoc (:config @conn) :branch :p))]
+            (try
+              (v/merge! p #{c1} [{:name "p"}])
+              (is (= #{c1 h} (d/parent-commit-ids @p)))
+              (is (= [(inc th) (:max-tx @p)] (v/commit-tx-range p (d/commit-id @p))))
+              (is (= {:branch :p :commit h :t th} (v/commit-at-tx @p th)))
+              (finally (d/release p)))))
+        (testing "a re-made branch that merges a commit of the branch it was before: its base is the commit it was made from"
+          (d/branch! conn :db :b)
+          (let [b (d/connect (assoc (:config @conn) :branch :b))
+                [x1 tx1] (tx! b "x1")
+                [x2 tx2] (tx! b "x2")]
+            (d/release b)
+            (let [[m3 t3] (tx! conn 3)]
+              (d/delete-branch! conn :b)
+              (d/branch! conn :db :b)
+              (let [b (d/connect (assoc (:config @conn) :branch :b))]
+                (try
+                  (v/merge! b #{x2} [{:name "back"}])
+                  (is (= #{m3 x2} (d/parent-commit-ids @b)))
+                  (is (= [(inc t3) (:max-tx @b)] (v/commit-tx-range b (d/commit-id @b))))
+                  (is (= {:branch :b :commit h :t th} (v/commit-at-tx @b tx2)) "x2 is not on b's lineage")
+                  (finally (d/release b)))))))))))
 
 (deftest a-lookup-reads-only-the-commits-it-has-not-met
   (with-conn "reads"
@@ -153,12 +212,26 @@
             [c150 t150] (nth points 150)]
         (v/forget-commit-points!)
         (let [db @conn]
-          (is (= [{:branch :db :commit c150 :t t150} 50] (reads #(v/commit-at-tx db t150)))
-              "a first lookup reads the commits from the head back to the answer, not the branch")
-          (is (= [{:branch :db :commit c150 :t t150} 0] (reads #(v/commit-at-tx db t150))) "again: none")
-          (is (= 0 (second (reads #(v/commit-at-tx db (second (nth points 170))))))
-              "nor at any commit already met"))
+          (is (= [{:branch :db :commit c150 :t t150} 51] (reads #(v/commit-at-tx db t150)))
+              "a first lookup reads the commits from the head back to the answer, not the branch, and asks the answer exists")
+          (is (= [{:branch :db :commit c150 :t t150} 1] (reads #(v/commit-at-tx db t150))) "again: only that it exists")
+          (is (= 1 (second (reads #(v/commit-at-tx db (second (nth points 170))))))
+              "and at any commit already met"))
         (dotimes [n 5] (tx! conn (str "new" n)))
         (let [db @conn]
-          (is (= [{:branch :db :commit c150 :t t150} 5] (reads #(v/commit-at-tx db t150)))
-              "after five commits, the five"))))))
+          (is (= [{:branch :db :commit c150 :t t150} 6] (reads #(v/commit-at-tx db t150)))
+              "after five commits, the five and the answer's"))))))
+
+(deftest without-history-a-merges-base-is-ambiguous
+  ;; a db keeps no transaction entity without history, so a merge's db cannot say which parent it was built on
+  (with-conn "no-history"
+    (fn [conn]
+      (let [[c1 t1] (tx! conn 1)]
+        (d/branch! conn :db :b)
+        (let [b (d/connect (assoc (:config @conn) :branch :b))]
+          (try
+            (tx! b "b1")
+            (v/merge! conn #{:b} [{:name "m"}])
+            (is (= :commit-base-ambiguous (:type (refusal #(v/commit-at-tx @conn t1)))))
+            (finally (d/release b))))))
+    :history? false))

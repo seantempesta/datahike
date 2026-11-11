@@ -22,6 +22,7 @@
             #?(:clj  [superv.async :refer [go-try- <?- <? S go-loop-try]]
                :cljs [superv.async :refer [S] :refer-macros [go-try- <?- <? go-loop-try]])
             [datahike.db.utils :refer [db?]]
+            [datahike.db.interface :as dbi]
             [datahike.tools :as dt]
             [replikativ.logging :as log]
             [clojure.core.async :as async]
@@ -660,36 +661,47 @@
 (defn- tx-refusal [message type branch tx extra]
   (log/raise message (merge {:type type :branch branch :tx tx} extra)))
 
+(defn- holds-tx?
+  "Whether `db` holds transaction `t`: its transaction entity has a
+   :db/txInstant in db. Ids are issued once across a store's branches and a
+   transaction entity is written only by its own transaction, so a db holds
+   exactly the transactions of its own lineage."
+  [db t]
+  (let [a (if (:attribute-refs? (dbi/-config db)) (dbi/-ref-for db :db/txInstant) :db/txInstant)]
+    (some? (first (dbi/-datoms db :eavt [t a] (dbi/-search-context db))))))
+
 (defn- point-base
-  "The base of the commit `cid` (entry `e`): the parent it was written over,
+  "The base of the commit `cid` (entry `e`): the parent its db was built on,
    whose transactions its db holds, so it adds those with ids after the base's
-   max-tx up to its own. Of its parents, those whose max-tx is below its own
-   (else, for a commit that added no transaction, equal to it): the one; of
-   several (a merge), the one written on the commit's own branch, the head it
-   merged into; when none is (a branch whose first commit is a merge), the one
-   the others descend from. Nil when no parent qualifies (a root; a forced head
-   older than its parent): its lineage ends there. Refuses
-   :commit-base-ambiguous when that leaves several, and :commit-expired when a
-   parent of a merge is gone."
+   max-tx up to its own. One parent: that parent (`commit!` builds a commit on
+   its branch's head), when its max-tx is not above the commit's; else, and
+   with no parent (a root), none: the lineage ends there. Several (a merge):
+   of the parents whose last transaction the merge's db holds (`holds-tx?`:
+   the base, and any parent the base descends from), the one with the greatest
+   max-tx, the base; a merged branch's own transactions are not in the merge's
+   db, whose content took new ids. Decided from the merge's db, read once
+   (its record and one seek per parent) and kept with its entry. Refuses
+   :commit-base-ambiguous when the merge's db holds no parent's last
+   transaction, :commit-expired when a parent is gone."
   [store sid branch tx cid e]
   (let [ps (:parents e)
         entry (fn [p] (or (point-entry store sid p)
-                          (tx-refusal "A commit on the branch's lineage was collected." :commit-expired branch tx {:commit p})))
-        older (filter #(< (:t (entry %)) (:t e)) ps)
-        candidates (if (seq older) older (filter #(= (:t (entry %)) (:t e)) ps))]
-    (if (< (count candidates) 2)
-      (first candidates)
-      (let [own (filter #(= (:branch e) (:branch (entry %))) candidates)
-            ;; no parent written on the merge's branch (the branch's first commit is a merge, its
-            ;; head the commit it was made from): of a parent and its descendant, the parent
-            ;; is the head, as merging an ancestor into its descendant changes nothing
-            node (graph-reader store)
-            oldest (filter (fn [x] (every? #(or (= x %) (reaches? node x %)) candidates)) candidates)]
-        (cond
-          (= 1 (count own)) (first own)
-          (and (empty? own) (= 1 (count oldest))) (first oldest)
-          :else (tx-refusal "A merge commit's base is not derivable: several parents could be the head it merged into."
-                            :commit-base-ambiguous branch tx {:commit cid :parents (set candidates)}))))))
+                          (tx-refusal "A commit on the branch's lineage was collected." :commit-expired branch tx {:commit p})))]
+    (cond
+      (contains? e :base) (:base e)
+      (empty? ps) nil
+      (= 1 (count ps)) (let [p (first ps)] (when (<= (:t (entry p)) (:t e)) p))
+      :else
+      (let [record (or (k/get store cid nil {:sync? true})
+                       (tx-refusal "A commit on the branch's lineage was collected." :commit-expired branch tx {:commit cid}))
+            db (stored->db record store)
+            held (filter #(holds-tx? db (:t (entry %))) ps)]
+        (when (empty? held)
+          (tx-refusal "A merge commit's db holds the last transaction of none of its parents, so its base is not derivable."
+                      :commit-base-ambiguous branch tx {:commit cid :parents ps}))
+        (let [base (apply max-key (comp :t entry) held)]
+          (swap! commit-points assoc-in [sid cid :base] base)
+          base)))))
 
 (defn- walk-to-tx
   "From commit `tip` of `branch` back through bases to the commit whose max-tx
@@ -741,8 +753,10 @@
    {max-tx parents branch} in memory (`forget-commit-points!`), so a first
    lookup reads the commits from the tip back to the answer, a later one only
    the commits it has not met (k new commits: k reads), and one that meets
-   only known commits reads nothing. An answer from memory is not checked
-   against a collection since.
+   only known commits none; then one `k/exists?` of the answer's commit, so a
+   commit a collection removed since, in any process, is :commit-expired: a
+   repeat lookup costs that one read. A merge's base is decided once from its
+   db (`point-base`).
 
    Refuses, each naming :branch and :tx: `:tx-after-head` (tx not committed on
    the branch yet), `:tx-before-first-commit` (tx before the first commit of
@@ -751,9 +765,20 @@
   ([db tx] (let [[store sid branch tip] (tip-of db)] (commit-at-tx* store sid branch tip tx)))
   ([conn-or-db branch tx] (let [[store sid branch tip] (tip-of conn-or-db branch)] (commit-at-tx* store sid branch tip tx))))
 
+(defn- answer-point
+  "The point of commit `c` on `branch`, {:branch :commit :t}, once the store is
+   seen to hold `c` still (one `k/exists?`, which reads no value): memory keeps
+   the walk, never the answer's existence, as a collection in any process may
+   have removed it since. Else `c`'s entry is dropped and :commit-expired."
+  [store sid branch tx c t]
+  (if (k/exists? store c {:sync? true})
+    {:branch branch :commit c :t t}
+    (do (swap! commit-points update sid dissoc c)
+        (tx-refusal "The commit at this transaction was collected." :commit-expired branch tx {:commit c}))))
+
 (defn- commit-at-tx* [store sid branch tip tx]
   (let [[c e] (walk-to-tx store sid branch tip tx)]
-    {:branch branch :commit c :t (:t e)}))
+    (answer-point store sid branch tx c (:t e))))
 
 (defn commit-holding-tx
   "The point of the commit of the branch's lineage that holds transaction
@@ -766,8 +791,8 @@
 (defn- commit-holding-tx* [store sid branch tip tx]
   (let [[c e child] (walk-to-tx store sid branch tip tx)]
     (if (or (= tx (:t e)) (nil? child))
-      {:branch branch :commit c :t (:t e)}
-      {:branch branch :commit child :t (:t (point-entry store sid child))})))
+      (answer-point store sid branch tx c (:t e))
+      (answer-point store sid branch tx child (:t (point-entry store sid child))))))
 
 (defn commit-tx-range
   "[first last], the ids of the transactions commit `cid` added, derived from
