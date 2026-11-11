@@ -373,22 +373,45 @@
      is compared whole (e, a, v and tx). A pure function of the two values. For two plain
      values the stored subtrees both share are skipped, so the work follows what differs
      between them, on any two branches or commits of one store. For a view (as-of, since,
-     history, filtered) each side's `datoms` is merged in one pass, so the work follows
-     the range, not the difference. An attribute in `components` that only db-b's schema
+     filtered) each side's `datoms` is merged in one pass, so the work follows the range,
+     not the difference; two whole histories of plain values (`history`) are diffed as
+     plain values are, by their indexes. An attribute in `components` that only db-b's schema
      declares (a branch whose schema grew since the other) is resolved by db-b: db-a
      holds none of its datoms."
      [db-a db-b index-type components]
-     (if (and (identical? (dbi/-search-context db-a) dbi/base-context)
-              (identical? (dbi/-search-context db-b) dbi/base-context))
-       (let [a (if (= :eavt index-type) (second components) (first components))
-             declares? (fn [db] (contains? (:db/ident (dbi/-rschema db)) a))
-             db (if (and (some? a) (not (declares? db-a)) (declares? db-b)) db-b db-a)]
-         (psi/diff (get db-a index-type) (get db-b index-type) index-type
-                   (dbu/components->pattern db index-type components e0 tx0)
-                   (dbu/components->pattern db index-type components emax txmax)))
-       ;; each `datoms` reads its range through the index, which records it as a read
-       (merge-diff (dbi/datoms db-a index-type components) (dbi/datoms db-b index-type components)
-                   (dd/index-type->cmp-quick index-type)))))
+     (let [plain? (fn [db] (identical? (dbi/-search-context db) dbi/base-context))
+           ;; the whole history of a plain value: what it holds now and what it held
+           ;; (the context is asked first: a filtered view answers no lookup of its fields)
+           history-of (fn [db] (let [c (dbi/-search-context db)]
+                                 (when (and (dbi/context-historical? c) (nil? (dbi/context-time-pred c)) (nil? (dbi/context-xform c)))
+                                   (let [o (:origin-db db)] (when (and o (plain? o)) o)))))
+           bounds (fn [db-a db-b]
+                    (let [a (if (= :eavt index-type) (second components) (first components))
+                          declares? (fn [db] (contains? (:db/ident (dbi/-rschema db)) a))
+                          db (if (and (some? a) (not (declares? db-a)) (declares? db-b)) db-b db-a)]
+                      [(dbu/components->pattern db index-type components e0 tx0)
+                       (dbu/components->pattern db index-type components emax txmax)]))]
+       (cond
+         (and (plain? db-a) (plain? db-b))
+         (let [[from to] (bounds db-a db-b)]
+           (psi/diff (get db-a index-type) (get db-b index-type) index-type from to))
+         ;; two histories of plain values: a history is the value's index and its temporal
+         ;; index together, so its difference is each pair's difference, less the datoms one
+         ;; side holds in one index and the other in the other (a datom retracted between
+         ;; the two moves from the index to the temporal index: both histories hold it).
+         ;; The work follows what differs, as for plain values, never the history's size.
+         (and (history-of db-a) (history-of db-b))
+         (let [oa (history-of db-a) ob (history-of db-b)
+               [from to] (bounds oa ob)
+               temporal (keyword (str "temporal-" (name index-type)))
+               cmp (dd/index-type->cmp-quick index-type)
+               [a-now b-now] (psi/diff (get oa index-type) (get ob index-type) index-type from to)
+               [a-was b-was] (psi/diff (get oa temporal) (get ob temporal) index-type from to)]
+           (merge-diff (sort cmp (concat a-now a-was)) (sort cmp (concat b-now b-was)) cmp))
+         :else
+         ;; each `datoms` reads its range through the index, which records it as a read
+         (merge-diff (dbi/datoms db-a index-type components) (dbi/datoms db-b index-type components)
+                     (dd/index-type->cmp-quick index-type))))))
 
 (defn contextual-seek-datoms [db index-type cs context]
   (-> (case (dbi/context-temporal? context)
