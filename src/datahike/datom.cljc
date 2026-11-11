@@ -395,6 +395,14 @@
           (throw e)
           (class-order v1 v2))))))
 
+(defn value=
+  "True when two values are one value to the index: `=`, or ordered equal by
+   compare-value. Byte arrays (and tuples holding them) of one content are one
+   value, though `=` on two arrays is false. nil is equal only to nil."
+  [v1 v2]
+  (or (= v1 v2)
+      (and (some? v1) (some? v2) (zero? (compare-value v1 v2)))))
+
 (defn- safe-compare [a b]
   ;; jolt: a pair of one scalar kind cannot throw, so it enters no try (the handler cost
   ;; ~176 B a comparison, every comparison of a slice's comparator through cmp-nil)

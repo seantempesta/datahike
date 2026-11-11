@@ -690,8 +690,9 @@
                                                 (.-v primary-datom)])))
          changed? (if (datom-added datom)
                     (if upsert?
-                      (not= (some-> ^Datom current-datom .-v)
-                            (.-v primary-datom))
+                      ;; by content, as the index compares: equal bytes are no change
+                      (not (dd/value= (some-> ^Datom current-datom .-v)
+                                      (.-v primary-datom)))
                       (nil? current-datom))
                     (some? current-datom))
          ;; `:db.ensure/attrs` below validates what the transaction ATTEMPTED,
@@ -907,7 +908,7 @@
     ;; entity (a rename is a new entity), and a hash collision is refused, never merged
     (when (dbu/content-id? db a-ident)
       (when-let [^Datom old (first (dbi/search db [e a]))]
-        (when (not= (.-v old) v)
+        (when-not (dd/value= (.-v old) v)
           (log/raise "Entity " e " holds " a-ident " " (pr-str (.-v old)) "; it cannot also hold " (pr-str v)
                      {:error :entity-id/collision :entity-id e :attribute a-ident :held (.-v old) :asserted v}))))
     (transact-report report new-datom upsert?)))
@@ -993,7 +994,7 @@
           (let [value   (if (every? nil? value) nil value)
                 current (:v (first (dbi/datoms db :eavt [eid tuple])))]
             (cond
-              (= value current) entities
+              (dd/value= value current) entities
                 ;; adds ::internal to meta-data to mean that these datoms were generated internally.
               (nil? value)      (conj entities ^::internal [:db/retract eid tuple current])
               :else             (conj entities ^::internal [:db/add eid tuple value]))))
@@ -1107,12 +1108,12 @@
       (let [ov (if (dbu/ref? db a) (dbu/entid-strict db ov) ov)]
         (validate-val nv op-vec db)
         (if (dbu/multival? db a)
-          (if (some (fn [^Datom d] (= (.-v d) ov)) datoms)
+          (if (some (fn [^Datom d] (dd/value= (.-v d) ov)) datoms)
             [(transact-add report [:db/add e a nv]) []]
             (log/raise ":db.fn/cas failed on datom [" e " " a " " (map :v datoms) "], expected " ov
                        {:error :transact/cas, :old datoms, :expected ov, :new nv}))
           (let [v (:v (first datoms))]
-            (if (= v ov)
+            (if (dd/value= v ov)
               [(transact-add report [:db/add e a nv]) []]
               (log/raise ":db.fn/cas failed on datom [" e " " a " " v "], expected " ov
                          {:error :transact/cas, :old (first datoms), :expected ov, :new nv}))))))))
