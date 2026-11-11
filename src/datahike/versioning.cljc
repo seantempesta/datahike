@@ -783,8 +783,10 @@
 (defn commit-holding-tx
   "The point of the commit of the branch's lineage that holds transaction
    `tx`, {:branch :commit :t}, `t` its last transaction (> tx when the commit
-   holds later transactions too: a group or run-ahead commit). Walked and
-   refused as `commit-at-tx` is."
+   holds later transactions too: a group or run-ahead commit). `tx` is taken
+   to be one of the lineage's own: ids are issued once across a store's
+   branches, so for another branch's transaction this answers the first commit
+   after it, which does not hold it. Walked and refused as `commit-at-tx` is."
   ([db tx] (let [[store sid branch tip] (tip-of db)] (commit-holding-tx* store sid branch tip tx)))
   ([conn-or-db branch tx] (let [[store sid branch tip] (tip-of conn-or-db branch)] (commit-holding-tx* store sid branch tip tx))))
 
