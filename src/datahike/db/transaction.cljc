@@ -68,10 +68,17 @@
               (- (inc emax) ce0))))
 
 (defn- content-attr
-  "The :db/contentId attribute entity map m carries, as [a v], or nil."
+  "The :db/contentId attribute entity map m carries, as [a v], or nil: the least by name when
+  it carries several, so every map of the entity names one."
   [db m]
-  (some (fn [[a v]] (when (and (keyword? a) (not= :db/id a) (dbu/content-id? db a) (not (sequential? v))) [a v]))
-        (sort-by key m)))
+  (let [cas (dbi/-attrs-by db :db/contentId)]
+    (when (seq cas)
+      (reduce-kv (fn [acc a v]
+                   (if (and (contains? cas a) (not (sequential? v))
+                            (or (nil? acc) (neg? (compare a (nth acc 0)))))
+                     [a v]
+                     acc))
+                 nil m))))
 
 (defn next-eid
   "A fresh entity id: from the store's ids (::ids, datahike.ids), issued once across every
@@ -116,27 +123,24 @@
      (update :db-after advance-max-eid eid))))
 
 (defn- content-tempids
-  "Before anything is resolved, give each entity that carries a :db/contentId attribute its
-  id: the entity db already holds with that value (an upsert's, whatever id it was minted
-  at), else its content eid. An entity map with no :db/id gets it as its :db/id, and a
-  tempid (a map's, or an op's [:db/add tempid a v]) resolves to it, so a ref to that tempid
-  made earlier in the transaction takes it too. Answers [report es]."
+  "Before anything is resolved, resolve each top-level tempid whose entity carries a
+  :db/contentId attribute (a map's :db/id, or an op's [:db/add tempid a v]) to its id: the
+  entity db already holds with that value (an upsert's, whatever id it was minted at), else
+  its content eid, so a ref to that tempid made earlier in the transaction takes it too. A
+  map's own id is given where every map is resolved (entity-map->op-vec). Answers report."
   [report db es]
-  (reduce (fn [[report es] e]
+  (reduce (fn [report e]
             (cond
-              (map? e)
+              (and (map? e) (tempid? (:db/id e)) (nil? (get-in report [:tempids (:db/id e)])))
               (if-let [[a v] (content-attr db e)]
-                (let [id (:db/id e) ce (or (dbu/entid db [a v]) (content-eid a v))]
-                  (cond (nil? id) [report (conj es (assoc e :db/id ce))]
-                        (and (tempid? id) (nil? (get-in report [:tempids id]))) [(allocate-eid report id ce) (conj es e)]
-                        :else [report (conj es e)]))
-                [report (conj es e)])
+                (allocate-eid report (:db/id e) (or (dbu/entid db [a v]) (content-eid a v)))
+                report)
               (and (sequential? e) (= :db/add (first e)) (tempid? (second e))
                    (keyword? (nth e 2 nil)) (dbu/content-id? db (nth e 2))
                    (nil? (get-in report [:tempids (second e)])))
-              [(allocate-eid report (second e) (or (dbu/entid db [(nth e 2) (nth e 3)]) (content-eid (nth e 2) (nth e 3)))) (conj es e)]
-              :else [report (conj es e)]))
-          [report []] es))
+              (allocate-eid report (second e) (or (dbu/entid db [(nth e 2) (nth e 3)]) (content-eid (nth e 2) (nth e 3))))
+              :else report))
+          report es))
 
 (defn update-schema [db ^Datom datom]
   (let [schema (dbi/-schema db)
@@ -1062,13 +1066,23 @@
         updated-report (cond-> report
                          tx? (allocate-eid old-eid resolved-eid))
         resolved-tempid (tempids resolved-eid)
-        upserted-eid (upsert-eid db updated-entity tempids)]
-    (if (and (some? upserted-eid)
+        upserted-eid (upsert-eid db updated-entity tempids)
+        ;; an entity map that names no entity yet, top-level or nested, and that carries a
+        ;; :db/contentId attribute is the entity at its content eid; a tempid an earlier ref
+        ;; resolved to a counter id is retried at it
+        content-id (when (and (nil? upserted-eid)
+                              (or (nil? resolved-eid)
+                                  (and (tempid? resolved-eid)
+                                       (or (nil? resolved-tempid) (< resolved-tempid ce0)))))
+                     (when-let [[a v] (content-attr db entity)]
+                       (content-eid a v)))
+        found-eid (or upserted-eid content-id)]
+    (if (and (some? found-eid)
              resolved-tempid
-             (not= upserted-eid resolved-tempid))
-      {:retry? true :old-eid resolved-eid :upserted-eid upserted-eid}
+             (not= found-eid resolved-tempid))
+      {:retry? true :old-eid resolved-eid :upserted-eid found-eid}
       (let [new-eid (cond
-                      (some? upserted-eid)   upserted-eid
+                      (some? found-eid)      found-eid
                       (nil? resolved-eid)    (next-eid report db)
                       (tempid? resolved-eid) (or resolved-tempid (next-eid report db))
                       (number? resolved-eid) (entity-id report resolved-eid entity)
@@ -1350,7 +1364,7 @@
                       (get-in initial-report [:tx-meta :datahike/validate-report]))
         initial-report (cond-> (update initial-report :tx-meta dissoc :datahike/validate-report)
                          validator (assoc ::report-validator validator))
-        [initial-report initial-es] (content-tempids initial-report db-before initial-es)
+        initial-report (content-tempids initial-report db-before initial-es)
         has-tuples? (seq (dbi/-attrs-by (:db-after initial-report) :db.type/tuple))
         initial-es' (if has-tuples?
                       (interleave initial-es (repeat ::flush-tuples))
