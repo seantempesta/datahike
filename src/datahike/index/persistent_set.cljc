@@ -308,24 +308,42 @@
            ;; edits a branch buffers for its children, which the children's stored nodes do not hold yet
            buffered (java.util.TreeSet. ^java.util.Comparator cmp)
            take! (fn [d] (when (within? d) (.add buffered d)))
-           ;; the in-range children of every branch in `level`; a child's buffered edits lie in its own range
-           children (fn [^IStorage storage level]
-                      (into [] (mapcat (fn [[_ ^Branch branch]]
-                                         (let [ks (when-not whole? (.keys branch))]
-                                           (for [i (range (.len branch))
-                                                 :when (or whole?
-                                                           (and (not (neg? (in-range (.get ks (int i)) from)))
-                                                                (or (zero? i) (not (pos? (in-range (.get ks (int (dec i))) to))))))
-                                                 :let [_ (run! take! (slot-datoms branch i))]]
-                                             [(.address branch (int i)) branch i storage]))))
-                            level))
-           ;; the entries at an address the other side does not hold; an unstored node (nil address) is never shared.
-           ;; One hashed lookup an entry, so the test is linear in the entries (Jolt's HashSet.retainAll scans
-           ;; its argument for each element: quadratic, 18.9M of 22.2M ticks at 203 scattered datoms)
+           ;; (f acc branch i) over the in-range children of every branch in `level`, in index order;
+           ;; the keys are read in the branch's own array, never copied
+           reduce-children (fn [f acc level]
+                             (reduce (fn [acc [_ ^Branch branch]]
+                                       (let [^objects ks (.-_keys branch) n (.len branch)]
+                                         (loop [i 0 acc acc]
+                                           (if (< i n)
+                                             (recur (inc i)
+                                                    (if (or whole?
+                                                            (and (not (neg? (in-range (aget ks i) from)))
+                                                                 (or (zero? i) (not (pos? (in-range (aget ks (dec i)) to))))))
+                                                      (f acc branch i)
+                                                      acc))
+                                             acc))))
+                                     acc level))
+           ;; the stored addresses of a level's in-range children
+           addresses (fn [level]
+                       (persistent! (reduce-children (fn [acc ^Branch branch i]
+                                                       (if-some [address (.address branch (int i))] (conj! acc address) acc))
+                                                     (transient #{}) level)))
+           ;; the in-range children of `level` at an address `other` does not hold, opened: one hashed
+           ;; lookup a child, so the test is linear in the children (Jolt's HashSet.retainAll scans its
+           ;; argument for each element: quadratic, 18.9M of 22.2M ticks at 203 scattered datoms). An
+           ;; unstored node (nil address) is never shared. A child's buffered edits lie in its own range.
+           unshared-children (fn [^IStorage storage level other]
+                               (persistent! (reduce-children (fn [acc ^Branch branch i]
+                                                               (run! take! (slot-datoms branch i))
+                                                               (let [address (.address branch (int i))]
+                                                                 (if (and (some? address) (contains? other address))
+                                                                   acc
+                                                                   (conj! acc [address (.child branch storage (int i))]))))
+                                                             (transient []) level)))
+           ;; the entries at an address the other side does not hold: a root met at the other tree's level
            unshared (fn [as bs]
                       (let [in-a (into #{} (keep first) as) in-b (into #{} (keep first) bs)]
                         [(into [] (remove #(contains? in-b (first %))) as) (into [] (remove #(contains? in-a (first %))) bs)]))
-           open (fn [entries] (mapv (fn [[address ^Branch branch i ^IStorage storage]] [address (.child branch storage (int i))]) entries))
            ra (.root a) rb (.root b)
            la (.level ^ANode ra) lb (.level ^ANode rb)]
        (let [[only-a only-b]
@@ -334,7 +352,7 @@
                (loop [level (max la lb)
                       as (if (== la level) [[(.-_address a) ra]] [])
                       bs (if (== lb level) [[(.-_address b) rb]] [])]
-                 (let [[as bs] (unshared as bs)]
+                 (let [[as bs] (if (and (not= la lb) (== level (min la lb))) (unshared as bs) [as bs])]
                    (if (zero? level)
                      ;; a datom both sides' unshared leaves hold is in both sets. One merge read in
                      ;; place from the leaves' own key arrays: `.keys` copies a leaf into a new vector,
@@ -361,11 +379,12 @@
                                (some? x) (recur xl (inc xk) yl yk (conj! oa x) ob)
                                (some? y) (recur xl xk yl (inc yk) oa (conj! ob y))
                                :else [(persistent! oa) (persistent! ob)])))))
-                     (let [[ea eb] (unshared (children (.-_storage a) as) (children (.-_storage b) bs))
-                           below (dec level)]
+                     (let [below (dec level)
+                           ea (unshared-children (.-_storage a) as (addresses bs))
+                           eb (unshared-children (.-_storage b) bs (addresses as))]
                        (recur below
-                              (into (if (== la below) [[(.-_address a) ra]] []) (open ea))
-                              (into (if (== lb below) [[(.-_address b) rb]] []) (open eb))))))))]
+                              (into (if (== la below) [[(.-_address a) ra]] []) ea)
+                              (into (if (== lb below) [[(.-_address b) rb]] []) eb)))))))]
          (if (.isEmpty buffered)
            ;; With no buffered edit, a set holds each of its datoms in exactly one leaf, and a
            ;; subtree stored at one address holds the same datoms on both sides. So a datom of
