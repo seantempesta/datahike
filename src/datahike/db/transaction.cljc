@@ -878,11 +878,25 @@
   [a-ident]
   (or (= a-ident :db.valid/from) (= a-ident :db.valid/to)))
 
+(defn- carried-tx
+  "`tx`, the transaction a datom in tx-data carries as its own (a Datom, or an op's
+  fifth element): a transaction id, in [tx0, txmax], and, when this transaction took
+  its id from the store's ids, one issued no later than it, since every transaction
+  id is issued once from that source. A speculation takes no id from the store, so
+  only the band holds it. Any other is refused: a datom placed in a transaction not
+  yet issued, or outside the transaction ids."
+  [report tx entity]
+  (let [bound (or (::tx report) txmax)]
+    (when-not (and (integer? tx) (<= tx0 tx bound))
+      (log/raise "Transaction id " tx " carried by " entity " is not an issued transaction id: it must be in [" tx0 ", " bound "]."
+                 {:error :tx-id/range :tx-id tx :bound [tx0 bound] :entity entity}))
+    tx))
+
 (defn- transact-add [{:keys [db-after] :as report} [_ e a v tx :as ent]]
   (let [a (dbu/normalize-and-validate-attr a ent db-after)
         _ (validate-val v ent db-after)
         attribute-refs? (:attribute-refs? (dbi/-config db-after))
-        tx (or tx (current-tx report))
+        tx (if (some? tx) (carried-tx report tx ent) (current-tx report))
         db db-after
         e (dbu/entid-strict db e)
         a-ident (if attribute-refs? (dbi/ident-for db a :error-on-missing) a)
@@ -917,7 +931,7 @@
   ([report] report)
   ([report ^Datom d] (transact-retract-datom report d false))
   ([report ^Datom d keep-tx-id]
-   (let [txid (or (and keep-tx-id (datom-tx d)) (current-tx report))]
+   (let [txid (if keep-tx-id (carried-tx report (datom-tx d) d) (current-tx report))]
      (transact-report report (datom (.-e d) (.-a d) (.-v d) txid false)))))
 
 (defn- transact-purge-datom [report ^Datom d]
