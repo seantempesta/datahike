@@ -680,9 +680,11 @@
    the base, and any parent the base descends from), the one with the greatest
    max-tx, the base; a merged branch's own transactions are not in the merge's
    db, whose content took new ids. Decided from the merge's db, read once
-   (its record and one seek per parent) and kept with its entry. Refuses
-   :commit-base-ambiguous when the merge's db holds no parent's last
-   transaction, :commit-expired when a parent is gone."
+   (its record and one seek per parent) and kept with its entry. A parent
+   the store no longer holds is no candidate (a merged branch's commits may
+   be collected while the merge and its base stay). Refuses
+   :commit-base-ambiguous when the merge's db holds no remaining parent's
+   last transaction, :commit-expired when no parent remains."
   [store sid branch tx cid e]
   (let [ps (:parents e)
         entry (fn [p] (or (point-entry store sid p)
@@ -695,7 +697,12 @@
       (let [record (or (k/get store cid nil {:sync? true})
                        (tx-refusal "A commit on the branch's lineage was collected." :commit-expired branch tx {:commit cid}))
             db (stored->db record store)
-            held (filter #(holds-tx? db (:t (entry %))) ps)]
+            ;; a parent collection removed is no candidate: a merged branch's commits
+            ;; may be collected while the merge and its base stay
+            known (filter #(point-entry store sid %) ps)
+            held (filter #(holds-tx? db (:t (entry %))) known)]
+        (when (empty? known)
+          (tx-refusal "A commit on the branch's lineage was collected." :commit-expired branch tx {:commit (first ps)}))
         (when (empty? held)
           (tx-refusal "A merge commit's db holds the last transaction of none of its parents, so its base is not derivable."
                       :commit-base-ambiguous branch tx {:commit cid :parents ps}))

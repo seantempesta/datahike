@@ -205,6 +205,26 @@
                   (is (= {:branch :b :commit h :t th} (v/commit-at-tx @b tx2)) "x2 is not on b's lineage")
                   (finally (d/release b)))))))))))
 
+(deftest a-merge-whose-merged-parent-is-gone-keeps-its-base
+  (with-conn "merged-parent-gone"
+    (fn [conn]
+      (let [[c1 t1] (tx! conn 1)]
+        (d/branch! conn :db :b)
+        (let [b (d/connect (assoc (:config @conn) :branch :b))
+              [x1 _] (tx! b "x1")]
+          (d/release b)
+          (let [[h th] (tx! conn 2)]
+            (v/merge! conn #{x1} [{:name "merged"}])
+            (tx! conn 3)
+            (d/delete-branch! conn :b)
+            ;; what a collection leaves once the merged branch is past its cut-off: the
+            ;; merge and its base stay, the merged-in parent is gone
+            (k/dissoc (:store @conn) x1 {:sync? true})
+            (v/forget-commit-points!)
+            (is (= {:branch :db :commit h :t th} (v/commit-at-tx @conn th))
+                "the walk passes the merge by its base")
+            (is (= {:branch :db :commit c1 :t t1} (v/commit-at-tx @conn t1)))))))))
+
 (deftest a-lookup-reads-only-the-commits-it-has-not-met
   (with-conn "reads"
     (fn [conn]
