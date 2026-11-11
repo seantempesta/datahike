@@ -180,6 +180,44 @@
   (let [{:keys [pass? fail seed]} (tc/quick-check 40 (prop/for-all [h history-gen] (replay h)) :seed 20261015 :max-size 30)]
     (is pass? (str "seed " seed " counterexample " (pr-str fail)))))
 
+(deftest a-diff-of-consecutive-commits-is-exact-where-datoms-move-between-leaves
+  ;; The unshared leaves' merge is the answer, with no lookup in either whole set: these
+  ;; commits retract a datom and assert it again in a later transaction, retract a run of
+  ;; entities (leaves merge with their neighbours), grow one entity (a leaf splits, its datoms
+  ;; move to a new neighbour) and replace values, with history kept and not.
+  (doseq [history? [true false]]
+    (let [cfg (assoc (shaped-config (file-store) 8 0) :keep-history? history?)
+          _ (d/create-database cfg)
+          conn (d/connect cfg)
+          tx! (fn [data] (:db-after (d/transact conn data)))
+          db0 (tx! (vec (for [i (range 400)] {:k/n (long i) :k/tags [(str "t" (mod i 5))]})))
+          es (mapv :e (d/datoms db0 {:index :aevt :components [:k/n]}))
+          e (nth es 200)
+          tag (first (map :v (d/datoms db0 {:index :eavt :components [e :k/tags]})))
+          dbs [db0
+               (tx! [[:db/retract e :k/tags tag]])
+               (tx! [[:db/add e :k/tags tag]])
+               (tx! (vec (for [x (subvec es 100 160)] [:db/retractEntity x])))
+               (tx! (vec (for [i (range 60)] [:db/add (nth es 300) :k/tags (str "many" i)])))
+               (tx! (vec (for [[i x] (map-indexed vector (take-nth 37 es))] [:db/add x :k/n (- -1 i)])))
+               (tx! [{:k/n 5000 :k/tags ["new"]}])]]
+      (testing (str "history " history? ": the datom asserted again is the same e, a, v in another transaction")
+        (let [[gone added] (d/datoms-diff (nth dbs 1) (nth dbs 2) :eavt [e :k/tags])]
+          (is (= [] gone))
+          (is (= [[e :k/tags tag]] (mapv (juxt :e :a :v) added))))
+        (let [[gone added] (d/datoms-diff (nth dbs 0) (nth dbs 2) :eavt [e :k/tags])]
+          (is (= [[e :k/tags tag]] (mapv (juxt :e :a :v) gone)))
+          (is (= [[e :k/tags tag]] (mapv (juxt :e :a :v) added)))
+          (is (not= (:tx (first gone)) (:tx (first added))))))
+      (testing (str "history " history? ": consecutive and further commits, both ways, every index")
+        (doseq [[a b] (concat (partition 2 1 dbs) [[(first dbs) (peek dbs)] [(nth dbs 2) (nth dbs 4)]])
+                [x y] [[a b] [b a]]]
+          (doseq [index [:eavt :aevt :avet]]
+            (is (exact? x y index)))
+          (doseq [attribute [:k/n :k/tags]]
+            (is (= (plain x y attribute) (answered x y attribute))))))
+      (d/release conn))))
+
 (deftest a-diff-records-the-range-it-read
   ;; A read built on a diff answers from both values over the diffed range, so with-reads
   ;; records that range, as it does a slice's: a datom added in it touches the read, a datom

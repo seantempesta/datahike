@@ -290,18 +290,20 @@
 
      Both trees are walked level by level and every child stored at an address both
      sides hold is skipped, so the work follows the nodes that differ between the two
-     values (one branch's new commits against another's), never the range. The
-     candidates are the datoms the two sides' unshared leaves do not both hold, plus
-     every buffered edit of an expanded branch; each is decided by membership in the
-     two whole sets. Its answer rests on both values over the whole range, so the range
-     is recorded as a read (di/record-read!), as -slice records its own."
+     values (one branch's new commits against another's), never the range. The answer
+     is the datoms the two sides' unshared leaves do not both hold; only when an
+     expanded branch buffers edits (diff-buf) are those datoms and the buffered ones
+     decided by membership in the two whole sets. Its answer rests on both values over
+     the whole range, so the range is recorded as a read (di/record-read!), as -slice
+     records its own."
      [^PersistentSortedSet a ^PersistentSortedSet b index-type from to]
      (di/record-read! from to)
      (let [in-range (slice-comparator-constructor index-type from to)
            ^java.util.Comparator cmp (.comparator a)
-           candidates (java.util.TreeSet. ^java.util.Comparator cmp)
+           ;; edits a branch buffers for its children, which the children's stored nodes do not hold yet
+           buffered (java.util.TreeSet. ^java.util.Comparator cmp)
            take! (fn [d] (when (and (not (neg? (in-range d from))) (not (pos? (in-range d to))))
-                           (.add candidates d)))
+                           (.add buffered d)))
            ;; the in-range children of every branch in `level`; a child's buffered edits lie in its own range
            children (fn [^IStorage storage level]
                       (into [] (mapcat (fn [[_ ^Branch branch]]
@@ -320,39 +322,54 @@
            open (fn [entries] (mapv (fn [[address ^Branch branch i ^IStorage storage]] [address (.child branch storage (int i))]) entries))
            ra (.root a) rb (.root b)
            la (.level ^ANode ra) lb (.level ^ANode rb)]
-       (when-not (and (some? (.-_address a)) (= (.-_address a) (.-_address b)))
-         (loop [level (max la lb)
-                as (if (== la level) [[(.-_address a) ra]] [])
-                bs (if (== lb level) [[(.-_address b) rb]] [])]
-           (let [[as bs] (unshared as bs)]
-             (if (zero? level)
-               ;; a datom both sides' unshared leaves hold is no candidate; buffered edits already are
-               (let [leaf-datoms (fn [leaves] (let [out (java.util.ArrayList.)]
-                                                (doseq [[_ ^Leaf leaf] leaves, d (.keys leaf)]
-                                                  (when (and (not (neg? (in-range d from))) (not (pos? (in-range d to))))
-                                                    (.add out d)))
-                                                out))
-                     ^java.util.ArrayList xs (leaf-datoms as) ^java.util.ArrayList ys (leaf-datoms bs)
-                     nx (.size xs) ny (.size ys)]
-                 (loop [i 0 j 0]
-                   (cond (and (< i nx) (< j ny))
-                         (let [c (.compare cmp (.get xs i) (.get ys j))]
-                           (cond (zero? c) (recur (inc i) (inc j))
-                                 (neg? c) (do (.add candidates (.get xs i)) (recur (inc i) j))
-                                 :else (do (.add candidates (.get ys j)) (recur i (inc j)))))
-                         (< i nx) (do (.add candidates (.get xs i)) (recur (inc i) j))
-                         (< j ny) (do (.add candidates (.get ys j)) (recur i (inc j))))))
-               (let [[ea eb] (unshared (children (.-_storage a) as) (children (.-_storage b) bs))
-                     below (dec level)]
-                 (recur below
-                        (into (if (== la below) [[(.-_address a) ra]] []) (open ea))
-                        (into (if (== lb below) [[(.-_address b) rb]] []) (open eb))))))))
-       (reduce (fn [[only-a only-b] d]
-                 (let [in-a (.contains a d) in-b (.contains b d)]
-                   (cond (and in-a (not in-b)) [(conj only-a d) only-b]
-                         (and in-b (not in-a)) [only-a (conj only-b d)]
-                         :else [only-a only-b])))
-               [[] []] candidates))))
+       (let [[only-a only-b]
+             (if (and (some? (.-_address a)) (= (.-_address a) (.-_address b)))
+               [[] []]
+               (loop [level (max la lb)
+                      as (if (== la level) [[(.-_address a) ra]] [])
+                      bs (if (== lb level) [[(.-_address b) rb]] [])]
+                 (let [[as bs] (unshared as bs)]
+                   (if (zero? level)
+                     ;; a datom both sides' unshared leaves hold is in both sets
+                     (let [leaf-datoms (fn [leaves] (let [out (java.util.ArrayList.)]
+                                                      (doseq [[_ ^Leaf leaf] leaves, d (.keys leaf)]
+                                                        (when (and (not (neg? (in-range d from))) (not (pos? (in-range d to))))
+                                                          (.add out d)))
+                                                      out))
+                           ^java.util.ArrayList xs (leaf-datoms as) ^java.util.ArrayList ys (leaf-datoms bs)
+                           nx (.size xs) ny (.size ys)]
+                       (loop [i 0 j 0 oa (transient []) ob (transient [])]
+                         (cond (and (< i nx) (< j ny))
+                               (let [c (.compare cmp (.get xs i) (.get ys j))]
+                                 (cond (zero? c) (recur (inc i) (inc j) oa ob)
+                                       (neg? c) (recur (inc i) j (conj! oa (.get xs i)) ob)
+                                       :else (recur i (inc j) oa (conj! ob (.get ys j)))))
+                               (< i nx) (recur (inc i) j (conj! oa (.get xs i)) ob)
+                               (< j ny) (recur i (inc j) oa (conj! ob (.get ys j)))
+                               :else [(persistent! oa) (persistent! ob)])))
+                     (let [[ea eb] (unshared (children (.-_storage a) as) (children (.-_storage b) bs))
+                           below (dec level)]
+                       (recur below
+                              (into (if (== la below) [[(.-_address a) ra]] []) (open ea))
+                              (into (if (== lb below) [[(.-_address b) rb]] []) (open eb))))))))]
+         (if (.isEmpty buffered)
+           ;; With no buffered edit, a set holds each of its datoms in exactly one leaf, and a
+           ;; subtree stored at one address holds the same datoms on both sides. So a datom of
+           ;; an unshared leaf of `a` that `b` holds cannot sit in a subtree `b` shares with `a`
+           ;; (`a` would then hold it twice): it is in an unshared leaf of `b`, where the merge
+           ;; above met it. The merge is the answer, with no lookup in either whole set. On Jolt
+           ;; no branch buffers edits (the port's Branch has no slots), so this is always the case.
+           [only-a only-b]
+           ;; A buffered edit changes what a child's stored nodes say, shared or not: every datom
+           ;; seen is decided by membership in the two whole sets.
+           (do (run! #(.add buffered %) only-a)
+               (run! #(.add buffered %) only-b)
+               (reduce (fn [[only-a only-b] d]
+                         (let [in-a (.contains a d) in-b (.contains b d)]
+                           (cond (and in-a (not in-b)) [(conj only-a d) only-b]
+                                 (and in-b (not in-a)) [only-a (conj only-b d)]
+                                 :else [only-a only-b])))
+                       [[] []] buffered)))))))
 
 (defn- canon
   "Normalize a value for content hashing: Datoms become [e a v tx added] vectors,
