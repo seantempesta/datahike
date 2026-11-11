@@ -137,6 +137,15 @@
 ;; jolt: core.async buffers do not support count; pressure warnings are skipped.
 (defn- buf-count [b] #?(:jolt 0 :default (count b)))
 
+(defn- merge-parents-of
+  "The merge parents the reports' values carry (a merge op sets them on its db's
+   :meta), and db with that key removed so it is never persisted: [parents db],
+   parents the union over the reports, nil when there are none. One commit of
+   these reports is a merge commit of the parents."
+  [reports db]
+  (let [parents (not-empty (into #{} (mapcat #(get-in % [:db-after :meta :datahike/merge-parents])) reports))]
+    [parents (if parents (update db :meta dissoc :datahike/merge-parents) db)]))
+
 (defn create-thread
   "Creates new transaction thread"
   [connection write-fn-map transaction-queue-size commit-queue-size commit-wait-time]
@@ -272,12 +281,8 @@
                       (let [parent-db @connection
                             db (:db-after (first (peek txs)))
                             ;; Merge parents of every report in the batch
-                            ;; (set by merge-writer!); the batch commits once.
-                            merge-parents (not-empty (into #{} (mapcat #(get-in (first %) [:db-after :meta :datahike/merge-parents])) txs))
-                            ;; Clear merge-parents from db meta before persisting
-                            db (if merge-parents
-                                 (update db :meta dissoc :datahike/merge-parents)
-                                 db)]
+                            ;; (set by the merge op); the batch commits once.
+                            [merge-parents db] (merge-parents-of (map first txs) db)]
                         (try
                           (let [start-ts (get-time-ms)
                                 modified-attrs
@@ -423,19 +428,17 @@
   (let [old @(:wrapped-atom connection)
         res (apply (write-fn-map op) old args)
         parent-db old
-        db (:db-after res)
-        merge-parents (get-in db [:meta :datahike/merge-parents])
-        db (if merge-parents (update db :meta dissoc :datahike/merge-parents) db)
+        [merge-parents db] (merge-parents-of [res] (:db-after res))
         start-ts (get-time-ms)
         modified-attrs (w/batch-cache-revision-attributes [res])
-        stored (w/commit! db (not-empty merge-parents) true @last-cid
+        stored (w/commit! db merge-parents true @last-cid
                           {:prior (:cache-context parent-db) :modified-attrs modified-attrs
-                           :unsafe? (boolean (seq merge-parents))}
+                           :unsafe? (boolean merge-parents)}
                           @known-gen)
         commit-id (get-in stored [:meta :datahike/commit-id])
         commit-db (assoc stored :cache-context
                          (some-> (:cache-context parent-db)
-                                 (q/advance-query-cache-context commit-id modified-attrs (boolean (seq merge-parents)))))
+                                 (q/advance-query-cache-context commit-id modified-attrs (boolean merge-parents))))
         report (-> res
                    (assoc-in [:tx-meta :db/commitId] commit-id)
                    (assoc :db-after commit-db)
@@ -495,14 +498,15 @@
     (if (empty? ok)
       rs
       (let [start-ts (get-time-ms)
+            [merge-parents db] (merge-parents-of ok db)
             modified-attrs (w/batch-cache-revision-attributes ok)
-            stored (w/commit! db nil true @(:last-cid writer)
-                              {:prior (:cache-context parent-db) :modified-attrs modified-attrs :unsafe? false}
+            stored (w/commit! db merge-parents true @(:last-cid writer)
+                              {:prior (:cache-context parent-db) :modified-attrs modified-attrs :unsafe? (boolean merge-parents)}
                               @(:known-generation writer))
             commit-id (get-in stored [:meta :datahike/commit-id])
             commit-db (assoc stored :cache-context
                              (some-> (:cache-context parent-db)
-                                     (q/advance-query-cache-context commit-id modified-attrs false)))
+                                     (q/advance-query-cache-context commit-id modified-attrs (boolean merge-parents))))
             commit {:commit-id commit-id :tx-count (count ok) :duration-ms (- (get-time-ms) start-ts)}]
         (vreset! (:last-cid writer) commit-id)
         (vreset! (:known-generation writer) (known-generation stored))
@@ -535,16 +539,19 @@
 
 (defn apply!
   "Apply arg-map to the connection's run-ahead value (its pending value, else its committed
-  one) with `w/transact!`, without committing. Answers the report (its :db-after is the new
-  run-ahead value), or the exception, leaving the value as it was. With `{:show? true}` the
+  one) with the writer's 'transact!, without committing. Answers the report (its :db-after is the new
+  run-ahead value), or the exception, leaving the value as it was. With `{:op 'merge!}` the
+  arg-map is a merge's (`{:parents :tx-data :tx-meta}`), applied with the writer's 'merge!,
+  and commit-pending! commits it as a merge. With `{:show? true}` the
   new run-ahead value is also made the connection's value, with no :datahike/commit-id in
   its :meta and the committed value's commit id as :datahike/uncommitted-parent. Only on a
   :sync writer."
   ([connection arg-map] (apply! connection arg-map nil))
-  ([connection arg-map {:keys [show?]}]
+  ([connection arg-map {:keys [show? op] :or {op 'transact!}}]
    (let [writer (:writer @(:wrapped-atom connection))
          _ (assert (instance? SyncWriter writer) "apply! needs a :sync writer")
-         tx! (get (:write-fn-map writer) 'transact!)
+         _ (assert (contains? #{'transact! 'merge!} op) "apply! applies 'transact! or 'merge!")
+         tx! (get (:write-fn-map writer) op)
          {:keys [db reports committed shown?]} (or @(:pending writer)
                                                    (let [db @(:wrapped-atom connection)]
                                                      {:db db :reports [] :committed db}))
@@ -556,7 +563,7 @@
        ;; connection too, so it never shows an older value than the pending one
        (when (or shown? show?)
          (let [shown (update (:db-after r) :meta
-                             #(-> (dissoc % :datahike/commit-id)
+                             #(-> (dissoc % :datahike/commit-id :datahike/merge-parents)
                                   (assoc :datahike/uncommitted-parent
                                          (get-in committed [:meta :datahike/commit-id]))))]
            #?(:jolt (reset! (.-wrapped-atom connection) shown) :clj (reset! connection shown)))))
@@ -576,14 +583,15 @@
   (let [writer (:writer @(:wrapped-atom connection))]
     (when-let [{:keys [db reports committed]} @(:pending writer)]
       (let [parent-db committed
+            [merge-parents db] (merge-parents-of reports db)
             modified-attrs (w/batch-cache-revision-attributes reports)
-            stored (w/commit! db nil true @(:last-cid writer)
-                              {:prior (:cache-context parent-db) :modified-attrs modified-attrs :unsafe? false}
+            stored (w/commit! db merge-parents true @(:last-cid writer)
+                              {:prior (:cache-context parent-db) :modified-attrs modified-attrs :unsafe? (boolean merge-parents)}
                               @(:known-generation writer))
             commit-id (get-in stored [:meta :datahike/commit-id])
             commit-db (assoc stored :cache-context
                              (some-> (:cache-context parent-db)
-                                     (q/advance-query-cache-context commit-id modified-attrs false)))]
+                                     (q/advance-query-cache-context commit-id modified-attrs (boolean merge-parents))))]
         (vreset! (:last-cid writer) commit-id)
         (vreset! (:known-generation writer) (known-generation stored))
         (vreset! (:pending writer) nil)
