@@ -13,7 +13,7 @@
                                       commit! create-commit-id get-and-clear-pending-kvs!
                                       write-pending-kvs! branch-heads-as-commits
                                       read-head resolve-head compact-head compact-head? commit-graph-writes
-                                      commit-graph-records commit-graph-key]]
+                                      commit-graph-records commit-graph-key commit-branch]]
             [datahike.writer]
             [datahike.index.secondary :as sec]
             ;; cljs: S is a VAR (the supervisor) → :refer; go-try-/<?-/<?/go-loop-try
@@ -631,6 +631,161 @@
            (log/raise "More than one best common ancestor (criss-cross merge)."
                       {:type :merge-base-criss-cross :merge-bases best}))
          (first best))))))
+
+(defonce ^:private commit-points
+  ;; {store-id {cid {:t max-tx :parents #{cid} :branch kw}}}: what this process
+  ;; has read of each commit for `commit-at-tx`, derived from immutable commit
+  ;; records, so never stale and dropped freely (`forget-commit-points!`)
+  (atom {}))
+
+(defn forget-commit-points!
+  "Drops what this process holds for `commit-at-tx` (of the store `store-id`,
+   else of every store); the next lookup reads the commits it walks again."
+  ([] (reset! commit-points {}) nil)
+  ([store-id] (swap! commit-points dissoc store-id) nil))
+
+(defn- point-entry
+  "What `commit-at-tx` reads of commit `cid`: {:t its max-tx :parents :branch},
+   from memory, else from its commit record (one read, kept). Nil when the
+   store holds no commit `cid`."
+  [store sid cid]
+  (or (get-in @commit-points [sid cid])
+      (when-let [record (k/get store cid nil {:sync? true})]
+        (let [e {:t (:max-tx record)
+                 :parents (set (get-in record [:meta :datahike/parents]))
+                 :branch (commit-branch record)}]
+          (swap! commit-points assoc-in [sid cid] e)
+          e))))
+
+(defn- tx-refusal [message type branch tx extra]
+  (log/raise message (merge {:type type :branch branch :tx tx} extra)))
+
+(defn- point-base
+  "The base of the commit `cid` (entry `e`): the parent it was written over,
+   whose transactions its db holds, so it adds those with ids after the base's
+   max-tx up to its own. Of its parents, those whose max-tx is below its own
+   (else, for a commit that added no transaction, equal to it): the one; of
+   several (a merge), the one written on the commit's own branch, the head it
+   merged into; when none is (a branch whose first commit is a merge), the one
+   the others descend from. Nil when no parent qualifies (a root; a forced head
+   older than its parent): its lineage ends there. Refuses
+   :commit-base-ambiguous when that leaves several, and :commit-expired when a
+   parent of a merge is gone."
+  [store sid branch tx cid e]
+  (let [ps (:parents e)
+        entry (fn [p] (or (point-entry store sid p)
+                          (tx-refusal "A commit on the branch's lineage was collected." :commit-expired branch tx {:commit p})))
+        older (filter #(< (:t (entry %)) (:t e)) ps)
+        candidates (if (seq older) older (filter #(= (:t (entry %)) (:t e)) ps))]
+    (if (< (count candidates) 2)
+      (first candidates)
+      (let [own (filter #(= (:branch e) (:branch (entry %))) candidates)
+            ;; no parent written on the merge's branch (the branch's first commit is a merge, its
+            ;; head the commit it was made from): of a parent and its descendant, the parent
+            ;; is the head, as merging an ancestor into its descendant changes nothing
+            node (graph-reader store)
+            oldest (filter (fn [x] (every? #(or (= x %) (reaches? node x %)) candidates)) candidates)]
+        (cond
+          (= 1 (count own)) (first own)
+          (and (empty? own) (= 1 (count oldest))) (first oldest)
+          :else (tx-refusal "A merge commit's base is not derivable: several parents could be the head it merged into."
+                            :commit-base-ambiguous branch tx {:commit cid :parents (set candidates)}))))))
+
+(defn- walk-to-tx
+  "From commit `tip` of `branch` back through bases to the commit whose max-tx
+   is the greatest <= tx: [commit entry child], `child` the commit walked just
+   before it (the one holding tx when the commit's max-tx is below it)."
+  [store sid branch tip tx]
+  (let [e (or (point-entry store sid tip)
+              (tx-refusal "A commit on the branch's lineage was collected." :commit-expired branch tx {:commit tip}))]
+    (when (< (:t e) tx)
+      (tx-refusal "No commit of the branch holds this transaction yet." :tx-after-head branch tx {:head-tx (:t e)}))
+    (loop [c tip e e child nil]
+      (if (<= (:t e) tx)
+        [c e child]
+        (if-let [p (point-base store sid branch tx c e)]
+          (recur p (or (point-entry store sid p)
+                       (tx-refusal "A commit on the branch's lineage was collected." :commit-expired branch tx {:commit p}))
+                 c)
+          (tx-refusal "The transaction precedes the first commit of the branch's lineage." :tx-before-first-commit branch tx {}))))))
+
+(defn- tip-of
+  "[store store-id branch tip-cid] of `conn-or-db` at `branch`: a db value's own
+   commit (or, for a run-ahead value shown on its connection, the commit it was
+   applied on) and branch; with `branch`, that branch's head, read."
+  ([db]
+   (db-check db)
+   [(:store db) (:id (:store (:config db))) (get-in db [:config :branch])
+    (or (get-in db [:meta :datahike/commit-id]) (get-in db [:meta :datahike/uncommitted-parent]))])
+  ([conn-or-db branch]
+   (branch-check branch)
+   (let [db (if (db? conn-or-db) conn-or-db @conn-or-db)
+         store (:store db)
+         head (k/get store branch nil {:sync? true})]
+     (when-not head
+       (log/raise "Branch does not exist." {:type :branch-does-not-exist :branch branch}))
+     [store (:id (:store (:config db))) branch (get-in head [:meta :datahike/commit-id])])))
+
+(declare commit-at-tx* commit-holding-tx*)
+
+(defn commit-at-tx
+  "The point of a branch at transaction `tx`: {:branch :commit :t}, the commit
+   of the branch's lineage whose last transaction `t` is the greatest <= tx
+   (the branch as it stood once tx was committed, nothing later), so
+   `(= tx t)` says tx is its commit's last transaction. Of `db`'s branch from
+   its own commit, or of `branch`'s head (one read) on `conn-or-db`'s store.
+
+   The lineage is each commit's base (`commit-tx-range`), so a branch made from
+   another commit reads that commit's lineage below it. Derived, nothing
+   stored: the walk reads each commit it meets once per process and keeps
+   {max-tx parents branch} in memory (`forget-commit-points!`), so a first
+   lookup reads the commits from the tip back to the answer, a later one only
+   the commits it has not met (k new commits: k reads), and one that meets
+   only known commits reads nothing. An answer from memory is not checked
+   against a collection since.
+
+   Refuses, each naming :branch and :tx: `:tx-after-head` (tx not committed on
+   the branch yet), `:tx-before-first-commit` (tx before the first commit of
+   the lineage), `:commit-expired` (the walk met a commit collection removed,
+   named as :commit); also :commit-base-ambiguous (`commit-tx-range`)."
+  ([db tx] (let [[store sid branch tip] (tip-of db)] (commit-at-tx* store sid branch tip tx)))
+  ([conn-or-db branch tx] (let [[store sid branch tip] (tip-of conn-or-db branch)] (commit-at-tx* store sid branch tip tx))))
+
+(defn- commit-at-tx* [store sid branch tip tx]
+  (let [[c e] (walk-to-tx store sid branch tip tx)]
+    {:branch branch :commit c :t (:t e)}))
+
+(defn commit-holding-tx
+  "The point of the commit of the branch's lineage that holds transaction
+   `tx`, {:branch :commit :t}, `t` its last transaction (> tx when the commit
+   holds later transactions too: a group or run-ahead commit). Walked and
+   refused as `commit-at-tx` is."
+  ([db tx] (let [[store sid branch tip] (tip-of db)] (commit-holding-tx* store sid branch tip tx)))
+  ([conn-or-db branch tx] (let [[store sid branch tip] (tip-of conn-or-db branch)] (commit-holding-tx* store sid branch tip tx))))
+
+(defn- commit-holding-tx* [store sid branch tip tx]
+  (let [[c e child] (walk-to-tx store sid branch tip tx)]
+    (if (or (= tx (:t e)) (nil? child))
+      {:branch branch :commit c :t (:t e)}
+      {:branch branch :commit child :t (:t (point-entry store sid child))})))
+
+(defn commit-tx-range
+  "[first last], the ids of the transactions commit `cid` added, derived from
+   its commit record and its base's: last is its max-tx, first its base's
+   max-tx + 1. Ids are issued once across a store's branches (`datahike.ids`),
+   so the ids between that are not in the commit's db are other branches'.
+   Its base is the parent it was written over (`point-base`): the one parent;
+   of a merge's, the head of the branch it merged into, never the merged
+   branch's, whose content arrives as the merge's own new transactions; for a
+   branch's first commit, the commit the branch was made from. A root, and a
+   commit whose lineage ends (no parent qualifies), added none:
+   [(inc last) last]. Read through `commit-at-tx`'s memory."
+  [conn-or-db cid]
+  (let [[store sid branch] (tip-of (if (db? conn-or-db) conn-or-db @conn-or-db))
+        e (or (point-entry store sid cid)
+              (log/raise "Commit record does not exist." {:type :commit-not-found :commit-id cid}))
+        base (point-base store sid branch nil cid e)]
+    [(inc (:t (if base (point-entry store sid base) e))) (:t e)]))
 
 (defn backfill-commit-graph!
   "Writes the commit graph record of every commit a branch head reaches
