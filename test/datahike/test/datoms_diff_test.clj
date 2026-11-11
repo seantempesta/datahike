@@ -434,3 +434,29 @@
         idx (d/reads-index reads)]
     (is (contains? idx [:a :k/tags]) "the diffed attribute is a read")
     (d/release conn)))
+
+(deftest the-diff-of-two-histories-is-the-set-difference-of-all-they-ever-held
+  ;; Two whole histories of plain values are diffed by their indexes, as plain values
+  ;; are: each value's index and its temporal index. A datom retracted between the two
+  ;; moves from one index to the other, and both histories hold it: it is in neither
+  ;; answer. Held against the merge of each side's whole history, datom for datom, with
+  ;; the retraction records (added false) told from the assertions.
+  (doseq [seed (range 3)]
+    (let [rnd (java.util.Random. seed) cfg (config) _ (d/create-database cfg) main (d/connect cfg)
+          whole (fn [db] (into #{} (map (juxt :e :a :v :tx :added)) (d/datoms (d/history db) {:index :eavt :components []})))]
+      (d/transact main (vec (for [i (range 1500)] {:k/n (long i) :k/tags [(str "t" (mod i 7))]})))
+      (d/branch! main :db :chain)
+      (let [chain (d/connect (assoc cfg :branch :chain)) commits (atom [(d/commit-id @main)])]
+        (dotimes [i 30]
+          (let [conn (if (zero? (.nextInt rnd 2)) main chain)
+                some-e (:e (nth (vec (d/datoms @conn {:index :aevt :components [:k/n]})) (.nextInt rnd 1000)))]
+            (d/transact conn (cond-> [{:k/n (long (+ 10000 (.nextInt rnd 100000))) :k/tags [(str "n" i)]}]
+                               (zero? (.nextInt rnd 2)) (conj [:db/add some-e :k/n (long (+ 200000 i))])
+                               (zero? (.nextInt rnd 3)) (conj [:db/retractEntity some-e])))
+            (swap! commits conj (d/commit-id @conn))))
+        (let [dbs (mapv #(v/commit-as-db main %) (take 8 (shuffle @commits)))]
+          (doseq [a dbs b dbs]
+            (let [wa (whole a) wb (whole b)
+                  [only-a only-b] (d/datoms-diff (d/history a) (d/history b) :eavt [])
+                  tup #(into #{} (map (juxt :e :a :v :tx :added)) %)]
+              (is (= [(set/difference wa wb) (set/difference wb wa)] [(tup only-a) (tup only-b)])))))))))
