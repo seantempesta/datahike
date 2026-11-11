@@ -304,7 +304,7 @@
            whole? (and (== e0 (.-e ^Datom from)) (nil? (.-a ^Datom from)) (nil? (.-v ^Datom from))
                        (== emax (.-e ^Datom to)) (nil? (.-a ^Datom to)) (nil? (.-v ^Datom to)))
            within? (fn [d] (or whole? (and (not (neg? (in-range d from))) (not (pos? (in-range d to))))))
-           ^java.util.Comparator cmp (.comparator a)
+           cmp (.comparator a)
            ;; edits a branch buffers for its children, which the children's stored nodes do not hold yet
            buffered (java.util.TreeSet. ^java.util.Comparator cmp)
            take! (fn [d] (when (within? d) (.add buffered d)))
@@ -337,20 +337,21 @@
                  (let [[as bs] (unshared as bs)]
                    (if (zero? level)
                      ;; a datom both sides' unshared leaves hold is in both sets
-                     (let [leaf-datoms (fn [leaves] (let [out (java.util.ArrayList.)]
-                                                      (doseq [[_ ^Leaf leaf] leaves, d (.keys leaf)]
-                                                        (when (within? d) (.add out d)))
-                                                      out))
-                           ^java.util.ArrayList xs (leaf-datoms as) ^java.util.ArrayList ys (leaf-datoms bs)
-                           nx (.size xs) ny (.size ys)]
+                     (let [leaf-datoms (fn [leaves]
+                                         (into [] (cond-> (mapcat (fn [[_ ^Leaf leaf]] (.keys leaf))) (not whole?) (comp (filter within?)))
+                                               leaves))
+                           xs (leaf-datoms as) ys (leaf-datoms bs)
+                           nx (count xs) ny (count ys)]
+                       ;; the comparator called as the function it is, on vectors: on Jolt `.compare` and
+                       ;; ArrayList's `.get` are each a dispatched method call
                        (loop [i 0 j 0 oa (transient []) ob (transient [])]
                          (cond (and (< i nx) (< j ny))
-                               (let [c (.compare cmp (.get xs i) (.get ys j))]
+                               (let [x (nth xs i) y (nth ys j) c (long (cmp x y))]
                                  (cond (zero? c) (recur (inc i) (inc j) oa ob)
-                                       (neg? c) (recur (inc i) j (conj! oa (.get xs i)) ob)
-                                       :else (recur i (inc j) oa (conj! ob (.get ys j)))))
-                               (< i nx) (recur (inc i) j (conj! oa (.get xs i)) ob)
-                               (< j ny) (recur i (inc j) oa (conj! ob (.get ys j)))
+                                       (neg? c) (recur (inc i) j (conj! oa x) ob)
+                                       :else (recur i (inc j) oa (conj! ob y))))
+                               (< i nx) (recur (inc i) j (conj! oa (nth xs i)) ob)
+                               (< j ny) (recur i (inc j) oa (conj! ob (nth ys j)))
                                :else [(persistent! oa) (persistent! ob)])))
                      (let [[ea eb] (unshared (children (.-_storage a) as) (children (.-_storage b) bs))
                            below (dec level)]

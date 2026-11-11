@@ -219,6 +219,22 @@
             (is (= (plain x y attribute) (answered x y attribute))))))
       (d/release conn))))
 
+(deftest a-diff-answers-vectors-in-index-order
+  ;; Each side's datoms come back as a vector sorted by the index's comparator, from a
+  ;; restored store's commits whose differing leaves interleave on both sides.
+  (let [cfg (shaped-config (file-store) 8 0) _ (d/create-database cfg) conn (d/connect cfg)]
+    (churn! conn 1500 60 11)
+    (let [cids (lineage conn 30)]
+      (d/release conn)
+      (let [conn (d/connect cfg)
+            dbs (mapv #(v/commit-as-db conn %) (take-nth 6 cids))]
+        (doseq [a dbs b dbs index [:eavt :aevt :avet]
+                :let [cmp (dd/index-type->cmp-quick index)]
+                side (d/datoms-diff a b index [])]
+          (is (vector? side))
+          (is (= side (vec (sort cmp side))) (str index)))
+        (d/release conn)))))
+
 ;; ---------------------------------------------------------------------------
 ;; What a diff costs: the work follows the children of the branches that differ.
 
