@@ -1205,16 +1205,22 @@
                :datahike/current-basis-t (:max-tx old)})))
   (complete-db-update old (with-store-ids old #(core/with old tx-data tx-meta %))))
 
-(defn merge-writer!
-  "Writer operation for merge: the ordinary `transact!` (so its
-   `:datahike/expected-basis-t` fence and report validation apply unchanged)
+(defn merge-writer-over
+  "Writer operation for merge over `transact`, a writer's transact operation:
+   `transact` on the arg-map as given (so its `:datahike/expected-basis-t` fence,
+   report validation and whatever the writer's transact adds apply unchanged)
    plus merge parents on the db meta, from which the commit loop creates a
    multi-parent merge commit."
-  [old {:keys [parents tx-data] :as arg-map}]
-  (log/trace :datahike/merge {:parent-count (count parents) :tx-count (count tx-data)})
-  (update (transact! old arg-map) :db-after
-          assoc-in [:meta :datahike/merge-parents]
-          (conj (set parents) (get-in old [:config :branch]))))
+  [transact]
+  (fn [old {:keys [parents tx-data] :as arg-map}]
+    (log/trace :datahike/merge {:parent-count (count parents) :tx-count (count tx-data)})
+    (update (transact old arg-map) :db-after
+            assoc-in [:meta :datahike/merge-parents]
+            (conj (set parents) (get-in old [:config :branch])))))
+
+(def merge-writer!
+  "Writer operation for merge over the ordinary `transact!` (`merge-writer-over`)."
+  (merge-writer-over transact!))
 
 (defn load-entities [old entities]
   (log/debug :datahike/load-entities {:entity-count (count entities)})

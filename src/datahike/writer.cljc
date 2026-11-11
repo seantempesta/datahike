@@ -357,6 +357,17 @@
                            ;; merge with multi-parent commit tracking
                            'merge! w/merge-writer!})
 
+(defn writer-fn-map
+  "A writer's operations: `default-write-fn-map` with `write-fn-map` over it.
+   Unless `write-fn-map` supplies its own 'merge!, 'merge! is the merge
+   operation over the map's 'transact!, so what a connection puts on transact
+   holds for a merge too."
+  [write-fn-map]
+  (let [m (merge default-write-fn-map write-fn-map)]
+    (if (contains? write-fn-map 'merge!)
+      m
+      (assoc m 'merge! (w/merge-writer-over (get m 'transact!))))))
+
 (defmulti create-writer
   (fn [writer-config _]
     (:backend writer-config)))
@@ -368,8 +379,7 @@
         commit-wait-time (or commit-wait-time DEFAULT_COMMIT_WAIT_TIME)
         [transaction-queue commit-queue inflight-ops processing-thread commit-thread]
         (create-thread connection
-                       (merge default-write-fn-map
-                              write-fn-map)
+                       (writer-fn-map write-fn-map)
                        transaction-queue-size
                        commit-queue-size
                        commit-wait-time)]
@@ -507,7 +517,7 @@
 
 (defmethod create-writer :sync
   [{:keys [write-fn-map streaming?]} connection]
-  (->SyncWriter connection (merge default-write-fn-map write-fn-map) (volatile! nil) (volatile! nil) (volatile! nil) streaming?))
+  (->SyncWriter connection (writer-fn-map write-fn-map) (volatile! nil) (volatile! nil) (volatile! nil) streaming?))
 
 ;; seon (lane A1): run-ahead writes at the serial caller. The caller owns its branch alone (an
 ;; agent process): each transaction is applied to the value ahead of the committed one and
