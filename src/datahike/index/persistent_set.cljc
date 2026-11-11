@@ -8,7 +8,7 @@
             [org.replikativ.persistent-sorted-set.arrays :as arrays]
             [datahike.datom :as dd :refer [index-type->cmp-quick]]
             [org.replikativ.persistent-sorted-set.fressian :as pss-fress]
-            [datahike.constants :refer [tx0 txmax]]
+            [datahike.constants :refer [e0 emax tx0 txmax]]
             [datahike.index.audit :as audit :refer [IAuditable]]
             [datahike.index.interface :as di :refer [IIndex]]
             [datahike.tools :as dt]
@@ -299,18 +299,23 @@
      [^PersistentSortedSet a ^PersistentSortedSet b index-type from to]
      (di/record-read! from to)
      (let [in-range (slice-comparator-constructor index-type from to)
+           ;; bounds of every entity and no attribute or value hold every datom of the index (every id
+           ;; lies in [e0, emax]): no datom or child is tested against them, the walk's commonest call
+           whole? (and (== e0 (.-e ^Datom from)) (nil? (.-a ^Datom from)) (nil? (.-v ^Datom from))
+                       (== emax (.-e ^Datom to)) (nil? (.-a ^Datom to)) (nil? (.-v ^Datom to)))
+           within? (fn [d] (or whole? (and (not (neg? (in-range d from))) (not (pos? (in-range d to))))))
            ^java.util.Comparator cmp (.comparator a)
            ;; edits a branch buffers for its children, which the children's stored nodes do not hold yet
            buffered (java.util.TreeSet. ^java.util.Comparator cmp)
-           take! (fn [d] (when (and (not (neg? (in-range d from))) (not (pos? (in-range d to))))
-                           (.add buffered d)))
+           take! (fn [d] (when (within? d) (.add buffered d)))
            ;; the in-range children of every branch in `level`; a child's buffered edits lie in its own range
            children (fn [^IStorage storage level]
                       (into [] (mapcat (fn [[_ ^Branch branch]]
-                                         (let [ks (.keys branch)]
+                                         (let [ks (when-not whole? (.keys branch))]
                                            (for [i (range (.len branch))
-                                                 :when (and (not (neg? (in-range (.get ks (int i)) from)))
-                                                            (or (zero? i) (not (pos? (in-range (.get ks (int (dec i))) to)))))
+                                                 :when (or whole?
+                                                           (and (not (neg? (in-range (.get ks (int i)) from)))
+                                                                (or (zero? i) (not (pos? (in-range (.get ks (int (dec i))) to))))))
                                                  :let [_ (run! take! (slot-datoms branch i))]]
                                              [(.address branch (int i)) branch i storage]))))
                             level))
@@ -334,8 +339,7 @@
                      ;; a datom both sides' unshared leaves hold is in both sets
                      (let [leaf-datoms (fn [leaves] (let [out (java.util.ArrayList.)]
                                                       (doseq [[_ ^Leaf leaf] leaves, d (.keys leaf)]
-                                                        (when (and (not (neg? (in-range d from))) (not (pos? (in-range d to))))
-                                                          (.add out d)))
+                                                        (when (within? d) (.add out d)))
                                                       out))
                            ^java.util.ArrayList xs (leaf-datoms as) ^java.util.ArrayList ys (leaf-datoms bs)
                            nx (.size xs) ny (.size ys)]

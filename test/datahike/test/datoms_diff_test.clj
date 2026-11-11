@@ -6,6 +6,7 @@
             [clojure.test.check.properties :as prop]
             [datahike.api :as d]
             [datahike.datom :as dd]
+            [datahike.index.persistent-set :as psi]
             [datahike.versioning :as v]
             ;; Jolt's :file backend (konserve.jolt.filestore): without it :file is konserve's JVM
             ;; store, whose Fressian a Jolt process cannot read, and every restored history threw
@@ -318,6 +319,32 @@
         (is (= (case index :eavt 0 1) (count (d/datoms @main {:index index :components cs}))) (str index " on the db after it")))
       (is (thrown-with-msg? Throwable #"not defined in current schema" (d/db-with before [{:k/new 1}]))
           "a write naming it is still refused"))))
+
+(deftest a-diff-of-the-whole-index-tests-no-datom-against-its-bounds
+  ;; Bounds of every entity and no attribute or value hold every datom, so the walk asks
+  ;; nothing of them; bounds that do cut the index are still asked, and still answer exactly.
+  (let [cfg (shaped-config (file-store) 8 0)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)
+        _ (d/transact conn (vec (for [i (range 300)] {:k/n (long i) :k/tags [(str "t" i)]})))
+        a @conn
+        b (:db-after (d/transact conn [{:k/n 1000 :k/tags ["new"]} [:db/add (:e (first (d/datoms a :eavt))) :k/tags "x"]]))
+        asked (atom 0)
+        counted (fn [f]
+                  (reset! asked 0)
+                  (with-redefs [psi/slice-comparator-constructor
+                                (let [make psi/slice-comparator-constructor]
+                                  (fn [& bounds]
+                                    (let [in-range (apply make bounds)]
+                                      (fn [x y] (swap! asked inc) (in-range x y)))))]
+                    (f))
+                  @asked)]
+    (doseq [index [:eavt :aevt :avet]]
+      (is (zero? (counted #(d/datoms-diff a b index []))) (str index " over the whole index"))
+      (is (exact? a b index)))
+    (is (pos? (counted #(d/datoms-diff a b :aevt [:k/tags]))) "an attribute's range is asked")
+    (is (= (plain a b :k/tags) (answered a b :k/tags)))
+    (d/release conn)))
 
 ;; ---------------------------------------------------------------------------
 ;; A temporal or filtered value holds no index of its own: its datoms are merged, not tree-diffed.
