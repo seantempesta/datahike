@@ -165,10 +165,14 @@
                   ;; writer set between the two is seen by one of them.
                   (let [state    (:wrapped-atom connection)
                         attached (promise-chan)]
-                    (add-watch state attached (fn [_ _ _ db] (when (:writer db) (put! attached true))))
-                    (when (:writer @state) (put! attached true))
+                    ;; a connection released before its writer was seen (its state is then
+                    ;; the keyword :released) will never have one: the wait ends, and the
+                    ;; loop below ends at its closed queue
+                    (add-watch state attached (fn [_ _ _ db] (when (or (= :released db) (:writer db)) (put! attached true))))
+                    (let [db @state] (when (or (= :released db) (:writer db)) (put! attached true)))
                     (<! attached)
-                    (remove-watch state attached))
+                    (remove-watch state attached)
+                    (when (= :released @state) (close! transaction-queue)))
                   (loop [old @(:wrapped-atom connection)]
                     (if-let [{:keys [op args callback applied] :as invocation} (<?- transaction-queue)]
                     (do
@@ -622,7 +626,14 @@
 ;; Note: :kabel backend is implemented in datahike.kabel.writer
 ;; Require that namespace to register the defmethod
 
-(defn dispatch! [writer arg-map]
+(defn dispatch!
+  "Hand arg-map to writer. A connection that has been released holds no writer (its state is
+   the keyword :released, and the writer read from it is nil): that is said as what it is,
+   where it read 'No implementation of method: :-dispatch! ... for class: nil'."
+  [writer arg-map]
+  (when (nil? writer)
+    (throw (ex-info "Connection has been released."
+                    {:type :connection-has-been-released :op (:op arg-map)})))
   (-dispatch! writer arg-map))
 
 (defn shutdown [writer]

@@ -546,3 +546,18 @@
     (async/close! transaction-queue)
     (async/close! commit-queue)
     (is (not= ::timeout (take-with-timeout processing)))))
+
+(deftest a-released-connection-says-so-and-its-writer-does-not-wait
+  ;; A released connection's state is the keyword :released, and the writer read from
+  ;; it is nil. A dispatch on it read "No implementation of method: :-dispatch! ... for
+  ;; class: nil", which names nothing; it says the connection was released. And a
+  ;; writer's thread whose connection is released before it saw its writer ends: it
+  ;; waited for that writer for good.
+  (let [e (try (writer/dispatch! (:writer :released) {:op 'transact!}) nil
+               (catch clojure.lang.ExceptionInfo e e))]
+    (is (= {:type :connection-has-been-released :op 'transact!} (ex-data e))))
+  (let [state (atom {})
+        [_ commit-queue _ processing] (writer/create-thread {:wrapped-atom state} {} 8 8 0)]
+    (reset! state :released)
+    (async/close! commit-queue)
+    (is (not= ::timeout (take-with-timeout processing)) "the processing loop ended")))
