@@ -514,6 +514,13 @@
     (dd/datom (.-e datom) (.-a datom) (secondary-only-hash (.-v datom)) (.-tx datom) (datom-added datom))
     datom))
 
+(defn- with-index
+  "db with index k as (f index): the same db when f answers the same index, as a transient index's insert
+  does (it changes in place), so a transaction's datom costs no copy of the db record per index."
+  [db k f]
+  (let [idx (get db k) idx' (f idx)]
+    (if (identical? idx idx') db (assoc db k idx'))))
+
 (defn- with-datom [db ^Datom datom current-datom]
   (validate-datom db datom)
   (let [{a-ident :ident} (dbu/attr-info db (.-a datom) :error-on-missing)
@@ -533,32 +540,34 @@
                  {:error :transact/secondary-only-uncovered :attribute a-ident :datom datom}))
     (if (datom-added datom)
       (cond-> db
-        true (update :eavt #(di/-insert % prim :eavt op-count))
-        true (update :aevt #(di/-insert % prim :aevt op-count))
-        indexing? (update :avet #(di/-insert % prim :avet op-count))
+        true (with-index :eavt #(di/-insert % prim :eavt op-count))
+        true (with-index :aevt #(di/-insert % prim :aevt op-count))
+        indexing? (with-index :avet #(di/-insert % prim :avet op-count))
         has-secondary? (update-secondary-indices a-ident datom true)
-        true (advance-max-eid (.-e datom))
-        true (update :hash + (hash prim))
         schema? (-> (update-schema datom)
                     (update-rschema (schema-attr-of db datom)))
-        true (update :op-count inc)
+        ;; the datom's max-eid, hash and op-count in one assoc (one copy of the db record, not three)
+        true (as-> d (let [e (.-e datom) me (:max-eid d)]
+                       (assoc d :max-eid (if (and (> e me) (< e tx0)) e me)
+                                :hash (+ (:hash d) (hash prim))
+                                :op-count (inc (:op-count d)))))
         additive-index-attr (backfill-avet additive-index-attr))
 
       (if-some [removing ^Datom current-datom]
         (cond-> db
-          true (update :eavt #(di/-remove % removing :eavt op-count))
-          true (update :aevt #(di/-remove % removing :aevt op-count))
-          indexing? (update :avet #(di/-remove % removing :avet op-count))
+          true (with-index :eavt #(di/-remove % removing :eavt op-count))
+          true (with-index :aevt #(di/-remove % removing :aevt op-count))
+          indexing? (with-index :avet #(di/-remove % removing :avet op-count))
           has-secondary? (update-secondary-indices a-ident datom false)
           true (update :hash - (hash removing))
           schema? (retract-schema datom)
-          keep-history? (update :temporal-eavt #(di/-temporal-insert % removing :eavt op-count))
-          keep-history? (update :temporal-eavt #(di/-temporal-insert % prim :eavt (inc op-count)))
-          keep-history? (update :temporal-aevt #(di/-temporal-insert % removing :aevt op-count))
-          keep-history? (update :temporal-aevt #(di/-temporal-insert % prim :aevt (inc op-count)))
+          keep-history? (with-index :temporal-eavt #(di/-temporal-insert % removing :eavt op-count))
+          keep-history? (with-index :temporal-eavt #(di/-temporal-insert % prim :eavt (inc op-count)))
+          keep-history? (with-index :temporal-aevt #(di/-temporal-insert % removing :aevt op-count))
+          keep-history? (with-index :temporal-aevt #(di/-temporal-insert % prim :aevt (inc op-count)))
           keep-history? (update :hash + (hash prim))
-          (and keep-history? indexing?) (update :temporal-avet #(di/-temporal-insert % removing :avet op-count))
-          (and keep-history? indexing?) (update :temporal-avet #(di/-temporal-insert % prim :avet (inc op-count)))
+          (and keep-history? indexing?) (with-index :temporal-avet #(di/-temporal-insert % removing :avet op-count))
+          (and keep-history? indexing?) (with-index :temporal-avet #(di/-temporal-insert % prim :avet (inc op-count)))
           true (update :op-count + (if (or keep-history? indexing?) 2 1)))
         db))))
 
@@ -573,18 +582,18 @@
         op-count (:op-count db)
         has-secondary? (seq (get-in db [:rschema :db.secondary/index a-ident]))]
     (cond-> db
-      current? (update :eavt #(di/-remove % current-datom :eavt op-count))
-      current? (update :aevt #(di/-remove % current-datom :aevt op-count))
-      (and current? indexing?) (update :avet #(di/-remove % current-datom :avet op-count))
+      current? (with-index :eavt #(di/-remove % current-datom :eavt op-count))
+      current? (with-index :aevt #(di/-remove % current-datom :aevt op-count))
+      (and current? indexing?) (with-index :avet #(di/-remove % current-datom :avet op-count))
       current? (update :hash - (hash current-datom))
       ;; Secondary indices represent current state only; emit a retraction
       ;; event so they drop the purged datom. Skip when the datom was only
       ;; in history (already retracted earlier — never reached the secondary).
       (and current? has-secondary?) (update-secondary-indices a-ident current-datom false)
       (and current? schema?) (retract-schema datom)
-      history? (update :temporal-eavt #(di/-remove % history-datom :eavt op-count))
-      history? (update :temporal-aevt #(di/-remove % history-datom :aevt op-count))
-      (and history? indexing?) (update :temporal-avet #(di/-remove % history-datom :avet op-count))
+      history? (with-index :temporal-eavt #(di/-remove % history-datom :eavt op-count))
+      history? (with-index :temporal-aevt #(di/-remove % history-datom :aevt op-count))
+      (and history? indexing?) (with-index :temporal-avet #(di/-remove % history-datom :avet op-count))
       (or current? history?) (update :op-count inc))))
 
 (defn- queue-tuple [queue tuple idx db e v]
@@ -641,28 +650,28 @@
         (catch ExceptionInfo _e
           db))
 
-      keep-history? (update :temporal-eavt #(di/-temporal-upsert % prim :eavt op-count old-datom))
-      true          (update :eavt #(di/-upsert % prim :eavt op-count old-datom))
+      keep-history? (with-index :temporal-eavt #(di/-temporal-upsert % prim :eavt op-count old-datom))
+      true          (with-index :eavt #(di/-upsert % prim :eavt op-count old-datom))
 
-      keep-history? (update :temporal-aevt #(di/-temporal-upsert % prim :aevt op-count old-datom))
-      true          (update :aevt #(di/-upsert % prim :aevt op-count old-datom))
+      keep-history? (with-index :temporal-aevt #(di/-temporal-upsert % prim :aevt op-count old-datom))
+      true          (with-index :aevt #(di/-upsert % prim :aevt op-count old-datom))
 
-      (and keep-history? indexing?) (update :temporal-avet #(di/-temporal-upsert % prim :avet op-count old-datom))
-      indexing?                     (update :avet #(di/-upsert % prim :avet op-count old-datom))
+      (and keep-history? indexing?) (with-index :temporal-avet #(di/-temporal-upsert % prim :avet op-count old-datom))
+      indexing?                     (with-index :avet #(di/-upsert % prim :avet op-count old-datom))
 
       ;; Secondary indices: retract old, assert new (full value)
       (and has-secondary? old-datom) (update-secondary-indices a-ident old-datom false)
       has-secondary? (update-secondary-indices a-ident datom true)
 
-      true    (update :op-count inc)
-      true    (advance-max-eid (.-e datom))
-      ;; the superseded value's term goes when it survives nowhere: with no history
-      ;; for it (keep-history? false: none kept, or :db/noHistory) it is in no index
-      ;; (upstream 7c849d15, #940). An equal value never reaches here: transact-report
-      ;; finds it unchanged and writes nothing, so upstream's equal-value term is not kept
-      (and old-datom (not keep-history?))
-      (update :hash - (hash old-datom))
-      true    (update :hash + (hash prim))
+      ;; op-count, max-eid and hash in one assoc (one copy of the db record, not three or four). The superseded
+      ;; value's term goes when it survives nowhere: with no history for it (keep-history? false: none kept, or
+      ;; :db/noHistory) it is in no index (upstream 7c849d15, #940). An equal value never reaches here:
+      ;; transact-report finds it unchanged and writes nothing, so upstream's equal-value term is not kept
+      true    (as-> d (let [e (.-e datom) me (:max-eid d)]
+                        (assoc d :op-count (inc (:op-count d))
+                                 :max-eid (if (and (> e me) (< e tx0)) e me)
+                                 :hash (cond-> (+ (:hash d) (hash prim))
+                                         (and old-datom (not keep-history?)) (- (hash old-datom))))))
       schema? (-> (update-schema datom)
                   (update-rschema (schema-attr-of db datom)))
       additive-index-attr (backfill-avet additive-index-attr))))
