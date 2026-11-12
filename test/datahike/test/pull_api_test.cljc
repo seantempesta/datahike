@@ -760,3 +760,15 @@
          (let [n (ticks named) s (ticks star)]
            (is (<= n s) (str "ticks of 100 entities pulled by 35 names and by '*: " [n s]))))
        (d/release conn))))
+
+(deftest a-named-pull-charges-the-datoms-it-reads
+  ;; A pattern of more than one attribute reads the entity's whole :eavt range: each datom
+  ;; read is work, as '*'s are, so a budget smaller than the entity is reached, loudly.
+  (let [attrs (mapv #(keyword "k" (str "a" %)) (range 35))
+        db (d/db-with (db/empty-db (into {} (for [a attrs] [a {:db/cardinality :db.cardinality/one}])))
+                      [(into {:db/id 1} (for [a attrs] [a (name a)]))
+                       {:db/id 2 :k/a0 "x" :k/a1 "y"}])
+        pull #(d/pull db {:selector [:k/a0 :k/a1] :eid % :max-work 20})]
+    (is (= {:k/a0 "x" :k/a1 "y"} (pull 2)) "an entity of two datoms fits the budget")
+    (is (budget-exceeded? (try (pull 1) nil (catch #?(:clj Exception :cljs :default) error error)) :query-work)
+        "an entity of 35 datoms is past it")))

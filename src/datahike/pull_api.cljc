@@ -424,10 +424,13 @@
 
 (defn entity-datoms
   "Entity `eid`'s datoms by attribute (as its datoms name it), each in :eavt order: its
-   :eavt range read once, so a pattern of n attributes reads the entity once, not n times."
+   :eavt range read once, so a pattern of n attributes reads the entity once, not n times.
+   Each datom read is charged to the budget's work."
   [db eid]
   (persistent!
    (reduce (fn [grouped ^Datom datom]
+             ;; each datom read is work, as '*'s are, whether the pattern keeps it or not
+             (resource/charge-work!)
              (let [a (.-a datom)]
                (assoc! grouped a (conj (get grouped a []) datom))))
            (transient {})
