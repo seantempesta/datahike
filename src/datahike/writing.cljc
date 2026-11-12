@@ -69,11 +69,16 @@
                (< ra 6) (compare a b)
                :else (compare (pr-str a) (pr-str b)))))
      (defn- schema-canon
-       "x with every map and set as a sorted vector (a map's entries by key), so equal values built in any
-        order encode to the same bytes: fasl writes a map in its iteration order."
+       "x with every map and set in one order whatever order built it, so equal values encode to the same
+        bytes (fasl writes a map in its iteration order). A hash map or set past 8 entries iterates in its
+        keys' hash order, the same for the same keys (its trie is a function of them): its entries in that
+        order, values made canonical. A smaller map is an array map, iterating in insertion order: sorted by key.
+        Sorting the whole schema map cost 0.87M of the key's 0.94M ticks."
        [x]
-       (cond (map? x) (into [::map] (sort-by first canon-compare (map (fn [[k v]] [(schema-canon k) (schema-canon v)]) x)))
-             (set? x) (into [::set] (sort canon-compare (map schema-canon x)))
+       (cond (map? x) (if (> (count x) 8)
+                        (persistent! (reduce-kv (fn [acc k v] (conj! (conj! acc k) (schema-canon v))) (transient [::hmap]) x))
+                        (into [::map] (sort-by first canon-compare (map (fn [[k v]] [(schema-canon k) (schema-canon v)]) x))))
+             (set? x) (if (> (count x) 8) x (into [::set] (sort canon-compare x)))
              (vector? x) (mapv schema-canon x)
              (seq? x) (into [::seq] (map schema-canon x))
              :else x))))
