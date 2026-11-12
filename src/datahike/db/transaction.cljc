@@ -193,16 +193,30 @@
     (:v datom)
     (let [i (get-in db [:schema (:e datom)])] (when (keyword? i) i))))
 
+(defn schema-keys-of
+  "The schema keys whose entries the added schema datom changes, read from db before it: a :db/ident
+  datom, the ident it adds and, when its entity already had an entry without one, the entity itself,
+  whose entry the ident replaces; any other datom, its entity's ident, or the entity itself while it
+  has none (dbu/rschema keeps such an entry under the entity)."
+  [db datom]
+  (let [e (:e datom) entry (get-in db [:schema e])]
+    (if (= :db/ident (:a datom))
+      (if (map? entry) [(:v datom) e] [(:v datom)])
+      [(if (keyword? entry) entry e)])))
+
 (defn update-rschema
-  "db with its reverse schema brought up to the schema entry of attr, which changed: for that attribute
+  "db with its reverse schema brought up to the schema entries of attrs, which changed: for those keys
   alone (dbu/rschema-update), or rebuilt from the whole schema when there is none to name. Every schema
   datom of a transaction rebuilt it whole, which was O(schema) a datom: transacting a schema of n
-  attributes was quadratic in n (459 attributes: 600 MB, a store's creation)."
+  attributes was quadratic in n (459 attributes: 600 MB, a store's creation). A datom of an entity
+  whose :db/ident had not come yet (a hash map iterates its keys in hash order) still did, and the
+  ident's own update left the entity's memberships behind."
   ([db] (assoc db :rschema (dbu/rschema (:schema db))))
-  ([db attr]
-   (if (and attr (:rschema db))
-     (assoc db :rschema (dbu/rschema-update (:rschema db) (:schema db) attr))
-     (update-rschema db))))
+  ([db attrs]
+   (let [attrs (if (sequential? attrs) attrs [attrs])]
+     (if (and (seq attrs) (every? some? attrs) (:rschema db))
+       (assoc db :rschema (reduce (fn [r attr] (dbu/rschema-update r (:schema db) attr)) (:rschema db) attrs))
+       (update-rschema db)))))
 
 (declare remove-schema)
 
@@ -545,7 +559,7 @@
         indexing? (with-index :avet #(di/-insert % prim :avet op-count))
         has-secondary? (update-secondary-indices a-ident datom true)
         schema? (-> (update-schema datom)
-                    (update-rschema (schema-attr-of db datom)))
+                    (update-rschema (schema-keys-of db datom)))
         ;; the datom's max-eid, hash and op-count in one assoc (one copy of the db record, not three)
         true (as-> d (let [e (.-e datom) me (:max-eid d)]
                        (assoc d :max-eid (if (and (> e me) (< e tx0)) e me)
@@ -673,7 +687,7 @@
                                  :hash (cond-> (+ (:hash d) (hash prim))
                                          (and old-datom (not keep-history?)) (- (hash old-datom))))))
       schema? (-> (update-schema datom)
-                  (update-rschema (schema-attr-of db datom)))
+                  (update-rschema (schema-keys-of db datom)))
       additive-index-attr (backfill-avet additive-index-attr))))
 
 ;; conj onto a report's ::effective-tx-data, made once: built per datom, the fnil was ~900 B of
