@@ -22,6 +22,7 @@
             [replikativ.logging :as log]
             [hasch.core :refer [uuid squuid]]
             [hasch.platform]
+            #?@(:jolt [[konserve.jolt.fasl-store :as fasl-store]])
             [clojure.core.async :as async :refer [go put!]]
             [superv.async #?(:clj :refer :cljs :refer-macros) [go-try- <?-]]
             [konserve.utils :refer [#?(:clj async+sync) multi-key-capable? *default-sync-translation*]
@@ -55,12 +56,39 @@
       db
       (vary-meta db assoc :datahike/schema-meta [schema-meta key (immutable?)]))))
 
+#?(:jolt
+   (do
+     (defn- canon-rank [x]
+       (cond (number? x) 0 (keyword? x) 1 (string? x) 2 (symbol? x) 3 (boolean? x) 4 (nil? x) 5 :else 6))
+     (defn- canon-compare
+       "A total order on the schema meta's keys and set members: by kind, then by value (a nested
+        canonical form by its printed text)."
+       [a b]
+       (let [ra (canon-rank a) rb (canon-rank b)]
+         (cond (not= ra rb) (compare ra rb)
+               (< ra 6) (compare a b)
+               :else (compare (pr-str a) (pr-str b)))))
+     (defn- schema-canon
+       "x with every map and set as a sorted vector (a map's entries by key), so equal values built in any
+        order encode to the same bytes: fasl writes a map in its iteration order."
+       [x]
+       (cond (map? x) (into [::map] (sort-by first canon-compare (map (fn [[k v]] [(schema-canon k) (schema-canon v)]) x)))
+             (set? x) (into [::set] (sort canon-compare (map schema-canon x)))
+             (vector? x) (mapv schema-canon x)
+             (seq? x) (into [::seq] (map schema-canon x))
+             :else x))))
+
 (defn schema-meta-uuid
   "The content key of schema-meta ({:schema :rschema :system-entities :ident-ref-map :ref-ident-map}),
    under which a commit that changed the schema stores it (immutable: a store reads it by the key its
-   commit recorded, never recomputing it)."
+   commit recorded, never recomputing it, so a store keyed by hasch reads as it is). On Jolt the first
+   16 bytes of a SHA-256 of a canonical form's fasl bytes, as a node's address is: hasch's walk cost
+   5.5M ticks and 19 MB for Seon's ~900 schema entries, every schema-changing commit."
   [schema-meta]
-  (uuid schema-meta))
+  #?(:jolt (let [d (java.nio.ByteBuffer/wrap (.digest (java.security.MessageDigest/getInstance "SHA-256")
+                                                      (fasl-store/serialize (schema-canon schema-meta))))]
+             (java.util.UUID. (.getLong d) (.getLong d)))
+     :default (uuid schema-meta)))
 
 (defn- schema-meta-content-key
   "The content UUID of `schema-meta`, the members of `db`: the key `db` carries when
