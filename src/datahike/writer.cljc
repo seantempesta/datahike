@@ -417,7 +417,7 @@
 ;; a batch of one (w/commit! with the revision change and the advanced query cache
 ;; context). Callers must be serial: two concurrent callers would both commit on the
 ;; same parent. Channel-returning ops (gc, index backfill) are not supported here.
-(defn- refuse-while-pending!
+(defn refuse-while-pending!
   "Refuse a write that does not run ahead while the caller has applied transactions not
   committed yet (apply!): it would build on the committed value, or on the one shown, and
   its commit would leave the pending transactions out of the branch."
@@ -530,6 +530,21 @@
                     r)
                   r))
               rs)))))
+
+(defn sync-writer?
+  "Is writer a :sync writer (its caller serial, its head the connection's value)?"
+  [writer]
+  (instance? SyncWriter writer))
+
+(defn follow-head!
+  "Tell a :sync writer its branch's head is now commit cid (force-branch! moved it): its next
+  commit's parent. Refused while transactions applied run-ahead are pending, which were
+  applied on the old head."
+  [writer cid]
+  (refuse-while-pending! writer)
+  (vreset! (:last-cid writer) cid)
+  (vreset! (:known-generation writer) nil)
+  writer)
 
 (defmethod create-writer :sync
   [{:keys [write-fn-map streaming?]} connection]

@@ -3,6 +3,8 @@
   compatibility and does not implement underlying functionality."
   (:refer-clojure :exclude [filter])
   (:require [datahike.connector :as dc]
+            [datahike.connections :refer [active-connection]]
+            [datahike.store :as dstore]
             [datahike.config :as config]
             [datahike.writer :as dw]
             [datahike.writing :as writing]
@@ -351,8 +353,15 @@
   ([db branch parents]
    (force-branch! db branch parents {}))
   ([db branch parents opts]
-   #?(:clj  (dv/force-branch! db branch parents (assoc opts :sync? true))
-      :cljs (dv/force-branch! db branch parents (assoc opts :sync? false)))))
+   ;; a live connection to the branch in this process is moved to the new head with it, so its
+   ;; writer's next commit keeps what the move brought; its pending run-ahead writes refuse the move first
+   (let [live (active-connection (dstore/connection-id (assoc (:config db) :branch branch)))
+         writer (some-> live :wrapped-atom deref :writer)]
+     (when (dw/sync-writer? writer) (dw/refuse-while-pending! writer))
+     #?(:clj  (let [cid (dv/force-branch! db branch parents (assoc opts :sync? true))]
+                (some-> live dc/follow-head!)
+                cid)
+        :cljs (dv/force-branch! db branch parents (assoc opts :sync? false))))))
 
 (defn merge-db
   ([conn arg-map]

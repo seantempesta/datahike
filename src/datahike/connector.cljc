@@ -80,6 +80,26 @@
        (.write w "#datahike/Connection")
        (.write w (pr-str (ds/connection-id config))))))
 
+(defn- head-db
+  "The branch head of the connection holding wrapped-atom's value, read from the store, as that
+  connection's db: its own config (the stored one names the store as it was made, its path, so a
+  moved store's db named the old path) and its cache context advanced to the head's commit."
+  [wrapped-atom]
+  (let [store  (:store @wrapped-atom)
+        stored (dsi/read-head store (:branch (:config @wrapped-atom)) {:sync? true})]
+    (log/trace :datahike/db-deref {:config (:config stored)})
+    (let [fresh-db (dsi/stored->db (assoc stored :config (:config @wrapped-atom)) store)
+          commit-id (get-in fresh-db [:meta :datahike/commit-id])]
+      (assoc fresh-db :cache-context
+             ;; Another process's commit carries its stored revisions.
+             (let [context (:cache-context @wrapped-atom)]
+               (cond-> context
+                 context (assoc :datahike.cache/commit-id commit-id
+                                :datahike.cache/committed? (some? commit-id))
+                 (and context commit-id (not= commit-id (:datahike.cache/commit-id context)))
+                 (-> (dissoc :datahike.cache/attribute-revisions)
+                     (merge (dsi/stored-revisions stored)))))))))
+
 (defn deref-conn
   "The connection's db value. On a writer that does not stream, the branch head read from the
   store, unless the connection holds a run-ahead value shown by apply! (`w/shown?`): that one is
@@ -91,23 +111,22 @@
                       {:type :connection-has-been-released})))
     (if (and (not (w/streaming? (get @wrapped-atom :writer)))
              (not (w/shown? @wrapped-atom)))
-      (let [store  (:store @wrapped-atom)
-            stored (dsi/read-head store (:branch (:config @wrapped-atom)) {:sync? true})]
-        (log/trace :datahike/db-deref {:config (:config stored)})
-        ;; the connection's own config, as connect builds its db (-connect-impl*): the stored
-        ;; one names the store as it was made (its path), so a moved store's db named the old path
-        (let [fresh-db (dsi/stored->db (assoc stored :config (:config @wrapped-atom)) store)
-              commit-id (get-in fresh-db [:meta :datahike/commit-id])]
-          (assoc fresh-db :cache-context
-                 ;; Another process's commit carries its stored revisions.
-                 (let [context (:cache-context @wrapped-atom)]
-                   (cond-> context
-                     context (assoc :datahike.cache/commit-id commit-id
-                                    :datahike.cache/committed? (some? commit-id))
-                     (and context commit-id (not= commit-id (:datahike.cache/commit-id context)))
-                     (-> (dissoc :datahike.cache/attribute-revisions)
-                         (merge (dsi/stored-revisions stored))))))))
+      (head-db wrapped-atom)
       @wrapped-atom)))
+
+(defn follow-head!
+  "Make the connection's value its branch's head as the store now holds it, after force-branch!
+  moved that head: its writer builds the next commit on the moved head, never on the value it
+  held before the move (which would drop what the move brought). Only a :sync writer is told
+  (`w/follow-head!`); another writer's connection keeps its value, to be released and reconnected."
+  [^Connection conn]
+  (let [wrapped-atom (.-wrapped-atom conn)
+        writer (:writer @wrapped-atom)]
+    (when (w/sync-writer? writer)
+      (let [db (assoc (head-db wrapped-atom) :writer writer)]
+        (w/follow-head! writer (get-in db [:meta :datahike/commit-id]))
+        (reset! wrapped-atom db)))
+    conn))
 
 (defn conn-from-db
   "Creates a mutable reference to a given immutable database. See [[create-conn]]."
