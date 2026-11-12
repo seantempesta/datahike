@@ -8,7 +8,7 @@
    a persistent-map update on each cost a seek 1.8x); the queue is a sorted map from a tick to
    the address, and an eviction takes the oldest, moving it to the newest end once if it was hit
    since."
-  (:require [datahike.datom]))
+  (:require [datahike.datom] [org.replikativ.persistent-sorted-set]))
 
 (def ^:private entry-bytes 200)
 
@@ -21,6 +21,8 @@
    Datoms weighed at 48 and symbols at 0 left the leaves 1.26x over their weight."
   [v]
   (cond
+    ;; a node's keys are Datoms: asked first
+    (instance? datahike.datom.Datom v) (+ 80 (value-bytes (.-v ^datahike.datom.Datom v)))
     (nil? v) 0
     (string? v) (+ 16 (* 4 (count v)))
     (bytes? v) (+ 16 (alength ^bytes v))
@@ -28,7 +30,6 @@
     (symbol? v) (+ 64 (* 4 (+ (count (name v)) (count (or (namespace v) "")))))
     (boolean? v) 0
     (number? v) 16
-    (instance? datahike.datom.Datom v) (+ 80 (value-bytes (:v v)))
     (vector? v) (+ 32 (* 8 (count v)) (reduce + 0 (map value-bytes v)))
     (map? v) (reduce-kv (fn [n k x] (+ n 32 (value-bytes k) (value-bytes x))) 64 v)
     (coll? v) (+ 32 (* 16 (count v)) (reduce + 0 (map value-bytes v)))
@@ -43,9 +44,16 @@
   [node]
   (if (or (vector? node) (map? node) (string? node) (nil? node))
     (+ entry-bytes (value-bytes node))
-    (let [ks (.keys node)]
-      (+ entry-bytes 64 (* 8 (count ks)) (reduce + 0 (map value-bytes ks))
-         (if (pos? (.level node)) (* 72 (count ks)) 0)))))
+    ;; the keys read in place from the node's own array (.keys copies them into a vector, and a
+    ;; lazy map over it boxed a count per key: 6.5 KB to weigh a leaf, 2026-11-12)
+    (let [leaf? (instance? org.replikativ.persistent_sorted_set.Leaf node)
+          ^objects ks (if leaf? (.-_keys ^org.replikativ.persistent_sorted_set.Leaf node)
+                          (.-_keys ^org.replikativ.persistent_sorted_set.Branch node))
+          n (long (.len node))]
+      (loop [i 0 acc (+ entry-bytes 64 (* 8 n) (if leaf? 0 (* 72 n)))]
+        (if (< i n)
+          (recur (inc i) (+ acc (long (value-bytes (aget ks i)))))
+          acc)))))
 
 (defrecord NodeCache [state max-bytes hits misses evictions])
 
