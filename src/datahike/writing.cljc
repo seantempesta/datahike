@@ -46,9 +46,14 @@
 (defn- with-schema-meta-key
   "`db` carrying `key` as the content uuid of its schema-meta (in its metadata, as
    `:datahike/schema-meta`): a db a data transaction makes from it holds the same
-   members, so its serialization reuses the key, whichever db was serialized in between."
-  [db schema-meta key]
-  (vary-meta db assoc :datahike/schema-meta [schema-meta key (immutable-schema-value? schema-meta)]))
+   members, so its serialization reuses the key, whichever db was serialized in between.
+   `immutable?` says identity proves the content unchanged; a db that carries these
+   members keyed already is answered as it is, so the schema is walked only when keyed anew."
+  [db schema-meta key immutable?]
+  (let [[held held-key] (:datahike/schema-meta (meta db))]
+    (if (and (= key held-key) held (every? (fn [[k v]] (identical? v (get held k))) schema-meta))
+      db
+      (vary-meta db assoc :datahike/schema-meta [schema-meta key (immutable?)]))))
 
 (defn- schema-meta-content-key
   "The content UUID of `schema-meta`, the members of `db`: the key `db` carries when
@@ -414,7 +419,8 @@
      ;; again, in every process that opens a db, not only the one that wrote it.
      (and (map? schema-meta) schema-meta-key
           (= #{:schema :rschema :system-entities :ident-ref-map :ref-ident-map} (set (keys schema-meta))))
-     (with-schema-meta-key schema-meta schema-meta-key)))))
+     ;; read from the store, it is a value no caller holds: identity proves it unchanged
+     (with-schema-meta-key schema-meta schema-meta-key (constantly true))))))
 
 #?(:clj
    (defn release-db
@@ -811,7 +817,7 @@
                         (<?- (online-gc/online-gc! store (assoc (:online-gc config) :sync? false))))
 
                       (-> db
-                          (with-schema-meta-key (schema-meta-of db) (:schema-meta-key db-to-store))
+                          (as-> d (let [m (schema-meta-of d)] (with-schema-meta-key d m (:schema-meta-key db-to-store) #(immutable-schema-value? m))))
                           ;; nil without a commit graph, so no generation outlives its commit
                           (vary-meta assoc :datahike/generation
                                      (:datahike/generation (second (peek graph-writes))))))
