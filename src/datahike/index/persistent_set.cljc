@@ -761,7 +761,8 @@
     (log/trace :datahike/index-read {:address address})
     (if-let [cached (di/cache-get cache address)]
       cached
-      (let [node (k/get store address nil {:sync? true})]
+      ;; a node is written immutable (writing.cljc): read without the key's lock, the probes or a revision
+      (let [node #?(:jolt (k/get-immutable store address) :default (k/get store address nil {:sync? true}))]
         (when (nil? node)
           (log/raise "Node not found in storage." {:type :node-not-found
                                                    :address address
