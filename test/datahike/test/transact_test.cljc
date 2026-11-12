@@ -558,8 +558,10 @@
                [:db/index true] [:db/doc "d"]]
         orders (vec (permutations props))
         attr (fn [i order] (apply array-map (mapcat (fn [[k v]] [k (if (= k :db/ident) (keyword "p" (str "a" i)) v)]) order)))
-        base (db/empty-db {:existing/name {:db/unique :db.unique/identity}})
         rebuilt? (fn [d] (= (:rschema d) (dbu/rschema (:schema d))))]
+   (doseq [refs? [false true]
+           :let [base (db/empty-db {:existing/name {:db/unique :db.unique/identity :db/valueType :db.type/string :db/cardinality :db.cardinality/one}} {:attribute-refs? refs? :schema-flexibility :write})]]
+    (testing (str ":attribute-refs? " refs?)
     (testing "each order alone"
       (doseq [[i order] (map-indexed vector orders)]
         (is (rebuilt? (d/db-with base [(attr i order)])) (pr-str (map first order)))))
@@ -568,5 +570,5 @@
         (is (rebuilt? after))
         (is (= (count orders) (count (filter #(= "p" (namespace %)) (keys (:ident-ref-map after))))))
         (testing "then a change to one of them"
-          (is (rebuilt? (d/db-with after [{:db/id [:db/ident :p/a3] :db/doc "changed"}]))))))))
+          (is (rebuilt? (d/db-with after [{:db/id [:db/ident :p/a3] :db/doc "changed"}]))))))))))
 

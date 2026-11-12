@@ -189,10 +189,12 @@
   "The schema keys whose entries the schema datom changes, added or retracted, read from db before it:
   a :db/ident datom, its ident and its entity (an entry without an ident is kept under the entity, as
   dbu/rschema keeps it, and the ident replaces or restores it); any other datom, its entity's ident, or
-  the entity itself while it has none."
+  the entity itself while it has none. Under :attribute-refs? a datom's attribute is an entity id,
+  named as update-schema names it."
   [db datom]
-  (let [e (:e datom) entry (get-in db [:schema e])]
-    (if (= :db/ident (:a datom))
+  (let [e (:e datom) entry (get-in db [:schema e])
+        a (if (:attribute-refs? (dbi/-config db)) (dbi/ident-for db (:a datom) :error-on-missing) (:a datom))]
+    (if (= :db/ident a)
       [(:v datom) e]
       [(if (keyword? entry) entry e)])))
 
