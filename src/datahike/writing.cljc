@@ -29,10 +29,6 @@
 
 ;; mapping to storage
 
-(def ^:private last-schema-meta
-  "The last schema-meta, its content key and whether identity proves unchanged content."
-  (atom nil))
-
 (defn- immutable-schema-value?
   "Whether identity suffices to reuse this schema value's content hash."
   {:malli/schema [:=> [:cat :any] :boolean]}
@@ -42,18 +38,27 @@
       #?(:clj (or (int? value) (float? value)) :cljs (number? value))
       (and (coll? value) (every? immutable-schema-value? value))))
 
+(defn- schema-meta-of
+  "The five members of `db` a schema-meta record holds."
+  [db]
+  (select-keys db [:schema :rschema :system-entities :ident-ref-map :ref-ident-map]))
+
+(defn- with-schema-meta-key
+  "`db` carrying `key` as the content uuid of its schema-meta (in its metadata, as
+   `:datahike/schema-meta`): a db a data transaction makes from it holds the same
+   members, so its serialization reuses the key, whichever db was serialized in between."
+  [db schema-meta key]
+  (vary-meta db assoc :datahike/schema-meta [schema-meta key (immutable-schema-value? schema-meta)]))
+
 (defn- schema-meta-content-key
-  "The content UUID, reused only for identical, immutable schema values."
-  {:malli/schema [:=> [:cat [:map [:schema [:maybe :map]] [:rschema [:maybe :map]] [:system-entities [:maybe [:set :int]]] [:ident-ref-map [:maybe :map]] [:ref-ident-map [:maybe :map]]]] :uuid]}
-  [schema-meta]
-  (let [[prior prior-key immutable?] @last-schema-meta
-        same? (and prior (every? (fn [[k v]] (identical? v (get prior k))) schema-meta))]
-    (if (and same? immutable?)
-      prior-key
-      (let [content-key (uuid schema-meta)]
-        (reset! last-schema-meta [schema-meta content-key
-                                 (if same? immutable? (immutable-schema-value? schema-meta))])
-        content-key))))
+  "The content UUID of `schema-meta`, the members of `db`: the key `db` carries when
+   each member is the identical, immutable value it was computed for, else hashed."
+  {:malli/schema [:=> [:cat :any [:map [:schema [:maybe :map]] [:rschema [:maybe :map]] [:system-entities [:maybe [:set :int]]] [:ident-ref-map [:maybe :map]] [:ref-ident-map [:maybe :map]]]] :uuid]}
+  [db schema-meta]
+  (let [[held key immutable?] (:datahike/schema-meta (meta db))]
+    (if (and held immutable? (every? (fn [[k v]] (identical? v (get held k))) schema-meta))
+      key
+      (uuid schema-meta))))
 
 (defn stored-db? [obj]
   ;; TODO use proper schema to match?
@@ -150,7 +155,7 @@
                      :system-entities system-entities
                      :ident-ref-map ident-ref-map
                      :ref-ident-map ref-ident-map}
-        schema-meta-key (schema-meta-content-key schema-meta)
+        schema-meta-key (schema-meta-content-key db schema-meta)
         backend                                          (di/konserve-backend (:index config) store)
         not-in-memory?                                    (not= :memory (-> config :store :backend))
         flush! (and flush? not-in-memory?)
@@ -353,15 +358,6 @@
                         (when-let [schema-meta (k/get store schema-meta-key nil {:sync? true})]
                           (sc/cache-miss schema-meta-key schema-meta)
                           schema-meta))
-        ;; The db below takes these five members from schema-meta itself, and
-        ;; schema-meta-key is their content uuid: the next serialization of this
-        ;; db (or of one a data transaction makes from it) reuses the key
-        ;; (schema-meta-content-key) instead of hashing the schema again, in
-        ;; every process that opens a db, not only the one that wrote it.
-        _ (when (and (map? schema-meta) schema-meta-key
-                     (= #{:schema :rschema :system-entities :ident-ref-map :ref-ident-map} (set (keys schema-meta)))
-                     (not (identical? schema-meta (first @last-schema-meta))))
-            (reset! last-schema-meta [schema-meta schema-meta-key (immutable-schema-value? schema-meta)]))
         effective-schema (or (:schema schema-meta) schema)
         effective-ident-ref-map (or (:ident-ref-map schema-meta) ident-ref-map)
         sec-indices (when secondary-indices?
@@ -386,7 +382,8 @@
         attach (fn [idx root]
                  (cond-> (di/with-storage (:index config) idx (:storage store))
                    root (di/-seed-root! root)))]
-    (merge
+    (cond->
+     (merge
      (assoc empty
             :max-tx max-tx
             :max-eid max-eid
@@ -410,7 +407,14 @@
        {:secondary-indices sec-indices
         :datahike.db/materialized-secondary-indices? true
         :datahike.db/released? (atom false)})
-     schema-meta))))
+     schema-meta)
+     ;; The db takes these five members from schema-meta itself, and schema-meta-key
+     ;; is their content uuid: it carries the key, so its next serialization (or that of
+     ;; one a data transaction makes from it) reuses it instead of hashing the schema
+     ;; again, in every process that opens a db, not only the one that wrote it.
+     (and (map? schema-meta) schema-meta-key
+          (= #{:schema :rschema :system-entities :ident-ref-map :ref-ident-map} (set (keys schema-meta))))
+     (with-schema-meta-key schema-meta schema-meta-key)))))
 
 #?(:clj
    (defn release-db
@@ -806,9 +810,11 @@
                       (when (get-in config [:online-gc :enabled?])
                         (<?- (online-gc/online-gc! store (assoc (:online-gc config) :sync? false))))
 
-                      ;; nil without a commit graph, so no generation outlives its commit
-                      (vary-meta db assoc :datahike/generation
-                                 (:datahike/generation (second (peek graph-writes)))))
+                      (-> db
+                          (with-schema-meta-key (schema-meta-of db) (:schema-meta-key db-to-store))
+                          ;; nil without a commit graph, so no generation outlives its commit
+                          (vary-meta assoc :datahike/generation
+                                     (:datahike/generation (second (peek graph-writes))))))
                     (catch #?(:clj Error :cljs :default) e
                       #?(:clj  (throw (ex-info "Fatal error during commit."
                                                {:type :fatal-commit-error}

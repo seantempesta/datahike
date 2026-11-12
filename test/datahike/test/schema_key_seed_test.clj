@@ -15,7 +15,6 @@
         (d/transact conn [{:db/ident :a/attr :db/valueType :db.type/string :db/cardinality :db.cardinality/one}])
         (let [db @conn
               record (dw/read-head (:store db) :db)
-              _ (reset! @#'dw/last-schema-meta nil)
               loaded (dw/stored->db record (:store db))
               next-db (:db-after (d/with loaded [{:a/attr "x"}]))
               calls (atom 0)
@@ -27,3 +26,28 @@
         (finally
           (d/release conn)
           (d/delete-database cfg))))))
+
+(deftest commits-that-change-no-schema-hash-none-whichever-connection-committed-last
+  ;; Two connections in one process, as a server holds them (its main and a branch, or two
+  ;; stores), commit in turn with no schema change: each commit's key is its schema's own, so
+  ;; neither hashes a schema, whatever the other committed in between. A key kept for the
+  ;; process's last schema was replaced by each other connection's, and every commit hashed
+  ;; its whole schema again.
+  (let [cfgs (for [attr [:a/one :b/two]]
+               {:store {:backend :memory :id (random-uuid)} :keep-history? false
+                :initial-tx [{:db/ident attr :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]})
+        _ (run! d/create-database cfgs)
+        [x y] (mapv d/connect cfgs)]
+    (try
+      (d/transact x [{:a/one "0"}])
+      (d/transact y [{:b/two "0"}])
+      (let [calls (atom 0)
+            real hasch/uuid]
+        (with-redefs [hasch/uuid (fn [& args] (when (map? (first args)) (swap! calls inc)) (apply real args))]
+          (dotimes [i 4]
+            (d/transact x [{:a/one (str i)}])
+            (d/transact y [{:b/two (str i)}])))
+        (is (zero? @calls) (str "8 commits that changed no schema hashed one " @calls " times")))
+      (finally
+        (run! d/release [x y])
+        (run! d/delete-database cfgs)))))
