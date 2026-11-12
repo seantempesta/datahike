@@ -1006,7 +1006,9 @@
                      (lower-entity-join node db pushdowns (:actual-consumed acc)
                                         bvc total-entities)]
                  (-> acc
-                     (update :ops conj op)
+                     ;; the node and what it saw bound, so Step 5b can choose its
+                     ;; scan again once the groups before it are known
+                     (update :ops conj (vary-meta op assoc ::node node ::bvc bvc))
                      (update :not-ops into (map #(plan-not-op db (analyze/classify-clause (list 'not %)) all-clause-vars rules))
                              unfolded-antis)
                      (update :actual-consumed into consumed)))
@@ -1174,6 +1176,39 @@
         ;; — only genuine bound relation columns; group DP order is independent of
         ;; this seed, which only affects non-group op readiness.)
         ordered-ops (plan/order-plan-ops all-ops bound-vars db)
+
+        ;; ---------------------------------------------------------------
+        ;; Step 5b: Choose each entity group's scan again in EXECUTION order.
+        ;; Step 2 gave a group the vars bound by nodes written before it
+        ;; (source order); once ordered, a group also runs after groups written
+        ;; later, whose output vars it joins on. Lowered again with those vars'
+        ;; cards, a group whose pattern on such a var emits few rows drives from
+        ;; it (plan/group-scan-cost-of), whatever order the clauses were written
+        ;; in. Ordering read :estimated-card, which the scan choice does not
+        ;; move, so the order stands. A group is kept as it was when its new
+        ;; scan would leave a pushdown on a merge that Step 4b did not restore,
+        ;; and keeps the predicates Step 4c attached to it.
+        ordered-ops
+        (loop [ops ordered-ops bound initial-bvc out []]
+          (if-let [op (first ops)]
+            (let [{node ::node seen ::bvc} (meta op)
+                  grown (when node
+                          (into {} (filter (fn [[v c]] (and (number? c)
+                                                            (not= v (:entity-var op))
+                                                            (contains? (set (:vars op)) v)
+                                                            (not (number? (get seen v))))))
+                                bound))
+                  op' (if (seq grown)
+                        (let [op2 (:op (lower-entity-join node db pushdowns #{} (merge-cards seen grown) total-entities))]
+                          (if (every? merge-lost-pred-clauses (:merge-lost-preds op2))
+                            (cond-> (with-meta (dissoc op2 :merge-lost-preds) (meta op))
+                              (:attached-preds op) (assoc :attached-preds (:attached-preds op)))
+                            op))
+                        op)]
+              (recur (rest ops)
+                     (cond-> bound (map? (:output-var-cards op')) (merge-cards (:output-var-cards op')))
+                     (conj out op')))
+            out))
 
         ;; ---------------------------------------------------------------
         ;; Step 6: Detect inter-group value joins
