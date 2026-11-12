@@ -575,6 +575,12 @@
   [op]
   (long (or (:output-card op) (:estimated-card op) 0)))
 
+(defn- group-scan-cost-of
+  "Cost of a pattern driving a group of two: the datoms it reads plus the rows
+  it emits, each of which the other pattern merges."
+  [op]
+  (+ (scan-cost-of op) (max 1 (output-card-of op))))
+
 (defn dp-order-fuse-ops
   "For N pattern ops on same entity var, find optimal (scan, merge-order).
    Uses short-circuit AND ordering: sort merges by ascending
@@ -605,8 +611,12 @@
           ;; Force scan-only pattern as scan, rest as merges
           {:scan (first scan-only) :merges (vec (concat (rest scan-only) mergeable))}
           (if (seq non-optional)
-            ;; Prefer non-optional as scan; pick the lowest BOUND-AWARE cost.
-            (let [sorted (sort-by scan-cost-of non-optional)]
+            ;; Prefer non-optional as scan; pick the lowest cost as the 3+ path
+            ;; prices it: scan work plus the rows the scan emits into the other
+            ;; pattern's merge. Scan work alone tied an unindexed `attr = ?bound`
+            ;; (every datom read, few rows out) with an unconstrained pattern on
+            ;; an attribute of the same size, and the tie went to clause order.
+            (let [sorted (sort-by group-scan-cost-of non-optional)]
               {:scan (first sorted) :merges (vec (concat (rest sorted)
                                                          (filterv :optional? pattern-ops)))})
             ;; All optional — pick lowest scan-cost as scan

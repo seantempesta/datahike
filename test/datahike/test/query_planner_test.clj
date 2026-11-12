@@ -1487,3 +1487,29 @@
     (testing "the optimization preserves results on both engines"
       (assert-engines-agree db query [42])
       (is (= 50 (count (d/q query db 42)))))))
+(deftest two-pattern-group-drives-from-the-pattern-that-emits-fewer-rows
+  ;; A var entity names its form through an unindexed ref; a few forms are found
+  ;; first through an indexed seek. Both candidate scans of the ?e group read every
+  ;; var, but [?e :var/form ?f] emits only the vars of the forms already bound,
+  ;; while [?e :var/name ?v] emits every var and leaves a :var/form lookup for
+  ;; each. A group of two patterns was priced by scan work alone, so the tie went
+  ;; to the clause written first.
+  (let [n 2000
+        db (d/db-with
+            (db/empty-db {:var/name  {:db/unique :db.unique/identity}
+                          :var/form  {:db/valueType :db.type/ref}
+                          :form/refs {:db/index true :db/cardinality :db.cardinality/many}})
+            (vec (mapcat (fn [i]
+                           [{:db/id (- (inc i)) :form/refs (if (zero? (mod i 100)) [:target :other] [:other])}
+                            {:var/name (symbol (str "v" i)) :var/form (- (inc i))}])
+                         (range n))))
+        var-first '[:find ?v :where [?e :var/name ?v] [?e :var/form ?f] [?f :form/refs :target]]
+        seek-first '[:find ?v :where [?f :form/refs :target] [?e :var/form ?f] [?e :var/name ?v]]]
+    (testing "either written order drives the ?e group from the bound ref"
+      (doseq [query [var-first seek-first]]
+        (is (re-find #"scan: \[\?e :var/form \?f\]" (q/explain query db))
+            (pr-str query))))
+    (testing "both orders and both engines answer the same"
+      (assert-engines-agree db var-first [])
+      (is (= (d/q seek-first db) (d/q var-first db)))
+      (is (= 20 (count (d/q var-first db)))))))
