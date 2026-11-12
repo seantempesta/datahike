@@ -4,6 +4,7 @@
       :clj  [clojure.test :as t :refer        [is are deftest testing]])
    [datahike.api :as d]
    [datahike.db :as db]
+   [datahike.db.utils :as dbu]
    [datahike.datom :as dd]
    [datahike.constants :as const]
    [datahike.tools :as tools]
@@ -538,3 +539,34 @@
                                :name "Updated"}])]
         (is (= "Updated" (-> (d/entity db :my.entity) :name)))
         (is (= "Updated" (-> (d/entity db [:db/ident :my.entity]) :name)))))))
+
+(defn- permutations
+  "Every order of xs."
+  [xs]
+  (if (empty? xs)
+    [[]]
+    (for [x xs, more (permutations (remove #{x} xs))] (cons x more))))
+
+(deftest a-schema-transaction-keeps-the-reverse-schema-whatever-order-its-keys-come-in
+  ;; Each schema datom brings :rschema up to date for the attribute it is about. A datom of an
+  ;; entity whose :db/ident has not been transacted yet (a hash map iterates its keys in hash
+  ;; order) named no attribute and rebuilt the whole reverse schema; it now updates the
+  ;; entity's own entry, as dbu/rschema keys it. The oracle: a rebuild of the schema the
+  ;; transaction left, for every order of an attribute's keys, alone and mixed in one
+  ;; transaction, and after a later change to an attribute declared so.
+  (let [props [[:db/ident nil] [:db/valueType :db.type/long] [:db/cardinality :db.cardinality/many]
+               [:db/index true] [:db/doc "d"]]
+        orders (vec (permutations props))
+        attr (fn [i order] (apply array-map (mapcat (fn [[k v]] [k (if (= k :db/ident) (keyword "p" (str "a" i)) v)]) order)))
+        base (db/empty-db {:existing/name {:db/unique :db.unique/identity}})
+        rebuilt? (fn [d] (= (:rschema d) (dbu/rschema (:schema d))))]
+    (testing "each order alone"
+      (doseq [[i order] (map-indexed vector orders)]
+        (is (rebuilt? (d/db-with base [(attr i order)])) (pr-str (map first order)))))
+    (testing "every order in one transaction"
+      (let [after (d/db-with base (vec (map-indexed attr orders)))]
+        (is (rebuilt? after))
+        (is (= (count orders) (count (filter #(= "p" (namespace %)) (keys (:ident-ref-map after))))))
+        (testing "then a change to one of them"
+          (is (rebuilt? (d/db-with after [{:db/id [:db/ident :p/a3] :db/doc "changed"}]))))))))
+
