@@ -460,3 +460,26 @@
                   [only-a only-b] (d/datoms-diff (d/history a) (d/history b) :eavt [])
                   tup #(into #{} (map (juxt :e :a :v :tx :added)) %)]
               (is (= [(set/difference wa wb) (set/difference wb wa)] [(tup only-a) (tup only-b)])))))))))
+
+(deftest a-diff-of-unstored-values-skips-the-children-both-hold
+  ;; A :memory store never flushes, so its nodes have no address. A one-datom `with`
+  ;; copies only the path to the leaf it changes; every other child is the identical
+  ;; object on both sides, and is skipped as a stored child at one address is. Both
+  ;; trees were walked whole: 1.1M ticks for one datom at 10,700 (Seon, 2026-11-12).
+  (let [cfg (shaped-config {:backend :memory :id (random-uuid)} 64 0)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)
+        cost (fn [n]
+               (d/transact conn (vec (for [i (range n)] {:k/n (long (- -1 i (* 1000000 n)))})))
+               (let [a @conn
+                     b (:db-after (d/with a [{:k/n 1}]))
+                     f #(d/datoms-diff a b :eavt [])]
+                 (is (= [[] [[:k/n 1]]] (mapv #(into [] (comp (map (juxt :a :v)) (remove (comp #{:db/txInstant} first))) %) (f))))
+                 (f)
+                 (ticks f)))
+        small (cost 1000)
+        large (cost 9000)]
+    ;; ~40 us estimated: a root, two or three branches and two leaves of 64 on each side
+    (is (< large 100000) (str "ticks of a one-datom diff at 10,000 datoms: " large))
+    (is (< large (* 2 small)) (str "ticks at 1,000 and 10,000 datoms: " [small large]))
+    (d/release conn)))

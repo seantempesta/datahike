@@ -323,22 +323,28 @@
                                                       acc))
                                              acc))))
                                      acc level))
-           ;; the stored addresses of a level's in-range children
-           addresses (fn [level]
+           ;; a level's in-range children, each named by its stored address, or, unstored, by the
+           ;; node itself: path copying keeps every child an edit did not reach the identical
+           ;; object, so a child with no address both sides hold is shared as a stored one is
+           ;; (a node has no equality of its own: a set holds it by identity)
+           addresses (fn [^IStorage storage level]
                        (persistent! (reduce-children (fn [acc ^Branch branch i]
-                                                       (if-some [address (.address branch (int i))] (conj! acc address) acc))
+                                                       (conj! acc (or (.address branch (int i)) (.child branch storage (int i)))))
                                                      (transient #{}) level)))
-           ;; the in-range children of `level` at an address `other` does not hold, opened: one hashed
+           ;; the in-range children of `level` that `other` (addresses') does not hold, opened: one hashed
            ;; lookup a child, so the test is linear in the children (Jolt's HashSet.retainAll scans its
            ;; argument for each element: quadratic, 18.9M of 22.2M ticks at 203 scattered datoms). An
-           ;; unstored node (nil address) is never shared. A child's buffered edits lie in its own range.
+           ;; unstored child is shared when it is the identical node. A child's buffered edits lie in its own range.
            unshared-children (fn [^IStorage storage level other]
                                (persistent! (reduce-children (fn [acc ^Branch branch i]
                                                                (run! take! (slot-datoms branch i))
                                                                (let [address (.address branch (int i))]
                                                                  (if (and (some? address) (contains? other address))
                                                                    acc
-                                                                   (conj! acc [address (.child branch storage (int i))]))))
+                                                                   (let [child (.child branch storage (int i))]
+                                                                     (if (and (nil? address) (contains? other child))
+                                                                       acc
+                                                                       (conj! acc [address child]))))))
                                                              (transient []) level)))
            ;; the entries at an address the other side does not hold: a root met at the other tree's level
            unshared (fn [as bs]
@@ -347,7 +353,7 @@
            ra (.root a) rb (.root b)
            la (.level ^ANode ra) lb (.level ^ANode rb)]
        (let [[only-a only-b]
-             (if (and (some? (.-_address a)) (= (.-_address a) (.-_address b)))
+             (if (or (identical? ra rb) (and (some? (.-_address a)) (= (.-_address a) (.-_address b))))
                [[] []]
                (loop [level (max la lb)
                       as (if (== la level) [[(.-_address a) ra]] [])
@@ -380,8 +386,8 @@
                                (some? y) (recur xl xk yl (inc yk) oa (conj! ob y))
                                :else [(persistent! oa) (persistent! ob)])))))
                      (let [below (dec level)
-                           ea (unshared-children (.-_storage a) as (addresses bs))
-                           eb (unshared-children (.-_storage b) bs (addresses as))]
+                           ea (unshared-children (.-_storage a) as (addresses (.-_storage b) bs))
+                           eb (unshared-children (.-_storage b) bs (addresses (.-_storage a) as))]
                        (recur below
                               (into (if (== la below) [[(.-_address a) ra]] []) ea)
                               (into (if (== lb below) [[(.-_address b) rb]] []) eb)))))))]
