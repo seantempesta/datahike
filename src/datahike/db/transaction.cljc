@@ -185,23 +185,15 @@
           (assoc-in db [:schema e a-ident] v-ident))
         (assoc-in db [:schema e] (hash-map a-ident v-ident))))))
 
-(defn schema-attr-of
-  "The attribute the schema datom is about: the ident it adds or retracts, else the ident of its entity
-  in db's schema; nil when db names none."
-  [db datom]
-  (if (= :db/ident (:a datom))
-    (:v datom)
-    (let [i (get-in db [:schema (:e datom)])] (when (keyword? i) i))))
-
 (defn schema-keys-of
-  "The schema keys whose entries the added schema datom changes, read from db before it: a :db/ident
-  datom, the ident it adds and, when its entity already had an entry without one, the entity itself,
-  whose entry the ident replaces; any other datom, its entity's ident, or the entity itself while it
-  has none (dbu/rschema keeps such an entry under the entity)."
+  "The schema keys whose entries the schema datom changes, added or retracted, read from db before it:
+  a :db/ident datom, its ident and its entity (an entry without an ident is kept under the entity, as
+  dbu/rschema keeps it, and the ident replaces or restores it); any other datom, its entity's ident, or
+  the entity itself while it has none."
   [db datom]
   (let [e (:e datom) entry (get-in db [:schema e])]
     (if (= :db/ident (:a datom))
-      (if (map? entry) [(:v datom) e] [(:v datom)])
+      [(:v datom) e]
       [(if (keyword? entry) entry e)])))
 
 (defn update-rschema
@@ -221,11 +213,13 @@
 (declare remove-schema)
 
 (defn- retract-schema
-  "db without the schema datom's property, its reverse schema brought up to the attribute it was about
-  (read before the removal: a retracted :db/ident takes its entry away)."
+  "db without the schema datom's property, its reverse schema brought up to the keys it was about (read
+  before the removal: a retracted :db/ident takes its entry away). The upsert path removes a schema
+  datom optimistically before each one it adds: of an entity with no ident yet it named no attribute
+  and rebuilt the whole reverse schema."
   [db datom]
-  (let [attr (schema-attr-of db datom)]
-    (-> db (remove-schema datom) (update-rschema attr))))
+  (let [attrs (schema-keys-of db datom)]
+    (-> db (remove-schema datom) (update-rschema attrs))))
 
 (defn- reject-schema-removal-with-current-data [db attr entity]
   (when (seq (dbi/-datoms db :aevt [attr] (dbi/-search-context db)))
