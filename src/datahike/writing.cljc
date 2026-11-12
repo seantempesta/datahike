@@ -55,6 +55,13 @@
       db
       (vary-meta db assoc :datahike/schema-meta [schema-meta key (immutable?)]))))
 
+(defn schema-meta-uuid
+  "The content key of schema-meta ({:schema :rschema :system-entities :ident-ref-map :ref-ident-map}),
+   under which a commit that changed the schema stores it (immutable: a store reads it by the key its
+   commit recorded, never recomputing it)."
+  [schema-meta]
+  (uuid schema-meta))
+
 (defn- schema-meta-content-key
   "The content UUID of `schema-meta`, the members of `db`: the key `db` carries when
    each member is the identical, immutable value it was computed for, else hashed."
@@ -63,7 +70,7 @@
   (let [[held key immutable?] (:datahike/schema-meta (meta db))]
     (if (and held immutable? (every? (fn [[k v]] (identical? v (get held k))) schema-meta))
       key
-      (uuid schema-meta))))
+      (schema-meta-uuid schema-meta))))
 
 (defn stored-db? [obj]
   ;; TODO use proper schema to match?
@@ -985,7 +992,7 @@
                       :system-entities system-entities
                       :ident-ref-map ident-ref-map
                       :ref-ident-map ref-ident-map}
-         schema-meta-key (uuid schema-meta)
+         schema-meta-key (schema-meta-uuid schema-meta)
          ;; Flush first → cid sees post-flush storage addresses.
          eavt'          (di/-flush eavt backend)
          aevt'          (di/-flush aevt backend)
