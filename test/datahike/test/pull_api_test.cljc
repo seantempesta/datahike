@@ -737,3 +737,26 @@
            '([:db/id {:attr :db/id}]
              [:name {:attr :name}]
              [:friend {:attr :friend :recursion nil}])))))
+
+#?(:jolt
+   (deftest a-named-pull-reads-each-entity-once
+     ;; 100 entities of 35 attributes: a pattern naming the 35 reads each entity's :eavt
+     ;; range once, as '* does, and keeps the named ones. One seek an attribute cost five
+     ;; times '*'s ticks (8M against 1.6M, Seon 2026-11-12). Counted in engine ticks (work).
+     (let [attrs (mapv #(keyword "k" (str "a" %)) (range 35))
+           cfg {:store {:backend :memory :id (random-uuid)} :keep-history? false :schema-flexibility :write
+                :initial-tx (vec (for [a attrs] {:db/ident a :db/valueType :db.type/string :db/cardinality :db.cardinality/one}))}
+           _ (d/create-database cfg)
+           conn (d/connect cfg)]
+       (d/transact conn (vec (for [i (range 100)] (into {} (for [a attrs] [a (str (name a) "-" i)])))))
+       (let [db @conn
+             eids (mapv :e (d/datoms db {:index :aevt :components [:k/a0]}))
+             ticks (fn [f] (f) (let [n (volatile! 0)]
+                                 (jolt.host/ticks-of (fn [] (let [t0 (jolt.host/ticks)] (f) (vreset! n (- (jolt.host/ticks) t0)))))
+                                 @n))
+             named #(d/pull-many db attrs eids)
+             star #(d/pull-many db '[*] eids)]
+         (is (= (mapv #(dissoc % :db/id) (star)) (named)))
+         (let [n (ticks named) s (ticks star)]
+           (is (<= n s) (str "ticks of 100 entities pulled by 35 names and by '*: " [n s]))))
+       (d/release conn))))

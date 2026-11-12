@@ -261,6 +261,7 @@
       (resource/charge-result-node!))
     (assoc frame
            :eids      eids
+           :grouped   nil
            :specs     (seq (:attrs pattern))
            :wildcard? (:wildcard? pattern)
            :kvps      (transient {})
@@ -421,12 +422,26 @@
                            [:avet [a eid] (fn [^Datom d] (and (= a (.-a d)) (= eid (.-v d))))])]
     (take-while keep? (dbi/rseek-datoms db index cs))))
 
+(defn entity-datoms
+  "Entity `eid`'s datoms by attribute (as its datoms name it), each in :eavt order: its
+   :eavt range read once, so a pattern of n attributes reads the entity once, not n times."
+  [db eid]
+  (persistent!
+   (reduce (fn [grouped ^Datom datom]
+             (let [a (.-a datom)]
+               (assoc! grouped a (conj (get grouped a []) datom))))
+           (transient {})
+           (dbi/datoms db :eavt [eid]))))
+
 (defn pull-attr
-  "Retrieve datoms for given entity id and specification from database"
-  [db spec eid frames]
+  "Retrieve datoms for given entity id and specification from database. `grouped`,
+   when given, is the entity's datoms by attribute (`entity-datoms`): a forward
+   attribute is read from it, a reverse one still seeks :avet."
+  ([db spec eid frames] (pull-attr db spec eid frames nil))
+  ([db spec eid frames grouped]
   (let [[attr-key opts] spec]
     (if (= :db/id attr-key)
-      (if (not-empty (dbi/datoms db :eavt [eid]))
+      (if (if grouped (seq grouped) (not-empty (dbi/datoms db :eavt [eid])))
         (do
           (resource/charge-result-node!)
           (conj (rest frames)
@@ -440,11 +455,12 @@
                 attr)
             results  (cond
                        (nil? a) []
+                       (and grouped forward?) (cond-> (get grouped a []) (:reverse opts) rseq)
                        (:reverse opts) (reverse-datoms db forward? eid a)
                        forward? (dbi/datoms db :eavt [eid a])
                        :else (dbi/datoms db :avet [a eid]))]
         (pull-attr-datoms db attr-key attr eid forward?
-                          results opts frames)))))
+                          results opts frames))))))
 
 (def ^:private filter-reverse-attrs
   (filter (fn [[k v]] (not= k (:attr v)))))
@@ -536,8 +552,14 @@
                        frames)
         (if-let [specs (seq (:specs frame))]
           (let [spec       (first specs)
-                new-frames (conj frames (assoc frame :specs (rest specs)))]
-            (pull-attr db spec (first eids) new-frames))
+                eid        (first eids)
+                ;; a pattern of more than one attribute reads the entity's :eavt range once, at
+                ;; its first attribute, and each attribute keeps its own: one seek an attribute
+                ;; cost five times a whole pattern's '* (35 attributes)
+                grouped    (or (:grouped frame)
+                               (when (next (:attrs (:pattern frame))) (entity-datoms db eid)))
+                new-frames (conj frames (assoc frame :specs (rest specs) :grouped grouped))]
+            (pull-attr db spec eid new-frames grouped))
           (->> frame :kvps persistent! not-empty
                (reset-frame frame (rest eids))
                (conj frames)
