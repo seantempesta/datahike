@@ -3708,11 +3708,14 @@
         ;; reused it; any other value (another branch, another store, a speculative value) replays
         ;; the estimates (~6k ticks; some sample datoms, read cold on a store not yet read). A
         ;; render or a session queries one branch after each of its commits, so it pays no check.
+        ;; A value with no committed identity (d/with, d/db-with: an agent's speculation) is told by
+        ;; its content hash (:hash, summed over its datoms): the same datoms give the same estimates.
         value-id (db/committed-cache-identity db)
-        where {:lineage (some-> value-id first)
-               :class (size-class (dbi/-max-eid db))}
+        where (cond-> {:class (size-class (dbi/-max-eid db))}
+                value-id (assoc :lineage (first value-id))
+                (and (nil? value-id) (number? (:hash db))) (assoc :content (:hash db)))
         holds? (fn [{:keys [stats checked]}]
-                 (or (and (:lineage where) (= where @checked))
+                 (or (and (or (:lineage where) (:content where)) (= where @checked))
                      (when (estimate/stats-hold? stats db)
                        (vreset! checked where)
                        true)))]
