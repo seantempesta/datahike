@@ -71,12 +71,13 @@
      :cljs false))
 
 (def ^:dynamic *query-result-cache?*
-  "When true, query results are cached by [query args db-snapshot]. Off by default
-   on our Jolt line (owner decision, L1 measurement 2026-10-20): a query on a value
-   just committed paid the cache's key, lookup and insert and missed; on proto's
-   render and agent-session workloads the uncached query is faster at p50 and p95.
-   A caller that repeats one query on one value should keep its result."
-  false)
+  "When true, query results are cached by [query args db-snapshot]: a repeated query on one
+   committed value answers from the cache (3.3k ticks against ~100k to run it). On, as upstream.
+   It was off on our Jolt line from 2026-10-20 (L1's measurement, recorded then as the owner's
+   decision, which it was not): a miss on a value just committed searches every older commit's
+   entries for one to inherit (inheritable-entry), so render and session workloads ran slower
+   with it on. datahike.reads binds it false while it records reads."
+  true)
 
 (declare -collect -resolve-clause resolve-clause resolve-context raw-q memoized-parse-query
          query-attribute-dependencies query-dependency-plan
