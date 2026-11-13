@@ -93,12 +93,15 @@
     (charge! (:results budget) (:max-results budget) :query-results 1)))
 
 (defn scalar-weight
-  "Returns the O(1) shallow weight of a scalar value."
+  "Returns the O(1) shallow weight of a scalar value. The common scalars are told by cheap
+   predicates first; only what is left asks its class whether it is an array (~50 ticks)."
   [value]
   (cond
     (nil? value) 0
     (string? value) (inc (count value))
-    #?(:clj (and value (.isArray ^Class (class value))) :cljs (array? value))
+    (or (number? value) (keyword? value) (symbol? value) (boolean? value) (char? value)
+        (uuid? value) (inst? value)) 1
+    #?(:clj (.isArray ^Class (class value)) :cljs (array? value))
     (inc (count value))
     :else 1))
 
@@ -108,42 +111,35 @@
   (charge-result-weight! (scalar-weight value))
   value)
 
-(defn- pop-pending
-  [stack]
-  (loop [stack stack]
-    (if-let [items (seq (first stack))]
-      [true (first items) (cons (next items) (next stack))]
-      (if (seq stack)
-        (recur (next stack))
-        [false nil nil]))))
-
 (defn shallow-weight-within
-  "Returns a bounded non-serializing weight, or nil when uncertifiable."
+  "Returns a bounded non-serializing weight, or nil when uncertifiable: each scalar's
+   scalar-weight plus 1 a collection (a map's keys and values walked), nil once the
+   weight would pass limit or for an uncounted (lazy) collection, which is never
+   realized. One reduce down the value: the walk it replaces kept an explicit stack of
+   seqs and destructured a vector a step, ~445 ticks a row of a query result."
   [value limit]
   (when (and limit (not (neg? limit)))
-    (loop [present? true value value stack nil weight 0]
-      (if-not present?
-        weight
-        (let [scalar? (or (nil? value)
-                          (string? value)
-                          #?(:clj (and value (.isArray ^Class (class value)))
-                             :cljs (array? value))
-                          (not (coll? value)))]
-          (if scalar?
-            (let [weight (+ weight (scalar-weight value))]
-              (when (<= weight limit)
-                (let [[present? value stack] (pop-pending stack)]
-                  (recur present? value stack weight))))
-            ;; Cache admission never realizes an uncounted/lazy collection.
-            (when (counted? value)
-              (let [entry-count (count value)
-                    lower-bound (+ 1 (if (map? value)
-                                       (* 2 entry-count)
-                                       entry-count))]
-                (when (<= (+ weight lower-bound) limit)
-                  (let [items (if (map? value) (mapcat identity value) (seq value))
-                        [present? value stack] (pop-pending (cons items stack))]
-                    (recur present? value stack (inc weight))))))))))))
+    (let [over #?(:clj (Object.) :cljs (js-obj))
+          walk (fn walk [weight value]
+                 (cond
+                   (not (coll? value))
+                   (let [weight (+ weight (scalar-weight value))]
+                     (if (<= weight limit) weight over))
+
+                   (not (counted? value)) over
+
+                   :else
+                   (let [entry-count (count value)
+                         lower-bound (+ 1 (if (map? value) (* 2 entry-count) entry-count))]
+                     (if (> (+ weight lower-bound) limit)
+                       over
+                       (let [step (fn [w x] (let [w (walk w x)] (if (identical? w over) (reduced over) w)))]
+                         (if (map? value)
+                           (reduce-kv (fn [w k v] (let [w (step w k)] (if (reduced? w) w (step w v))))
+                                      (inc weight) value)
+                           (reduce step (inc weight) value)))))))
+          weight (walk 0 value)]
+      (when-not (identical? weight over) weight))))
 
 (defn result-count
   "Returns the O(1) top-level cardinality of a query result."

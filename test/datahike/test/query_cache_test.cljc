@@ -1798,3 +1798,41 @@
            (is (= :datahike.cache.outcome/hit (outcome inherited)) "inherited across two untouched commits")
            (is (= #{["second"]} (:datahike.query/result recomputed)))
            (is (not= :datahike.cache.outcome/hit (outcome recomputed)) "a touched attribute runs the query"))))))
+
+#?(:clj
+   (deftest a-cached-plan-is-reused-only-where-its-estimates-hold
+     ;; A plan's join order follows the estimates it was made from. Two databases with one query
+     ;; shape and entity ids of one size class but opposite populations (:t/a on many entities and
+     ;; :t/b on few, then the reverse) need different plans: a plan cached for the first, reused on the
+     ;; second, scanned the populous attribute (Seon, 2026-11-13: an earlier test's plan made one
+     ;; query on the program cost 199M ticks against 4k).
+     (let [schema [{:db/ident :t/a :db/valueType :db.type/long :db/cardinality :db.cardinality/one}
+                   {:db/ident :t/b :db/valueType :db.type/long :db/cardinality :db.cardinality/one}]
+           db-of (fn [many few]
+                   (let [cfg {:store {:backend :memory :id (random-uuid)} :schema-flexibility :write :keep-history? false}]
+                     (d/create-database cfg)
+                     (let [conn (d/connect cfg)]
+                       (d/transact conn schema)
+                       (d/transact conn (vec (for [i (range 1000)]
+                                               (cond-> {many i} (< i 5) (assoc few i)))))
+                       [cfg conn @conn])))
+           [cfg1 conn1 db1] (db-of :t/a :t/b)
+           [cfg2 conn2 db2] (db-of :t/b :t/a)
+           query '[:find ?e :where [?e :t/a ?x] [?e :t/b ?y]]
+           ;; the work a run of the query does on db (resource evidence: datoms visited), which is
+           ;; the plan it ran; explain plans afresh, and the executor's replanning keeps its reads alike
+           work-of (fn [db] (binding [dq/*query-result-cache?* false]
+                              (get-in (dq/q-with-evidence query db)
+                                      [:datahike.query/resource-evidence :datahike.resource/work])))
+           clear-plans! #(vreset! @#'dq/plan-cache (datahike.lru/lru 100))]
+       (try
+         (clear-plans!)
+         (binding [dq/*query-result-cache?* false] (d/q query db1))
+         (let [after-db1 (work-of db2)
+               fresh (do (clear-plans!) (work-of db2))]
+           (is (= fresh after-db1) "db2 runs the plan it would with no plan cached for db1")
+           (is (< fresh 100) "db2's own plan scans the attribute it holds few of")
+           (is (= 5 (count (d/q query db2)))))
+         (finally
+           (d/release conn1) (d/release conn2)
+           (d/delete-database cfg1) (d/delete-database cfg2))))))

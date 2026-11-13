@@ -15,6 +15,7 @@
    [datahike.array :refer [wrap-comparable]]
    [datahike.impl.entity :as de]
    [datahike.lru :as lru]
+   [datahike.query.estimate :as estimate]
    [datahike.pull-api :as dpa]
    [datahike.query-stats :as dqs]
    [datahike.query.single-flight :as single-flight]
@@ -2552,9 +2553,20 @@
   "Total cached structural weight of one DB-snapshot bucket — sums the
    per-entry :weight precomputed at cache-put time (see `result-weight`)."
   [bucket]
-  (reduce-kv (fn [acc _ entry] (+ acc (:weight entry 0))) 0 (:entries bucket)))
+  (or (:weight bucket)
+      (reduce-kv (fn [acc _ entry] (+ acc (:weight entry 0))) 0 (:entries bucket))))
 
-(def ^:private empty-result-bucket {:owners #{} :entries {}})
+(def ^:private empty-result-bucket {:owners #{} :entries {} :weight 0})
+
+(defn- bucket-with-entry
+  "bucket holding entry under cache-key, its running :weight moved by the entry's weight less
+   the one it replaces: the weighted LRU weighs a bucket on every put and touch, and summing its
+   entries each time made each cache interaction O(bucket size) (upstream keeps the same total)."
+  [bucket cache-key entry]
+  (let [replaced (get-in bucket [:entries cache-key :weight] 0)]
+    (-> bucket
+        (assoc-in [:entries cache-key] entry)
+        (assoc :weight (+ (- (bucket-weight bucket) replaced) (:weight entry 0))))))
 
 (def ^:private latest-limit
   "How many [lineage cache-key] pointers the result cache keeps (latest-entry)."
@@ -3175,8 +3187,7 @@
                                     (assoc lru result-key
                                            (-> (or bucket empty-result-bucket)
                                                (update :owners conj scope-key)
-                                               (assoc-in [:entries cache-key]
-                                                         promoted))))
+                                               (bucket-with-entry cache-key promoted))))
                              (update :latest (fnil assoc (lru/lru latest-limit)) (lineage-key scope-key cache-key) result-key))
                          state))
                      state)))))
@@ -3202,11 +3213,11 @@
                                 (assoc lru result-key
                                        (-> bucket
                                            (update :owners conj scope-key)
-                                           (assoc-in [:entries cache-key]
-                                                     {:result result
-                                                      :dependency-plan dependency-plan
-                                                      :source-contexts source-contexts
-                                                      :weight weight}))))
+                                           (bucket-with-entry cache-key
+                                                              {:result result
+                                                               :dependency-plan dependency-plan
+                                                               :source-contexts source-contexts
+                                                               :weight weight}))))
                          (update :latest (fnil assoc (lru/lru latest-limit)) (lineage-key scope-key cache-key) result-key)))
                    state)))
         @stored?))))
@@ -3666,22 +3677,22 @@
   #?(:clj (- 64 (Long/numberOfLeadingZeros (long n)))
      :cljs (- 32 (js/Math.clz32 n))))
 
+(def ^:private plan-variants
+  "How many plans one query shape keeps, each for the statistics it was made from."
+  4)
+
 (defn- get-or-create-plan
   "Get a cached query plan or create a new one. Plans are cached by
-   [clauses bound-vars rules-keys in-cards schema-hash size-class]. The plan
-   structure (index selection, merge ordering, the estimates that gate seeks
-   at run time) depends on query shape, schema and the data's size: a plan
-   made on a small database scans what a large one must seek. The size class of
-   `max-eid` separates different entity-id high-water-mark buckets. It does
-   not measure population: sparse ids, retractions and history can leave
-   very different populations in the same bucket.
-   `in-cards` (shape-derived, value-independent) is in
-   the key only to separate tuple from relation :in bindings (see
-   get-or-create-plan body).
-
-   `clauses` may embed substituted constants (substitute-consts-with-lookup-refs),
-   so the key is run through `scale-sensitive-key` to keep BigDecimals of
-   different scale distinct (Clojure `=`/`hash` would otherwise collapse them)."
+   [clauses bound-vars rules-keys in-cards schema-hash], as upstream keys them, and each
+   cached plan carries the estimates the planner read making it (estimate/*read-stats*):
+   it is reused on a database only where every one of them lands in the same size class
+   (estimate/stats-hold?), so a database of another population plans again instead of
+   running a plan chosen for different counts. A key keeps up to plan-variants plans.
+   Keyed by the size class of max-eid alone, a plan made on one database ran on another of
+   the same id range: one query on Seon's program cost 199M ticks against 4k fresh.
+   `in-cards` (shape-derived, value-independent) is in the key only to separate tuple from
+   relation :in bindings. `clauses` may embed substituted constants, so the key is run
+   through `scale-sensitive-key` to keep BigDecimals of different scale distinct."
   [db clauses bound-vars rules in-cards]
   (let [schema-hash (hash (dbi/-schema db))
         ;; `in-cards` is part of the key: it is value-independent (shape-only),
@@ -3689,12 +3700,30 @@
         ;; [?a ?b] (#{?a ?b}, card 1) from a relation [[?a ?b]] (#{?a ?b}, many)
         ;; — which would otherwise collide on identical clauses + bound-vars.
         cache-key (scale-sensitive-key [clauses bound-vars (when rules rules)
-                                        (not-empty in-cards) schema-hash
-                                        (size-class (dbi/-max-eid db))])]
-    (if-some [cached (get @plan-cache cache-key nil)]
+                                        (not-empty in-cards) schema-hash])
+        variants (get @plan-cache cache-key nil)
+        ;; Where the plan was last checked: the branch of a committed value (its connection id, the
+        ;; store and branch, whichever connection reads it) and the size class of its max-eid. On
+        ;; the same branch, in the same size class, the plan is reused unchecked, as the old key
+        ;; reused it; any other value (another branch, another store, a speculative value) replays
+        ;; the estimates (~6k ticks; some sample datoms, read cold on a store not yet read). A
+        ;; render or a session queries one branch after each of its commits, so it pays no check.
+        value-id (db/committed-cache-identity db)
+        where {:lineage (some-> value-id first)
+               :class (size-class (dbi/-max-eid db))}
+        holds? (fn [{:keys [stats checked]}]
+                 (or (and (:lineage where) (= where @checked))
+                     (when (estimate/stats-hold? stats db)
+                       (vreset! checked where)
+                       true)))]
+    (if-some [cached (some (fn [variant] (when (holds? variant) (:plan variant))) variants)]
       cached
-      (let [plan (create-plan-via-ir db clauses bound-vars rules in-cards)]
-        (vswap! plan-cache assoc cache-key plan)
+      (let [stats (volatile! [])
+            plan (binding [estimate/*read-stats* stats]
+                   (create-plan-via-ir db clauses bound-vars rules in-cards))]
+        (vswap! plan-cache assoc cache-key
+                (into [{:stats @stats :plan plan :checked (volatile! where)}]
+                      (take (dec plan-variants) variants)))
         plan))))
 
 (def ^:dynamic *profile?* false)

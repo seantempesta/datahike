@@ -13,6 +13,51 @@
 #?(:clj (set! *warn-on-reflection* true))
 
 ;; ---------------------------------------------------------------------------
+;; The statistics a plan was made from
+;;
+;; A plan's choices (scan, merge order, join order) follow the estimates it read of the
+;; database. While a plan is made, *read-stats* holds a volatile vector and each estimate
+;; below records [raw-fn args result], the database in args replaced by ::db; a cached plan
+;; is reused on another database only where every recorded estimate lands in the same size
+;; class there (stats-hold?). Calls nested inside a recorded one are not recorded again.
+
+(def ^:dynamic *read-stats* nil)
+
+(defn- recorded
+  "(apply f args), recorded in *read-stats* with the database at db-index replaced by ::db.
+   An estimate's own index reads are the planner's, not the query's: they never enter a
+   reader's recorded reads (di/*reads*, datahike.reads), which hold what its result depends on."
+  [f args db-index]
+  (binding [di/*reads* nil]
+    (if-let [v *read-stats*]
+      (let [result (binding [*read-stats* nil] (apply f args))]
+        (vswap! v conj [f (assoc (vec args) db-index ::db) result])
+        result)
+      (apply f args))))
+
+(defn- stat-class
+  "An estimate's size class: the bit length of a count, of a fraction's 1/1024ths; other values as they are."
+  [x]
+  (letfn [(bits [n] #?(:clj (- 64 (Long/numberOfLeadingZeros (long (max 0 n))))
+                       :cljs (- 32 (js/Math.clz32 (max 0 n)))))]
+    (cond (integer? x) (bits x)
+          (number? x) (bits (long (* 1024 (double x))))
+          :else x)))
+
+(defn stats-hold?
+  "Does every estimate in stats (recorded by `recorded`) land in its recorded size class on db?"
+  [stats db]
+  ;; the estimates are the planner's, not the query's reads (see recorded)
+  (binding [di/*reads* nil]
+    (every? (fn [[f args result]]
+              (= (stat-class result)
+                 (stat-class (apply f (mapv #(if (= ::db %) db %) args)))))
+            stats)))
+
+(declare estimate-pattern estimate-pattern-with-bindings sample-predicate-selectivity
+         estimate-pushdown-range estimate-total-entities)
+
+;; ---------------------------------------------------------------------------
 ;; Comparators for count-slice
 
 (defn cmp-entity-only
@@ -149,7 +194,7 @@
       :else
       (di/-count (:eavt db)))))
 
-(defn estimate-pattern
+(defn- estimate-pattern-raw
   "Estimate the cardinality (number of matching datoms) for a pattern clause.
    Uses count-slice on the appropriate index with partial comparators when
    subtree counts are available, otherwise falls back to O(1) heuristics.
@@ -216,7 +261,7 @@
 ;; `bound-var-cards` is a {var-symbol → cardinality-upper-bound} map. Vars not
 ;; in the map are treated as free.
 
-(defn estimate-pattern-with-bindings
+(defn- estimate-pattern-with-bindings-raw
   "Estimate cardinality for a pattern clause, factoring in upstream-bound
    free variables. `bound-var-cards` maps each bound var symbol to its known
    cardinality upper bound (output rel size of the producing op). Vars not in
@@ -304,7 +349,7 @@
     (> < >= <=) 0.33
     0.5))
 
-(defn sample-predicate-selectivity
+(defn- sample-predicate-selectivity-raw
   "Sample datoms from the index and apply the predicate to estimate
    actual selectivity. Returns a double in (0.01, 1.0].
 
@@ -402,7 +447,7 @@
                  {:pred-op pred-op :error #?(:clj (.getMessage ^Exception e) :cljs (str e))})
       (estimate-predicate-selectivity-heuristic pred-op))))
 
-(defn estimate-pushdown-range
+(defn- estimate-pushdown-range-raw
   "Estimate cardinality after applying pushdown predicates to a pattern.
    Uses sampled predicate selectivity when db and scan-op are provided,
    falls back to heuristic otherwise."
@@ -433,10 +478,48 @@
         rate (/ (double merge-card) total)]
     (min 1.0 (max 0.001 rate))))
 
-(defn estimate-total-entities
+(defn- estimate-total-entities-raw
   "Estimate total distinct entities in the database.
    NOTE: counts total datoms, not distinct entities. This overestimates
    for entities with many attributes but is acceptable for merge ordering."
   [db]
   (let [eavt (:eavt db)]
     (max 1 (di/-count eavt))))
+
+;; ---------------------------------------------------------------------------
+;; The estimates the planner reads, each recorded while a plan is made (*read-stats*)
+
+(defn estimate-pattern
+  "Estimated cardinality of a pattern (estimate-pattern-raw), recorded for the plan it informs."
+  [db pattern-info schema-info]
+  (recorded estimate-pattern-raw [db pattern-info schema-info] 0))
+
+(defn estimate-pattern-with-bindings
+  "Bound-aware estimate (estimate-pattern-with-bindings-raw), recorded for the plan it informs."
+  ([db pattern-info schema-info bound-var-cards]
+   (recorded estimate-pattern-with-bindings-raw [db pattern-info schema-info bound-var-cards] 0))
+  ([db pattern-info schema-info bound-var-cards base]
+   (recorded estimate-pattern-with-bindings-raw [db pattern-info schema-info bound-var-cards base] 0)))
+
+(defn sample-predicate-selectivity
+  "Sampled predicate selectivity (sample-predicate-selectivity-raw), recorded for the plan it informs."
+  [db scan-op pred-op pred-var const-val]
+  (recorded sample-predicate-selectivity-raw [db scan-op pred-op pred-var const-val] 0))
+
+(defn estimate-pushdown-range
+  "Cardinality after pushdown predicates (estimate-pushdown-range-raw); the database-reading arity
+  is recorded for the plan it informs."
+  ([base-estimate pushdown-preds] (estimate-pushdown-range-raw base-estimate pushdown-preds))
+  ([base-estimate pushdown-preds db scan-op]
+   (recorded estimate-pushdown-range-raw [base-estimate pushdown-preds db scan-op] 2)))
+
+(defn estimate-total-entities
+  "Total datoms (estimate-total-entities-raw), recorded for the plan it informs."
+  [db]
+  (recorded estimate-total-entities-raw [db] 0))
+
+(defn max-eid-of
+  "The database's highest entity id, recorded for the plan it informs."
+  [db]
+  (recorded (fn [db] (dbi/-max-eid db)) [db] 0))
+
