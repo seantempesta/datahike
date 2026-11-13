@@ -83,22 +83,33 @@
 (defn- head-db
   "The branch head of the connection holding wrapped-atom's value, read from the store, as that
   connection's db: its own config (the stored one names the store as it was made, its path, so a
-  moved store's db named the old path) and its cache context advanced to the head's commit."
+  moved store's db named the old path) and its cache context advanced to the head's commit.
+  An unmoved head (the commit id its raw entry names is the one this connection last built)
+  answers the db already built, as upstream's reload-branch-head does: one read of the head's
+  entry (~10k ticks) instead of resolving it and building the db again (~52k), on every deref."
   [wrapped-atom]
   (let [store  (:store @wrapped-atom)
-        stored (dsi/read-head store (:branch (:config @wrapped-atom)) {:sync? true})]
-    (log/trace :datahike/db-deref {:config (:config stored)})
-    (let [fresh-db (dsi/stored->db (assoc stored :config (:config @wrapped-atom)) store)
-          commit-id (get-in fresh-db [:meta :datahike/commit-id])]
-      (assoc fresh-db :cache-context
-             ;; Another process's commit carries its stored revisions.
-             (let [context (:cache-context @wrapped-atom)]
-               (cond-> context
-                 context (assoc :datahike.cache/commit-id commit-id
-                                :datahike.cache/committed? (some? commit-id))
-                 (and context commit-id (not= commit-id (:datahike.cache/commit-id context)))
-                 (-> (dissoc :datahike.cache/attribute-revisions)
-                     (merge (dsi/stored-revisions stored)))))))))
+        branch (:branch (:config @wrapped-atom))
+        raw    (k/get store branch nil {:sync? true})
+        cid    (get-in raw [:meta :datahike/commit-id])
+        built  (::head (meta wrapped-atom))]
+    (if (and cid built (= cid (get-in built [:meta :datahike/commit-id])))
+      built
+      (let [stored (dsi/resolve-head store branch raw {:sync? true})]
+        (log/trace :datahike/db-deref {:config (:config stored)})
+        (let [fresh-db (dsi/stored->db (assoc stored :config (:config @wrapped-atom)) store)
+              commit-id (get-in fresh-db [:meta :datahike/commit-id])
+              db (assoc fresh-db :cache-context
+                        ;; Another process's commit carries its stored revisions.
+                        (let [context (:cache-context @wrapped-atom)]
+                          (cond-> context
+                            context (assoc :datahike.cache/commit-id commit-id
+                                           :datahike.cache/committed? (some? commit-id))
+                            (and context commit-id (not= commit-id (:datahike.cache/commit-id context)))
+                            (-> (dissoc :datahike.cache/attribute-revisions)
+                                (merge (dsi/stored-revisions stored))))))]
+          (when commit-id (alter-meta! wrapped-atom assoc ::head db))
+          db)))))
 
 (defn deref-conn
   "The connection's db value. On a writer that does not stream, the branch head read from the

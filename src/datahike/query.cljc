@@ -2540,17 +2540,13 @@
       1000000)))
 
 (defn- result-weight
-  "Cached-tuple weight of one query result, as upstream weighs it: a relation or collection
-   find weighs its tuple count, a scalar or single-tuple find 1; nil for a result that is not
-   counted (a lazy seq), which is not cached, since weighing it would realize it. Computed
-   once at cache-put time and stored on the entry as :weight. A walk of each result's
-   structure (shallow-weight-within) cost ~200 ticks a row, most of a miss's put."
+  "Bounded shallow structural weight of one query result, or nil when the
+   result cannot be certified without realizing lazy data. Computed once at
+   cache-put time and stored on the entry as :weight. Structural, not a tuple
+   count: a one-row result holding a large value is weighed by its size, so the
+   weight limit bounds the cache's memory (lru-weighted-test)."
   [result]
-  (cond
-    (nil? result) 0
-    (counted? result) (count result)
-    (coll? result) nil
-    :else 1))
+  (resource/shallow-weight-within result *query-cache-weight-limit*))
 
 (defn- bucket-weight
   "Total cached structural weight of one DB-snapshot bucket — sums the
