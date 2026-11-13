@@ -2540,11 +2540,17 @@
       1000000)))
 
 (defn- result-weight
-  "Bounded shallow structural weight of one query result, or nil when the
-   result cannot be certified without realizing lazy data. Computed once at
-   cache-put time and stored on the entry as :weight."
+  "Cached-tuple weight of one query result, as upstream weighs it: a relation or collection
+   find weighs its tuple count, a scalar or single-tuple find 1; nil for a result that is not
+   counted (a lazy seq), which is not cached, since weighing it would realize it. Computed
+   once at cache-put time and stored on the entry as :weight. A walk of each result's
+   structure (shallow-weight-within) cost ~200 ticks a row, most of a miss's put."
   [result]
-  (resource/shallow-weight-within result *query-cache-weight-limit*))
+  (cond
+    (nil? result) 0
+    (counted? result) (count result)
+    (coll? result) nil
+    :else 1))
 
 (defn- bucket-weight
   "Total cached structural weight of one DB-snapshot bucket — sums the
@@ -2554,15 +2560,21 @@
 
 (def ^:private empty-result-bucket {:owners #{} :entries {}})
 
+(def ^:private latest-limit
+  "How many [lineage cache-key] pointers the result cache keeps (latest-entry)."
+  65536)
+
 (defn- empty-query-result-cache [size weight-limit]
   {:lru (lru/weighted-lru size weight-limit bucket-weight)
+   :latest (lru/lru latest-limit)
    :generations {}
    :epoch 0})
 
 (defn- replace-query-result-lru [state size weight-limit]
   (-> state
       (update :epoch inc)
-      (assoc :lru (lru/weighted-lru size weight-limit bucket-weight))))
+      (assoc :lru (lru/weighted-lru size weight-limit bucket-weight)
+             :latest (lru/lru latest-limit))))
 
 (defonce ^{:doc "Global weighted query-result cache plus atomic connection-generation admission."}
   query-result-cache
@@ -3092,30 +3104,46 @@
                             [:datahike.cache/attribute-revisions attribute])))
                attributes)))
 
+(defn- lineage-key
+  "A query's place in a lineage: its scope key without the commit (the reading connection
+   generations of its sources) and its cache key. Two values of one lineage carry comparable
+   attribute revisions (source-context-unchanged?)."
+  [scope-key cache-key]
+  [(if (= composite-source-key-tag (first scope-key))
+     [composite-source-key-tag
+      (mapv (fn [[symbol position database-key]] [symbol position (subvec database-key 0 2)])
+            (second scope-key))]
+     (subvec scope-key 0 2))
+   cache-key])
+
 (defn- inheritable-entry
-  [lru current-source-key cache-key current-contexts]
-  (some (fn [[cached-source-key {:keys [entries]}]]
-          (when (and (not= cached-source-key current-source-key)
-                     (compatible-source-keys? cached-source-key
-                                              current-source-key))
-            (when-let [{:keys [dependency-plan source-contexts] :as entry}
-                       (get entries cache-key)]
-              (when (every?
-                     true?
-                     (map (fn [cached-member current-member]
-                            (let [cached-key (nth cached-member 2)
-                                  current-key (nth current-member 2)
-                                  attributes
-                                  (dependency-plan-source-attributes
-                                   dependency-plan cached-source-key cached-key)]
-                              (source-context-unchanged?
-                               (get source-contexts cached-key)
-                               (get current-contexts current-key)
-                               attributes)))
-                          (source-key-members cached-source-key)
-                          (source-key-members current-source-key)))
-                entry))))
-        (lru/weighted-entries lru)))
+  "The entry a miss may inherit: the latest result cached for this query in this lineage
+   (latest-entry), when no attribute the query reads moved between its value and this one.
+   One lookup: a miss searched every cached commit for one, and on values just committed,
+   where nearly every query misses, that search cost more than running the query."
+  [{:keys [lru latest]} scope-key current-source-key cache-key current-contexts]
+  (let [cached-source-key (get latest (lineage-key scope-key cache-key))
+        entries (:entries (get lru cached-source-key))]
+    (when (and cached-source-key
+               (not= cached-source-key current-source-key)
+               (compatible-source-keys? cached-source-key current-source-key))
+      (when-let [{:keys [dependency-plan source-contexts] :as entry}
+                 (get entries cache-key)]
+        (when (every?
+               true?
+               (map (fn [cached-member current-member]
+                      (let [cached-key (nth cached-member 2)
+                            current-key (nth current-member 2)
+                            attributes
+                            (dependency-plan-source-attributes
+                             dependency-plan cached-source-key cached-key)]
+                        (source-context-unchanged?
+                         (get source-contexts cached-key)
+                         (get current-contexts current-key)
+                         attributes)))
+                    (source-key-members cached-source-key)
+                    (source-key-members current-source-key)))
+          entry)))))
 
 (defn- result-cache-get
   "Look up an exact result or lazily promote a dependency-safe older result.
@@ -3139,19 +3167,21 @@
                               (assoc lru result-key
                                      (update bucket :owners conj scope-key)))))
                    (if-let [entry
-                            (inheritable-entry lru result-key cache-key
+                            (inheritable-entry state scope-key result-key cache-key
                                                current-contexts)]
                      (let [promoted
                            (assoc entry :source-contexts current-contexts)]
                        (vreset! found promoted)
                        (if (source-key-generations-current?
                             scope-key generations)
-                         (assoc state :lru
-                                (assoc lru result-key
-                                       (-> (or bucket empty-result-bucket)
-                                           (update :owners conj scope-key)
-                                           (assoc-in [:entries cache-key]
-                                                     promoted))))
+                         (-> state
+                             (assoc :lru
+                                    (assoc lru result-key
+                                           (-> (or bucket empty-result-bucket)
+                                               (update :owners conj scope-key)
+                                               (assoc-in [:entries cache-key]
+                                                         promoted))))
+                             (update :latest (fnil assoc (lru/lru latest-limit)) (lineage-key scope-key cache-key) result-key))
                          state))
                      state)))))
       @found)))
@@ -3171,15 +3201,17 @@
                            scope-key generations))
                    (let [bucket (or (get lru result-key) empty-result-bucket)]
                      (vreset! stored? true)
-                     (assoc state :lru
-                            (assoc lru result-key
-                                   (-> bucket
-                                       (update :owners conj scope-key)
-                                       (assoc-in [:entries cache-key]
-                                                 {:result result
-                                                  :dependency-plan dependency-plan
-                                                  :source-contexts source-contexts
-                                                  :weight weight})))))
+                     (-> state
+                         (assoc :lru
+                                (assoc lru result-key
+                                       (-> bucket
+                                           (update :owners conj scope-key)
+                                           (assoc-in [:entries cache-key]
+                                                     {:result result
+                                                      :dependency-plan dependency-plan
+                                                      :source-contexts source-contexts
+                                                      :weight weight}))))
+                         (update :latest (fnil assoc (lru/lru latest-limit)) (lineage-key scope-key cache-key) result-key)))
                    state)))
         @stored?))))
 
@@ -4868,14 +4900,19 @@
                      :cljs (:result cached)))
               (let [computation-evidence (volatile! nil)
                     compute (fn [shared-cancel]
-                              (let [sink (volatile! nil)]
-                                (binding [resource/*evidence-sink* sink]
-                                  (try
-                                    (uncached shared-cancel)
-                                    (finally
-                                      (vreset! computation-evidence @sink)
-                                      (when outer-evidence-sink
-                                        (vreset! outer-evidence-sink @sink)))))))]
+                              ;; resource evidence is recorded only for a caller that reads it
+                              ;; (an outer sink, or the cache evidence): a sink bound for nobody
+                              ;; made every cached miss record it, ~20k ticks on a 60-row result
+                              (if-not (or outer-evidence-sink cache-evidence)
+                                (uncached shared-cancel)
+                                (let [sink (volatile! nil)]
+                                  (binding [resource/*evidence-sink* sink]
+                                    (try
+                                      (uncached shared-cancel)
+                                      (finally
+                                        (vreset! computation-evidence @sink)
+                                        (when outer-evidence-sink
+                                          (vreset! outer-evidence-sink @sink))))))))]
                 (let [arguments
                       [[source-key cache-key max-work max-results
                         max-result-weight]
@@ -4914,9 +4951,11 @@
                                      completed))))]
                       result
                       #?(:clj
-                         (if deferred?
+                         (cond
+                           deferred?
                            (apply single-flight/acquire-execution!
                                   (conj arguments reject-overflow?))
+                           :else
                            (apply single-flight/execute! arguments))
                          :cljs
                          (apply single-flight/execute! arguments))]

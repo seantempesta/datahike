@@ -12,15 +12,16 @@
    #?(:clj [datahike.writing :as writing])))
 
 #?(:clj
-   ;; The result cache is off by default on our Jolt line (datahike.query/*query-result-cache?*);
-   ;; these tests are about the cache, so they run with it on.
+   ;; The result cache is on by default (datahike.query/*query-result-cache?*); these tests are
+   ;; about the cache, so they bind it on whatever the default.
    (t/use-fixtures :each (fn [f] (binding [dq/*query-result-cache?* true] (f)))))
 
 #?(:clj
-   (deftest query-result-cache-is-off-by-default-and-can-be-turned-on
-     (is (false? (.getRawRoot #'dq/*query-result-cache?*)) "the root value is off")
-     (binding [dq/*query-result-cache?* true]
-       (is (true? dq/*query-result-cache?*)))))
+   (deftest query-result-cache-is-on-by-default-and-can-be-turned-off
+     (is (true? (.getRawRoot #'dq/*query-result-cache?*)) "the root value is on")
+     (binding [dq/*query-result-cache?* false]
+       (is (false? dq/*query-result-cache?*)))))
+
 
 (defn- with-temp-db
   "Create a temp in-memory db with schema, run f with the connection, then clean up."
@@ -1773,3 +1774,27 @@
        (aset args 1 :changed)
        (is (= [:a 1] key-arguments)
            "the key owns its values; it shares no storage with the caller's array"))))
+
+#?(:clj
+   (deftest a-miss-inherits-from-the-latest-value-that-cached-the-query
+     ;; A miss looks up the latest result cached for its query in its lineage, not every cached
+     ;; commit; it inherits when no attribute the query reads moved since, across commits nobody
+     ;; queried, and runs the query when one did.
+     (with-temp-db
+       (conj label-schema {:c/id "lineage" :c/note "first"})
+       (fn [conn]
+         (dq/clear-query-cache!)
+         (let [query '[:find ?value :where [_ :c/note ?value]]
+               outcome #(get-in % [:datahike.query/cache-evidence :datahike.cache/outcome])
+               initial (dq/q-with-evidence query @conn)
+               ;; two commits that touch only :c/labels, the second never queried
+               _ (d/transact conn [{:c/id "lineage" :c/labels ["a"]}])
+               untouched (:db-after (d/transact conn [{:c/id "lineage" :c/labels ["b"]}]))
+               inherited (dq/q-with-evidence query untouched)
+               ;; a commit that touches :c/note: the query runs again, on the new value
+               touched (:db-after (d/transact conn [{:c/id "lineage" :c/note "second"}]))
+               recomputed (dq/q-with-evidence query touched)]
+           (is (= #{["first"]} (:datahike.query/result initial) (:datahike.query/result inherited)))
+           (is (= :datahike.cache.outcome/hit (outcome inherited)) "inherited across two untouched commits")
+           (is (= #{["second"]} (:datahike.query/result recomputed)))
+           (is (not= :datahike.cache.outcome/hit (outcome recomputed)) "a touched attribute runs the query"))))))
