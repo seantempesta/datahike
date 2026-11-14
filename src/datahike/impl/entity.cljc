@@ -3,7 +3,8 @@
   (:require [#?(:cljs cljs.core :clj clojure.core)]
             [datahike.db :as db]
             [datahike.db.interface :as dbi]
-            [datahike.db.utils :as dbu])
+            [datahike.db.utils :as dbu]
+            [datahike.index.interface :as di])
   #?(:clj (:import [datahike.java IEntity])))
 
 (declare entity ->Entity equiv-entity lookup-entity touch)
@@ -17,7 +18,15 @@
 (defn entity [db eid]
   {:pre [(dbu/db? db)]}
   (when-let [e (entid db eid)]
-    (->Entity db e (volatile! false) (volatile! {}))))
+    ;; the recorder bound where the entity is made (datahike.reads/with-reads): its lazy lookups record into it
+    ;; when they run with none bound (task datahike.reads/a-lazy-read-records-into-the-read-it-belongs-to)
+    (->Entity db e (volatile! false) (volatile! {}) di/*reads*)))
+
+(defn- recorded
+  "f's value, its reads recorded into the recorder bound now, else into the one entity e was made under."
+  [e f]
+  (let [r (.-reads ^Entity e)]
+    (if (and r (nil? di/*reads*)) (binding [di/*reads* r] (f)) (f))))
 
 (defn- entity-attr [db a-ident datoms]
   (if (dbu/multival? db a-ident)
@@ -50,7 +59,7 @@
          [a (multival->js v)]
          [a v]))))
 
-(deftype Entity [db eid touched cache]
+(deftype Entity [db eid touched cache reads]
   #?@(:cljs
       [Object
        (toString [this]
@@ -168,7 +177,7 @@
    (if (= a-ident :db/id)
      (.-eid this)
      (if (dbu/reverse-ref? a-ident)
-       (-lookup-backwards (.-db this) (.-eid this) (dbu/reverse-ref a-ident) not-found)
+       (recorded this #(-lookup-backwards (.-db this) (.-eid this) (dbu/reverse-ref a-ident) not-found))
        (if-some [v (@(.-cache this) a-ident)]
          v
          (if @(.-touched this)
@@ -176,7 +185,7 @@
            (if-let [a-db (if (:attribute-refs? (dbi/-config (.-db this)))
                            (dbi/-ref-for (.-db this) a-ident)
                            a-ident)]
-             (if-some [datoms (not-empty (dbi/search (.-db this) [(.-eid this) a-db]))]
+             (if-some [datoms (not-empty (recorded this #(dbi/search (.-db this) [(.-eid this) a-db])))]
                (let [value (entity-attr (.-db this) a-ident datoms)]
                  (vreset! (.-cache this) (assoc @(.-cache this) a-ident value))
                  value)
@@ -205,7 +214,7 @@
 (defn touch [^Entity e]
   {:pre [(entity? e)]}
   (when-not @(.-touched e)
-    (when-let [datoms (not-empty (dbi/search (.-db e) [(.-eid e)]))]
+    (when-let [datoms (not-empty (recorded e #(dbi/search (.-db e) [(.-eid e)])))]
       (vreset! (.-cache e) (->> datoms
                                 (datoms->cache (.-db e))
                                 (touch-components (.-db e))))

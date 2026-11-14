@@ -15,13 +15,15 @@
    each once however often it was read. While recording, queries run with no result cache and
    the search memo is bypassed, so every read reaches an index; the planner stays on (on Jolt
    its cursors read through the index protocol, which records: datahike.reads-test). f's result
-   should be realized: a lazy read after it returns is not recorded."
+   should be realized, except an entity: one made inside f records its later lookups into this recorder
+   when none is bound where they run. Those land in the live recorder, the set's metadata
+   :datahike.reads/live, an atom a holder re-reads (the set answered is what f read by its return)."
   [f]
   (let [r (atom #{})
         result (binding [di/*reads* r
                          q/*query-result-cache?* false]
                  (f))]
-    [result @r]))
+    [result (with-meta @r {:datahike.reads/live r})]))
 
 (defn- bound
   "A range component's bound value: x when from and to agree on it and it is not open."
