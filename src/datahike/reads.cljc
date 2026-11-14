@@ -7,8 +7,7 @@
    one of its own keys is among the read's (datom-keys). Matching a transaction costs its
    datoms, whatever was read."
   (:require [datahike.index.interface :as di]
-            [datahike.constants :refer [e0 emax]]
-            [datahike.query :as q]))
+            [datahike.constants :refer [e0 emax]]))
 
 (defn with-reads
   "Call f (no arguments) and answer [result reads]: reads, the set of ranges f's reads scanned,
