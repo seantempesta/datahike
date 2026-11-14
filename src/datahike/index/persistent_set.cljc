@@ -188,19 +188,35 @@
   (when-not #?(:clj (.-_address ^PersistentSortedSet pset) :cljs (.-address pset))
     (throw (ex-info "Index needs to be properly flushed before marking."
                     {:type :flush-before-marking})))
-  (let [addresses (volatile! (transient #{}))]
-    (psset/walk-addresses pset (fn [address]
-                                 (let [[before _] (swap-vals! seen conj address)]
-                                   (when-not (contains? before address)
-                                     (vswap! addresses conj! address)
-                                     true))))
-    (let [marked (persistent! @addresses)]
-      #?(:jolt
-         ;; and the values out of line each newly marked node references, read as stored (the
-         ;; storage's restore swaps them back); a fused root is in no key and holds none
-         (let [store (:store (.-_storage ^PersistentSortedSet pset))]
-           (into marked (mapcat #(some-> (k/get store % nil {:sync? true}) refs)) marked))
-         :default marked))))
+  (let [addresses (volatile! (transient #{}))
+        unseen? (fn [address]
+                  (let [[before _] (swap-vals! seen conj address)]
+                    (when-not (contains? before address)
+                      (vswap! addresses conj! address)
+                      true)))]
+    #?(:jolt
+       ;; Each unseen node is read once, as stored: its out-of-line values are still references
+       ;; there (the storage's restore swaps them back), so its references and its children's
+       ;; addresses come from that one read, and the node never enters the node cache. Walking
+       ;; through the storage instead restored each upper branch (a cache miss, its values read
+       ;; back) and then every node was read whole again for its references: one boot's mark of
+       ;; the standing store made 446,829 such reads beside 69,806 restores (27.4 GB, 5.79B ticks).
+       ;; A fused root is in no key and holds no references: its children are walked from it.
+       (let [store (:store (.-_storage ^PersistentSortedSet pset))
+             walk (fn walk [node]
+                    (when (instance? Branch node)
+                      (doseq [a (.-_addresses ^Branch node) :when (and a (unseen? a))]
+                        (when-let [child (k/get-immutable store a)]
+                          (vswap! addresses #(reduce conj! % (refs child)))
+                          (walk child)))))
+             root-address (.-_address ^PersistentSortedSet pset)]
+         (when (unseen? root-address)
+           (if-let [root (k/get-immutable store root-address)]
+             (do (vswap! addresses #(reduce conj! % (refs root))) (walk root))
+             (walk (.root ^PersistentSortedSet pset)))))
+       :default
+       (psset/walk-addresses pset unseen?))
+    (persistent! @addresses)))
 
 (extend-type #?(:clj PersistentSortedSet :cljs BTSet)
   IIndex
