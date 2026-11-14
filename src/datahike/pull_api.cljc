@@ -2,6 +2,8 @@
   (:require
    [datahike.db.utils :as dbu]
    [datahike.db.interface :as dbi]
+   [datahike.index.interface :as di]
+   [datahike.constants :refer [e0 tx0]]
    [datahike.resource :as resource]
    [datalog.parser.pull :as dpp #?@(:cljs [:refer [PullSpec]])])
   #?(:clj
@@ -422,19 +424,33 @@
                            [:avet [a eid] (fn [^Datom d] (and (= a (.-a d)) (= eid (.-v d))))])]
     (take-while keep? (dbi/rseek-datoms db index cs))))
 
+(defn- record-attrs!
+  "While reads are recorded (di/*reads*, datahike.reads/with-reads), record entity eid's :eavt range of each
+   attribute in attrs, [e a]: what a pull of those attributes depends on, never the whole entity, so a commit
+   to another of its attributes reaches no reader of these (task datahike.pull-api/a-pull-of-an-attribute-
+   records-its-slice). The bounds are the ones a seek of [eid a] would record."
+  [db eid attrs]
+  (when di/*reads*
+    (doseq [a attrs]
+      (let [from (dbu/components->pattern db :eavt [eid a] e0 tx0)]
+        (di/record-read! from (dbu/pattern-upper :eavt [eid a] from))))))
+
 (defn entity-datoms
   "Entity `eid`'s datoms by attribute (as its datoms name it), each in :eavt order: its
    :eavt range read once, so a pattern of n attributes reads the entity once, not n times.
-   Each datom read is charged to the budget's work."
-  [db eid]
-  (persistent!
-   (reduce (fn [grouped ^Datom datom]
-             ;; each datom read is work, as '*'s are, whether the pattern keeps it or not
-             (resource/charge-work!)
-             (let [a (.-a datom)]
-               (assoc! grouped a (conj (get grouped a []) datom))))
-           (transient {})
-           (dbi/datoms db :eavt [eid]))))
+   Each datom read is charged to the budget's work. While reads are recorded, the read
+   records each of `attrs` (record-attrs!), not the entity's whole range."
+  [db eid attrs]
+  (let [datoms (binding [di/*reads* nil] (vec (dbi/datoms db :eavt [eid])))]
+    (record-attrs! db eid attrs)
+    (persistent!
+     (reduce (fn [grouped ^Datom datom]
+               ;; each datom read is work, as '*'s are, whether the pattern keeps it or not
+               (resource/charge-work!)
+               (let [a (.-a datom)]
+                 (assoc! grouped a (conj (get grouped a []) datom))))
+             (transient {})
+             datoms))))
 
 (defn pull-attr
   "Retrieve datoms for given entity id and specification from database. `grouped`,
@@ -560,7 +576,9 @@
                 ;; its first attribute, and each attribute keeps its own: one seek an attribute
                 ;; cost five times a whole pattern's '* (35 attributes)
                 grouped    (or (:grouped frame)
-                               (when (next (:attrs (:pattern frame))) (entity-datoms db eid)))
+                               (when (next (:attrs (:pattern frame)))
+                                 (entity-datoms db eid (keep (fn [[k v]] (when (and (= k (:attr v)) (not= :db/id k)) k))
+                                                             (:attrs (:pattern frame))))))
                 new-frames (conj frames (assoc frame :specs (rest specs) :grouped grouped))]
             (pull-attr db spec eid new-frames grouped))
           (->> frame :kvps persistent! not-empty
@@ -593,7 +611,12 @@
   (resource/charge-work!)
   (when-let [eid (dbu/entid db entity-ref)]
     (when (or (not (number? entity-ref))
-              (first (dbi/datoms db :eavt [eid])))
+              ;; the existence probe records nothing wider than what the pull reads: the entity's range only
+              ;; when it is missing, so its first datom reaches the read (an existing one's attributes are
+              ;; recorded by what the pattern reads of it)
+              (let [found (binding [di/*reads* nil] (first (dbi/datoms db :eavt [eid])))]
+                (when-not found (when di/*reads* (dbi/datoms db :eavt [eid])))
+                found))
       eid)))
 
 (defn pull-spec
