@@ -3196,7 +3196,7 @@
 (defn- result-cache-put!
   "Store a query result when every source generation remains admitted."
   [result-key scope-key cache-key result dependency-plan source-contexts
-   expected-epoch]
+   expected-epoch & [ranges]]
   (when-let [weight (and (pos? *query-cache-weight-limit*)
                          (result-weight result))]
     (when result-key
@@ -3215,6 +3215,8 @@
                                            (update :owners conj scope-key)
                                            (bucket-with-entry cache-key
                                                               {:result result
+                                                               ;; the ranges its computation read (datahike.reads): a recorded hit replays them
+                                                               :ranges ranges
                                                                :dependency-plan dependency-plan
                                                                :source-contexts source-contexts
                                                                :weight weight}))))
@@ -4913,6 +4915,8 @@
             (if cached
               (do (resource/certify-cached-result! (:result cached)
                                                    resource-options)
+                  ;; a recorded read served from the cache records what its computation read
+                  (when-some [rr di/*reads*] (when (seq (:ranges cached)) (swap! rr into (:ranges cached))))
                   (when cached-dependency-plan
                     (vreset! cached-dependency-plan
                              (:dependency-plan cached)))
@@ -4927,6 +4931,15 @@
                             (:result cached))
                      :cljs (:result cached)))
               (let [computation-evidence (volatile! nil)
+                    computed-ranges (volatile! nil)
+                    ;; the computation reads under a recorder of its own, kept with the entry and composed into the
+                    ;; caller's when it records (task datahike.reads/a-cached-read-records-what-it-read)
+                    uncached (fn [shared-cancel]
+                               (let [r (atom #{}) outer di/*reads*
+                                     v (binding [di/*reads* r] (uncached shared-cancel))]
+                                 (vreset! computed-ranges @r)
+                                 (when (and outer (seq @r)) (swap! outer into @r))
+                                 v))
                     compute (fn [shared-cancel]
                               ;; resource evidence is recorded only for a caller that reads it
                               ;; (an outer sink, or the cache evidence): a sink bound for nobody
@@ -4951,6 +4964,7 @@
                                                              source-contexts)]
                             (resource/certify-cached-result!
                              (:result entry) resource-options)
+                            (when-some [rr di/*reads*] (when (seq (:ranges entry)) (swap! rr into (:ranges entry))))
                             (when cached-dependency-plan
                               (vreset! cached-dependency-plan
                                        (:dependency-plan entry)))
@@ -4958,16 +4972,20 @@
                        compute
                        #(result-cache-put! result-key source-key cache-key %
                                            @dependency-plan source-contexts
-                                           cache-epoch)
+                                           cache-epoch @computed-ranges)
                        #(when cache-evidence (vreset! cache-evidence %))
                        #(cond-> {:datahike.read/dependency-plan
                                  (or (when cached-dependency-plan
                                        @cached-dependency-plan)
-                                     @dependency-plan)}
+                                     @dependency-plan)
+                                 :datahike.read/ranges @computed-ranges}
                           @computation-evidence
                           (assoc :datahike.query/resource-evidence
                                  @computation-evidence))
                        (fn [completed]
+                         ;; a follower of an in-flight computation records what it read, as a hit does
+                         (when-some [rr di/*reads*]
+                           (when (seq (:datahike.read/ranges completed)) (swap! rr into (:datahike.read/ranges completed))))
                          (when-let [evidence
                                     (:datahike.query/resource-evidence
                                      completed)]
