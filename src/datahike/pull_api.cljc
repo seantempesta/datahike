@@ -431,9 +431,13 @@
    records-its-slice). The bounds are the ones a seek of [eid a] would record."
   [db eid attrs]
   (when di/*reads*
-    (doseq [a attrs]
-      (let [from (dbu/components->pattern db :eavt [eid a] e0 tx0)]
-        (di/record-read! from (dbu/pattern-upper :eavt [eid a] from))))))
+    (let [schema (dbi/-schema db)]
+      (doseq [a attrs]
+        ;; an attribute the schema lacks has no range to record, and resolving one throws where the pull
+        ;; itself answers nothing: skipped. Defining it later is a schema datom, which reaches every read.
+        (when (contains? schema a)
+          (let [from (dbu/components->pattern db :eavt [eid a] e0 tx0)]
+            (di/record-read! from (dbu/pattern-upper :eavt [eid a] from))))))))
 
 (defn entity-datoms
   "Entity `eid`'s datoms by attribute (as its datoms name it), each in :eavt order: its
