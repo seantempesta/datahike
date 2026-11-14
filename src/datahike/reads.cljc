@@ -19,11 +19,16 @@
    when none is bound where they run. Those land in the live recorder, the set's metadata
    :datahike.reads/live, an atom a holder re-reads (the set answered is what f read by its return)."
   [f]
-  (let [r (atom #{})
+  (let [outer di/*reads*
+        r (atom #{})
         result (binding [di/*reads* r
                          q/*query-result-cache?* false]
-                 (f))]
-    [result (with-meta @r {:datahike.reads/live r})]))
+                 (f))
+        rs @r]
+    ;; recording composes: a read inside a nested with-reads is the outer read's too
+    ;; (task datahike.reads/with-reads-nests-in-an-outer-recorder), O(inner ranges) at the return
+    (when (and outer (seq rs)) (swap! outer into rs))
+    [result (with-meta rs {:datahike.reads/live r})]))
 
 (defn- bound
   "A range component's bound value: x when from and to agree on it and it is not open."
