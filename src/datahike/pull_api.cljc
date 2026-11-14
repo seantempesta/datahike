@@ -441,8 +441,12 @@
    Each datom read is charged to the budget's work. While reads are recorded, the read
    records each of `attrs` (record-attrs!), not the entity's whole range."
   [db eid attrs]
-  (let [datoms (binding [di/*reads* nil] (vec (dbi/datoms db :eavt [eid])))]
-    (record-attrs! db eid attrs)
+  ;; off the recorder (every read but a recorded one), the range as before: no binding, no copy
+  (let [datoms (if di/*reads*
+                 (let [ds (binding [di/*reads* nil] (vec (dbi/datoms db :eavt [eid])))]
+                   (record-attrs! db eid attrs)
+                   ds)
+                 (dbi/datoms db :eavt [eid]))]
     (persistent!
      (reduce (fn [grouped ^Datom datom]
                ;; each datom read is work, as '*'s are, whether the pattern keeps it or not
@@ -614,9 +618,11 @@
               ;; the existence probe records nothing wider than what the pull reads: the entity's range only
               ;; when it is missing, so its first datom reaches the read (an existing one's attributes are
               ;; recorded by what the pattern reads of it)
-              (let [found (binding [di/*reads* nil] (first (dbi/datoms db :eavt [eid])))]
-                (when-not found (when di/*reads* (dbi/datoms db :eavt [eid])))
-                found))
+              (if di/*reads*
+                (let [found (binding [di/*reads* nil] (first (dbi/datoms db :eavt [eid])))]
+                  (when-not found (dbi/datoms db :eavt [eid]))
+                  found)
+                (first (dbi/datoms db :eavt [eid]))))
       eid)))
 
 (defn pull-spec
