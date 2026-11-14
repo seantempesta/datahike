@@ -11,14 +11,14 @@
             [datahike.query :as q]))
 
 (defn with-reads
-  "Call f (no arguments) and answer [result reads]: reads, the ranges f's reads scanned. While
-   recording, queries run on the relational engine (the planner's cursors read past the index
-   protocol) with no result cache, and the search memo is bypassed, so every read reaches an
-   index. f's result should be realized: a lazy read after it returns is not recorded."
+  "Call f (no arguments) and answer [result reads]: reads, the set of ranges f's reads scanned,
+   each once however often it was read. While recording, queries run with no result cache and
+   the search memo is bypassed, so every read reaches an index; the planner stays on (on Jolt
+   its cursors read through the index protocol, which records: datahike.reads-test). f's result
+   should be realized: a lazy read after it returns is not recorded."
   [f]
-  (let [r (atom [])
+  (let [r (atom #{})
         result (binding [di/*reads* r
-                         q/*disable-planner* true
                          q/*query-result-cache?* false]
                  (f))]
     [result @r]))
