@@ -683,6 +683,44 @@
     (let [pending-ops (mapv (fn [[k v]] (k/assoc store k v {:immutable? true} {:sync? false})) kvs)]
       (go-try- (doseq [op pending-ops] (<?- op))))))
 
+(defn write-commit!
+  "Write commit `cid`'s values in causal order, its mutable head last: the index nodes it flushed
+   (pending-kvs, children before the parents that address them), its schema-meta, its graph
+   records, what it changed (`commit-changes-kv`), its record under `cid`, then `head` under
+   `head-key` when given. Every value but the head is content-addressed, so immutable. One ordered
+   batch on a store that takes one (a torn batch leaves collectable orphans, never a head naming a
+   value that was not written; a sync subscriber applies it in this order), else each write awaited
+   before the next. The one writer of a commit's values: commit!, datahike.versioning/force-branch!
+   and create-database call it, each keeping its own head (force-branch! rechecks the head itself;
+   create-database writes the roster after). As write-pending-kvs!: with sync? the writes are made
+   at once; else it answers a go block to await."
+  [store {:keys [pending-kvs schema-meta-kv graph-writes changes-kv cid record head-key head sync?]}]
+  (let [opts {:sync? sync?}
+        immutable {:immutable? true}]
+    (if (multi-key-capable? store)
+      (let [writes (cond-> (vec pending-kvs)
+                     schema-meta-kv (conj schema-meta-kv)
+                     true           (into graph-writes)
+                     changes-kv     (conj changes-kv)
+                     record         (conj [cid record])
+                     head-key       (conj [head-key head]))
+            metas (into {} (comp (map first) (remove #(= % head-key)) (map (fn [k] [k immutable]))) writes)]
+        (k/multi-assoc store writes metas opts))
+      (let [values (cond-> []
+                     schema-meta-kv (conj schema-meta-kv)
+                     true           (into graph-writes)
+                     changes-kv     (conj changes-kv)
+                     record         (conj [cid record]))]
+        (if sync?
+          (do (write-pending-kvs! store pending-kvs true)
+              (doseq [[wk wv] values] (k/assoc store wk wv immutable opts))
+              (when head-key (k/assoc store head-key head opts)))
+          (go-try-
+           (<?- (write-pending-kvs! store pending-kvs false))
+           (doseq [[wk wv] values] (<?- (k/assoc store wk wv immutable opts)))
+           ;; the record awaited before the head is issued: a crash between them never leaves a head naming a missing record
+           (when head-key (<?- (k/assoc store head-key head opts)))))))))
+
 (defn commit-revisions
   "The cache revisions of the commit `cid` that advances `prior` by
    `modified-attrs` (`datahike.db/advance-cache-context`), else nil when
@@ -806,73 +844,14 @@
                           graph-writes  (when commit-graph?
                                           (commit-graph-writes store cid parents (commit-branch db-to-store)
                                                                known-generations))
-                        ;; what the commit changed, its transactions' effective datoms (complete-db-update kept
-                        ;; them on the value), written before the commit record, as its graph record is
+                        ;; what the commit changed since its base (datahike.core/with keeps it on the value)
                           changes-kv    (when commit-graph? (commit-changes-kv db cid))]
 
-                      (if (multi-key-capable? store)
-                        (let [[meta-key meta-val] schema-meta-kv-to-write
-                              branch-key (:branch config)
-                            ;; ORDERED batch. konserve applies a [k v] seq in sequence order,
-                            ;; so state the SAME causal discipline the non-atomic path below
-                            ;; spells out ("make sure all pointed to values are written before
-                            ;; the commit log and branch"): every value the new head references
-                            ;; first, the MUTABLE branch head LAST.
-                            ;;
-                            ;; Handing konserve a MAP would throw that order away — and the
-                            ;; order is real: pending-kvs comes out of the index flush with
-                            ;; children before the parents that address them. A torn batch then
-                            ;; leaves unreachable orphans (collectable), never a head pointing
-                            ;; at values that were never written. That is what makes the batch
-                            ;; safe WITHOUT atomic multi-key writes, which S3 and filesystems
-                            ;; cannot give us anyway.
-                            ;;
-                            ;; It also means a sync subscriber relaying this batch applies it
-                            ;; in the order we committed it, instead of guessing an order back
-                            ;; from the shape of the keys.
-                              writes (cond-> (vec pending-kvs)
-                                       schema-meta-kv-to-write (conj [meta-key meta-val])
-                                       commit-graph?           (into graph-writes)
-                                       changes-kv              (conj changes-kv)
-                                       commit-graph?           (conj [cid db-to-store])
-                                       true                    (conj [branch-key head]))
-                            ;; nodes + schema-meta (uuid) + commit (cid) are content-addressed →
-                            ;; immutable; the branch-head pointer stays mutable (unmarked).
-                              metas  (into {}
-                                           (comp (map first)
-                                                 (remove #(= % branch-key))
-                                                 (map (fn [k] [k {:immutable? true}])))
-                                           writes)]
-                          (<?- (k/multi-assoc store writes metas {:sync? sync?})))
-                    ;; Then write schema-meta, commit-log, branch
-                        (let [[meta-key meta-val] schema-meta-kv-to-write
-                              schema-meta-written (when schema-meta-kv-to-write
-                                                ;; schema-meta-key = (uuid schema-meta) → content-addressed → immutable
-                                                    (k/assoc store meta-key meta-val {:immutable? true} {:sync? sync?}))
-
-                          ;; Make sure all pointed to values are written before the commit log and branch
-                              _ (when schema-meta-kv-to-write (<?- schema-meta-written))
-                              _ (<?- (write-pending-kvs! store pending-kvs sync?))
-
-                          ;; the graph records are immutable and precede the commit they describe
-                              _ (doseq [[gk gv] graph-writes]
-                                  (<?- (k/assoc store gk gv {:immutable? true} {:sync? sync?})))
-                              _ (when-let [[ck cv] changes-kv]
-                                  (<?- (k/assoc store ck cv {:immutable? true} {:sync? sync?})))
-                          ;; the commit is content-addressed by cid → immutable; the branch head is mutable
-                              commit-log-written (when commit-graph?
-                                                   (k/assoc store cid db-to-store {:immutable? true} {:sync? sync?}))
-                            ;; AWAIT the commit record before ISSUING the head write.
-                            ;; Under :sync? false both k/assoc calls return ops that are
-                            ;; ALREADY RUNNING, so binding them side by side lets the
-                            ;; mutable head land before the immutable record it names —
-                            ;; a crash in between truncates branch-history. (Under
-                            ;; :sync? true k/assoc blocks, so the order already holds.)
-                              _                  (when (and commit-log-written (not sync?))
-                                                   (<?- commit-log-written))
-                              branch-written     (k/assoc store (:branch config) head {:sync? sync?})]
-                          (when-not sync?
-                            (<?- branch-written))))
+                      ;; every value before the head, in causal order (write-commit!)
+                      (<?- (write-commit! store {:pending-kvs pending-kvs :schema-meta-kv schema-meta-kv-to-write
+                                                 :graph-writes (when commit-graph? graph-writes) :changes-kv changes-kv
+                                                 :cid cid :record (when commit-graph? db-to-store)
+                                                 :head-key (:branch config) :head head :sync? sync?}))
 
                   ;; Online GC: delete freed addresses after writes are committed
                       (when (get-in config [:online-gc :enabled?])
@@ -1096,20 +1075,15 @@
      (try
        ;;we just created the first data base in this store, so the write cache is empty
        ;; schema-meta-key = (uuid schema-meta) → content-addressed, immutable
-       (<?- (k/assoc store schema-meta-key schema-meta {:immutable? true} opts))
+       ;; its nodes, schema-meta, graph record and record, then the :db head (write-commit!)
+       (<?- (write-commit! store {:pending-kvs (get-and-clear-pending-kvs! store)
+                                  :schema-meta-kv [schema-meta-key schema-meta]
+                                  :graph-writes (when (get config :commit-graph? true)
+                                                  (commit-graph-writes store cid #{} (commit-branch db-to-store)))
+                                  :cid cid :record db-to-store :head-key :db :head db-to-store :sync? false}))
        (sc/add-to-write-cache (:store config) schema-meta-key)
        (when-not (sc/cache-has? schema-meta-key)
          (sc/cache-miss schema-meta-key schema-meta))
-
-       ;; Process pending KVs from index flushes synchronously
-       (let [pending-kvs (get-and-clear-pending-kvs! store)]
-         (<?- (write-pending-kvs! store pending-kvs false)))
-
-       (when (get config :commit-graph? true)
-         (doseq [[gk gv] (commit-graph-writes store cid #{} (commit-branch db-to-store))]
-           (<?- (k/assoc store gk gv {:immutable? true} opts))))
-       (<?- (k/assoc store cid db-to-store {:immutable? true} opts)) ; content-addressed commit
-       (<?- (k/assoc store :db db-to-store opts))             ; mutable: branch head
        ;; the roster names :db, so it is a POINTER and must be written LAST — a
        ;; collector that reads it before the head exists marks nothing for :db.
        (<?- (roster-add! store :db opts))                    ; the roster log

@@ -13,7 +13,7 @@
                                       commit! create-commit-id get-and-clear-pending-kvs!
                                       write-pending-kvs! branch-heads-as-commits
                                       read-head resolve-head compact-head compact-head? commit-graph-writes
-                                      commit-graph-records commit-graph-key commit-changes-key commit-changes-kv commit-branch]]
+                                      commit-graph-records commit-graph-key commit-changes-key commit-changes-kv write-commit! commit-branch]]
             [datahike.writer]
             [datahike.index.secondary :as sec]
             ;; cljs: S is a VAR (the supervisor) → :refer; go-try-/<?-/<?/go-loop-try
@@ -426,32 +426,14 @@
                             ;; Same opt-out as datahike.writing/commit!: no
                             ;; commit-graph store means no separate cid record.
                             commit-graph? (get (:config db) :commit-graph? true)
-                            ;; what the value changed since its base rides with its graph record, written before the commit
                             graph-writes (when commit-graph?
-                                           (cond-> (commit-graph-writes store cid resolved-parents branch)
-                                             (commit-changes-kv db cid) (conj (commit-changes-kv db cid))))]
-                        ;; Write every immutable value before the mutable head.
-                        (if (multi-key-capable? store)
-                          (let [[meta-key meta-val] schema-meta-kv-to-write
-                                writes (cond-> (vec pending-kvs)
-                                         schema-meta-kv-to-write (conj [meta-key meta-val])
-                                         commit-graph?           (into graph-writes)
-                                         commit-graph?           (conj [cid db-to-store]))
-                                metas (into {} (map (fn [[key _]] [key {:immutable? true}])) writes)]
-                            (<?- (k/multi-assoc store writes metas store-opts)))
-                          (do
-                            (<?- (write-pending-kvs! store pending-kvs sync?))
-                            (when schema-meta-kv-to-write
-                              (<?- (k/assoc store
-                                            (first schema-meta-kv-to-write)
-                                            (second schema-meta-kv-to-write)
-                                            {:immutable? true}
-                                            store-opts)))
-                            (doseq [[gk gv] graph-writes]
-                              (<?- (k/assoc store gk gv {:immutable? true} store-opts)))
-                            (when commit-graph?
-                              (<?- (k/assoc store cid db-to-store {:immutable? true}
-                                           store-opts)))))
+                                           (commit-graph-writes store cid resolved-parents branch))]
+                        ;; every immutable value before the mutable head, in causal order (write-commit!); the head
+                        ;; is updated below, rechecked
+                        (<?- (write-commit! store {:pending-kvs pending-kvs :schema-meta-kv schema-meta-kv-to-write
+                                                   :graph-writes graph-writes
+                                                   :changes-kv (when commit-graph? (commit-changes-kv db cid))
+                                                   :cid cid :record (when commit-graph? db-to-store) :sync? sync?}))
 
                         ;; Recheck inside the mutable head update. The GC guard
                         ;; protects the values-to-head window; the expected head
