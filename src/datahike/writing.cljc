@@ -521,9 +521,10 @@
   [:datahike/commit-graph cid])
 
 (defn commit-changes-key
-  "The store key of what commit `cid` changed: the effective datoms of the transactions it
-   committed, in order (datahike.versioning/changes reads them). Written beside the commit record,
-   collected with it."
+  "The store key of what commit `cid` changed: {:base the commit its value was built on, :datoms the
+   effective datoms of the transactions applied since, in order} (datahike.core/with keeps them on the
+   value; datahike.versioning/changes walks them by :base). Written beside the commit record and kept
+   with its graph record, so it outlives a swept snapshot."
   [cid]
   [:datahike/commit-changes cid])
 
@@ -799,7 +800,9 @@
                                                                known-generations))
                         ;; what the commit changed, its transactions' effective datoms (complete-db-update kept
                         ;; them on the value), written before the commit record, as its graph record is
-                          changes       (when commit-graph? (::uncommitted (meta db)))]
+                          changes       (when commit-graph?
+                                          (when-some [ds (:datahike/uncommitted (meta db))]
+                                            {:base (:datahike/uncommitted-base (meta db)) :datoms ds}))]
 
                       (if (multi-key-capable? store)
                         (let [[meta-key meta-val] schema-meta-kv-to-write
@@ -870,7 +873,7 @@
                         (<?- (online-gc/online-gc! store (assoc (:online-gc config) :sync? false))))
 
                       (-> db
-                          (vary-meta dissoc ::uncommitted)
+                          (vary-meta dissoc :datahike/uncommitted :datahike/uncommitted-base)
                           (as-> d (let [m (schema-meta-of d)] (with-schema-meta-key d m (:schema-meta-key db-to-store) #(immutable-schema-value? m))))
                           ;; nil without a commit graph, so no generation outlives its commit
                           (vary-meta assoc :datahike/generation
@@ -919,10 +922,7 @@
         {:keys [db-after]
          {:keys [db/txInstant]} :tx-meta} tx-report
         new-meta  (assoc (:meta db-after) :datahike/updated-at txInstant)
-        ;; the effective datoms since the last commit, kept on the value for commit! to write beside the
-        ;; commit (commit-changes-key); a speculation never comes here, so it keeps none
-        uncommitted (into (or (::uncommitted (meta old)) []) (:tx-data tx-report))
-        db        (vary-meta (assoc db-after :meta new-meta :writer writer) assoc ::uncommitted uncommitted)
+        db        (assoc db-after :meta new-meta :writer writer)
         tx-report (assoc tx-report :db-after db)]
     tx-report))
 

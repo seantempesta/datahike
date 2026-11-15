@@ -124,6 +124,19 @@
 
 ; Changing DB
 
+;; What a value changed since the committed value it was built on, kept on it for commit! to write beside
+;; its commit (datahike.writing/commit-changes-key): every transaction, the writer's or a speculation's,
+;; so a commit of a speculated value (a merge, force-branch!) keeps its changes too.
+(defn- kept-changes [report]
+  (let [db (:db-before report)
+        m (meta db)]
+    (update report :db-after vary-meta assoc
+            :datahike/uncommitted (into (or (:datahike/uncommitted m) []) (:tx-data report))
+            :datahike/uncommitted-base (if (contains? m :datahike/uncommitted)
+                                         (:datahike/uncommitted-base m)
+                                         (get-in db [:meta :datahike/commit-id])))))
+
+
 (defn with
   "Same as [[transact!]], but applies to an immutable database value. Returns transaction report (see [[transact!]])."
   ([db tx-data] (with db tx-data nil))
@@ -134,7 +147,8 @@
    {:pre [(dbu/db? db)]}
    (if (is-filtered db)
      (throw (ex-info "Filtered DB cannot be modified" {:error :transaction/filtered}))
-     (dbt/transact-tx-data
+     (kept-changes
+      (dbt/transact-tx-data
       (cond-> (db/map->TxReport
                {:db-before db
                 :db-after  (db/clear-cache-context db)
@@ -142,12 +156,13 @@
                 :tempids   {}
                 :tx-meta   tx-meta})
         ids (assoc ::dbt/ids ids ::dbt/tx (datahike.ids/-take! ids :tx)))
-      tx-data))))
+      tx-data)))))
 
 (defn load-entities-with
   ([db entities tx-meta] (load-entities-with db entities tx-meta nil))
   ([db entities tx-meta ids]
-   (update (dbt/transact-entities-directly
+   (kept-changes
+    (update (dbt/transact-entities-directly
             (cond-> (db/map->TxReport {:db-before db
                                        :db-after  db
                                        :tx-data   []
@@ -155,7 +170,7 @@
                                        :tx-meta   tx-meta})
               ids (assoc ::dbt/ids ids ::dbt/tx (datahike.ids/-take! ids :tx)))
             entities)
-           :db-after assoc :cache-context nil)))
+           :db-after assoc :cache-context nil))))
 
 (defn db-with
   "Applies transaction to an immutable db value, returning new immutable db value. Same as `(:db-after (with db tx-data))`."
