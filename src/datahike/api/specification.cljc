@@ -179,6 +179,18 @@
      :doc "Returns the merge base of two commit ids or branch keywords: their best common ancestor commit id, nil when they share none. Raises :merge-base-criss-cross when there is more than one. The optional fourth argument reads a commit's graph record (cid -> record or nil), so many calls can share one cache of commit-graph-record."
      :impl datahike.versioning/merge-base}
 
+    changes
+    {:args [:=> [:cat :any :uuid :uuid] [:vector :any]]
+     :ret [:vector :any]
+     :categories [:versioning :query :host]
+     :stability :experimental
+     :supports-remote? false
+     :referentially-transparent? true
+     :doc "The datoms the commits after `from` up to `to` changed, netted by [e a v]: each commit's own transactions as it kept them beside its record, never the indexes, so it costs the commits and their datoms. `to`'s lineage must reach `from`. Raises :datahike/changes-unrecorded for a commit written before commits kept their changes, :datahike/changes-not-ancestor when the lineage ends first."
+     :examples [{:desc "What a branch changed since its fork"
+                 :code "(changes conn fork-commit (commit-id @conn))"}]
+     :impl datahike.versioning/changes}
+
     commit-graph-record
     {:args [:=> [:cat :any :uuid] [:maybe :map]]
      :ret [:maybe :map]

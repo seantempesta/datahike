@@ -520,6 +520,13 @@
   [cid]
   [:datahike/commit-graph cid])
 
+(defn commit-changes-key
+  "The store key of what commit `cid` changed: the effective datoms of the transactions it
+   committed, in order (datahike.versioning/changes reads them). Written beside the commit record,
+   collected with it."
+  [cid]
+  [:datahike/commit-changes cid])
+
 (defn commit-branch
   "The branch a stored commit record was written on: its `[:config :branch]`,
    `:db` (Datahike's default branch) when absent."
@@ -789,7 +796,10 @@
                         ;; commit record, so no commit exists without it.
                           graph-writes  (when commit-graph?
                                           (commit-graph-writes store cid parents (commit-branch db-to-store)
-                                                               known-generations))]
+                                                               known-generations))
+                        ;; what the commit changed, its transactions' effective datoms (complete-db-update kept
+                        ;; them on the value), written before the commit record, as its graph record is
+                          changes       (when commit-graph? (::uncommitted (meta db)))]
 
                       (if (multi-key-capable? store)
                         (let [[meta-key meta-val] schema-meta-kv-to-write
@@ -814,6 +824,7 @@
                               writes (cond-> (vec pending-kvs)
                                        schema-meta-kv-to-write (conj [meta-key meta-val])
                                        commit-graph?           (into graph-writes)
+                                       changes                 (conj [(commit-changes-key cid) changes])
                                        commit-graph?           (conj [cid db-to-store])
                                        true                    (conj [branch-key head]))
                             ;; nodes + schema-meta (uuid) + commit (cid) are content-addressed →
@@ -837,6 +848,8 @@
                           ;; the graph records are immutable and precede the commit they describe
                               _ (doseq [[gk gv] graph-writes]
                                   (<?- (k/assoc store gk gv {:immutable? true} {:sync? sync?})))
+                              _ (when changes
+                                  (<?- (k/assoc store (commit-changes-key cid) changes {:immutable? true} {:sync? sync?})))
                           ;; the commit is content-addressed by cid → immutable; the branch head is mutable
                               commit-log-written (when commit-graph?
                                                    (k/assoc store cid db-to-store {:immutable? true} {:sync? sync?}))
@@ -857,6 +870,7 @@
                         (<?- (online-gc/online-gc! store (assoc (:online-gc config) :sync? false))))
 
                       (-> db
+                          (vary-meta dissoc ::uncommitted)
                           (as-> d (let [m (schema-meta-of d)] (with-schema-meta-key d m (:schema-meta-key db-to-store) #(immutable-schema-value? m))))
                           ;; nil without a commit graph, so no generation outlives its commit
                           (vary-meta assoc :datahike/generation
@@ -905,7 +919,10 @@
         {:keys [db-after]
          {:keys [db/txInstant]} :tx-meta} tx-report
         new-meta  (assoc (:meta db-after) :datahike/updated-at txInstant)
-        db        (assoc db-after :meta new-meta :writer writer)
+        ;; the effective datoms since the last commit, kept on the value for commit! to write beside the
+        ;; commit (commit-changes-key); a speculation never comes here, so it keeps none
+        uncommitted (into (or (::uncommitted (meta old)) []) (:tx-data tx-report))
+        db        (vary-meta (assoc db-after :meta new-meta :writer writer) assoc ::uncommitted uncommitted)
         tx-report (assoc tx-report :db-after db)]
     tx-report))
 

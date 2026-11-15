@@ -3,7 +3,7 @@
             [datahike.gc-guard :as guard]
             [datahike.index.interface :refer [-mark -seed-root! with-storage collection-key]]
             [datahike.index.secondary :as sec]
-            [datahike.writing :refer [read-head commit-graph-key]]
+            [datahike.writing :refer [read-head commit-graph-key commit-changes-key]]
             [datahike.roster :refer [roster roster-store-keys]]
             [konserve.core :as k]
             [konserve.gc :refer [sweep!]]
@@ -101,7 +101,7 @@
                             cid (get-in record [:meta :datahike/commit-id])
                             new-reachable (cond-> (set/union reachable #{to-check}
                                                              ;; the commit's graph record lives and dies with it
-                                                             (when cid #{(commit-graph-key cid)})
+                                                             (when cid #{(commit-graph-key cid) (commit-changes-key cid)})
                                                              (when schema-meta-key #{schema-meta-key})
                                                              (mark eavt-key eavt-root)
                                                              (mark aevt-key aevt-root)
@@ -143,7 +143,7 @@
             (recur todo seen keys)
             (let [k (commit-graph-key c)
                   record (<?- (k/get store k nil {:sync? sync?}))]
-              (recur (into todo (:datahike/parents record)) (conj seen c) (cond-> keys record (conj k))))))
+              (recur (into todo (:datahike/parents record)) (conj seen c) (cond-> keys record (conj k (commit-changes-key c)))))))
         keys)))))
 
 (defn gc-storage!

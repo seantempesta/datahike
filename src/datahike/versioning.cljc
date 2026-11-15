@@ -13,7 +13,7 @@
                                       commit! create-commit-id get-and-clear-pending-kvs!
                                       write-pending-kvs! branch-heads-as-commits
                                       read-head resolve-head compact-head compact-head? commit-graph-writes
-                                      commit-graph-records commit-graph-key commit-branch]]
+                                      commit-graph-records commit-graph-key commit-changes-key commit-branch]]
             [datahike.writer]
             [datahike.index.secondary :as sec]
             ;; cljs: S is a VAR (the supervisor) → :refer; go-try-/<?-/<?/go-loop-try
@@ -820,6 +820,47 @@
               (log/raise "Commit record does not exist." {:type :commit-not-found :commit-id cid}))
         base (point-base store sid branch nil cid e)]
     [(inc (:t (if base (point-entry store sid base) e))) (:t e)]))
+
+;; ---- what commits changed (datahike.writing/commit-changes-key) ----
+
+(defn- net-changes
+  "datoms in order, netted by [e a v]: each fact's last datom, and none for a fact whose first and
+   last datoms are an assertion and a retraction or the other way round (it ends as it began)."
+  [datoms]
+  (let [first-op (volatile! {})
+        last-d (reduce (fn [m d]
+                         (let [k [(:e d) (:a d) (:v d)]]
+                           (when-not (contains? @first-op k) (vswap! first-op assoc k (:added d)))
+                           (assoc m k d)))
+                       {} datoms)]
+    (into [] (keep (fn [[k d]] (when (= (get @first-op k) (:added d)) d))) last-d)))
+
+(defn changes
+  "What the commits after `from` up to `to` changed, as datoms netted by [e a v] (a fact
+   asserted then retracted between them is none): each commit's own transactions, read from
+   what it kept beside its record (`datahike.writing/commit-changes-key`), never the indexes, so
+   it costs the commits and their datoms, never the store's size. `to`'s first-parent lineage
+   (each commit's base, `point-base`: of a merge, the branch it merged into, whose own new
+   transactions carry the merged content) must reach `from`. `conn-or-db` names the store and
+   the branch whose lineage is walked.
+
+   Refuses, each naming :from and :to: `:datahike/changes-unrecorded` (a commit on the way was
+   written before commits kept their changes, named as :commit), `:datahike/changes-not-ancestor`
+   (the lineage ended before `from`), `:commit-not-found`."
+  [conn-or-db from to]
+  (let [[store sid branch] (tip-of (if (db? conn-or-db) conn-or-db @conn-or-db))
+        refuse (fn [message type extra] (log/raise message (merge {:type type :from from :to to} extra)))]
+    (loop [c to acc ()]
+      (if (= c from)
+        (net-changes (apply concat acc))
+        (let [e (or (point-entry store sid c)
+                    (refuse "Commit record does not exist." :commit-not-found {:commit c}))
+              ch (k/get store (commit-changes-key c) nil {:sync? true})
+              _ (when (nil? ch) (refuse "A commit on the way kept no changes." :datahike/changes-unrecorded {:commit c}))
+              base (point-base store sid branch nil c e)]
+          (if (nil? base)
+            (refuse "The lineage ended before the first commit." :datahike/changes-not-ancestor {:commit c})
+            (recur base (cons ch acc))))))))
 
 (defn backfill-commit-graph!
   "Writes the commit graph record of every commit a branch head reaches
