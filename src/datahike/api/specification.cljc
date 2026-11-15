@@ -1122,14 +1122,15 @@
             [:=> [:cat :datahike/SDB :keyword [:set :any]] :uuid]
             [:=> [:cat :datahike/SDB :keyword [:set :any]
                   [:map {:closed true}
-                   [:expected-current-commit {:optional true} [:maybe :uuid]]]]
+                   [:expected-current-commit {:optional true} [:maybe :uuid]]
+                   [:changes {:optional true} [:map [:base :uuid] [:datoms [:sequential :any]]]]]]
              :uuid]]
      :ret :uuid
      :categories [:versioning :write :advanced]
      :stability :stable
      :supports-remote? false
      :referentially-transparent? false
-     :doc "Force a branch to point to the provided db value while the caller holds exclusive write access to the store. Pass :expected-current-commit in an options map to reject a stale planned head; the written head is read back, verified and its commit id returned. Parent branch names are resolved to immutable commit ids before storage. WARNING: without the guard this overwrites the branch head unconditionally, like git reset --hard. Existing connections to this branch will see stale state and must be released and reconnected."
+     :doc "Force a branch to point to the provided db value while the caller holds exclusive write access to the store. Pass :expected-current-commit in an options map to reject a stale planned head; the written head is read back, verified and its commit id returned. Parent branch names are resolved to immutable commit ids before storage. Pass :changes {:base commit-id :datoms [...]} to state what the commit changed against :base, so d/changes from :base reads exactly those datoms (a merge built on another lineage). WARNING: without the guard this overwrites the branch head unconditionally, like git reset --hard. Existing connections to this branch will see stale state and must be released and reconnected."
      :examples [{:desc "Force only if the branch has not moved"
                  :code "(force-branch! target-db :db #{target-cid} {:expected-current-commit current-cid})"}]
      :impl datahike.api.impl/force-branch!}

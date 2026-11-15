@@ -348,6 +348,9 @@
   it does not exist. Parents must point to a set of branches or commits.
 
   By default this overwrites the branch head unconditionally, like git reset --hard.
+  Pass `:changes` {:base commit-id :datoms [datom ...]} to state what the commit changed against :base
+  (d/changes from :base then reads exactly :datoms), in place of the value's own record.
+
   Pass `:expected-current-commit` in opts to reject a stale branch head before
   mutation. The new head is read back and verified before this function returns;
   its commit id is the return value.
@@ -363,9 +366,19 @@
    (db-check db)
    (branch-check branch)
    (parent-check parents)
-   (let [unknown-opts (seq (remove #{:sync? :expected-current-commit
+   (let [unknown-opts (seq (remove #{:sync? :expected-current-commit :changes
                                     :datahike.gc-guard/reachability-permit}
                                   (keys opts)))
+         ;; :changes {:base commit-id :datoms [datom ...]}: what this commit changed as its caller states it,
+         ;; written beside it in place of the value's own (datahike.writing/commit-changes-key), so
+         ;; d/changes from :base reads exactly :datoms. For a value built on another lineage (a merge built on
+         ;; main's head, forced onto a branch): its change against the branch head it replaces, where the
+         ;; value's own record would name main's head as its base
+         changes (:changes opts)
+         _ (when (some? changes)
+             (when-not (and (map? changes) (uuid? (:base changes)) (sequential? (:datoms changes)))
+               (log/raise "force-branch!'s :changes is {:base commit-id :datoms [datom ...]}."
+                          {:type :invalid-force-branch-changes :changes-keys (when (map? changes) (vec (keys changes)))})))
          _ (when unknown-opts
              (log/raise "Unknown force-branch! option."
                         {:type :invalid-force-branch-options
@@ -432,7 +445,10 @@
                         ;; is updated below, rechecked
                         (<?- (write-commit! store {:pending-kvs pending-kvs :schema-meta-kv schema-meta-kv-to-write
                                                    :graph-writes graph-writes
-                                                   :changes-kv (when commit-graph? (commit-changes-kv db cid))
+                                                   :changes-kv (when commit-graph?
+                                                                (if changes
+                                                                  [(commit-changes-key cid) {:base (:base changes) :datoms (vec (:datoms changes))}]
+                                                                  (commit-changes-kv db cid)))
                                                    :cid cid :record (when commit-graph? db-to-store) :sync? sync?}))
 
                         ;; Recheck inside the mutable head update. The GC guard
