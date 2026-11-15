@@ -7,20 +7,21 @@
    one of its own keys is among the read's (datom-keys). Matching a transaction costs its
    datoms, whatever was read."
   (:require [datahike.index.interface :as di]
-            [datahike.constants :refer [e0 emax]]))
+            [datahike.constants :refer [e0 emax]]
+            [datahike.query :as q]))
 
 (defn with-reads
   "Call f (no arguments) and answer [result reads]: reads, the set of ranges f's reads scanned,
    each once however often it was read. While recording, a query the result cache holds is served by it and records the ranges its computation read
-   (the search memo, off in Seon, is bypassed); the planner stays on (on Jolt
-   its cursors read through the index protocol, which records: datahike.reads-test). f's result
+   (the search memo, off in Seon, is bypassed), and the planner is off: its merges probe the eavt set past the index
+   protocol (execute.cljc's lookupGE and cursors) and recorded nothing for the attributes they read. f's result
    should be realized, except an entity: one made inside f records its later lookups into this recorder
    when none is bound where they run. Those land in the live recorder, the set's metadata
    :datahike.reads/live, an atom a holder re-reads (the set answered is what f read by its return)."
   [f]
   (let [outer di/*reads*
         r (atom #{})
-        result (binding [di/*reads* r] (f))
+        result (binding [di/*reads* r q/*disable-planner* true] (f))
         rs @r]
     ;; recording composes: a read inside a nested with-reads is the outer read's too
     ;; (task datahike.reads/with-reads-nests-in-an-outer-recorder), O(inner ranges) at the return

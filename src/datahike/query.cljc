@@ -77,7 +77,7 @@
    It was off on our Jolt line from 2026-10-20 (L1's measurement, recorded then as the owner's
    decision, which it was not): a miss on a value just committed searches every older commit's
    entries for one to inherit (inheritable-entry), so render and session workloads ran slower
-   with it on. datahike.reads binds it false while it records reads."
+   with it on. A recorded read (datahike.reads) is served by it and records what its computation read."
   true)
 
 (declare -collect -resolve-clause resolve-clause resolve-context raw-q memoized-parse-query
@@ -4906,8 +4906,10 @@
                            [query non-db-args offset limit order-by *disable-planner*])
                 source-contexts
                 (query-cache-source-contexts source-bindings args result-key)
-                cached (result-cache-get result-key source-key cache-key
-                                         source-contexts)]
+                cached (let [c (result-cache-get result-key source-key cache-key
+                                                 source-contexts)]
+                         ;; an entry computed unrecorded holds no ranges: a recording caller computes its own
+                         (when-not (and c di/*reads* (nil? (:ranges c))) c))]
             ;; Completed hits never enter the in-flight path and therefore do
             ;; not allocate a promise, request identity, flight key, or delayed
             ;; dependency analysis. The coordinator rechecks on a miss to close
@@ -4932,14 +4934,18 @@
                      :cljs (:result cached)))
               (let [computation-evidence (volatile! nil)
                     computed-ranges (volatile! nil)
-                    ;; the computation reads under a recorder of its own, kept with the entry and composed into the
-                    ;; caller's when it records (task datahike.reads/a-cached-read-records-what-it-read)
+                    ;; a recording caller's computation reads under a recorder of its own, kept with the entry and
+                    ;; composed into the caller's (task datahike.reads/a-cached-read-records-what-it-read); an
+                    ;; unrecorded one records nothing and its entry holds no ranges (a recording caller never hits it:
+                    ;; with-reads turns the planner off, which is in the cache key)
                     uncached (fn [shared-cancel]
-                               (let [r (atom #{}) outer di/*reads*
-                                     v (binding [di/*reads* r] (uncached shared-cancel))]
-                                 (vreset! computed-ranges @r)
-                                 (when (and outer (seq @r)) (swap! outer into @r))
-                                 v))
+                               (if-some [outer di/*reads*]
+                                 (let [r (atom #{})
+                                       v (binding [di/*reads* r] (uncached shared-cancel))]
+                                   (vreset! computed-ranges @r)
+                                   (when (seq @r) (swap! outer into @r))
+                                   v)
+                                 (uncached shared-cancel)))
                     compute (fn [shared-cancel]
                               ;; resource evidence is recorded only for a caller that reads it
                               ;; (an outer sink, or the cache evidence): a sink bound for nobody
