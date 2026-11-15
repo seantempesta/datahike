@@ -1522,7 +1522,9 @@
           (dissoc ::ids ::tx)
           (assoc :tx-data (vec (::effective-tx-data report)))
           (dissoc ::effective-tx-data)
-          (assoc-in [:db-after :max-tx] (current-tx report))
+          ;; the largest id the load allocated (one a source transaction), never only the first
+          (update-in [:db-after :max-tx] #(max (long %) (long (current-tx report))))
+          (dissoc ::tx-taken)
           (update-in [:db-after :migration] #(if %
                                                (merge % migration-state)
                                                migration-state))
@@ -1540,19 +1542,25 @@
                   (log/raise "Configuration mismatch: import data with attribute references can not be imported into a database with no attribute references."
                              {:error :import/mismatch :data entity})
                   a-ident))
-            max-tid (inc (get-in report [:db-after :max-tx]))]
+            ;; a source transaction's new id: the one this report took from the store's ids first, then a fresh
+            ;; one each (datahike.ids: issued once across every branch), or the next after the db's for a speculation
+            fresh-tid (fn [report]
+                        (let [tid (cond (and (::tx report) (not (::tx-taken report))) (::tx report)
+                                        (::ids report) (ids/-take! (::ids report) :tx)
+                                        :else (inc (long (get-in report [:db-after :max-tx]))))]
+                          [tid (-> report (assoc ::tx-taken true)
+                                   (update-in [:db-after :max-tx] #(max (long %) (long tid))))]))]
         (cond
           (= :db.install/attribute a-ident)
           (recur report entities migration-state)
 
           ;; meta entity
           (ds/meta-attr? a-ident)
-          (let [new-t (get-in migration-state [:tids t] max-tid)
+          (let [[new-t report] (if-some [known (get-in migration-state [:tids t])] [known report] (fresh-tid report))
                 new-datom (dd/datom new-t a v new-t op)
                 new-e (.-e new-datom)
                 upsert? (not (dbu/multival? db a-ident))]
-            (recur (-> (transact-report report new-datom upsert?)
-                       (assoc-in [:db-after :max-tx] max-tid))
+            (recur (transact-report report new-datom upsert?)
                    entities
                    (-> migration-state
                        (assoc-in [:tids e] new-e)
@@ -1560,7 +1568,8 @@
 
           ;; tx not added yet
           (nil? (get-in migration-state [:tids t]))
-          (recur (update-in report [:db-after :max-tx] inc) es (assoc-in migration-state [:tids t] max-tid))
+          (let [[tid report] (fresh-tid report)]
+            (recur report es (assoc-in migration-state [:tids t] tid)))
 
           ;; ref not added yet
           (and (dbu/ref? db a) (nil? (get-in migration-state [:eids v])))
