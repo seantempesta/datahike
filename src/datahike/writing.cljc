@@ -528,6 +528,14 @@
   [cid]
   [:datahike/commit-changes cid])
 
+(defn commit-changes-kv
+  "[key value] of what `db`'s commit `cid` changed (commit-changes-key), or nil when the value
+   carries none (it was not built by a transaction since its last commit). Every commit writer
+   (commit!, datahike.versioning/force-branch!) writes it before the commit record."
+  [db cid]
+  (when-some [ds (:datahike/uncommitted (meta db))]
+    [(commit-changes-key cid) {:base (:datahike/uncommitted-base (meta db)) :datoms ds}]))
+
 (defn commit-branch
   "The branch a stored commit record was written on: its `[:config :branch]`,
    `:db` (Datahike's default branch) when absent."
@@ -800,9 +808,7 @@
                                                                known-generations))
                         ;; what the commit changed, its transactions' effective datoms (complete-db-update kept
                         ;; them on the value), written before the commit record, as its graph record is
-                          changes       (when commit-graph?
-                                          (when-some [ds (:datahike/uncommitted (meta db))]
-                                            {:base (:datahike/uncommitted-base (meta db)) :datoms ds}))]
+                          changes-kv    (when commit-graph? (commit-changes-kv db cid))]
 
                       (if (multi-key-capable? store)
                         (let [[meta-key meta-val] schema-meta-kv-to-write
@@ -827,7 +833,7 @@
                               writes (cond-> (vec pending-kvs)
                                        schema-meta-kv-to-write (conj [meta-key meta-val])
                                        commit-graph?           (into graph-writes)
-                                       changes                 (conj [(commit-changes-key cid) changes])
+                                       changes-kv              (conj changes-kv)
                                        commit-graph?           (conj [cid db-to-store])
                                        true                    (conj [branch-key head]))
                             ;; nodes + schema-meta (uuid) + commit (cid) are content-addressed →
@@ -851,8 +857,8 @@
                           ;; the graph records are immutable and precede the commit they describe
                               _ (doseq [[gk gv] graph-writes]
                                   (<?- (k/assoc store gk gv {:immutable? true} {:sync? sync?})))
-                              _ (when changes
-                                  (<?- (k/assoc store (commit-changes-key cid) changes {:immutable? true} {:sync? sync?})))
+                              _ (when-let [[ck cv] changes-kv]
+                                  (<?- (k/assoc store ck cv {:immutable? true} {:sync? sync?})))
                           ;; the commit is content-addressed by cid → immutable; the branch head is mutable
                               commit-log-written (when commit-graph?
                                                    (k/assoc store cid db-to-store {:immutable? true} {:sync? sync?}))

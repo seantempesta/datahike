@@ -13,7 +13,7 @@
                                       commit! create-commit-id get-and-clear-pending-kvs!
                                       write-pending-kvs! branch-heads-as-commits
                                       read-head resolve-head compact-head compact-head? commit-graph-writes
-                                      commit-graph-records commit-graph-key commit-changes-key commit-branch]]
+                                      commit-graph-records commit-graph-key commit-changes-key commit-changes-kv commit-branch]]
             [datahike.writer]
             [datahike.index.secondary :as sec]
             ;; cljs: S is a VAR (the supervisor) → :refer; go-try-/<?-/<?/go-loop-try
@@ -426,8 +426,10 @@
                             ;; Same opt-out as datahike.writing/commit!: no
                             ;; commit-graph store means no separate cid record.
                             commit-graph? (get (:config db) :commit-graph? true)
+                            ;; what the value changed since its base rides with its graph record, written before the commit
                             graph-writes (when commit-graph?
-                                           (commit-graph-writes store cid resolved-parents branch))]
+                                           (cond-> (commit-graph-writes store cid resolved-parents branch)
+                                             (commit-changes-kv db cid) (conj (commit-changes-kv db cid))))]
                         ;; Write every immutable value before the mutable head.
                         (if (multi-key-capable? store)
                           (let [[meta-key meta-val] schema-meta-kv-to-write
