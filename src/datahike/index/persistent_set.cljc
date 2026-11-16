@@ -14,6 +14,7 @@
             [datahike.tools :as dt]
             [konserve.core :as k]
             [datahike.gc-guard :as guard]
+            [datahike.connections]
             [konserve.serializers :refer [fressian-serializer]]
             #?(:cljs [fress.api :as fress])
             [hasch.core :refer [uuid squuid]]
@@ -836,9 +837,22 @@
                  :reads    0
                  :accessed 0})
 
+#?(:jolt
+   (dd/read-values-with!
+    (fn [store-id vk]
+      ;; through a live connection of this process to the store: no store is held for it, so none outlives its connections
+      (if-let [db (some (fn [[_ {:keys [conn count]}]]
+                          (when (and conn (pos? count))
+                            (let [db @conn] (when (= store-id (get-in db [:config :store :id])) db))))
+                        ;; resolved at the call: a reference from this fn would let every Datom reach every connection (its
+                        ;; record type reaches this namespace), and a node's weighed retention would count the whole registry
+                        @@(resolve 'datahike.connections/*connections*))]
+        (fetch-value (:store db) (:config db) vk)
+        (throw (ex-info "No connection of this process reads this value: its store is not open here."
+                        {:type :value-store-not-open :store store-id :key vk}))))))
+
 (defn create-storage [store config]
   ;; this process reads the store's out-of-line values through it (a LazyValue names its store by id)
-  #?(:jolt (dd/read-values-with! (get-in config [:store :id]) #(fetch-value store config %)))
   (CachedStorage. store config
                   ;; nodes are immutable by address: every connection to one
                   ;; physical store shares the cache its connection reserved

@@ -105,22 +105,16 @@
 #?(:jolt
    (deftype LazyValue [key store-id memo]))
 
-;; How this process reads a value of each store it has open: store id -> (fn [key] value), set when a
-;; storage over the store is made (datahike.index.persistent-set/create-storage). A LazyValue names its
-;; store by id, never by handle, so a node holding one stays valid in any process, as the node cache's
-;; adoption across fork(2) needs (datahike.connections/after-fork!, which forgets these: the parent's
-;; handles are not used across fork, and the child's own connect sets them again).
-(defonce ^:private value-readers (atom {}))
+;; How this process reads a stored value: (f store-id key), installed once by datahike.index.persistent-set, which
+;; reads it through a live connection of this process to that store. A LazyValue names its store by id, never by
+;; handle, so a node holding one stays valid in any process, as the node cache's adoption across fork(2) needs
+;; (datahike.connections/after-fork!: a fork reads through its own connect). Nothing per store is kept here.
+(defonce ^:private value-reader (volatile! nil))
 
 (defn read-values-with!
-  "Read the values of store store-id with (f key), in this process."
-  [store-id f]
-  (swap! value-readers assoc store-id f))
-
-(defn forget-value-readers!
-  "Forget every store's value reader (a process forked from another: its handles are the parent's)."
-  []
-  (reset! value-readers {}))
+  "Read stored values with (f store-id key) in this process."
+  [f]
+  (vreset! value-reader f))
 
 (defn lazy-value? [x] #?(:jolt (instance? LazyValue x) :default false))
 
@@ -135,11 +129,7 @@
   #?(:jolt (if (instance? LazyValue x)
              (let [memo (.-memo ^LazyValue x) m @memo]
                (if (identical? m ::unread)
-                 (let [sid (.-store-id ^LazyValue x)
-                       f (or (get @value-readers sid)
-                             (throw (ex-info "No store of this process reads this value: its store is not open here."
-                                             {:type :value-store-not-open :store sid :key (.-key ^LazyValue x)})))]
-                   (vreset! memo (f (.-key ^LazyValue x))))
+                 (vreset! memo (@value-reader (.-store-id ^LazyValue x) (.-key ^LazyValue x)))
                  m))
              x)
      :default x))
