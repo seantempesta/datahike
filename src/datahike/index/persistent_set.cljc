@@ -783,6 +783,19 @@
            (when cache (di/cache-put! cache k v))
            v)))))
 
+#?(:jolt
+   (defn- connected-value
+     "The value of content key vk in the store store-cfg names, read through this process's live connection to that store, found
+     by its id and its path: the one way a leaf's value is read (CachedStorage's readKey), or :value-store-not-open."
+     [store-cfg vk]
+     (if-let [db (some (fn [[k {:keys [conn count]}]]
+                         (when (and conn (pos? count) (= (:id store-cfg) (first k)))
+                           (let [db @conn] (when (= (:path store-cfg) (get-in db [:config :store :path])) db))))
+                       @@(resolve 'datahike.connections/*connections*))]
+       (stored-value (:store db) (:config db) (get (:store db) di/node-cache-key) vk)
+       (throw (ex-info "No connection of this process reads this value: its store is not open here."
+                       {:type :value-store-not-open :store (:id store-cfg) :key vk})))))
+
 (defrecord CachedStorage [store config cache stats pending-writes freed-addresses freed-set freelist cost-center-fn]
   IStorage
   (store [_ node #?(:cljs opts)]
@@ -831,12 +844,13 @@
         (let [node #?(:jolt (in-line store config node) :default node)]
           (di/cache-put! cache address node)
           node))))
-  ;; a leaf's value is read from the store this storage reads it from, never looked up by its store's id: two stores of one id
-  ;; (a clone keeps its original's id) both open in one process made the registry answer the other one, "Value not found"
+  ;; a leaf's value is read through this process's live connection to the leaf's own store, named by its id AND its path: two
+  ;; stores of one id (a store's copy keeps its id) both open in one process made the id alone answer the other one, "Value
+  ;; not found"; never through this storage itself, which in a forked child is the parent's (LMDB forbids it across fork)
   #?@(:jolt [IReadKey
              (readKey [_ k]
                (if (and (dd/datom? k) (dd/lazy-value? (.-v ^Datom k)))
-                 (dd/datom (.-e ^Datom k) (.-a ^Datom k) (stored-value store config cache (dd/lazy-key (.-v ^Datom k)))
+                 (dd/datom (.-e ^Datom k) (.-a ^Datom k) (connected-value (:store config) (dd/lazy-key (.-v ^Datom k)))
                            (dd/datom-tx k) (dd/datom-added k))
                  k))])
   (markFreed [_ address]
