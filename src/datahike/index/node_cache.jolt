@@ -39,10 +39,12 @@
   "Estimated bytes a cached entry retains: for an index node, an entry, its key array and what
    its keys retain, and for a branch each child's address (a uuid) and slot, without following
    children into other nodes; for anything else the cache holds (an out-of-line value's
-   [generation value-key] under its datom, persistent-set's in-line), an entry and what the
-   value retains."
+   [generation value-key] under its datom, persistent-set's in-line; a large value read, of any
+   kind, under [::value key]), an entry and what the value retains. A node is named by its type,
+   so a value is never read as one (a byte array read as a node threw at a root's boot, 2026-11-16)."
   [node]
-  (if (or (vector? node) (map? node) (string? node) (nil? node))
+  (if-not (or (instance? org.replikativ.persistent_sorted_set.Leaf node)
+              (instance? org.replikativ.persistent_sorted_set.Branch node))
     (+ entry-bytes (value-bytes node))
     ;; the keys read in place from the node's own array (.keys copies them into a vector, and a
     ;; lazy map over it boxed a count per key: 6.5 KB to weigh a leaf, 2026-11-12)
