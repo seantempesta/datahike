@@ -237,7 +237,9 @@
       (d/transact bc [{:db/id -1 :big big}])
       (d/release bc)
       (let [bc (d/connect b)]
-        (try (is (= big (:v (first (d/datoms @bc :aevt :big)))) "b's value reads from b, whatever else holds b's id")
+        (try (let [v (:v (first (d/datoms @bc :aevt :big)))]
+               (when-not (= big v) (println "DEPS-DEBUG read" (type v) (if (string? v) (count v) (pr-str v))))
+               (is (= big v) "b's value reads from b, whatever else holds b's id"))
              (finally (d/release bc))))
       (finally
         (d/release held)

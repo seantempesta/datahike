@@ -771,6 +771,18 @@
                                                (dd/datom-tx d) (dd/datom-added d)))))))
          node))))
 
+#?(:jolt
+   (defn- stored-value
+     "The value of content key vk in store, through cache (the node cache), under the value's own weighed entry: the one holder
+     of a value read, bounded with the nodes."
+     [store config cache vk]
+     (let [k [::value vk]]
+       (if-some [v (when cache (di/cache-get cache k))]
+         v
+         (let [v (fetch-value store config vk)]
+           (when cache (di/cache-put! cache k v))
+           v)))))
+
 (defrecord CachedStorage [store config cache stats pending-writes freed-addresses freed-set freelist cost-center-fn]
   IStorage
   (store [_ node #?(:cljs opts)]
@@ -819,8 +831,14 @@
         (let [node #?(:jolt (in-line store config node) :default node)]
           (di/cache-put! cache address node)
           node))))
+  ;; a leaf's value is read from the store this storage reads it from, never looked up by its store's id: two stores of one id
+  ;; (a clone keeps its original's id) both open in one process made the registry answer the other one, "Value not found"
   #?@(:jolt [IReadKey
-             (readKey [_ k] (value-read k))])
+             (readKey [_ k]
+               (if (and (dd/datom? k) (dd/lazy-value? (.-v ^Datom k)))
+                 (dd/datom (.-e ^Datom k) (.-a ^Datom k) (stored-value store config cache (dd/lazy-key (.-v ^Datom k)))
+                           (dd/datom-tx k) (dd/datom-added k))
+                 k))])
   (markFreed [_ address]
     (when address
       (let [now #?(:clj (java.util.Date.) :cljs (js/Date.))]
@@ -848,13 +866,7 @@
                         ;; resolved at the call: a reference from this fn would let every Datom reach every connection (its
                         ;; record type reaches this namespace), and a node's weighed retention would count the whole registry
                         @@(resolve 'datahike.connections/*connections*))]
-        ;; through the node cache, under the value's own weighed entry: the one holder of a value read, bounded with the nodes
-        (let [cache (get (:store db) di/node-cache-key) k [::value vk]]
-          (if-some [v (when cache (di/cache-get cache k))]
-            v
-            (let [v (fetch-value (:store db) (:config db) vk)]
-              (when cache (di/cache-put! cache k v))
-              v)))
+        (stored-value (:store db) (:config db) (get (:store db) di/node-cache-key) vk)
         (throw (ex-info "No connection of this process reads this value: its store is not open here."
                         {:type :value-store-not-open :store store-id :key vk}))))))
 
