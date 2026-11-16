@@ -140,8 +140,9 @@
 (defn- commit-changes-of
   "db, the value a batch of reports commits, carrying what that commit changes (datahike.writing/commit-changes-kv):
    the batch's datoms in order, on the committed value parent-db it replaces. The transaction loop applies each
-   transaction to the one before it while that one commits, so its values' own record runs back to the writer's
-   first commit; the batch's reports are exactly this commit's."
+   transaction to the one before it while that one commits, so its values' own :datahike/uncommitted runs back to
+   the writer's first commit (it stays on them: a reader tells a run-ahead value from a committed one by it); the
+   batch's reports are exactly this commit's."
   [db parent-db reports]
   (vary-meta db assoc
              :datahike/uncommitted (into [] (mapcat :tx-data) reports)
@@ -267,11 +268,7 @@
                                 (if (>! commit-queue [res callback])
                                   ;; Merge parents belong to the report that
                                   ;; set them, never to the next operation.
-                                  ;; nor do the uncommitted changes: the commit loop states each commit's own
-                                  ;; (commit-changes-of), so a value applied ahead carries none forward
-                                  (recur (-> (:db-after res)
-                                             (update :meta dissoc :datahike/merge-parents)
-                                             (vary-meta dissoc :datahike/uncommitted :datahike/uncommitted-base)))
+                                  (recur (update (:db-after res) :meta dissoc :datahike/merge-parents))
                                   (let [error (writer-shut-down-error)]
                                     (put! callback error)
                                     (close! transaction-queue)
