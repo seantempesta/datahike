@@ -45,3 +45,18 @@
               (is (= #{3 4} (set (keep #(when (= :n (:a %)) (:v %)) (d/changes ch from (d/commit-id @ch))))))
               (finally (d/release ch)))))
         (finally (d/release p) (d/release m))))))
+
+(deftest changes-from-a-commit-off-the-chain-refuses-where-it-passes-it
+  ;; context, 2026-11-16: a from not on to's :base chain read every commit to the store's first before refusing
+  ;; (59M ticks between two of root's turns); the walk stops at the first commit no newer than from's generation
+  (let [c (cfg) _ (d/create-database c) m (d/connect c)]
+    (d/transact m [{:db/id -1 :n 1}])
+    (d/branch! m :db :side)
+    (let [side (d/connect (assoc c :branch :side))]
+      (try
+        (d/transact side [{:db/id -1 :n 2}])
+        (let [from (d/commit-id @side)]
+          (dotimes [i 5] (d/transact m [{:db/id -1 :n (+ 10 i)}]))
+          (let [e (try (d/changes m from (d/commit-id @m)) nil (catch Exception e (ex-data e)))]
+            (is (= :datahike/changes-not-ancestor (:type e)) (pr-str e))))
+        (finally (d/release side) (d/release m))))))
