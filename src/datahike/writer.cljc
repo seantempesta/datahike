@@ -137,6 +137,16 @@
 ;; jolt: core.async buffers do not support count; pressure warnings are skipped.
 (defn- buf-count [b] #?(:jolt 0 :default (count b)))
 
+(defn- commit-changes-of
+  "db, the value a batch of reports commits, carrying what that commit changes (datahike.writing/commit-changes-kv):
+   the batch's datoms in order, on the committed value parent-db it replaces. The transaction loop applies each
+   transaction to the one before it while that one commits, so its values' own record runs back to the writer's
+   first commit; the batch's reports are exactly this commit's."
+  [db parent-db reports]
+  (vary-meta db assoc
+             :datahike/uncommitted (into [] (mapcat :tx-data) reports)
+             :datahike/uncommitted-base (get-in parent-db [:meta :datahike/commit-id])))
+
 (defn- merge-parents-of
   "The merge parents the reports' values carry (a merge op sets them on its db's
    :meta), and db with that key removed so it is never persisted: [parents db],
@@ -257,7 +267,11 @@
                                 (if (>! commit-queue [res callback])
                                   ;; Merge parents belong to the report that
                                   ;; set them, never to the next operation.
-                                  (recur (update (:db-after res) :meta dissoc :datahike/merge-parents))
+                                  ;; nor do the uncommitted changes: the commit loop states each commit's own
+                                  ;; (commit-changes-of), so a value applied ahead carries none forward
+                                  (recur (-> (:db-after res)
+                                             (update :meta dissoc :datahike/merge-parents)
+                                             (vary-meta dissoc :datahike/uncommitted :datahike/uncommitted-base)))
                                   (let [error (writer-shut-down-error)]
                                     (put! callback error)
                                     (close! transaction-queue)
@@ -291,7 +305,7 @@
                       (log/trace :datahike/batch-commit {:batch-size (count txs)})
               ;; commit latest tx to disk
                       (let [parent-db @connection
-                            db (:db-after (first (peek txs)))
+                            db (commit-changes-of (:db-after (first (peek txs))) parent-db (map first txs))
                             ;; Merge parents of every report in the batch
                             ;; (set by the merge op); the batch commits once.
                             [merge-parents db] (merge-parents-of (map first txs) db)]
