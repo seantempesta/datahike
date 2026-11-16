@@ -155,3 +155,33 @@
       (finally
         (d/release conn)
         (d/delete-database cfg)))))
+
+(deftest every-kind-of-value-read-is-weighed-by-the-node-cache
+  ;; a large value read is held by the node cache under its own entry, so the cache weighs whatever a value can be, never
+  ;; only a node: a byte array read at the standing root's first boot write threw "No matching field found: _keys for class
+  ;; [B" (node-bytes took any value but a vector, map or string for a node; reverted ff183e37a9, 2026-11-16)
+  (let [cfg {:store {:backend :lmdb :path (str run-dir "-kinds") :default-serializer :FaslSerializer
+                     :id #uuid "9c000000-0000-0000-0000-0000000001b4"}
+             :store-cache-bytes 100000000
+             :keep-history? true :schema-flexibility :read
+             :index-config {:value-out-of-line-bytes 1024}}
+        values {:bytes (byte-array 4000 (byte 7)) :set (set (map #(str % "-" (s 40)) (range 100)))
+                :list (apply list (map #(str % "-" (s 40)) (range 100))) :string (s 4000)}
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)
+        _ (d/transact conn [(assoc values :db/id -1)])
+        _ (d/release conn)
+        conn (d/connect cfg)]
+    (try
+      (doseq [[a v] values]
+        (let [read (:v (first (d/datoms @conn :aevt a)))]
+          (is (= (if (bytes? v) (seq v) v) (if (bytes? read) (seq read) read)) (str a " reads back"))))
+      (let [cache (some (fn [[k v]] (when (and (vector? k) (= (get-in cfg [:store :id]) (first k))) (:node-cache v)))
+                        @connections/*connections*)
+            st @(:state cache)]
+        (is (= (:total st) (reduce + 0 (map (fn [[n]] (datahike.index.node-cache/node-bytes n)) (vals (:nodes st)))))
+            "every entry is weighed, and the booked total is what they weigh"))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
