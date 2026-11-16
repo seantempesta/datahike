@@ -185,3 +185,31 @@
       (finally
         (d/release conn)
         (d/delete-database cfg)))))
+
+(deftest a-value-read-touches-only-its-own-store
+  ;; a large value is read through a live connection to its own store, found by the registry's key (its store id), never by
+  ;; dereferencing every connection: a deref reads that store's head, and a connection whose env was closed while it was still
+  ;; registered (a store directory removed under it) threw lmdb-env-closed into every other store's value reads (an agent died
+  ;; after a test's on-disk stores were removed, 2026-11-16)
+  (let [cfg-of (fn [n id] {:store {:backend :lmdb :path (str run-dir "-" n) :default-serializer :FaslSerializer :id id}
+                           ;; the writer Seon's stores take: a deref reads the branch head from the store (a streaming writer's does not)
+                           :writer {:backend :sync}
+                           :keep-history? true :schema-flexibility :read
+                           :index-config {:value-out-of-line-bytes 1024}})
+        b-cfg (cfg-of "closed" #uuid "9c000000-0000-0000-0000-0000000001b5")
+        a-cfg (cfg-of "own" #uuid "9c000000-0000-0000-0000-0000000001b6")
+        big (s 4000)
+        _ (doseq [c [b-cfg a-cfg]] (d/delete-database c) (d/create-database c))
+        b (d/connect b-cfg)
+        a (d/connect a-cfg)
+        _ (d/transact a [{:db/id -1 :big big}])
+        _ (d/release a)
+        a (d/connect a-cfg)]
+    (try
+      ;; b stays registered while its env is closed, as a removed directory leaves it
+      (konserve.jolt.lmdb/close-envs-under! (get-in b-cfg [:store :path]))
+      (is (= big (:v (first (d/datoms @a :aevt :big)))) "a's value reads, whatever b's env")
+      (finally
+        (d/release a)
+        (try (d/release b) (catch Exception _ nil))
+        (doseq [c [b-cfg a-cfg]] (try (d/delete-database c) (catch Exception _ nil)))))))
