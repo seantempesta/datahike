@@ -57,3 +57,40 @@
       (finally
         (d/release conn)
         (d/delete-database cfg)))))
+
+(deftest a-seek-fetches-only-the-values-it-returns
+  ;; a cold leaf whose neighbours hold large out-of-line values: a seek of one small attribute
+  ;; fetches none of them, and the large value it does return is the value written
+  (let [cfg {:store {:backend :lmdb :path (str run-dir "-lazy") :default-serializer :FaslSerializer
+                     :id #uuid "9c000000-0000-0000-0000-0000000001b1"}
+             :keep-history? true :schema-flexibility :read
+             :index-config {:value-out-of-line-bytes 1024}}
+        big (fn [i] (str i "-" (s 4000)))
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)
+        _ (d/transact conn (vec (for [i (range 40)] {:db/id (- -1 i) :small i :big (big i)})))
+        e (:e (first (filter #(= 7 (:v %)) (d/datoms @conn :aevt :small))))
+        _ (d/release conn)
+        conn (d/connect cfg)
+        fetches (atom 0)
+        get0 konserve.core/get]
+    (try
+      (with-redefs [konserve.core/get (fn [& args] (let [r (apply get0 args)] (when (string? r) (swap! fetches inc)) r))]
+        (testing "a small attribute's seek fetches no large value"
+          (is (= [7] (mapv :v (d/datoms @conn :eavt e :small))))
+          (is (= 0 @fetches)))
+        (testing "the large value it returns is the value written, fetched once"
+          (is (= (big 7) (:v (first (d/datoms @conn :eavt e :big)))))
+          (is (= 1 @fetches))
+          (is (= (big 7) (:v (first (d/datoms @conn :eavt e :big)))))
+          (is (= 1 @fetches))))
+      (testing "a commit that rewrites the leaf keeps every value, unread ones included"
+        (d/transact conn [{:db/id e :small 700}])
+        (d/release conn)
+        (let [conn (d/connect cfg)]
+          (is (= (set (map big (range 40))) (set (map :v (d/datoms @conn :aevt :big)))))
+          (is (= (big 7) (:big (d/pull @conn [:big] e))))
+          (d/release conn)))
+      (finally
+        (d/delete-database cfg)))))

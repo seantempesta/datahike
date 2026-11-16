@@ -24,7 +24,8 @@
                    [org.fressian Writer StreamingWriter]
                    [org.fressian.handlers WriteHandler ReadHandler]
                    [org.replikativ.persistent_sorted_set PersistentSortedSet IStorage Leaf Branch ANode Settings Slot]
-                   [java.util List])))
+                   [java.util List]))
+  #?(:jolt (:import [org.replikativ.persistent_sorted_set IReadKey])))
 
 (def index-type->kwseq
   {:eavt [:e :a :v :tx :added]
@@ -707,6 +708,16 @@
                    (if (< i n)
                      (let [d (aget ks i)
                            v (when (dd/datom? d) (.-v d))]
+                       (if (dd/lazy-value? v)
+                         ;; a value this leaf was read with and nobody read since: its key named again, unread; a key the
+                         ;; store no longer holds (a sweep took it) is written again from the value, read now
+                         (let [vk (dd/lazy-key v)
+                               vk (if (guard/reused! store-id vk #(k/exists? store vk {:sync? true}) false)
+                                    vk
+                                    (let [x (dd/value-of v)] (swap! pending-writes conj [vk x]) vk))
+                               out (or out (aclone ^objects ks))]
+                           (aset ^objects out i (dd/datom (.-e d) (.-a d) (ValueRef. vk) (dd/datom-tx d) (dd/datom-added d)))
+                           (recur (inc i) out))
                        (if (cond (nil? v) false
                                  (string? v) (>= (count v) limit)
                                  (bytes? v) (>= (alength ^bytes v) limit)
@@ -716,30 +727,34 @@
                                out (or out (aclone ^objects ks))]
                            (aset ^objects out i (dd/datom (.-e d) (.-a d) (ValueRef. vk) (dd/datom-tx d) (dd/datom-added d)))
                            (recur (inc i) out))
-                         (recur (inc i) out)))
+                         (recur (inc i) out))))
                      out))]
          (cond
            (nil? out) node
            (instance? Branch node) (psset/restore-node (.-_level node) (vec (take n out)) (.addresses node) (.-_subtreeCount node) (.-_settings node))
            :else (psset/restore-node 0 (vec (take n out)) nil (.-_settings node)))))
 
+     (defn- fetch-value
+       "The value of content key vk, read from store, or the :value-not-found refusal."
+       [store config vk]
+       (let [v (k/get store vk ::missing {:sync? true})]
+         (when (= ::missing v)
+           (log/raise "Value not found in storage." {:type :value-not-found :key vk :store (get-in config [:store :id])}))
+         v))
+
      (defn- in-line
-       "A stored node with each ValueRef in its keys swapped for the value it names (in
-       place: the node was just read and nothing else holds it), each value's key kept in
-       the node cache under its datom (value-key)."
-       [store cache config node]
-       (let [ks (.-_keys node) gen (generation store)]
+       "A stored node with each ValueRef in its keys swapped, in place (the node was just read and
+       nothing else holds it), for a LazyValue of its key: read only when a reader takes the datom
+       (CachedStorage's readKey) or a comparison reaches its v, so decoding a leaf never reads its
+       neighbours' large values (task datahike.index.persistent-set/a-leaf-decodes-only-the-values-read)."
+       [store config node]
+       (let [ks (.-_keys node)]
          (dotimes [i (.-_len node)]
            (let [d (aget ks i)]
              (when (and (dd/datom? d) (instance? ValueRef (.-v d)))
-               (let [vk (.-key ^ValueRef (.-v d))
-                     g @gen
-                     v (k/get store vk ::missing {:sync? true})]
-                 (when (= ::missing v)
-                   (log/raise "Value not found in storage." {:type :value-not-found :key vk :store (get-in config [:store :id])}))
-                 (let [d' (dd/datom (.-e d) (.-a d) v (dd/datom-tx d) (dd/datom-added d))]
-                   (aset ^objects ks i d')
-                   (di/cache-put! cache d' [g vk]))))))
+               (let [vk (.-key ^ValueRef (.-v d))]
+                 (aset ^objects ks i (dd/datom (.-e d) (.-a d) (dd/lazy-value vk #(fetch-value store config vk))
+                                               (dd/datom-tx d) (dd/datom-added d)))))))
          node))))
 
 (defrecord CachedStorage [store config cache stats pending-writes freed-addresses freed-set freelist cost-center-fn]
@@ -787,9 +802,14 @@
                                                    :address address
                                                    :store (get-in config [:store :id])}))
         (swap! stats update :reads inc)
-        (let [node #?(:jolt (in-line store cache config node) :default node)]
+        (let [node #?(:jolt (in-line store config node) :default node)]
           (di/cache-put! cache address node)
           node))))
+  #?@(:jolt [IReadKey
+             (readKey [_ k]
+               (if (and (dd/datom? k) (dd/lazy-value? (.-v ^Datom k)))
+                 (dd/datom (.-e ^Datom k) (.-a ^Datom k) (dd/value-of (.-v ^Datom k)) (dd/datom-tx k) (dd/datom-added k))
+                 k))])
   (markFreed [_ address]
     (when address
       (let [now #?(:clj (java.util.Date.) :cljs (js/Date.))]

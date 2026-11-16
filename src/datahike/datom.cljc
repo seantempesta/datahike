@@ -98,15 +98,49 @@
 
 (defn datom? [x] (instance? Datom x))
 
+;; A large value a leaf read from the store holds unread (datahike.index.persistent-set's in-line):
+;; its content key, a thunk that reads it, and the value once read. A datom leaving the index is
+;; given its value (the storage's readKey); comparison, equality and hashing read it when they reach
+;; v, so nothing ever compares a reference with a value. Two of one key are one value, unread.
+#?(:jolt
+   (deftype LazyValue [key fetch memo]))
+
+(defn lazy-value? [x] #?(:jolt (instance? LazyValue x) :default false))
+
+(defn lazy-key
+  "The content key of a LazyValue x, or nil for any other value."
+  [x]
+  #?(:jolt (when (instance? LazyValue x) (.-key ^LazyValue x)) :default nil))
+
+(defn value-of
+  "x, or the value a LazyValue x names, read once."
+  [x]
+  #?(:jolt (if (instance? LazyValue x)
+             (let [memo (.-memo ^LazyValue x) m @memo]
+               (if (identical? m ::unread) (vreset! memo ((.-fetch ^LazyValue x))) m))
+             x)
+     :default x))
+
+#?(:jolt
+   (defn lazy-value
+     "A LazyValue of content key, read by (fetch) when first needed."
+     [key fetch]
+     (LazyValue. key fetch (volatile! ::unread))))
+
 (defn- hash-datom [^Datom d]
   (-> (hash (.-e d))
       (combine-hashes (hash (.-a d)))
-      (combine-hashes (hash (.-v d)))))
+      (combine-hashes (hash (value-of (.-v d))))))
 
 (defn- equiv-datom [^Datom d ^Datom o]
   (and (== (.-e d) (.-e o))
        (= (.-a d) (.-a o))
-       (= (.-v d) (.-v o))))
+       (let [v (.-v d) w (.-v o)]
+         (or (= v w)
+             (let [kv (lazy-key v) kw (lazy-key w)]
+               (cond (and kv kw) (= kv kw)
+                     (or kv kw) (= (value-of v) (value-of w))
+                     :else false))))))
 
 (defn- seq-datom [^Datom d]
   (list (.-e d) (.-a d) (.-v d) (datom-tx d) (datom-added d)))
@@ -345,6 +379,11 @@
   #?(:jolt (cond
              (one-scalar-kind? v1 v2) (compare v1 v2)
              (and (da/bytes? v1) (da/bytes? v2)) (da/compare-arrays v1 v2)
+             ;; a value a leaf holds unread: one key is one value, else read and compared
+             (or (lazy-value? v1) (lazy-value? v2))
+             (if (and (lazy-value? v1) (lazy-value? v2) (= (.-key ^LazyValue v1) (.-key ^LazyValue v2)))
+               0
+               (compare-value (value-of v1) (value-of v2)))
              :else (or (compare-data v1 v2)
                        ;; two values of different kinds: compare throws, and their type names order them
                        (try (compare v1 v2)
