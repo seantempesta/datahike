@@ -99,11 +99,13 @@
 (defn datom? [x] (instance? Datom x))
 
 ;; A large value a leaf read from the store holds unread (datahike.index.persistent-set's in-line):
-;; its content key, a thunk that reads it, and the value once read. A datom leaving the index is
+;; its content key and its store's id, and nothing more: the value read is held by the node cache under
+;; its own weighed entry (the value reader), never in the leaf, so a cached leaf weighs after any read
+;; what it weighed when the cache booked it. A datom leaving the index is
 ;; given its value (the storage's readKey); comparison, equality and hashing read it when they reach
 ;; v, so nothing ever compares a reference with a value. Two of one key are one value, unread.
 #?(:jolt
-   (deftype LazyValue [key store-id memo]))
+   (deftype LazyValue [key store-id]))
 
 ;; How this process reads a stored value: (f store-id key), installed once by datahike.index.persistent-set, which
 ;; reads it through a live connection of this process to that store. A LazyValue names its store by id, never by
@@ -124,13 +126,10 @@
   #?(:jolt (when (instance? LazyValue x) (.-key ^LazyValue x)) :default nil))
 
 (defn value-of
-  "x, or the value a LazyValue x names, read once."
+  "x, or the value a LazyValue x names, read through the value reader (the node cache, then the store)."
   [x]
   #?(:jolt (if (instance? LazyValue x)
-             (let [memo (.-memo ^LazyValue x) m @memo]
-               (if (identical? m ::unread)
-                 (vreset! memo (@value-reader (.-store-id ^LazyValue x) (.-key ^LazyValue x)))
-                 m))
+             (@value-reader (.-store-id ^LazyValue x) (.-key ^LazyValue x))
              x)
      :default x))
 
@@ -138,7 +137,7 @@
    (defn lazy-value
      "A LazyValue of content key in store store-id, read when first needed (value-of)."
      [key store-id]
-     (LazyValue. key store-id (volatile! ::unread))))
+     (LazyValue. key store-id)))
 
 (defn- hash-datom [^Datom d]
   (-> (hash (.-e d))

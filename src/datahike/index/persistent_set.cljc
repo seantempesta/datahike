@@ -847,7 +847,13 @@
                         ;; resolved at the call: a reference from this fn would let every Datom reach every connection (its
                         ;; record type reaches this namespace), and a node's weighed retention would count the whole registry
                         @@(resolve 'datahike.connections/*connections*))]
-        (fetch-value (:store db) (:config db) vk)
+        ;; through the node cache, under the value's own weighed entry: the one holder of a value read, bounded with the nodes
+        (let [cache (get (:store db) di/node-cache-key) k [::value vk]]
+          (if-some [v (when cache (di/cache-get cache k))]
+            v
+            (let [v (fetch-value (:store db) (:config db) vk)]
+              (when cache (di/cache-put! cache k v))
+              v)))
         (throw (ex-info "No connection of this process reads this value: its store is not open here."
                         {:type :value-store-not-open :store store-id :key vk}))))))
 

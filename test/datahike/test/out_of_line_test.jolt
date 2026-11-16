@@ -126,3 +126,32 @@
           (d/release child)))
       (finally
         (d/delete-database cfg)))))
+
+(deftest a-cached-leaf-never-outgrows-its-weight
+  ;; the node cache books an entry's weight once, at put!; a read of a leaf's large values must not grow the leaf after that,
+  ;; or the bound counts less than the cache holds (a standing agent's leaves booked 112.7 MB weighed 155.6 MB after reads,
+  ;; 2026-11-16): a large value read is held by the cache under its own weighed entry, never written into the leaf
+  (let [cfg {:store {:backend :lmdb :path (str run-dir "-weight") :default-serializer :FaslSerializer
+                     :id #uuid "9c000000-0000-0000-0000-0000000001b3"}
+             ;; the byte-bounded node cache, as Seon configures it (without it the cache is a count-bounded LRU)
+             :store-cache-bytes 100000000
+             :keep-history? true :schema-flexibility :read
+             :index-config {:value-out-of-line-bytes 1024}}
+        big (fn [i] (str i "-" (s 4000)))
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)
+        _ (d/transact conn (vec (for [i (range 40)] {:db/id (- -1 i) :small i :big (big i)})))
+        _ (d/release conn)
+        conn (d/connect cfg)]
+    (try
+      (is (= (set (map big (range 40))) (set (map :v (d/datoms @conn :aevt :big)))) "every large value reads back")
+      ;; this store's cache: the registry also holds what earlier tests left (an inherited entry is another store's)
+      (let [cache (some (fn [[k v]] (when (and (vector? k) (= (get-in cfg [:store :id]) (first k))) (:node-cache v)))
+                        @connections/*connections*)
+            st @(:state cache)
+            now (reduce + 0 (map (fn [[n]] (datahike.index.node-cache/node-bytes n)) (vals (:nodes st))))]
+        (is (= (:total st) now) "the booked total is what the cached entries weigh now"))
+      (finally
+        (d/release conn)
+        (d/delete-database cfg)))))
