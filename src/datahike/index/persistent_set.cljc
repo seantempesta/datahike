@@ -841,9 +841,10 @@
    (dd/read-values-with!
     (fn [store-id vk]
       ;; through a live connection of this process to the store: no store is held for it, so none outlives its connections
-      (if-let [db (some (fn [[_ {:keys [conn count]}]]
-                          (when (and conn (pos? count))
-                            (let [db @conn] (when (= store-id (get-in db [:config :store :id])) db))))
+      ;; found by the registry's key, a connection id [store-id branch ...]: only that connection is dereferenced, since a
+      ;; deref reads its store's head, and another store's connection (one whose env was closed under it) is never touched
+      (if-let [db (some (fn [[k {:keys [conn count]}]]
+                          (when (and conn (pos? count) (= store-id (first k))) @conn))
                         ;; resolved at the call: a reference from this fn would let every Datom reach every connection (its
                         ;; record type reaches this namespace), and a node's weighed retention would count the whole registry
                         @@(resolve 'datahike.connections/*connections*))]
