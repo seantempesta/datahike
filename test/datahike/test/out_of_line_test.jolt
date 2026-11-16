@@ -8,7 +8,7 @@
             [datahike.datom :as dd]
             [datahike.connections :as connections]
             [datahike.index.interface :as di]
-            [konserve.store] [konserve.jolt.store] [konserve.jolt.lmdb])
+            [konserve.store] [konserve.jolt.store] [konserve.jolt.lmdb] [clojure.java.shell])
   (:import [org.replikativ.persistent_sorted_set Leaf Settings]))
 
 ;; a path prefix of this run's own: parallel runs must not delete-database each other's stores
@@ -213,3 +213,32 @@
         (d/release a)
         (try (d/release b) (catch Exception _ nil))
         (doseq [c [b-cfg a-cfg]] (try (d/delete-database c) (catch Exception _ nil)))))))
+
+(deftest a-leaf-reads-its-values-from-its-own-store
+  ;; two stores of one id open in one process (a store's copy keeps its id): a leaf's large value is read from the store the
+  ;; leaf came from, never found by the id, which answered the other store's connection: "Value not found in storage" (a Seon
+  ;; candidate, a clone of the standing store, read from a process that held the standing store, 2026-11-17)
+  (let [id #uuid "9c000000-0000-0000-0000-0000000001b7"
+        cfg (fn [n] {:store {:backend :lmdb :path (str run-dir "-" n) :default-serializer :FaslSerializer :id id}
+                     :writer {:backend :sync} :keep-history? true :schema-flexibility :read
+                     :index-config {:value-out-of-line-bytes 1024}})
+        a (cfg "same-a") b (cfg "same-b")
+        _ (d/delete-database a) _ (d/delete-database b)
+        _ (d/create-database a)
+        c (d/connect a)
+        _ (d/transact c [{:db/id -1 :small 1}])
+        _ (d/branch! c :db :other)
+        _ (d/release c)
+        _ (clojure.java.shell/sh "cp" "-R" (get-in a [:store :path]) (get-in b [:store :path]))
+        held (d/connect (assoc a :branch :other))
+        bc (d/connect b)
+        big (s 4000)]
+    (try
+      (d/transact bc [{:db/id -1 :big big}])
+      (d/release bc)
+      (let [bc (d/connect b)]
+        (try (is (= big (:v (first (d/datoms @bc :aevt :big)))) "b's value reads from b, whatever else holds b's id")
+             (finally (d/release bc))))
+      (finally
+        (d/release held)
+        (doseq [x [a b]] (try (d/delete-database x) (catch Exception _ nil)))))))
