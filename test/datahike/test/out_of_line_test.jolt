@@ -26,7 +26,7 @@
   (let [calls (atom 0)
         vb @value-bytes
         node (with-redefs [datahike.index.persistent-set/value-bytes (fn [v l] (swap! calls inc) (vb v l))]
-               (out-of-line store (di/make-node-cache {:store-cache-size 16}) (atom []) limit (leaf values)))
+               (out-of-line nil store (di/make-node-cache {:store-cache-size 16}) (atom []) limit (leaf values)))
         ks (.-_keys node)]
     [(set (keep (fn [i] (when-not (identical? (nth values i) (.-v (aget ks i))) i)) (range (count values))))
      @calls]))

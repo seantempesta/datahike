@@ -286,20 +286,15 @@
 ;; ---- a content key named again without being written ----------------------------------
 ;; A sequence that finds a content-addressed value already stored names its key and writes
 ;; nothing (persistent-set value-key), so the key keeps its first write's time, older than any
-;; sweep's cutoff. The sweep spares such keys by key: each open sequence's reused keys, and while a
-;; sweep runs on a store, every reuse since it began. Its batch deletes and a reuse's check of the
-;; store take one per-store exclusion, so a key is either spared before its batch goes or seen gone.
+;; sweep's cutoff. The sweep spares such keys by key: each open sequence's reused keys at its
+;; start, and every reuse while it runs. One atom holds it all, changed by swaps alone (no lock: a
+;; reuse runs on a fiber, which may park in a store read): a reuse registers and reads the sweep's
+;; state in one swap, and a batch takes its keys and marks them deleting in one swap, so each key
+;; is either spared before its batch takes it, or seen deleting (the reuse waits for that delete,
+;; then writes the value again) or gone (written again).
 
-;; store-id -> {token #{key}}: the content keys each open sequence reused
-(defonce ^:private reused-by (atom {}))
-;; store-id -> #{key}: what the store's running sweep spares; absent when none runs
-(defonce ^:private spared (atom {}))
-;; store-id -> the object a sweep's batch deletes and a reuse's check hold
-(defonce ^:private reuse-locks (atom {}))
-
-(defn- reuse-lock [store-id]
-  (or (get @reuse-locks store-id)
-      (get (swap! reuse-locks update store-id #(or % #?(:cljs #js {} :default (Object.)))) store-id)))
+;; store-id -> {:reused-by {token #{key}}, :sweep nil | {:spared #{} :deleting {key promise} :gone #{}}}
+(defonce ^:private reuse-state (atom {}))
 
 (def ^:dynamic *sequence*
   "[store-id token] of the unreferenced-write sequence the calling thread writes in (datahike.writing/commit!
@@ -308,39 +303,57 @@
 
 (defn reused!
   "Name content key `k` of `store-id` again without writing it. `present?` asks the store whether it holds k;
-   it is asked unless the caller found k in its cache (`cached?`) and no sweep runs. A present key is kept as
-   the open sequence's (*sequence*) and, while a sweep runs, spared by it. Answers whether k is present."
+   it is asked unless the caller found k in its cache (`cached?`). A key this store's running sweep deleted, or
+   is deleting (waited for), is absent: the caller writes it again. A present key is the open sequence's
+   (*sequence*), and spared by a running sweep. Answers whether k is present."
   [store-id k present? cached?]
-  (locking (reuse-lock store-id)
-    (let [sweeping? (contains? @spared store-id)
-          here? (if (and cached? (not sweeping?)) true (boolean (present?)))]
-      (when here?
-        (when-let [[sid t] *sequence*]
-          (when (= sid store-id) (swap! reused-by update-in [store-id t] (fnil conj #{}) k)))
-        (when sweeping? (swap! spared update store-id conj k)))
-      here?)))
+  (let [here? (or cached? (boolean (present?)))
+        token (when-let [[sid t] *sequence*] (when (= sid store-id) t))
+        [old _] (swap-vals! reuse-state
+                            (fn [st]
+                              (let [{:keys [sweep]} (get st store-id)
+                                    taken? (and sweep (or (contains? (:gone sweep) k) (contains? (:deleting sweep) k)))]
+                                (cond-> st
+                                  (and here? token (not taken?)) (update-in [store-id :reused-by token] (fnil conj #{}) k)
+                                  (and here? sweep (not taken?)) (update-in [store-id :sweep :spared] conj k)))))
+        {:keys [sweep]} (get old store-id)]
+    (cond
+      (not here?) false
+      (nil? sweep) true
+      (contains? (:gone sweep) k) false
+      (contains? (:deleting sweep) k) (do (deref (get-in sweep [:deleting k])) false)
+      :else true)))
 
 (defn sweep-started!
   "A sweep of `store-id` begins: it spares what the open sequences reused, and every reuse until sweep-ended!.
    Call before the mark."
   [store-id]
-  (locking (reuse-lock store-id)
-    (swap! spared assoc store-id (reduce into #{} (vals (get @reused-by store-id)))))
+  (swap! reuse-state update store-id
+         (fn [m] (assoc m :sweep {:spared (reduce into #{} (vals (:reused-by m))) :deleting {} :gone #{}})))
   nil)
 
 (defn sweep-ended! [store-id]
-  (locking (reuse-lock store-id) (swap! spared dissoc store-id))
+  (swap! reuse-state update store-id dissoc :sweep)
   nil)
 
 (defn admit-batch
-  "A sweep's batch delete of `keys` on `store-id` (konserve's :konserve.gc/admit): deletes those not spared,
-   under the exclusion a reuse's check takes, and answers them."
+  "A sweep's batch delete of `keys` on `store-id` (konserve's :konserve.gc/admit): takes those not spared as
+   deleting in one swap, deletes them, then marks them gone; a reuse that saw one deleting waits for this.
+   Answers the keys deleted."
   [store-id keys delete!]
-  (locking (reuse-lock store-id)
-    (let [s (get @spared store-id #{})
-          ks (into [] (remove s) keys)]
-      (delete! ks)
-      ks)))
+  (let [p (promise)
+        [old _] (swap-vals! reuse-state
+                            (fn [st]
+                              (let [spared (get-in st [store-id :sweep :spared] #{})]
+                                (update-in st [store-id :sweep :deleting]
+                                           (fn [d] (reduce #(assoc %1 %2 p) (or d {}) (remove spared keys)))))))
+        ks (into [] (remove (get-in old [store-id :sweep :spared] #{})) keys)]
+    (try (delete! ks)
+         (finally
+           (swap! reuse-state update-in [store-id :sweep]
+                  (fn [sw] (when sw (-> sw (update :deleting #(apply dissoc % ks)) (update :gone into ks)))))
+           (deliver p true)))
+    ks))
 
 (defn writing!
   "Open an unreferenced-write sequence on `store-id`. Returns a token to close it
@@ -354,7 +367,7 @@
   "Close the sequence — its pointer has landed, so everything it wrote is now
    reachable (or garbage, if the pointer superseded it)."
   [store-id token]
-  (swap! reused-by update store-id dissoc token)
+  (swap! reuse-state update-in [store-id :reused-by] dissoc token)
   (swap! in-flight (fn [m]
                      (let [m' (update m store-id dissoc token)]
                        (if (empty? (get m' store-id))
