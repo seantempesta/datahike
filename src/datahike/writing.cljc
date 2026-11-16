@@ -531,10 +531,13 @@
 (defn commit-changes-kv
   "[key value] of what `db`'s commit `cid` changed (commit-changes-key), or nil when the value
    carries none (it was not built by a transaction since its last commit). Every commit writer
-   (commit!, datahike.versioning/force-branch!) writes it before the commit record."
-  [db cid]
-  (when-some [ds (:datahike/uncommitted (meta db))]
-    [(commit-changes-key cid) {:base (:datahike/uncommitted-base (meta db)) :datoms ds}]))
+   (commit!, datahike.versioning/force-branch!) writes it before the commit record. `base`, when
+   given, is the commit this one replaces as its branch's head (an ordinary commit's one parent,
+   which commit! resolves); else the commit the value was built on, as its meta records it."
+  ([db cid] (commit-changes-kv db cid nil))
+  ([db cid base]
+   (when-some [ds (:datahike/uncommitted (meta db))]
+     [(commit-changes-key cid) {:base (or base (:datahike/uncommitted-base (meta db))) :datoms ds}])))
 
 (defn commit-branch
   "The branch a stored commit record was written on: its `[:config :branch]`,
@@ -802,6 +805,9 @@
                         ;; transaction loop chains applied dbs whose meta
                         ;; predates recent commits (the old storage read was,
                         ;; in effect, the cross-loop synchronization point).
+                          ;; an ordinary commit (no explicit parents) replaces its branch's head, its one parent:
+                          ;; the base its changes record names (commit-changes-kv)
+                          ordinary?     (nil? parents)
                           known-heads   (if (and (nil? parents) known-head-cid)
                                           {(get config :branch) known-head-cid}
                                           {})
@@ -845,7 +851,7 @@
                                           (commit-graph-writes store cid parents (commit-branch db-to-store)
                                                                known-generations))
                         ;; what the commit changed since its base (datahike.core/with keeps it on the value)
-                          changes-kv    (when commit-graph? (commit-changes-kv db cid))]
+                          changes-kv    (when commit-graph? (commit-changes-kv db cid (when ordinary? (first parents))))]
 
                       ;; every value before the head, in causal order (write-commit!)
                       (<?- (write-commit! store {:pending-kvs pending-kvs :schema-meta-kv schema-meta-kv-to-write

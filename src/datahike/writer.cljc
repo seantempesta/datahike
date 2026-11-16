@@ -139,14 +139,12 @@
 
 (defn- commit-changes-of
   "db, the value a batch of reports commits, carrying what that commit changes (datahike.writing/commit-changes-kv):
-   the batch's datoms in order, on the committed value parent-db it replaces. The transaction loop applies each
+   the batch's datoms in order; commit! names the head it replaces as the base. The transaction loop applies each
    transaction to the one before it while that one commits, so its values' own :datahike/uncommitted runs back to
    the writer's first commit (it stays on them: a reader tells a run-ahead value from a committed one by it); the
    batch's reports are exactly this commit's."
-  [db parent-db reports]
-  (vary-meta db assoc
-             :datahike/uncommitted (into [] (mapcat :tx-data) reports)
-             :datahike/uncommitted-base (get-in parent-db [:meta :datahike/commit-id])))
+  [db reports]
+  (vary-meta db assoc :datahike/uncommitted (into [] (mapcat :tx-data) reports)))
 
 (defn- merge-parents-of
   "The merge parents the reports' values carry (a merge op sets them on its db's
@@ -302,7 +300,7 @@
                       (log/trace :datahike/batch-commit {:batch-size (count txs)})
               ;; commit latest tx to disk
                       (let [parent-db @connection
-                            db (commit-changes-of (:db-after (first (peek txs))) parent-db (map first txs))
+                            db (commit-changes-of (:db-after (first (peek txs))) (map first txs))
                             ;; Merge parents of every report in the batch
                             ;; (set by the merge op); the batch commits once.
                             [merge-parents db] (merge-parents-of (map first txs) db)]
