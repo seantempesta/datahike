@@ -6,6 +6,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [datahike.api :as d]
             [datahike.datom :as dd]
+            [datahike.connections :as connections]
             [datahike.index.interface :as di]
             [konserve.store] [konserve.jolt.store] [konserve.jolt.lmdb])
   (:import [org.replikativ.persistent_sorted_set Leaf Settings]))
@@ -92,5 +93,36 @@
           (is (= (set (map big (range 40))) (set (map :v (d/datoms @conn :aevt :big)))))
           (is (= (big 7) (:big (d/pull @conn [:big] e))))
           (d/release conn)))
+      (finally
+        (d/delete-database cfg)))))
+
+(deftest an-unread-value-is-read-through-the-reading-processs-store
+  ;; a node holding an unread value is valid in any process: a fork (simulated, as connections-fork-test does)
+  ;; that adopts the node cache reads the value through its own connect, never its parent's handle
+  (let [cfg {:store {:backend :lmdb :path (str run-dir "-fork") :default-serializer :FaslSerializer
+                     :id #uuid "9c000000-0000-0000-0000-0000000001b2"}
+             :keep-history? true :schema-flexibility :read
+             :index-config {:value-out-of-line-bytes 1024}}
+        big (fn [i] (str i "-" (s 4000)))
+        _ (d/delete-database cfg)
+        _ (d/create-database cfg)
+        conn (d/connect cfg)
+        _ (d/transact conn (vec (for [i (range 40)] {:db/id (- -1 i) :small i :big (big i)})))
+        _ (d/release conn)
+        conn (d/connect cfg)
+        db @conn
+        e (:e (first (filter #(= 7 (:v %)) (d/datoms db :aevt :small))))]
+    (try
+      ;; the leaf is cached, its large values unread
+      (is (= [7] (mapv :v (d/datoms db :eavt e :small))))
+      (connections/after-fork!)
+      (testing "after the fork, nothing reads a value through the parent's store"
+        (is (= :value-store-not-open
+               (try (:v (first (d/datoms db :eavt e :big))) nil
+                    (catch Exception x (:type (ex-data x)))))))
+      (testing "the fork's own connect reads it, from the node cache it adopted"
+        (let [child (d/connect cfg)]
+          (is (= (big 7) (:v (first (d/datoms @child :eavt e :big)))))
+          (d/release child)))
       (finally
         (d/delete-database cfg)))))

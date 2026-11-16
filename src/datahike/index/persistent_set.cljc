@@ -766,7 +766,7 @@
            (let [d (aget ks i)]
              (when (and (dd/datom? d) (instance? ValueRef (.-v d)))
                (let [vk (.-key ^ValueRef (.-v d))]
-                 (aset ^objects ks i (dd/datom (.-e d) (.-a d) (dd/lazy-value vk #(fetch-value store config vk))
+                 (aset ^objects ks i (dd/datom (.-e d) (.-a d) (dd/lazy-value vk (get-in config [:store :id]))
                                                (dd/datom-tx d) (dd/datom-added d)))))))
          node))))
 
@@ -837,6 +837,8 @@
                  :accessed 0})
 
 (defn create-storage [store config]
+  ;; this process reads the store's out-of-line values through it (a LazyValue names its store by id)
+  #?(:jolt (dd/read-values-with! (get-in config [:store :id]) #(fetch-value store config %)))
   (CachedStorage. store config
                   ;; nodes are immutable by address: every connection to one
                   ;; physical store shares the cache its connection reserved

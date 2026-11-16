@@ -1,4 +1,5 @@
-(ns ^:no-doc datahike.connections)
+(ns ^:no-doc datahike.connections
+  (:require [datahike.datom]))
 
 (def ^:dynamic *connections* (atom {}))
 
@@ -116,6 +117,8 @@
   one by node store and threshold) and reads what the parent decoded instead of fetching
   and decoding it again. Call it first thing in the child, before any connect."
   []
+  ;; a LazyValue a cached node holds names its store by id: this process reads it through its own connect
+  (datahike.datom/forget-value-readers!)
   (swap! *connections*
          (fn [connections]
            (into {} (for [[_ {:keys [node-store-key threshold node-cache]}] connections

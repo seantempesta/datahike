@@ -103,7 +103,24 @@
 ;; given its value (the storage's readKey); comparison, equality and hashing read it when they reach
 ;; v, so nothing ever compares a reference with a value. Two of one key are one value, unread.
 #?(:jolt
-   (deftype LazyValue [key fetch memo]))
+   (deftype LazyValue [key store-id memo]))
+
+;; How this process reads a value of each store it has open: store id -> (fn [key] value), set when a
+;; storage over the store is made (datahike.index.persistent-set/create-storage). A LazyValue names its
+;; store by id, never by handle, so a node holding one stays valid in any process, as the node cache's
+;; adoption across fork(2) needs (datahike.connections/after-fork!, which forgets these: the parent's
+;; handles are not used across fork, and the child's own connect sets them again).
+(defonce ^:private value-readers (atom {}))
+
+(defn read-values-with!
+  "Read the values of store store-id with (f key), in this process."
+  [store-id f]
+  (swap! value-readers assoc store-id f))
+
+(defn forget-value-readers!
+  "Forget every store's value reader (a process forked from another: its handles are the parent's)."
+  []
+  (reset! value-readers {}))
 
 (defn lazy-value? [x] #?(:jolt (instance? LazyValue x) :default false))
 
@@ -117,15 +134,21 @@
   [x]
   #?(:jolt (if (instance? LazyValue x)
              (let [memo (.-memo ^LazyValue x) m @memo]
-               (if (identical? m ::unread) (vreset! memo ((.-fetch ^LazyValue x))) m))
+               (if (identical? m ::unread)
+                 (let [sid (.-store-id ^LazyValue x)
+                       f (or (get @value-readers sid)
+                             (throw (ex-info "No store of this process reads this value: its store is not open here."
+                                             {:type :value-store-not-open :store sid :key (.-key ^LazyValue x)})))]
+                   (vreset! memo (f (.-key ^LazyValue x))))
+                 m))
              x)
      :default x))
 
 #?(:jolt
    (defn lazy-value
-     "A LazyValue of content key, read by (fetch) when first needed."
-     [key fetch]
-     (LazyValue. key fetch (volatile! ::unread))))
+     "A LazyValue of content key in store store-id, read when first needed (value-of)."
+     [key store-id]
+     (LazyValue. key store-id (volatile! ::unread))))
 
 (defn- hash-datom [^Datom d]
   (-> (hash (.-e d))
