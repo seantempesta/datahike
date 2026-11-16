@@ -301,7 +301,7 @@
                  (tree-seq #(and (coll? %) (not (instance? Datom %))) seq (.-diff slot)))))))
 
 #?(:clj
-   (defn diff
+   (defn- diff*
      "The datoms within the slice bounds `from` and `to` (as `-slice` takes them for
      `index-type`) held by exactly one of two persistent sorted sets: `[only-a only-b]`,
      each a vector in index order. A datom differs by the set's own comparator.
@@ -427,6 +427,19 @@
                                  (and in-b (not in-a)) [only-a (conj only-b d)]
                                  :else [only-a only-b])))
                        [[] []] buffered)))))))
+
+(defn- value-read
+  "Datom d with its value: a datom read in place from a leaf may hold one unread (in-line's LazyValue)."
+  [d]
+  (if (and (dd/datom? d) (dd/lazy-value? (.-v ^Datom d)))
+    (dd/datom (.-e ^Datom d) (.-a ^Datom d) (dd/value-of (.-v ^Datom d)) (dd/datom-tx d) (dd/datom-added d))
+    d))
+
+#?(:clj
+   (defn diff
+     "diff*'s answer ([only-a only-b] of two sets within from and to), each datom with its value."
+     [a b index-type from to]
+     (let [[x y] (diff* a b index-type from to)] [(mapv value-read x) (mapv value-read y)])))
 
 (defn- canon
   "Normalize a value for content hashing: Datoms become [e a v tx added] vectors,
@@ -806,10 +819,7 @@
           (di/cache-put! cache address node)
           node))))
   #?@(:jolt [IReadKey
-             (readKey [_ k]
-               (if (and (dd/datom? k) (dd/lazy-value? (.-v ^Datom k)))
-                 (dd/datom (.-e ^Datom k) (.-a ^Datom k) (dd/value-of (.-v ^Datom k)) (dd/datom-tx k) (dd/datom-added k))
-                 k))])
+             (readKey [_ k] (value-read k))])
   (markFreed [_ address]
     (when address
       (let [now #?(:clj (java.util.Date.) :cljs (js/Date.))]
