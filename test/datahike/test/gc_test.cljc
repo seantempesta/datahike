@@ -56,16 +56,17 @@
       (is (= fresh-count (count-store @conn)))
       (d/transact conn schema)
       (is (= 1 (count (-mark (:eavt @conn)))))
-      ;; the commit adds its cid record and its graph record
-      (is (= (+ 3 history-count fresh-count num-roots) (count-store @conn))))
+      ;; the commit adds its cid record, its graph record and its changes record (a6a86a9d)
+      (is (= (+ 4 history-count fresh-count num-roots) (count-store @conn))))
     (testing "Delete old db with roots."
       ;; the old empty current roots are still the temporal indexes' roots
       ;; (an empty index's address is its content), so only the old commit
-      ;; record goes, and its graph record stays: a merge base is walked over it
+      ;; record goes, and its graph record stays: a merge base is walked over it; so does its
+      ;; changes record, which d/changes reads after its snapshot is swept (a6a86a9d)
       (is (= 2 (count (<?? S (d/gc-storage conn (Date.))))))
       ;; and the collection's generation key is written (700c473: a value key a cache found
       ;; before a sweep is asked of the store again after it)
-      (is (= (+ 2 history-count fresh-count num-roots) (count-store @conn))))
+      (is (= (+ 3 history-count fresh-count num-roots) (count-store @conn))))
     (testing "Try to run on dirty index and fail."
       (is (thrown-with-msg? Throwable #"Index needs to be properly flushed before marking."
                             (-mark (:eavt
