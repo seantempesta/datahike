@@ -846,19 +846,13 @@
 
    Refuses, each naming :from and :to: `:datahike/changes-unrecorded` (a commit on the way kept
    no changes: written before commits kept them, named as :commit), `:datahike/changes-not-ancestor`
-   (the bases ended before `from`, or passed it: the walk stops at the first commit no newer than
-   `from`'s generation, so a `from` off the chain costs the commits between them, never the lineage)."
+   (the bases ended before `from`)."
   [conn-or-db from to]
   (let [[store] (tip-of (if (db? conn-or-db) conn-or-db @conn-or-db))
-        refuse (fn [message type extra] (log/raise message (merge {:type type :from from :to to} extra)))
-        generation #(:datahike/generation (commit-graph-record store %))
-        from-g (generation from)]
+        refuse (fn [message type extra] (log/raise message (merge {:type type :from from :to to} extra)))]
     (loop [c to acc ()]
       (cond (= c from) (net-changes (apply concat acc))
             (nil? c) (refuse "The commits' bases ended before the first commit." :datahike/changes-not-ancestor {})
-            ;; a commit no newer than from that is not from: from is not on this chain
-            (and from-g (<= (or (generation c) 0) from-g))
-            (refuse "The commits' bases passed the first commit without meeting it." :datahike/changes-not-ancestor {:commit c})
             :else (let [{:keys [base datoms] :as ch} (k/get store (commit-changes-key c) nil {:sync? true})]
                     (when (nil? ch) (refuse "A commit on the way kept no changes." :datahike/changes-unrecorded {:commit c}))
                     (recur base (cons datoms acc)))))))
