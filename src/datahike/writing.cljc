@@ -788,6 +788,8 @@
                               gc-store-id :roster {:sync? sync?})))
                       gc-token (guard/writing! gc-store-id)]
                   (try
+                    ;; a content key this sequence names again without writing it is this sequence's (gc-guard/reused!)
+                    (binding [guard/*sequence* [gc-store-id gc-token]]
                     (let [{:keys [store config]} db
                         ;; Head-cid cache: for an ORDINARY commit (no explicit
                         ;; parents) the writer's own head cid is already in
@@ -868,7 +870,7 @@
                           (as-> d (let [m (schema-meta-of d)] (with-schema-meta-key d m (:schema-meta-key db-to-store) #(immutable-schema-value? m))))
                           ;; nil without a commit graph, so no generation outlives its commit
                           (vary-meta assoc :datahike/generation
-                                     (:datahike/generation (second (peek graph-writes))))))
+                                     (:datahike/generation (second (peek graph-writes)))))))
                     (catch #?(:clj Error :cljs :default) e
                       #?(:clj  (throw (ex-info "Fatal error during commit."
                                                {:type :fatal-commit-error}

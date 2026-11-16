@@ -208,6 +208,8 @@
                         {:sync? sync?
                          :datahike.gc-guard/maintenance-receipt
                          (:datahike.gc/maintenance-receipt opts)}))]
+             ;; from here every content key a commit names again without writing it is spared by this sweep
+             (guard/sweep-started! store-id)
              (try
                (let [now #?(:clj (Date.) :cljs (js/Date.))
                      ;; Capture `now` before reading the safe point. Ordinary
@@ -253,7 +255,9 @@
                        #{})
                      reachable (-> native-reachable (into (roster-store-keys store)) (into extension) (conj collection-key))
                      batch-size (or (:datahike.gc/batch-size opts) 1000)
-                     sweep-opts (cond-> (or (:datahike.gc/sweep-opts opts) {})
+                     sweep-opts (cond-> (assoc (or (:datahike.gc/sweep-opts opts) {})
+                                               ;; each batch deletes only what no commit named again, under the exclusion a reuse takes
+                                               :konserve.gc/admit (fn [ks delete!] (guard/admit-batch store-id ks delete!)))
                                   sync? (assoc :konserve.gc/sync-io? true))]
                  (log/trace :datahike/gc-reachable {:reachable-count (count reachable)
                                                     :cutoff cutoff})
@@ -273,6 +277,8 @@
                      (<?- (k/update store collection-key (fnil inc 0) {:sync? sync?})))
                    swept))
                (finally
+                 ;; after the generation moved: a cached key is asked of the store again from here
+                 (guard/sweep-ended! store-id)
                  (guard/release-reachability-permit! sweep-permit)))))))))
 
 (defn start-background-gc!

@@ -283,6 +283,65 @@
   [p]
   (release-permit! p))
 
+;; ---- a content key named again without being written ----------------------------------
+;; A sequence that finds a content-addressed value already stored names its key and writes
+;; nothing (persistent-set value-key), so the key keeps its first write's time, older than any
+;; sweep's cutoff. The sweep spares such keys by key: each open sequence's reused keys, and while a
+;; sweep runs on a store, every reuse since it began. Its batch deletes and a reuse's check of the
+;; store take one per-store exclusion, so a key is either spared before its batch goes or seen gone.
+
+;; store-id -> {token #{key}}: the content keys each open sequence reused
+(defonce ^:private reused-by (atom {}))
+;; store-id -> #{key}: what the store's running sweep spares; absent when none runs
+(defonce ^:private spared (atom {}))
+;; store-id -> the object a sweep's batch deletes and a reuse's check hold
+(defonce ^:private reuse-locks (atom {}))
+
+(defn- reuse-lock [store-id]
+  (or (get @reuse-locks store-id)
+      (get (swap! reuse-locks update store-id #(or % #?(:cljs #js {} :default (Object.)))) store-id)))
+
+(def ^:dynamic *sequence*
+  "[store-id token] of the unreferenced-write sequence the calling thread writes in (datahike.writing/commit!
+   binds it), so a reuse inside it is that sequence's."
+  nil)
+
+(defn reused!
+  "Name content key `k` of `store-id` again without writing it. `present?` asks the store whether it holds k;
+   it is asked unless the caller found k in its cache (`cached?`) and no sweep runs. A present key is kept as
+   the open sequence's (*sequence*) and, while a sweep runs, spared by it. Answers whether k is present."
+  [store-id k present? cached?]
+  (locking (reuse-lock store-id)
+    (let [sweeping? (contains? @spared store-id)
+          here? (if (and cached? (not sweeping?)) true (boolean (present?)))]
+      (when here?
+        (when-let [[sid t] *sequence*]
+          (when (= sid store-id) (swap! reused-by update-in [store-id t] (fnil conj #{}) k)))
+        (when sweeping? (swap! spared update store-id conj k)))
+      here?)))
+
+(defn sweep-started!
+  "A sweep of `store-id` begins: it spares what the open sequences reused, and every reuse until sweep-ended!.
+   Call before the mark."
+  [store-id]
+  (locking (reuse-lock store-id)
+    (swap! spared assoc store-id (reduce into #{} (vals (get @reused-by store-id)))))
+  nil)
+
+(defn sweep-ended! [store-id]
+  (locking (reuse-lock store-id) (swap! spared dissoc store-id))
+  nil)
+
+(defn admit-batch
+  "A sweep's batch delete of `keys` on `store-id` (konserve's :konserve.gc/admit): deletes those not spared,
+   under the exclusion a reuse's check takes, and answers them."
+  [store-id keys delete!]
+  (locking (reuse-lock store-id)
+    (let [s (get @spared store-id #{})
+          ks (into [] (remove s) keys)]
+      (delete! ks)
+      ks)))
+
 (defn writing!
   "Open an unreferenced-write sequence on `store-id`. Returns a token to close it
    with. Call BEFORE the first value is written."
@@ -295,6 +354,7 @@
   "Close the sequence — its pointer has landed, so everything it wrote is now
    reachable (or garbage, if the pointer superseded it)."
   [store-id token]
+  (swap! reused-by update store-id dissoc token)
   (swap! in-flight (fn [m]
                      (let [m' (update m store-id dissoc token)]
                        (if (empty? (get m' store-id))

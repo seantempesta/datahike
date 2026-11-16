@@ -13,6 +13,7 @@
             [datahike.index.interface :as di :refer [IIndex]]
             [datahike.tools :as dt]
             [konserve.core :as k]
+            [datahike.gc-guard :as guard]
             [konserve.serializers :refer [fressian-serializer]]
             #?(:cljs [fress.api :as fress])
             [hasch.core :refer [uuid squuid]]
@@ -663,14 +664,16 @@
        [generation key], and one from an earlier collection generation than gen (a delay
        of the store's, read before the store is asked) is a miss: that collection may have
        swept the value."
-       [store cache pending-writes gen d]
+       [store-id store cache pending-writes gen d]
+       ;; a key named again without a write keeps its first write's time, so the collection's guard spares it by
+       ;; key (datahike.gc-guard/reused!), and asks the store again while a sweep runs
        (let [[g k] (di/cache-get cache d)]
-         (if (and k (= g @gen))
+         (if (and k (= g @gen) (guard/reused! store-id k #(k/exists? store k {:sync? true}) true))
            k
            (let [v (.-v d) vk (uuid v)]
              (cond
                (some #(= vk (first %)) @pending-writes) nil
-               (k/exists? store vk {:sync? true}) (di/cache-put! cache d [@gen vk])
+               (guard/reused! store-id vk #(k/exists? store vk {:sync? true}) false) (di/cache-put! cache d [@gen vk])
                :else (swap! pending-writes conj [vk v]))
              vk))))
 
@@ -695,7 +698,7 @@
      (defn- out-of-line
        "node as it is stored: each key whose value is at least `limit` bytes holding a
        ValueRef to the value's content key (value-key). node itself when none is that large."
-       [store cache pending-writes limit node]
+       [store-id store cache pending-writes limit node]
        ;; value-bytes' answer, without a call, for what it answers at once: most values
        ;; are numbers, keywords and short strings, and a written node is ~64 datoms
        (let [ks (.-_keys node) n (.-_len node) gen (generation store pending-writes)
@@ -709,7 +712,7 @@
                                  (bytes? v) (>= (alength ^bytes v) limit)
                                  (coll? v) (>= (value-bytes v limit) limit)
                                  :else scalar-large?)
-                         (let [vk (value-key store cache pending-writes gen d)
+                         (let [vk (value-key store-id store cache pending-writes gen d)
                                out (or out (aclone ^objects ks))]
                            (aset ^objects out i (dd/datom (.-e d) (.-a d) (ValueRef. vk) (dd/datom-tx d) (dd/datom-added d)))
                            (recur (inc i) out))
@@ -752,7 +755,7 @@
           ;; out of line, so the merkle audit, which reads the stored node back,
           ;; recomputes the same address
           stored #?(:jolt (if-let [limit (get-in config [:index-config :value-out-of-line-bytes])]
-                            (out-of-line store cache pending-writes limit node)
+                            (out-of-line (get-in config [:store :id]) store cache pending-writes limit node)
                             node)
                     :default node)
           address (or reused (gen-address stored (:crypto-hash? config)))
