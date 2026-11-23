@@ -11,6 +11,7 @@
    [datahike.db.search :as dbs]
    [datahike.db.utils :as dbu]
    [datahike.index :as di]
+   [datahike.index.audit :as idx-audit]
    #?(:clj [datahike.index.persistent-set :as psi])
    [datahike.index.secondary :as sec]
    [datahike.schema :as ds]
@@ -920,11 +921,34 @@
       (= (first xs) (first ys)) (recur (next xs) (next ys))
       :else false)))
 
+(defn- eavt-root-address [eavt]
+  (when (satisfies? idx-audit/IAuditable eavt)
+    (idx-audit/-merkle-root eavt)))
+
 (defn- equiv-db [db other]
-  (and (or (instance? DB other) (instance? FilteredDB other))
-       (or (not (instance? DB other)) (= (hash db) (hash other)))
-       (= (dbi/-schema db) (dbi/-schema other))
-       (equiv-db-index (dbi/datoms db :eavt []) (dbi/datoms other :eavt []))))
+  (cond
+    (identical? db other) true
+
+    (and (instance? DB db) (instance? DB other))
+    (and (= (hash db) (hash other))
+         (or (let [a (committed-cache-identity db)]
+               (and (some? a) (= a (committed-cache-identity other))))
+             (and (= (dbi/-schema db) (dbi/-schema other))
+                  (or (identical? (.-eavt db) (.-eavt other))
+                      (let [addr1 (eavt-root-address (.-eavt db))
+                            addr2 (eavt-root-address (.-eavt other))
+                            sid1 (store/store-identity (:store (dbi/-config db)))]
+                        (and (some? addr1)
+                             (= addr1 addr2)
+                             (some? sid1)
+                             (= sid1 (store/store-identity (:store (dbi/-config other))))))
+                      (equiv-db-index (dbi/datoms db :eavt []) (dbi/datoms other :eavt []))))))
+
+    :else
+    (and (or (instance? DB other) (instance? FilteredDB other))
+         (or (not (instance? DB other)) (= (hash db) (hash other)))
+         (= (dbi/-schema db) (dbi/-schema other))
+         (equiv-db-index (dbi/datoms db :eavt []) (dbi/datoms other :eavt [])))))
 
 #?(:cljs
    (do
