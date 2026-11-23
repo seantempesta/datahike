@@ -242,3 +242,78 @@
       (finally
         (d/release held)
         (doseq [x [a b]] (try (d/delete-database x) (catch Exception _ nil)))))))
+
+(deftest a-pull-fetches-only-its-requested-out-of-line-values
+  ;; a named d/pull reads the entity's :eavt range once, so without attribute-scoped IReadKey
+  ;; filtering it decoded every unrequested out-of-line blob on the entity (and resolve-pull-eid
+  ;; decoded the entity's first datom even for a single scalar attr).
+  (doseq [attr-refs? [false true]]
+    (testing (str "attribute-refs?=" attr-refs?)
+      (let [cfg {:store {:backend :lmdb
+                         :path (str run-dir "-pull-" attr-refs?)
+                         :config {:encoding {:serializer :FaslSerializer}}
+                         :id (if attr-refs?
+                               #uuid "9c000000-0000-0000-0000-0000000001b9"
+                               #uuid "9c000000-0000-0000-0000-0000000001b8")}
+                 :keep-history? true
+                 :schema-flexibility (if attr-refs? :write :read)
+                 :attribute-refs? attr-refs?
+                 :index-config {:value-out-of-line-bytes 1024}}
+            big (fn [i] (str i "-" (s 4000)))
+            _ (d/delete-database cfg)
+            _ (d/create-database cfg)
+            conn (d/connect cfg)
+            _ (when attr-refs?
+                (d/transact conn [{:db/ident :a-big :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+                                  {:db/ident :small :db/valueType :db.type/long   :db/cardinality :db.cardinality/one}
+                                  {:db/ident :tag   :db/valueType :db.type/string :db/cardinality :db.cardinality/one}
+                                  {:db/ident :z-big :db/valueType :db.type/string :db/cardinality :db.cardinality/one}]))
+            _ (d/transact conn (vec (for [i (range 20)]
+                                      {:db/id (- -1 i)
+                                       :a-big (big i)
+                                       :small i
+                                       :tag (str "t" i)
+                                       :z-big (big (+ 100 i))})))
+            e (:e (first (filter #(= 7 (:v %)) (d/datoms @conn :aevt :small))))
+            _ (d/release conn)
+            conn (d/connect cfg)
+            fetches (atom 0)
+            get0 konserve.core/get]
+        (try
+          (with-redefs [konserve.core/get (fn [& args]
+                                            (let [r (apply get0 args)]
+                                              (when (and (string? r) (>= (count r) 4000))
+                                                (swap! fetches inc))
+                                              r))]
+            (testing "multi-attr scalar pull fetches zero out-of-line blobs"
+              (is (= {:small 7 :tag "t7"} (d/pull @conn [:small :tag] e)))
+              (is (= 0 @fetches)))
+            (testing "single-attr scalar pull fetches zero out-of-line blobs even when :a-big sorts first"
+              (is (= {:small 7} (d/pull @conn [:small] e)))
+              (is (= 0 @fetches)))
+            (testing ":db/id with unrequested/absent attrs preserves entity presence with zero fetches"
+              (is (= {:db/id e} (d/pull @conn [:db/id :missing/attr] e)))
+              (is (= {:db/id e} (d/pull @conn [:db/id] e)))
+              (is (= 0 @fetches)))
+            (testing "explicitly requesting one out-of-line attr fetches ONLY that one"
+              (is (= {:small 7 :z-big (big 107)} (d/pull @conn [:small :z-big] e)))
+              (is (= 1 @fetches)))
+            (testing "wildcard pull returns all resolved values transparently"
+              (let [full (d/pull @conn '[*] e)]
+                (is (= 7 (:small full)))
+                (is (= "t7" (:tag full)))
+                (is (= (big 7) (:a-big full)))
+                (is (= (big 107) (:z-big full)))
+                (is (= 2 @fetches))))
+            (testing "FilteredDB predicate sees resolved datom values, never a LazyValue"
+              (let [e2 (:e (first (filter #(= 8 (:v %)) (d/datoms @conn :aevt :small))))
+                    seen-lazy? (atom false)
+                    fdb (d/filter @conn (fn [_ d]
+                                          (when (dd/lazy-value? (.-v d))
+                                            (reset! seen-lazy? true))
+                                          true))]
+                (is (= {:small 8 :tag "t8"} (d/pull fdb [:small :tag] e2)))
+                (is (false? @seen-lazy?)))))
+          (finally
+            (d/release conn)
+            (d/delete-database cfg)))))))

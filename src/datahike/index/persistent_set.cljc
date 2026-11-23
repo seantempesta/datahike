@@ -849,7 +849,10 @@
   ;; not found"; never through this storage itself, which in a forked child is the parent's (LMDB forbids it across fork)
   #?@(:jolt [IReadKey
              (readKey [_ k]
-               (if (and (dd/datom? k) (dd/lazy-value? (.-v ^Datom k)))
+               (if (and (dd/datom? k)
+                        (dd/lazy-value? (.-v ^Datom k))
+                        (or (nil? di/*read-key-attrs*)
+                            (contains? di/*read-key-attrs* (.-a ^Datom k))))
                  (dd/datom (.-e ^Datom k) (.-a ^Datom k) (connected-value (:store config) (dd/lazy-key (.-v ^Datom k)))
                            (dd/datom-tx k) (dd/datom-added k))
                  k))])

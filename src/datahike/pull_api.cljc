@@ -4,6 +4,7 @@
    [datahike.db.interface :as dbi]
    [datahike.index.interface :as di]
    [datahike.constants :refer [e0 tx0]]
+   [datahike.lru :as lru]
    [datahike.resource :as resource]
    [datalog.parser.pull :as dpp #?@(:cljs [:refer [PullSpec]])])
   #?(:clj
@@ -148,9 +149,32 @@
   [plan]
   (:spec plan))
 
+(def ^:private ^:const pull-plan-cache-size 256)
+
+(def ^:private pull-plan-cache
+  (atom (lru/lru pull-plan-cache-size)))
+
+(defn clear-pull-plan-cache!
+  "Clears the bounded pull selector plan LRU cache."
+  []
+  (reset! pull-plan-cache (lru/lru pull-plan-cache-size))
+  nil)
+
+(defn- cached-pull-plan
+  "Returns an immutable `PullPlan` for `selector-or-plan`, reusing a lock-free
+  bounded LRU cache on repeated EDN selectors (zero `swap!` on cache hit)."
+  [selector-or-plan]
+  (if (pull-plan? selector-or-plan)
+    selector-or-plan
+    (if-some [hit (get @pull-plan-cache selector-or-plan)]
+      hit
+      (let [plan (compile-pull-plan selector-or-plan)]
+        (swap! pull-plan-cache assoc selector-or-plan plan)
+        plan))))
+
 (defn- options-pull-plan
   [{:keys [selector] plan :datahike.pull/plan}]
-  (compile-pull-plan (or plan selector)))
+  (cached-pull-plan (or plan selector)))
 
 (defn pull-spec-attribute-dependencies
   "Returns canonical stored attributes from a parsed PullSpec.
@@ -216,9 +240,10 @@
   ([selector entity-refs]
    (pull-dependency-plan nil selector entity-refs))
   ([db selector-or-plan entity-refs]
-   (let [plan (if db
-                (compile-pull-plan db selector-or-plan)
-                (compile-pull-plan selector-or-plan))
+   (let [base-plan (cached-pull-plan selector-or-plan)
+         plan (if db
+                (compile-pull-plan db base-plan)
+                base-plan)
          retained-attributes (:attribute-dependencies plan)
          selector-attributes
          (or retained-attributes
@@ -233,21 +258,34 @@
         :datahike.query.source/argument-position 0
         :datahike.query.source/attributes attributes}]})))
 
+(defn- forward-attrs-of
+  "Set of forward non-:db/id attribute keys in `pattern`, or nil when `pattern` has <= 1 attr."
+  [pattern]
+  (when (next (:attrs pattern))
+    (persistent!
+     (reduce-kv (fn [acc k v]
+                  (if (and (= k (:attr v)) (not= :db/id k))
+                    (conj! acc k)
+                    acc))
+                (transient #{})
+                (:attrs pattern)))))
+
 (defn- initial-frame
   "Creates an empty pattern frame according to pattern information."
   ([pattern eids multi?]
    (initial-frame pattern eids multi? false))
   ([pattern eids multi? pull-many?]
-   {:state      :pattern
-    :pattern    pattern
-    :wildcard?  (:wildcard? pattern)
-    :specs      (-> pattern :attrs seq)
-    :results    (transient [])
-    :kvps       (transient {})
-    :eids       eids
-    :multi?     multi?
-    :pull-many? pull-many?
-    :recursion  {:depth {} :seen #{}}}))
+   {:state         :pattern
+    :pattern       pattern
+    :forward-attrs (forward-attrs-of pattern)
+    :wildcard?     (:wildcard? pattern)
+    :specs         (-> pattern :attrs seq)
+    :results       (transient [])
+    :kvps          (transient {})
+    :eids          eids
+    :multi?        multi?
+    :pull-many?    pull-many?
+    :recursion     {:depth {} :seen #{}}}))
 
 (defn subpattern-frame
   "Returns frame specific for given attribute"
@@ -439,26 +477,47 @@
           (let [from (dbu/components->pattern db :eavt [eid a] e0 tx0)]
             (di/record-read! from (dbu/pattern-upper :eavt [eid a] from))))))))
 
+(defn- unfiltered-db?
+  [db]
+  (nil? (dbi/context-xform (dbi/-search-context db))))
+
 (defn entity-datoms
   "Entity `eid`'s datoms by attribute (as its datoms name it), each in :eavt order: its
    :eavt range read once, so a pattern of n attributes reads the entity once, not n times.
    Each datom read is charged to the budget's work. While reads are recorded, the read
-   records each of `attrs` (record-attrs!), not the entity's whole range."
+   records each of `attrs` (record-attrs!), not the entity's whole range.
+   On Jolt, binds `di/*read-key-attrs*` (when `db` is unfiltered) so out-of-line LazyValues
+   for attributes not in `attrs` are never fetched from storage."
   [db eid attrs]
-  ;; off the recorder (every read but a recorded one), the range as before: no binding, no copy
-  (let [datoms (if di/*reads*
-                 (let [ds (binding [di/*reads* nil] (vec (dbi/datoms db :eavt [eid])))]
-                   (record-attrs! db eid attrs)
-                   ds)
-                 (dbi/datoms db :eavt [eid]))]
-    (persistent!
-     (reduce (fn [grouped ^Datom datom]
-               ;; each datom read is work, as '*'s are, whether the pattern keeps it or not
-               (resource/charge-work!)
-               (let [a (.-a datom)]
-                 (assoc! grouped a (conj (get grouped a []) datom))))
-             (transient {})
-             datoms))))
+  (let [attr-refs? (:attribute-refs? (dbi/-config db))
+        keep-attrs (if (and (set? attrs) (not attr-refs?))
+                     attrs
+                     (into #{}
+                           (keep (fn [attr]
+                                   (if (and attr-refs? (not (number? attr)))
+                                     (dbi/-ref-for db attr)
+                                     attr)))
+                           attrs))
+        filter-attrs (when (unfiltered-db? db) keep-attrs)]
+    (binding [di/*read-key-attrs* filter-attrs]
+      ;; off the recorder (every read but a recorded one), the range as before: no binding, no copy
+      (let [datoms (if di/*reads*
+                     (let [ds (binding [di/*reads* nil] (vec (dbi/datoms db :eavt [eid])))]
+                       (record-attrs! db eid attrs)
+                       ds)
+                     (dbi/datoms db :eavt [eid]))]
+        (persistent!
+         (reduce (fn [grouped ^Datom datom]
+                   ;; each datom read is work, as '*'s are, whether the pattern keeps it or not
+                   (resource/charge-work!)
+                   (let [a (.-a datom)]
+                     (if (contains? keep-attrs a)
+                       (assoc! grouped a (conj (get grouped a []) datom))
+                       ;; Preserve non-empty marker so :db/id sees entity presence without
+                       ;; retaining unread LazyValue datoms for unrequested attributes.
+                       (assoc! grouped ::present? true))))
+                 (transient {})
+                 datoms))))))
 
 (defn pull-attr
   "Retrieve datoms for given entity id and specification from database. `grouped`,
@@ -468,7 +527,10 @@
   ([db spec eid frames grouped]
   (let [[attr-key opts] spec]
     (if (= :db/id attr-key)
-      (if (if grouped (seq grouped) (not-empty (dbi/datoms db :eavt [eid])))
+      (if (if grouped
+            (seq grouped)
+            (binding [di/*read-key-attrs* (when (unfiltered-db? db) #{})]
+              (not-empty (dbi/datoms db :eavt [eid]))))
         (do
           (resource/charge-result-node!)
           (conj (rest frames)
@@ -584,9 +646,9 @@
                 ;; its first attribute, and each attribute keeps its own: one seek an attribute
                 ;; cost five times a whole pattern's '* (35 attributes)
                 grouped    (or (:grouped frame)
-                               (when (next (:attrs (:pattern frame)))
-                                 (entity-datoms db eid (keep (fn [[k v]] (when (and (= k (:attr v)) (not= :db/id k)) k))
-                                                             (:attrs (:pattern frame))))))
+                               (when-let [fattrs (or (:forward-attrs frame)
+                                                     (forward-attrs-of (:pattern frame)))]
+                                 (entity-datoms db eid fattrs)))
                 new-frames (conj frames (assoc frame :specs (rest specs) :grouped grouped))]
             (pull-attr db spec eid new-frames grouped))
           (->> frame :kvps persistent! not-empty
@@ -622,11 +684,12 @@
               ;; the existence probe records nothing wider than what the pull reads: the entity's range only
               ;; when it is missing, so its first datom reaches the read (an existing one's attributes are
               ;; recorded by what the pattern reads of it)
-              (if di/*reads*
-                (let [found (binding [di/*reads* nil] (first (dbi/datoms db :eavt [eid])))]
-                  (when-not found (dbi/datoms db :eavt [eid]))
-                  found)
-                (first (dbi/datoms db :eavt [eid]))))
+              (binding [di/*read-key-attrs* (when (unfiltered-db? db) #{})]
+                (if di/*reads*
+                  (let [found (binding [di/*reads* nil] (first (dbi/datoms db :eavt [eid])))]
+                    (when-not found (dbi/datoms db :eavt [eid]))
+                    found)
+                  (first (dbi/datoms db :eavt [eid])))))
       eid)))
 
 (defn pull-spec
@@ -650,7 +713,7 @@
   ([db selector-or-plan eid]
    {:pre [(dbu/db? db)]}
    (pull-spec db
-              (pull-plan-spec (compile-pull-plan selector-or-plan))
+              (pull-plan-spec (cached-pull-plan selector-or-plan))
               [eid] false)))
 
 (defn pull-many
@@ -667,7 +730,7 @@
   ([db selector-or-plan eids]
    {:pre [(dbu/db? db)]}
    (pull-spec db
-              (pull-plan-spec (compile-pull-plan selector-or-plan))
+              (pull-plan-spec (cached-pull-plan selector-or-plan))
               eids true)))
 
 (defn pull-plan-with-evidence
@@ -679,7 +742,7 @@
       :datahike.read/dependency-plan (pull-dependency-plan db plan [eid])
       :datahike.pull/plan plan}))
   ([db selector-or-plan eid]
-   (let [plan (compile-pull-plan selector-or-plan)]
+   (let [plan (cached-pull-plan selector-or-plan)]
      {:datahike.pull/result (pull db plan eid)
       :datahike.read/dependency-plan (pull-dependency-plan db plan [eid])
       :datahike.pull/plan plan})))
@@ -700,7 +763,7 @@
       :datahike.read/dependency-plan (pull-dependency-plan db plan eids)
       :datahike.pull/plan plan}))
   ([db selector-or-plan eids]
-   (let [plan (compile-pull-plan selector-or-plan)]
+   (let [plan (cached-pull-plan selector-or-plan)]
      {:datahike.pull-many/result (pull-many db plan eids)
       :datahike.read/dependency-plan (pull-dependency-plan db plan eids)
       :datahike.pull/plan plan})))

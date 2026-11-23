@@ -11,6 +11,15 @@
   read reaches an index through this protocol, so the ranges are exactly what was read."
   nil)
 
+(def ^:dynamic *read-key-attrs*
+  "When non-nil, a set of stored attribute identifiers (keywords, or numeric refs when
+  `:attribute-refs?` is true) whose out-of-line LazyValue datoms `IReadKey/readKey`
+  should resolve; datoms for other attributes are returned with their LazyValue unread.
+  Bound strictly around internal index scans (such as `datahike.pull-api/entity-datoms`
+  and existence probes) that discard unrequested attributes and never expose unread
+  LazyValues to callers."
+  nil)
+
 (defn record-read!
   "Record the range [from to] when reads are being recorded (*reads*)."
   [from to]

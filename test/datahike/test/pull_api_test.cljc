@@ -237,6 +237,7 @@
 
 (deftest pull-many-parses-once-and-shares-one-budget
   (doseq [n [1 32 1000]]
+    (p/clear-pull-plan-cache!)
     (let [parse dpp/parse-pull
           calls (atom 0)]
       (with-redefs [dpp/parse-pull (fn [selector]
@@ -772,3 +773,25 @@
     (is (= {:k/a0 "x" :k/a1 "y"} (pull 2)) "an entity of two datoms fits the budget")
     (is (budget-exceeded? (try (pull 1) nil (catch #?(:clj Exception :cljs :default) error error)) :query-work)
         "an entity of 35 datoms is past it")))
+
+#?(:clj
+   (deftest pull-caches-compiled-selector-across-repeated-calls
+     (p/clear-pull-plan-cache!)
+     (let [selector '[:name :aka {:child [:name :db/id]}]
+           parse-pull dpp/parse-pull
+           parse-count (atom 0)]
+       (with-redefs [dpp/parse-pull
+                     (fn [edn-selector]
+                       (swap! parse-count inc)
+                       (parse-pull edn-selector))]
+         (let [results (mapv (fn [_] (d/pull ordered-test-db selector [:person/id "petr"]))
+                             (range 10))]
+           (is (= 10 (count results)))
+           (is (every? #(= {:name "Petr"
+                            :aka ["Devil" "Tupen"]
+                            :child [{:db/id 2 :name "David"}
+                                    {:db/id 3 :name "Thomas"}]}
+                           %)
+                       results))
+           (is (= 2 @parse-count)
+               "repeated d/pull calls with the same selector parse once (2 levels) and hit the LRU cache"))))))
