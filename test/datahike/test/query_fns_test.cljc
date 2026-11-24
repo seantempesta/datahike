@@ -3,7 +3,8 @@
    #?(:cljs [cljs.test    :as t :refer-macros [is are deftest testing]]
       :clj  [clojure.test :as t :refer        [is are deftest testing]])
    [datahike.api :as d]
-   [datahike.db :as db])
+   [datahike.db :as db]
+   [datahike.query :as dq])
   (:import [java.util UUID Date])
   #?(:clj
      (:import [clojure.lang ExceptionInfo])))
@@ -608,3 +609,12 @@
                             ['(>= ?a1 ?a2 ?a3)]])
                      db)))))))
 
+
+(deftest join-tuples-reads-array-and-vector-tuples
+  (let [idxs (to-array [1 0])]
+    (is (= [:b :a :y :x]
+           (vec (dq/join-tuples (to-array [:a :b]) idxs (to-array [:x :y]) idxs))))
+    (is (= [:b :a :y :x]
+           (vec (dq/join-tuples [:a :b] idxs [:x :y] idxs))))
+    (is (= [:b :a :y :x]
+           (vec (dq/join-tuples (to-array [:a :b]) idxs [:x :y] idxs))))))
