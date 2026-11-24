@@ -12,7 +12,7 @@
    [datahike.db :as db]
    [datahike.db.utils :as dbu]
    [datahike.index.interface :as di]
-   [datahike.array :refer [wrap-comparable]]
+   [datahike.array :refer [wrap-comparable a=]]
    [datahike.impl.entity :as de]
    [datahike.lru :as lru]
    [datahike.query.estimate :as estimate]
@@ -430,6 +430,72 @@
                   acc (:tuples rel2)))
         (transient []) (:tuples rel1)))))))
 
+(defn- unify-rel-plan
+  "The attr-map-derived half of `unify-rel`: nil when the two relations share no
+   variable (so `prod-rel` applies), otherwise the output attr map, the two
+   column-index arrays and the equality obligations."
+  [attrs1 attrs2]
+  (let [shared (filterv #(contains? attrs1 %) (keys attrs2))]
+    (when (seq shared)
+      (let [keys1 (vec (keys attrs1))
+            only2 (filterv #(not (contains? attrs1 %)) (keys attrs2))]
+        {:attrs (zipmap (concat keys1 only2) (range))
+         :idxs1 (to-array (map attrs1 keys1))
+         :idxs2 (to-array (map attrs2 only2))
+         :obligations (mapv (fn [v] [(attrs1 v) (attrs2 v)]) shared)}))))
+
+(defn- unify-rel-with-plan
+  "The tuple loop of `unify-rel`, given the plan from `unify-rel-plan`."
+  [plan rel1 rel2]
+  (let [idxs1 (:idxs1 plan)
+        idxs2 (:idxs2 plan)
+        obligations (:obligations plan)
+        tuples2 (:tuples rel2)]
+    (rel/->Relation
+     (:attrs plan)
+     (persistent!
+      (reduce
+       (fn [acc t1]
+         (reduce (fn [acc t2]
+                   (resource/charge-work!)
+                   (if (every? (fn [[i1 i2]] (a= (tget t1 i1) (tget t2 i2)))
+                               obligations)
+                     (conj! acc (join-tuples t1 idxs1 t2 idxs2))
+                     acc))
+                 acc tuples2))
+       (transient []) (:tuples rel1))))))
+
+(defn- prod-rel-plan
+  "The attr-map-derived half of `prod-rel`, in the shape of the non-nil result
+   of `unify-rel-plan` (without obligations)."
+  [attrs1 attrs2]
+  (let [k1 (keys attrs1)
+        k2 (keys attrs2)]
+    {:attrs (zipmap (concat k1 k2) (range))
+     :idxs1 (to-array (map attrs1 k1))
+     :idxs2 (to-array (map attrs2 k2))
+     :obligations nil}))
+
+(defn- join-tuples-into!
+  "Join the one tuple T1 with every tuple of TUPLES2 under PLAN (from
+   `unify-rel-plan` or `prod-rel-plan`), conj!-ing the survivors onto ACC."
+  [acc plan t1 tuples2]
+  (let [idxs1 (:idxs1 plan)
+        idxs2 (:idxs2 plan)
+        obligations (:obligations plan)]
+    (reduce (fn [acc t2]
+              (if (every? (fn [[i1 i2]] (a= (tget t1 i1) (tget t2 i2))) obligations)
+                (conj! acc (join-tuples t1 idxs1 t2 idxs2))
+                acc))
+            acc tuples2)))
+
+(defn unify-rel
+  "Like `prod-rel`, except that a variable present in BOTH relations is an
+   equality obligation rather than a second column."
+  [rel1 rel2]
+  (if-let [plan (unify-rel-plan (:attrs rel1) (:attrs rel2))]
+    (unify-rel-with-plan plan rel1 rel2)
+    (prod-rel rel1 rel2)))
 ;; built-ins
 
 (defn- translate-for [db a]
@@ -817,6 +883,49 @@
 (defprotocol IBinding
   (in->rel [binding value]))
 
+(defn- scalar-binding-syms
+  "The variable symbols of BINDINGS when every one is a plain scalar binding
+   with a distinct name, else nil. Such a tuple binding is one flat row."
+  [bindings]
+  (let [syms (mapv #(when (instance? BindScalar %) (get-in % [:variable :symbol])) bindings)]
+    (when (and (every? some? syms) (= (count syms) (count (set syms))))
+      syms)))
+
+(defn- fast-coll-rel
+  "Relation for a collection binding whose element is a scalar or a flat tuple
+   of scalars, built in one pass: the generic path allocates one relation per
+   element (and one per tuple column) and folds them with sum-rel / prod-rel.
+   Returns nil when the shape or an element is not the simple case, so the
+   caller falls back to the generic path (and its error messages)."
+  [inner coll]
+  (cond
+    (instance? BindScalar inner)
+    (when-let [sym (get-in inner [:variable :symbol])]
+      (rel/->Relation {sym 0}
+                      (persistent!
+                       (reduce (fn [acc v]
+                                 (let [^objects t (da/make-array 1)]
+                                   (aset t 0 v)
+                                   (conj! acc t)))
+                               (transient []) coll))))
+
+    (instance? BindTuple inner)
+    (when-let [syms (scalar-binding-syms (:bindings inner))]
+      (let [k (count syms)
+            ok? (fn [x] (and (seqable? x) (>= (count x) k)))
+            tuples (reduce (fn [acc x]
+                             (if (ok? x)
+                               (let [^objects t (da/make-array k)]
+                                 (loop [i 0 s (seq x)]
+                                   (when (< i k)
+                                     (aset t i (first s))
+                                     (recur (inc i) (next s))))
+                                 (conj! acc t))
+                               (reduced nil)))
+                           (transient []) coll)]
+        (when tuples
+          (rel/->Relation (zipmap syms (range)) (persistent! tuples)))))))
+
 (extend-protocol IBinding
   BindIgnore
   (in->rel [_ _]
@@ -824,7 +933,9 @@
 
   BindScalar
   (in->rel [binding value]
-    (rel/->Relation {(get-in binding [:variable :symbol]) 0} [(into-array [value])]))
+    (let [^objects t (da/make-array 1)]
+      (aset t 0 value)
+      (rel/->Relation {(get-in binding [:variable :symbol]) 0} [t])))
 
   BindColl
   (in->rel [binding coll]
@@ -835,9 +946,10 @@
       (empty? coll)
       (empty-rel binding)
       :else
-      (->> coll
-           (map #(in->rel (:binding binding) %))
-           (reduce sum-rel))))
+      (or (fast-coll-rel (:binding binding) coll)
+          (->> coll
+               (map #(in->rel (:binding binding) %))
+               (reduce sum-rel)))))
 
   BindTuple
   (in->rel [binding coll]
@@ -1230,12 +1342,35 @@
                                                          (count (:tuples production))))))
             new-rel (if fun
                       (let [tuple-fn (-call-fn context production fun args)
-                            rels (for [tuple (:tuples production)
-                                       :let [_ (resource/charge-work!)]
-                                       :let [val (tuple-fn tuple)]
-                                       :when (not (nil? val))]
-                                   (prod-rel (rel/->Relation (:attrs production) [tuple])
-                                             (in->rel binding val)))]
+                            attrs1 (:attrs production)
+                            rels (loop [ts (seq (:tuples production))
+                                        plan-attrs2 nil
+                                        plan nil
+                                        acc nil
+                                        rels []]
+                                   (if-not ts
+                                     (if acc
+                                       (conj rels (rel/->Relation (:attrs plan) (persistent! acc)))
+                                       rels)
+                                     (let [_ (resource/charge-work!)
+                                           tuple (first ts)
+                                           val (tuple-fn tuple)]
+                                       (if (nil? val)
+                                         (recur (next ts) plan-attrs2 plan acc rels)
+                                         (let [r2 (in->rel binding val)
+                                               attrs2 (:attrs r2)
+                                               same? (= attrs2 plan-attrs2)
+                                               pl (if same?
+                                                    plan
+                                                    (or (unify-rel-plan attrs1 attrs2)
+                                                        (prod-rel-plan attrs1 attrs2)))
+                                               rels (if (and acc (not same?))
+                                                      (conj rels (rel/->Relation (:attrs plan) (persistent! acc)))
+                                                      rels)
+                                               acc (if (and acc same?) acc (transient []))]
+                                           (recur (next ts) attrs2 pl
+                                                  (join-tuples-into! acc pl tuple (:tuples r2))
+                                                  rels))))))]
                         (if (empty? rels)
                           (prod-rel production (empty-rel binding))
                           (reduce sum-rel rels)))
