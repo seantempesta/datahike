@@ -593,9 +593,12 @@
          ;; upstream (e.g. a reference-driven join whose attribute comes from the
          ;; data): AVET point-seek per (attr, value) pair instead of full-scanning
          ;; EAVT and filtering. O(pairs * log n) vs O(all datoms).
-         (mapcat (fn [[pa pv]]
-                   (di/-slice (:avet db) (datom e0 pa pv tx0) (datom emax pa pv txmax) :avet))
-                 avet-pairs)
+         (let [seeks (mapcat (fn [[pa pv]]
+                               (di/-slice (:avet db) (datom e0 pa pv tx0) (datom emax pa pv txmax) :avet))
+                             avet-pairs)]
+           (if-let [bounds (slice-bounds-filter clause index pushdown-preds)]
+             (filter bounds seeks)
+             seeks))
          (if-let [probe (pattern-probe-set db clause resolved-a rels scan-n)]
            (let [k     (.size ^java.util.HashSet (:values probe))
                  field (int (:field probe))
