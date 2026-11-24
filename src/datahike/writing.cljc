@@ -1326,7 +1326,10 @@
          (complete-db-update
           old
           {:db-before old
-           :db-after  (update counted :meta counts-complete-meta)
+           :db-after  (vary-meta (update counted :meta counts-complete-meta)
+                                 assoc
+                                 :datahike/uncommitted []
+                                 :datahike/uncommitted-base (get-in old [:meta :datahike/commit-id]))
            :tx-data   []
            :tempids   {}
            :tx-meta   {:db/txInstant (dt/get-date)}})))))
