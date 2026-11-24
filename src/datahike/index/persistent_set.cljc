@@ -658,15 +658,34 @@
          (coll? v) (reduce (fn [n x] (let [n (+ n 1 (value-bytes x (- limit n)))] (if (>= n limit) (reduced n) n))) 0 v)
          :else 8))
 
+     (defn- slot-refs
+       "Collect ValueRef keys nested inside a diff-buf slot's diff."
+       [x out]
+       (cond
+         (dd/datom? x) (if (instance? ValueRef (.-v ^Datom x)) (conj out (.-key ^ValueRef (.-v ^Datom x))) out)
+         (map? x) (reduce-kv (fn [acc _ v] (slot-refs v acc)) out x)
+         (sequential? x) (reduce (fn [acc v] (slot-refs v acc)) out x)
+         :else out))
+
      (defn- refs
-       "The ValueRef keys a stored node's keys hold."
+       "The ValueRef keys a stored node's keys (and any diff-buf slots) hold."
        [node]
-       (let [ks (.-_keys node)]
-         (loop [i 0 out []]
-           (if (< i (.-_len node))
-             (let [d (aget ks i)]
-               (recur (inc i) (if (and (dd/datom? d) (instance? ValueRef (.-v d))) (conj out (.-key ^ValueRef (.-v d))) out)))
-             out))))
+       (let [ks (.-_keys node)
+             out (loop [i 0 out []]
+                   (if (< i (.-_len node))
+                     (let [d (aget ks i)]
+                       (recur (inc i) (if (and (dd/datom? d) (instance? ValueRef (.-v d))) (conj out (.-key ^ValueRef (.-v d))) out)))
+                     out))]
+         (if (instance? Branch node)
+           (if-let [^objects ss (.slots ^Branch node)]
+             (loop [i 0 out out]
+               (if (< i (alength ss))
+                 (if-let [^Slot sl (aget ss i)]
+                   (recur (inc i) (slot-refs (.-diff sl) out))
+                   (recur (inc i) out))
+                 out))
+             out)
+           out)))
 
      (defn- value-key
        "The content key of datom d's value, and the value queued on pending-writes unless
@@ -710,42 +729,79 @@
                               q
                               (vary-meta q assoc ::generation (generation store))))))))))
 
+     (defn- out-of-line-datom
+       [store-id store cache pending-writes gen limit scalar-large? d]
+       (if-not (dd/datom? d)
+         d
+         (let [v (.-v ^Datom d)]
+           (if (dd/lazy-value? v)
+             ;; a value this leaf was read with and nobody read since: its key named again, unread; a key the
+             ;; store no longer holds (a sweep took it) is written again from the value, read now
+             (let [vk (dd/lazy-key v)
+                   vk (if (guard/reused! store-id vk #(k/exists? store vk {:sync? true}) false)
+                        vk
+                        (let [x (dd/value-of v)] (swap! pending-writes conj [vk x]) vk))]
+               (dd/datom (.-e ^Datom d) (.-a ^Datom d) (ValueRef. vk) (dd/datom-tx d) (dd/datom-added d)))
+             (if (cond (nil? v) false
+                       (string? v) (>= (count v) limit)
+                       (bytes? v) (>= (alength ^bytes v) limit)
+                       (coll? v) (>= (value-bytes v limit) limit)
+                       :else scalar-large?)
+               (let [vk (value-key store-id store cache pending-writes gen d)]
+                 (dd/datom (.-e ^Datom d) (.-a ^Datom d) (ValueRef. vk) (dd/datom-tx d) (dd/datom-added d)))
+               d)))))
+
+     (defn- transform-slot-data
+       "Walk storage-form diff-buf slot structures applying datom-fn to each Datom; returns the
+       identical structure when no datom changed."
+       [datom-fn x]
+       (cond
+         (dd/datom? x) (datom-fn x)
+         (vector? x) (let [n (count x)]
+                       (loop [i 0 out nil]
+                         (if (< i n)
+                           (let [el (nth x i) el' (transform-slot-data datom-fn el)]
+                             (if (identical? el el')
+                               (recur (inc i) out)
+                               (recur (inc i) (assoc (or out x) i el'))))
+                           (or out x))))
+         (map? x) (reduce-kv (fn [m k v]
+                               (let [v' (transform-slot-data datom-fn v)]
+                                 (if (identical? v v') m (assoc m k v'))))
+                             x x)
+         :else x))
+
      (defn- out-of-line
-       "node as it is stored: each key whose value is at least `limit` bytes holding a
-       ValueRef to the value's content key (value-key). node itself when none is that large."
+       "node as it is stored: each key (and buffered diff-buf slot datom) whose value is at least
+       `limit` bytes holding a ValueRef to the value's content key (value-key). node itself when
+       none is that large."
        [store-id store cache pending-writes limit node]
        ;; value-bytes' answer, without a call, for what it answers at once: most values
        ;; are numbers, keywords and short strings, and a written node is ~64 datoms
        (let [ks (.-_keys node) n (.-_len node) gen (generation store pending-writes)
              scalar-large? (>= 8 limit)
+             datom-fn #(out-of-line-datom store-id store cache pending-writes gen limit scalar-large? %)
              out (loop [i 0 out nil]
                    (if (< i n)
                      (let [d (aget ks i)
-                           v (when (dd/datom? d) (.-v d))]
-                       (if (dd/lazy-value? v)
-                         ;; a value this leaf was read with and nobody read since: its key named again, unread; a key the
-                         ;; store no longer holds (a sweep took it) is written again from the value, read now
-                         (let [vk (dd/lazy-key v)
-                               vk (if (guard/reused! store-id vk #(k/exists? store vk {:sync? true}) false)
-                                    vk
-                                    (let [x (dd/value-of v)] (swap! pending-writes conj [vk x]) vk))
-                               out (or out (aclone ^objects ks))]
-                           (aset ^objects out i (dd/datom (.-e d) (.-a d) (ValueRef. vk) (dd/datom-tx d) (dd/datom-added d)))
-                           (recur (inc i) out))
-                       (if (cond (nil? v) false
-                                 (string? v) (>= (count v) limit)
-                                 (bytes? v) (>= (alength ^bytes v) limit)
-                                 (coll? v) (>= (value-bytes v limit) limit)
-                                 :else scalar-large?)
-                         (let [vk (value-key store-id store cache pending-writes gen d)
-                               out (or out (aclone ^objects ks))]
-                           (aset ^objects out i (dd/datom (.-e d) (.-a d) (ValueRef. vk) (dd/datom-tx d) (dd/datom-added d)))
-                           (recur (inc i) out))
-                         (recur (inc i) out))))
-                     out))]
+                           d' (datom-fn d)]
+                       (if (identical? d d')
+                         (recur (inc i) out)
+                         (let [out (or out (aclone ^objects ks))]
+                           (aset ^objects out i d')
+                           (recur (inc i) out))))
+                     out))
+             branch? (instance? Branch node)
+             orig-slots (when branch? (.slotsForStorage ^Branch node))
+             out-slots (when orig-slots (transform-slot-data datom-fn orig-slots))]
          (cond
-           (nil? out) node
-           (instance? Branch node) (psset/restore-node (.-_level node) (vec (take n out)) (.addresses node) (.-_subtreeCount node) (.-_settings node))
+           (and (nil? out) (identical? orig-slots out-slots)) node
+           branch? (psset/restore-node (.-_level ^Branch node)
+                                       (vec (take n (or out ks)))
+                                       (.addresses ^Branch node)
+                                       (.-_subtreeCount ^Branch node)
+                                       (.-_settings ^Branch node)
+                                       out-slots)
            :else (psset/restore-node 0 (vec (take n out)) nil (.-_settings node)))))
 
      (defn- fetch-value
@@ -757,18 +813,31 @@
          v))
 
      (defn- in-line
-       "A stored node with each ValueRef in its keys swapped, in place (the node was just read and
-       nothing else holds it), for a LazyValue of its key: read only when a reader takes the datom
-       (CachedStorage's readKey) or a comparison reaches its v, so decoding a leaf never reads its
-       neighbours' large values (task datahike.index.persistent-set/a-leaf-decodes-only-the-values-read)."
+       "A stored node with each ValueRef in its keys (and any diff-buf slots) swapped, in place
+       (the node was just read and nothing else holds it), for a LazyValue of its key: read only
+       when a reader takes the datom (CachedStorage's readKey) or a comparison reaches its v, so
+       decoding a leaf never reads its neighbours' large values (task datahike.index.persistent-set/a-leaf-decodes-only-the-values-read)."
        [store config node]
-       (let [ks (.-_keys node)]
+       (let [store-id (get-in config [:store :id])
+             ks (.-_keys node)
+             in-line-datom (fn [d]
+                             (if (and (dd/datom? d) (instance? ValueRef (.-v ^Datom d)))
+                               (dd/datom (.-e ^Datom d) (.-a ^Datom d)
+                                         (dd/lazy-value (.-key ^ValueRef (.-v ^Datom d)) store-id)
+                                         (dd/datom-tx d) (dd/datom-added d))
+                               d))]
          (dotimes [i (.-_len node)]
-           (let [d (aget ks i)]
-             (when (and (dd/datom? d) (instance? ValueRef (.-v d)))
-               (let [vk (.-key ^ValueRef (.-v d))]
-                 (aset ^objects ks i (dd/datom (.-e d) (.-a d) (dd/lazy-value vk (get-in config [:store :id]))
-                                               (dd/datom-tx d) (dd/datom-added d)))))))
+           (let [d (aget ks i) d' (in-line-datom d)]
+             (when-not (identical? d d')
+               (aset ^objects ks i d'))))
+         (when (instance? Branch node)
+           (when-let [^objects ss (.slots ^Branch node)]
+             (dotimes [i (alength ss)]
+               (when-let [^Slot sl (aget ss i)]
+                 (let [diff (.-diff sl)
+                       diff' (transform-slot-data in-line-datom diff)]
+                   (when-not (identical? diff diff')
+                     (aset ss i (Slot. diff' (.-count sl) (.-measure sl) (.-anchor sl) (.-bufEntries sl)))))))))
          node))))
 
 #?(:jolt
@@ -917,7 +986,8 @@
                                                       :storage (:storage store)
                                                       :ref-type (:datahike/ref-type store)
                                                       :branching-factor (:datahike/branching-factor store DEFAULT_BRANCHING_FACTOR)
-                                                      :diff-buf-size (:datahike/diff-buf-size store 0)})]
+                                                      :diff-buf-size (:datahike/diff-buf-size store 0)
+                                                      :edge-append? (:datahike/edge-append? store false)})]
     (with-meta pset (root-meta store index-type))))
 
 (defmethod di/init-index :datahike.index/persistent-set [_index-name store datoms index-type _ {:keys [indexed]}]
@@ -940,7 +1010,8 @@
                                                            (arrays/alength arr)
                                                            #?(:clj  {:ref-type (:datahike/ref-type store)
                                                                      :branching-factor (:datahike/branching-factor store DEFAULT_BRANCHING_FACTOR)
-                                                                     :diff-buf-size (:datahike/diff-buf-size store 0)}
+                                                                     :diff-buf-size (:datahike/diff-buf-size store 0)
+                                                                     :edge-append? (:datahike/edge-append? store false)}
                                                               :cljs {:branching-factor (:datahike/branching-factor store DEFAULT_BRANCHING_FACTOR)
                                                                      :diff-buf-size (:datahike/diff-buf-size store 0)
                                                                      :storage (:storage store)}))]
@@ -992,10 +1063,12 @@
   #?(:jolt
      (let [store-id (or (get-in config [:store :id]) (:id config))
            bf       (get-in config [:index-config :branching-factor] DEFAULT_BRANCHING_FACTOR)
+           dbs      (get-in config [:index-config :diff-buf-size] 0)
+           edge?    (boolean (get-in config [:index-config :edge-append?] false))
            ;; :weak when nodes are cached by their bytes: a branch then keeps no child it
            ;; restored, so the cache is the one holder and its weight is what the nodes retain
            ref-type (when (:store-cache-bytes config) :weak)
-           settings (psset/default-settings bf ref-type)
+           settings (psset/default-settings bf ref-type dbs edge?)
            ;; proto/core: a JVM-written store (Fressian nodes, E9's tags) opens with E4a's
            ;; real nodes, each tag building what the EDN readers below build. The root
            ;; handler needs the storage, which needs the store: a cell breaks the cycle.
@@ -1009,7 +1082,7 @@
                          (fressian-serializer
                            {"pss/leaf" (fn [rdr _ _] (let [m (read-obj rdr)] (psset/restore-node 0 (:keys m) nil settings)))
                             "pss/branch" (fn [rdr _ _] (let [m (read-obj rdr)]
-                                                         (psset/restore-node (:level m) (:keys m) (:addresses m) (:subtree-count m -1) settings)))
+                                                         (psset/restore-node (:level m) (:keys m) (:addresses m) (:subtree-count m -1) settings (:slots m))))
                             "pss/set" (fn [rdr _ _] (let [{:keys [address count meta]} (read-obj rdr)]
                                                       (with-meta
                                                         (PersistentSortedSet. nil (index-type->cmp-quick (:index-type meta) false)
@@ -1032,7 +1105,8 @@
                                                       address storage nil (or count -1) settings 0)
                                 meta))})))
        (assoc store :storage storage :datahike/store-id store-id
-              :datahike/branching-factor bf :datahike/diff-buf-size 0 :datahike/ref-type ref-type))
+              :datahike/branching-factor bf :datahike/diff-buf-size dbs
+              :datahike/edge-append? edge? :datahike/ref-type ref-type))
      :default (add-konserve-handlers-clj config store)))
 
 (defn- add-konserve-handlers-clj [config store]

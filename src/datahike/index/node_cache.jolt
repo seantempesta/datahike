@@ -51,11 +51,21 @@
     (let [leaf? (instance? org.replikativ.persistent_sorted_set.Leaf node)
           ^objects ks (if leaf? (.-_keys ^org.replikativ.persistent_sorted_set.Leaf node)
                           (.-_keys ^org.replikativ.persistent_sorted_set.Branch node))
-          n (long (.len node))]
-      (loop [i 0 acc (+ entry-bytes 64 (* 8 n) (if leaf? 0 (* 72 n)))]
-        (if (< i n)
-          (recur (inc i) (+ acc (long (value-bytes (aget ks i)))))
-          acc)))))
+          n (long (.len node))
+          base (loop [i 0 acc (+ entry-bytes 64 (* 8 n) (if leaf? 0 (* 72 n)))]
+                 (if (< i n)
+                   (recur (inc i) (+ acc (long (value-bytes (aget ks i)))))
+                   acc))]
+      (if leaf?
+        base
+        (if-let [^objects ss (.slots ^org.replikativ.persistent_sorted_set.Branch node)]
+          (loop [i 0 acc (+ base 32 (* 8 (alength ss)))]
+            (if (< i (alength ss))
+              (if-let [^org.replikativ.persistent_sorted_set.Slot sl (aget ss i)]
+                (recur (inc i) (+ acc 64 (long (value-bytes (.-diff sl)))))
+                (recur (inc i) acc))
+              acc))
+          base)))))
 
 (defrecord NodeCache [state max-bytes hits misses evictions])
 
