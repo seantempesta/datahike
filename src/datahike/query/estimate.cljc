@@ -85,12 +85,12 @@
   (when-not @heuristic-warned?
     (reset! heuristic-warned? true)
     (log/info :datahike/estimate-heuristic-fallback
-              "Index lacks precomputed subtree counts (old database format). Using heuristic estimates for query planning. Consider re-indexing for optimal performance."))
+              "An index root has no element count (#1108); planning from heuristics. For a persistent-set database, (datahike.index.recount/recount! conn) stores the counts."))
   (let [{:keys [e a v]} pattern-info
         e-ground? (analyze/ground? e)
         a-ground? (analyze/ground? a)
         v-ground? (analyze/ground? v)
-        total (max 1 (di/-count (:eavt db)))]
+        total (max 1 (di/estimated-count (:index (dbi/-config db)) (:eavt db)))]
     (cond
       ;; [e a ?v] — single datom for card-one, small fan-out for card-many
       (and e-ground? a-ground? (not v-ground?))
@@ -192,7 +192,14 @@
 
       ;; [?e ?a ?v] — full scan (worst case)
       :else
-      (di/-count (:eavt db)))))
+      (di/estimated-count (:index (dbi/-config db)) (:eavt db)))))
+
+(defn counted-indices?
+  "Do all of `db`'s current indices know their root counts?"
+  [db]
+  (and (di/-has-subtree-counts? (:eavt db))
+       (di/-has-subtree-counts? (:aevt db))
+       (or (nil? (:avet db)) (di/-has-subtree-counts? (:avet db)))))
 
 (defn- estimate-pattern-raw
   "Estimate the cardinality (number of matching datoms) for a pattern clause.
@@ -200,7 +207,7 @@
    subtree counts are available, otherwise falls back to O(1) heuristics.
    Returns a long estimate, or nil if estimation is not possible."
   [db pattern-info schema-info]
-  (if (di/-has-subtree-counts? (:eavt db))
+  (if (counted-indices? db)
     (estimate-pattern-counted db pattern-info schema-info)
     (estimate-pattern-heuristic db pattern-info schema-info)))
 
@@ -484,7 +491,7 @@
    for entities with many attributes but is acceptable for merge ordering."
   [db]
   (let [eavt (:eavt db)]
-    (max 1 (di/-count eavt))))
+    (max 1 (di/estimated-count (:index (dbi/-config db)) eavt))))
 
 ;; ---------------------------------------------------------------------------
 ;; The estimates the planner reads, each recorded while a plan is made (*read-stats*)

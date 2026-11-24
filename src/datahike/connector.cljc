@@ -147,6 +147,32 @@
 (s/def ::connection #(and (instance? Connection %)
                           (not= @(:wrapped-atom %) :released)))
 
+(defonce ^:private counts-warned (atom #{}))
+
+(defn- warn-incomplete-counts!
+  "Log once per database and branch when `stored-db` lacks `:datahike/index-counts :complete`."
+  [config stored-db]
+  (try
+    (let [index (:index config)
+          k [(get-in config [:store :id]) (:branch config)]]
+      (when (and (= :datahike.index/persistent-set index)
+                 (not (dii/counts-complete? stored-db))
+                 (not (contains? @counts-warned k)))
+        (let [roots (vec (for [ik [:eavt-key :aevt-key :avet-key
+                                   :temporal-eavt-key :temporal-aevt-key :temporal-avet-key]
+                               :let [ix (get stored-db ik)]
+                               :when (and ix (not (dii/root-count-known? index ix)))]
+                           ik))
+              [old _] (swap-vals! counts-warned conj k)]
+          (when-not (contains? old k)
+            (log/warn :datahike/index-counts-incomplete
+                      (str "This database was created before every index branch was stored with its element count (#1108). "
+                           "To fix it, run once per branch: (require 'datahike.index.recount) (datahike.index.recount/recount! conn)")
+                      {:store-id (get-in config [:store :id])
+                       :branch (:branch config)
+                       :roots-without-count roots})))))
+    (catch #?(:clj Exception :cljs js/Error) _ nil)))
+
 (defn version-check [{:keys [meta config] :as db}]
   (let [{dh-stored :datahike/version
          hh-stored :hitchhiker.tree/version
@@ -430,6 +456,7 @@
                          store (kp/-set-write-hooks! store write-hooks)
                          _ (vswap! resources assoc :store store)
                          _ (version-check stored-db)
+                         _ (warn-incomplete-counts! config stored-db)
                          _ (when-not (:allow-unsafe-config config)
                              (ensure-stored-config-consistency config (:config stored-db)))
                          committed-db (dsi/stored->db (assoc stored-db :config config) store)

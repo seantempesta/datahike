@@ -8,6 +8,7 @@
             [datahike.db.utils :as dbu]
             [datahike.db.interface :as dbi]
             [datahike.index :as di]
+            [datahike.index.interface :as dii]
             [datahike.index.audit :as audit]
             [datahike.index.secondary :as sec]
             [datahike.store :as ds]
@@ -1282,3 +1283,50 @@
 (defn load-entities [old entities]
   (log/debug :datahike/load-entities {:entity-count (count entities)})
   (complete-db-update old (with-store-ids old #(core/load-entities-with old entities nil %))))
+
+(def ^:private index-keys
+  [:eavt :aevt :avet :temporal-eavt :temporal-aevt :temporal-avet])
+
+#?(:clj
+   (defn- counts-complete-meta [meta]
+     (cond-> (assoc meta :datahike/index-counts dii/counts-complete)
+       (neg? (compare (str (:persistent.set/version meta)) (str dt/persistent-set-version)))
+       (assoc :persistent.set/version dt/persistent-set-version))))
+
+(defn ^:no-doc recount-indices!
+  "Writer operation: store every branch of every index of `old` with its element
+   count, mark the database `dii/counts-complete`, and commit with no transaction."
+  [old]
+  #?(:cljs
+     (throw (ex-info "Index counts can only be rewritten from the JVM."
+                     {:type :recount/unsupported-platform}))
+     :clj
+     (let [index (get-in old [:config :index])]
+       (when-not (= :datahike.index/persistent-set index)
+         (throw (ex-info "Only persistent-set indices keep counts; there is nothing to recount."
+                         {:type :recount/unsupported-index :index index})))
+       (let [storage (get-in old [:store :storage])
+             freed-set (:freed-set storage)
+             freed-before (if freed-set @freed-set #{})
+             unhint! (fn []
+                       (when freed-set
+                         (let [mine (reduce disj @freed-set freed-before)]
+                           (when (seq mine)
+                             (swap! freed-set #(reduce disj % mine))
+                             (swap! (:freed-addresses storage) #(filterv (fn [[a _]] (not (contains? mine a))) %))
+                             (when-let [stacks (:freed-stacks storage)]
+                               (swap! stacks #(reduce dissoc % mine)))))))
+             counted (try
+                       (reduce (fn [db k]
+                                 (if-let [ix (get db k)]
+                                   (assoc db k (dii/recount index ix))
+                                   db))
+                               old index-keys)
+                       (finally (unhint!)))]
+         (complete-db-update
+          old
+          {:db-before old
+           :db-after  (update counted :meta counts-complete-meta)
+           :tx-data   []
+           :tempids   {}
+           :tx-meta   {:db/txInstant (dt/get-date)}})))))

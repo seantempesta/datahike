@@ -1184,6 +1184,25 @@
                nil storage (.-address pset) (.-settings pset))
        pset)))
 
+(defmethod di/root-count-known? :datahike.index/persistent-set [_index-name pset]
+  #?(:clj  (if (instance? PersistentSortedSet pset)
+             (>= (.-_count ^PersistentSortedSet pset) 0)
+             true)
+     :cljs (if (instance? BTSet pset)
+             (let [c (.-cnt pset)] (and (some? c) (>= c 0)))
+             true)))
+
+#?(:clj
+   (defmethod di/count-census :datahike.index/persistent-set [_index-name pset]
+     (when (instance? PersistentSortedSet pset)
+       (psset/count-census pset))))
+
+#?(:clj
+   (defmethod di/recount :datahike.index/persistent-set [_index-name pset]
+     (if (instance? PersistentSortedSet pset)
+       (psset/recount pset)
+       pset)))
+
 (defmethod di/konserve-backend :datahike.index/persistent-set [_index-name store]
   store)
 

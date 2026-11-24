@@ -31,6 +31,13 @@
 (def konserve-backend di/konserve-backend)
 (def default-index-config di/default-index-config)
 (def with-storage di/with-storage)
+(def counts-complete di/counts-complete)
+(def counts-complete? di/counts-complete?)
+(def mark-counts-complete di/mark-counts-complete)
+(def root-count-known? di/root-count-known?)
+(def estimated-count di/estimated-count)
+(def count-census di/count-census)
+(def recount di/recount)
 
 ;; Other functions
 

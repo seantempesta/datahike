@@ -132,6 +132,51 @@
 
 (defmethod with-storage :default [_index-name index _storage] index)
 
+(def counts-complete
+  "What a database's `:meta` holds under `:datahike/index-counts` once every branch
+   of every index is stored with its element count: set when the database is created,
+   and by `datahike.index.recount/recount!`."
+  :complete)
+
+(defn counts-complete? [db]
+  (= counts-complete (get-in db [:meta :datahike/index-counts])))
+
+(defn mark-counts-complete
+  "`meta` with the mark for persistent-set indices; `meta` unchanged for any other."
+  [meta index-name]
+  (if (= :datahike.index/persistent-set index-name)
+    (assoc meta :datahike/index-counts counts-complete)
+    meta))
+
+(defmulti root-count-known?
+  "Does `index` carry its element count in its header without reading from storage?"
+  (fn [index-name _index] index-name))
+
+(defmethod root-count-known? :default [_index-name _index] true)
+
+(def ^:const unknown-count-estimate
+  "Fixed scale returned by `estimated-count` when an index root has no stored count."
+  1000000)
+
+(defn estimated-count
+  "Element count FOR ESTIMATES ONLY: true count when known in header, else `unknown-count-estimate`."
+  [index-name index]
+  (if (root-count-known? index-name index)
+    (-count index)
+    unknown-count-estimate))
+
+(defmulti count-census
+  "`{:branches n :unknown m}` for `index`, or nil for index types without subtree counts."
+  (fn [index-name _index] index-name))
+
+(defmethod count-census :default [_index-name _index] nil)
+
+(defmulti recount
+  "`index` with every branch counted and repaired branches marked dirty for `store`."
+  (fn [index-name _index] index-name))
+
+(defmethod recount :default [_index-name index] index)
+
 ;; Default handlers for missing index implementations
 
 (defn- hitchhiker-tree-missing-error []

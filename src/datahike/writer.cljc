@@ -381,7 +381,9 @@
                            #?@(:clj ['build-secondary-index! w/build-secondary-index!
                                      'install-secondary-index! w/install-secondary-index!])
                            ;; merge with multi-parent commit tracking
-                           'merge! w/merge-writer!})
+                           'merge! w/merge-writer!
+                           ;; recount every uncounted index branch in place (no datom changes)
+                           'recount-indices! w/recount-indices!})
 
 (defn writer-fn-map
   "A writer's operations: `default-write-fn-map` with `write-fn-map` over it.
@@ -816,6 +818,23 @@
                   listeners (some-> (:listeners (meta connection)) deref)]
               (when (map? tx-report)
                 (notify-listeners! connection listeners tx-report))
+              (#?(:jolt (fn [p v] (p v)) :clj deliver :cljs put!) p tx-report)))
+          p))))
+
+(defn recount-indices!
+  "Rewrite every uncounted index branch with its count through the writer; see
+   `datahike.index.recount/recount!`. Works on both :sync and :self writers."
+  [connection]
+  (let [p (throwable-promise)
+        writer (:writer @(:wrapped-atom connection))]
+    (if (instance? SyncWriter writer)
+      (let [tx-report (try (sync-apply! connection (:write-fn-map writer) (:last-cid writer) (:known-generation writer)
+                                        {:op 'recount-indices! :args []})
+                           (catch #?(:clj Throwable :cljs js/Error) e e))]
+        (#?(:jolt (fn [p v] (p v)) :clj deliver :cljs put!) p tx-report)
+        p)
+      (do (go
+            (let [tx-report (<! (dispatch! writer {:op 'recount-indices! :args []}))]
               (#?(:jolt (fn [p v] (p v)) :clj deliver :cljs put!) p tx-report)))
           p))))
 
